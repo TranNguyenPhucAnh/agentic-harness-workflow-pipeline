@@ -14,7 +14,7 @@ from pathlib import Path
 
 DASHSCOPE_API_KEY = os.environ["DASHSCOPE_API_KEY"]
 DASHSCOPE_URL     = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
-QWEN_MODEL        = "qwen3.6-plus"
+MODEL             = "qwen3.6-plus"
 
 ROOT           = Path(__file__).parent.parent
 SPEC_PATH      = ROOT / "spec.md"
@@ -56,7 +56,7 @@ def call_qwen(system: str, user_message: str) -> dict:
         "Content-Type": "application/json",
     }
     payload = {
-        "model": QWEN_MODEL,
+        "model": MODEL,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user",   "content": user_message},
