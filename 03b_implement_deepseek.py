@@ -1,14 +1,14 @@
 """
-pipeline/03b_implement_glm.py
-Step 3b — Call GLM 5.1 (Zhipu AI) to implement scaffold stubs.
+pipeline/03b_implement_deepseek.py
+Step 3b — Call DeepSeek V3 to implement scaffold stubs.
 Reads:   spec.md, scaffold/scaffold.json
-Writes:  src/**  (non-test files only)
-         scaffold/impl_glm.json
+Writes:  src_deepseek/**  (non-test files only)
+         scaffold/impl_deepseek.json
 
 NOTE: Runs in parallel with 03a via separate GitHub Actions steps.
       Each model writes to its OWN directory to avoid race conditions:
-        Qwen → src/  (canonical for now; swapped by 04_test_and_iterate.py)
-        GLM  → src_glm/  (isolated impl)
+        Qwen     → src/           (canonical; swapped by 04_test_and_iterate.py)
+        DeepSeek → src_deepseek/  (isolated impl)
 """
 
 import os
@@ -17,16 +17,16 @@ import sys
 import httpx
 from pathlib import Path
 
-GLM_API_KEY = os.environ["GLM_API_KEY"]
-GLM_URL     = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
-GLM_MODEL   = "glm-4-plus"   # GLM 5.1 / GLM-4-Plus
+DEEPSEEK_API_KEY = os.environ["DEEPSEEK_API_KEY"]
+DEEPSEEK_URL     = "https://api.deepseek.com"
+DEEPSEEK_MODEL   = "deepseek-chat"
 
 ROOT           = Path(__file__).parent.parent
 SPEC_PATH      = ROOT / "spec.md"
 SCAFFOLD_JSON  = ROOT / "scaffold" / "scaffold.json"
-INSTRUCTIONS   = ROOT / "scaffold" / "instructions_glm.txt"
-IMPL_RECORD    = ROOT / "scaffold" / "impl_glm.json"
-OUT_DIR        = ROOT / "src_glm"   # isolated; test runner swaps this in
+INSTRUCTIONS   = ROOT / "scaffold" / "instructions_deepseek.txt"
+IMPL_RECORD    = ROOT / "scaffold" / "impl_deepseek.json"
+OUT_DIR        = ROOT / "src_deepseek"   # isolated; test runner swaps this in
 
 
 def build_system_prompt(instructions: str) -> str:
@@ -57,13 +57,13 @@ Model-specific instructions:
 {instructions}"""
 
 
-def call_glm(system: str, user_message: str) -> dict:
+def call_deepseek(system: str, user_message: str) -> dict:
     headers = {
-        "Authorization": f"Bearer {GLM_API_KEY}",
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
         "Content-Type": "application/json",
     }
     payload = {
-        "model": GLM_MODEL,
+        "model": DEEPSEEK_MODEL,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user",   "content": user_message},
@@ -72,9 +72,9 @@ def call_glm(system: str, user_message: str) -> dict:
         "max_tokens": 32768,
     }
 
-    print("[03b] Calling GLM 5.1 …")
+    print("[03b] Calling DeepSeek V3 …")
     with httpx.Client(timeout=180) as client:
-        r = client.post(GLM_URL, headers=headers, json=payload)
+        r = client.post(DEEPSEEK_URL, headers=headers, json=payload)
         r.raise_for_status()
 
     text = r.json()["choices"][0]["message"]["content"].strip()
@@ -99,14 +99,14 @@ def main():
         f"{json.dumps(stub_files, indent=2)}"
     )
 
-    result = call_glm(build_system_prompt(instrs), user_msg)
+    result = call_deepseek(build_system_prompt(instrs), user_msg)
 
     written = []
     for entry in result["files"]:
-        # Remap src/ → src_glm/ to isolate GLM's impl
+        # Remap src/ → src_deepseek/ to isolate DeepSeek's impl
         rel = entry["file_path"]
         if rel.startswith("src/"):
-            rel = "src_glm/" + rel[len("src/"):]
+            rel = "src_deepseek/" + rel[len("src/"):]
         path = ROOT / rel
 
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -114,7 +114,7 @@ def main():
         written.append(rel)
         print(f"[03b] WROTE {rel}")
 
-    IMPL_RECORD.write_text(json.dumps({"model": "glm", "files": written}, indent=2))
+    IMPL_RECORD.write_text(json.dumps({"model": "deepseek", "files": written}, indent=2))
     print(f"[03b] Done — {len(written)} files written.")
 
 
