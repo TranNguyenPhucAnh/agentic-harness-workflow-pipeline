@@ -49,23 +49,23 @@ jobs:
       # ── STEP 3: Qwen + GLM implement in parallel ────────────────────────
       - name: Step 3a — Qwen implement
         env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          QWEN_API_KEY: ${{ secrets.QWEN_API_KEY }}
         run: python pipeline/03a_implement_qwen.py
 
       - name: Step 3b — GLM implement
         env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
         run: python pipeline/03b_implement_glm.py
 
       # ── STEP 4 + 5: Test with iteration ─────────────────────────────────
       - name: Step 4+5 — Test Qwen impl + iterate
         env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          QWEN_API_KEY: ${{ secrets.QWEN_API_KEY }}
         run: python pipeline/04_test_and_iterate.py --impl qwen --max-iter 3
 
       - name: Step 4+5 — Test GLM impl + iterate
         env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
         run: python pipeline/04_test_and_iterate.py --impl glm --max-iter 3
 
       # ── STEP 6: Report ────────────────────────────────────────────────────
