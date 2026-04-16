@@ -2,7 +2,7 @@
 # Version: 1.0.0
 # Last updated: 2025-04-16
 # Agent: Claude (Spec Normalizer)
-# Downstream consumers: Gemini 2.5 Flash (scaffold), Qwen 3.6 Plus, GLM 5.1 (implement)
+# Downstream consumers: Gemini 2.5 Flash (scaffold), Qwen 3.6 Plus, Deepseek v3.2 (implement)
 
 ---
 
@@ -18,7 +18,7 @@ OUTPUT_DIRS     : src/, tests/
 ```
 
 Gemini: output MUST be a single JSON object matching schema in §8.
-Qwen / GLM: receive spec.md + scaffold JSON → implement ONLY the files listed in scaffold → do not add new files.
+Qwen / Deepseek: receive spec.md + scaffold JSON → implement ONLY the files listed in scaffold → do not add new files.
 
 ---
 
@@ -411,7 +411,7 @@ tests/
   ],
   "implementation_instructions": {
     "for_qwen": "string — specific hints for Qwen 3.6 Plus",
-    "for_glm": "string — specific hints for GLM 5.1"
+    "for_deepseek": "string — specific hints for Deepseek v3.2"
   },
   "vite_config_notes": "string",
   "tailwind_config_notes": "string"
@@ -427,7 +427,7 @@ tests/
 
 ---
 
-## 9. Qwen / GLM implementation rules
+## 9. Qwen / Deepseek implementation rules
 
 - Receive: `spec.md` + full scaffold JSON from Gemini
 - Task: implement ONLY the function bodies in non-test files
