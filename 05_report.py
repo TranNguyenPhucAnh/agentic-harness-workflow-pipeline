@@ -12,7 +12,7 @@ ROOT        = Path(__file__).parent.parent
 REPORTS_DIR = ROOT / "reports"
 REPORTS_DIR.mkdir(exist_ok=True)
 
-IMPLS = ["qwen", "glm"]
+IMPLS = ["qwen", "deepseek"]
 
 
 def load_report(impl: str) -> dict | None:
