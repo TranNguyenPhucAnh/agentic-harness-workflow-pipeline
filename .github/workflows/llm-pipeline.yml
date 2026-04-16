@@ -1,0 +1,86 @@
+name: LLM Pipeline — Spec to Tested Code
+
+on:
+  push:
+    paths:
+      - 'spec.md'
+  workflow_dispatch:   # manual trigger for debugging
+
+concurrency:
+  group: llm-pipeline-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  llm-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Python deps
+        run: pip install httpx pytest
+
+      - name: Install Node deps
+        run: |
+          npm install
+          # vitest + testing-library must be in package.json already
+          # this step just restores node_modules from lockfile
+
+      # ── STEP 2: Gemini 2.5 Flash → scaffolding ──────────────────────────
+      # NOTE: Step 1 (Claude spec normalisation) is done manually by the author.
+      # spec.md in the repo IS the normalised spec. Pipeline starts at Step 2.
+      - name: Step 2 — Gemini scaffold
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python pipeline/02_scaffold_gemini.py
+
+      # ── STEP 3: Qwen + GLM implement in parallel ────────────────────────
+      - name: Step 3a — Qwen implement
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: python pipeline/03a_implement_qwen.py
+
+      - name: Step 3b — GLM implement
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: python pipeline/03b_implement_glm.py
+
+      # ── STEP 4 + 5: Test with iteration ─────────────────────────────────
+      - name: Step 4+5 — Test Qwen impl + iterate
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: python pipeline/04_test_and_iterate.py --impl qwen --max-iter 3
+
+      - name: Step 4+5 — Test GLM impl + iterate
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: python pipeline/04_test_and_iterate.py --impl glm --max-iter 3
+
+      # ── STEP 6: Report ────────────────────────────────────────────────────
+      - name: Step 6 — Generate report
+        if: always()   # run even if tests fail
+        run: python pipeline/05_report.py
+
+      - name: Upload report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-report-${{ github.run_number }}
+          path: reports/
+          retention-days: 30
+
+      - name: Print summary to Actions log
+        if: always()
+        run: cat reports/summary.md >> $GITHUB_STEP_SUMMARY
