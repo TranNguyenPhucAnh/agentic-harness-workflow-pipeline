@@ -49,7 +49,7 @@ jobs:
       # ── STEP 3: Qwen + GLM implement in parallel ────────────────────────
       - name: Step 3a — Qwen implement
         env:
-          QWEN_API_KEY: ${{ secrets.QWEN_API_KEY }}
+          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
         run: python pipeline/03a_implement_qwen.py
 
       - name: Step 3b — GLM implement
@@ -60,7 +60,7 @@ jobs:
       # ── STEP 4 + 5: Test with iteration ─────────────────────────────────
       - name: Step 4+5 — Test Qwen impl + iterate
         env:
-          QWEN_API_KEY: ${{ secrets.QWEN_API_KEY }}
+          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
         run: python pipeline/04_test_and_iterate.py --impl qwen --max-iter 3
 
       - name: Step 4+5 — Test GLM impl + iterate
