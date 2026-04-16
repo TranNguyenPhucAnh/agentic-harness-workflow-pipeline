@@ -4,7 +4,7 @@ harness.py — Local dev runner for the LLM pipeline.
 Mirrors the GitHub Actions workflow exactly, runs on your machine.
 
 Usage:
-    # Full pipeline (Gemini scaffold → Qwen + GLM implement → test → report)
+    # Full pipeline (Gemini scaffold → Qwen + Deepseek implement → test → report)
     python harness.py
 
     # Skip scaffold (reuse existing scaffold/scaffold.json)
@@ -19,7 +19,7 @@ Usage:
 
 Requirements:
     pip install httpx
-    GEMINI_API_KEY, QWEN_API_KEY, GLM_API_KEY must be set as env vars
+    GEMINI_API_KEY, DASHSCOPE_API_KEY, DEEPSEEK_API_KEY must be set as env vars
     (or in a .env file — this script loads .env automatically)
 """
 
@@ -96,7 +96,7 @@ def main():
     models = ["qwen", "deepseek"] if args.only is None else [args.only]
 
     for model in models:
-        if model == "qwen" and not check_env(["QWEN_API_KEY"]):
+        if model == "qwen" and not check_env(["DASHSCOPE_API_KEY"]):
             results[f"impl_{model}"] = False
             continue
         if model == "deepseek" and not check_env(["DEEPSEEK_API_KEY"]):
