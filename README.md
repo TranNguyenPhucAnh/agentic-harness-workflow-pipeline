@@ -6,7 +6,7 @@
 |---|---|
 | **You** | Edit `spec.md` → push → GitHub Action runs automatically |
 | **Claude (Spec Agent)** | Normalise / generate `spec.md` on request |
-| **GitHub Action** | Gemini scaffold → Qwen + GLM implement → vitest → iterate → report |
+| **GitHub Action** | Gemini scaffold → Qwen + Deepseek implement → vitest → iterate → report |
 
 Claude does **not** call any API. You copy Claude's `spec.md` response, commit it, push.
 
@@ -17,8 +17,8 @@ Claude does **not** call any API. You copy Claude's `spec.md` response, commit i
 | Secret | Value |
 |---|---|
 | `GEMINI_API_KEY` | Google AI Studio key |
-| `QWEN_API_KEY` | DashScope key (Alibaba Cloud) |
-| `GLM_API_KEY` | Zhipu AI open platform key |
+| `DASHSCOPE_API_KEY` | DashScope key (Alibaba Cloud) |
+| `DEEPSEEK_API_KEY` | Deepseek key |
 
 ---
 
@@ -40,7 +40,7 @@ python harness.py --skip-scaffold
 
 # Only test one model
 python harness.py --only qwen
-python harness.py --only glm
+python harness.py --only deepseek
 
 # More iterations
 python harness.py --max-iter 5
@@ -67,20 +67,20 @@ harness.py                       ← local runner
 pipeline/
   02_scaffold_gemini.py          ← Gemini 2.5 Flash → scaffold JSON
   03a_implement_qwen.py          ← Qwen 3.6 Plus → src/ impl
-  03b_implement_glm.py           ← GLM 5.1 → src_glm/ impl
+  03b_implement_deepseek.py      ← Deepseek v3.2 → src_deepseek/ impl
   04_test_and_iterate.py         ← vitest + fix loop (max 3 iter)
   05_report.py                   ← summary.md
 
 scaffold/
   scaffold.json                  ← Gemini output
   instructions_qwen.txt
-  instructions_glm.txt
+  instructions_deekseek.txt
   impl_qwen.json
-  impl_glm.json
+  impl_deepseek.json
 
 reports/
   qwen_iterations.json
-  glm_iterations.json
+  deepseek_iterations.json
   summary.md                     ← shown in GitHub Actions summary tab
 ```
 
