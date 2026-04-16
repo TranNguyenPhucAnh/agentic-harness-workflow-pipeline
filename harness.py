@@ -12,7 +12,7 @@ Usage:
 
     # Only run one model
     python harness.py --only qwen
-    python harness.py --only glm
+    python harness.py --only deepseek
 
     # Override iteration cap
     python harness.py --max-iter 5
@@ -70,7 +70,7 @@ def main():
 
     parser = argparse.ArgumentParser(description="Local LLM pipeline runner")
     parser.add_argument("--skip-scaffold", action="store_true", help="Reuse existing scaffold.json")
-    parser.add_argument("--only", choices=["qwen", "glm"], help="Run only one model")
+    parser.add_argument("--only", choices=["qwen", "deepseek"], help="Run only one model")
     parser.add_argument("--max-iter", type=int, default=3, help="Max fix iterations per model")
     args = parser.parse_args()
 
@@ -93,17 +93,17 @@ def main():
         print("[harness] Skipping scaffold (reusing existing scaffold.json)")
 
     # ── Step 3+4+5: Implement + test ─────────────────────────────────────────
-    models = ["qwen", "glm"] if args.only is None else [args.only]
+    models = ["qwen", "deepseek"] if args.only is None else [args.only]
 
     for model in models:
         if model == "qwen" and not check_env(["QWEN_API_KEY"]):
             results[f"impl_{model}"] = False
             continue
-        if model == "glm" and not check_env(["GLM_API_KEY"]):
+        if model == "deepseek" and not check_env(["DEEPSEEK_API_KEY"]):
             results[f"impl_{model}"] = False
             continue
 
-        script_map = {"qwen": "03a_implement_qwen.py", "glm": "03b_implement_glm.py"}
+        script_map = {"qwen": "03a_implement_qwen.py", "deepseek": "03b_implement_deepseek.py"}
         ok = run_step(f"Step 3 — {model.upper()} implement", script_map[model])
         results[f"impl_{model}"] = ok
 
