@@ -17,9 +17,9 @@ import sys
 import httpx
 from pathlib import Path
 
-GLM_API_KEY = os.environ["GLM_API_KEY"]
-GLM_URL     = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
-GLM_MODEL   = "glm-4-plus"   # GLM 5.1 / GLM-4-Plus
+OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
+OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions"
+GLM_MODEL          = "z-ai/glm-5.1"
 
 ROOT           = Path(__file__).parent.parent
 SPEC_PATH      = ROOT / "spec.md"
@@ -59,7 +59,7 @@ Model-specific instructions:
 
 def call_glm(system: str, user_message: str) -> dict:
     headers = {
-        "Authorization": f"Bearer {GLM_API_KEY}",
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
     }
     payload = {
@@ -74,7 +74,7 @@ def call_glm(system: str, user_message: str) -> dict:
 
     print("[03b] Calling GLM 5.1 …")
     with httpx.Client(timeout=180) as client:
-        r = client.post(GLM_URL, headers=headers, json=payload)
+        r = client.post(OPENROUTER_URL, headers=headers, json=payload)
         r.raise_for_status()
 
     text = r.json()["choices"][0]["message"]["content"].strip()
