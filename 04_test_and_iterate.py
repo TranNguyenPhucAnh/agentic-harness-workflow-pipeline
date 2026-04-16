@@ -32,9 +32,9 @@ REPORTS_DIR.mkdir(exist_ok=True)
 def call_qwen(messages: list) -> str:
     api_key = os.environ["QWEN_API_KEY"]
     r = httpx.post(
-        "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+        "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json={"model": "qwen-plus", "messages": messages, "temperature": 0.1, "max_tokens": 32768},
+        json={"model": "qwen3.6-plus", "messages": messages, "temperature": 0.1, "max_tokens": 32768},
         timeout=180,
     )
     r.raise_for_status()
@@ -44,7 +44,7 @@ def call_qwen(messages: list) -> str:
 def call_deepseek(messages: list) -> str:
     api_key = os.environ["DEEPSEEK_API_KEY"]
     r = httpx.post(
-        "https://api.deepseek.com/v1/chat/completions",
+        "https://api.deepseek.com",
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         json={"model": "deepseek-chat", "messages": messages, "temperature": 0.1, "max_tokens": 32768},
         timeout=180,
