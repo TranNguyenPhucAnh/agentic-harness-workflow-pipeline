@@ -17,7 +17,8 @@ Claude does **not** call any API. You copy Claude's `spec.md` response, commit i
 | Secret | Value |
 |---|---|
 | `GEMINI_API_KEY` | Google AI Studio key |
-| `OPENROUTER_API_KEY` | Open Router key |
+| `QWEN_API_KEY` | DashScope key (Alibaba Cloud) |
+| `GLM_API_KEY` | Zhipu AI open platform key |
 
 ---
 
