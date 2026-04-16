@@ -12,9 +12,9 @@ import sys
 import httpx
 from pathlib import Path
 
-OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
-OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions"
-QWEN_MODEL         = "qwen/qwen3.6-plus"
+QWEN_API_KEY = os.environ["QWEN_API_KEY"]
+QWEN_URL     = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+QWEN_MODEL   = "qwen-plus"   # Qwen 3.6 Plus model alias on DashScope
 
 ROOT           = Path(__file__).parent.parent
 SPEC_PATH      = ROOT / "spec.md"
@@ -53,7 +53,7 @@ Model-specific instructions:
 
 def call_qwen(system: str, user_message: str) -> dict:
     headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Authorization": f"Bearer {QWEN_API_KEY}",
         "Content-Type": "application/json",
     }
     payload = {
@@ -68,7 +68,7 @@ def call_qwen(system: str, user_message: str) -> dict:
 
     print("[03a] Calling Qwen 3.6 Plus …")
     with httpx.Client(timeout=180) as client:
-        r = client.post(OPENROUTER_URL, headers=headers, json=payload)
+        r = client.post(QWEN_URL, headers=headers, json=payload)
         r.raise_for_status()
 
     text = r.json()["choices"][0]["message"]["content"].strip()
