@@ -13,7 +13,7 @@ import httpx
 from pathlib import Path
 
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-GEMINI_MODEL   = "gemini-2.5-flash-preview-05-20"
+GEMINI_MODEL   = "gemini-2.5-flash"
 GEMINI_URL     = (
     f"https://generativelanguage.googleapis.com/v1beta/models/"
     f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
