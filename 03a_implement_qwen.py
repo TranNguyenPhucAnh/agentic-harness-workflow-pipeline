@@ -12,9 +12,9 @@ import sys
 import httpx
 from pathlib import Path
 
-QWEN_API_KEY = os.environ["QWEN_API_KEY"] # aka. DASHSCOPE_API_KEY
-QWEN_URL     = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
-QWEN_MODEL   = "qwen3.6-plus"
+DASHSCOPE_API_KEY = os.environ["DASHSCOPE_API_KEY"]
+DASHSCOPE_URL     = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+QWEN_MODEL        = "qwen3.6-plus"
 
 ROOT           = Path(__file__).parent.parent
 SPEC_PATH      = ROOT / "spec.md"
@@ -52,7 +52,7 @@ Model-specific instructions:
 
 def call_qwen(system: str, user_message: str) -> dict:
     headers = {
-        "Authorization": f"Bearer {QWEN_API_KEY}",
+        "Authorization": f"Bearer {DASHSCOPE_API_KEY}",
         "Content-Type": "application/json",
     }
     payload = {
@@ -67,7 +67,7 @@ def call_qwen(system: str, user_message: str) -> dict:
 
     print("[03a] Calling Qwen 3.6 Plus …")
     with httpx.Client(timeout=180) as client:
-        r = client.post(QWEN_URL, headers=headers, json=payload)
+        r = client.post(DASHSCOPE_URL, headers=headers, json=payload)
         r.raise_for_status()
 
     text = r.json()["choices"][0]["message"]["content"].strip()
