@@ -12,16 +12,15 @@ import sys
 import httpx
 from pathlib import Path
 
-QWEN_API_KEY = os.environ["QWEN_API_KEY"]
-QWEN_URL     = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
-QWEN_MODEL   = "qwen-plus"   # Qwen 3.6 Plus model alias on DashScope
+QWEN_API_KEY = os.environ["QWEN_API_KEY"] # aka. DASHSCOPE_API_KEY
+QWEN_URL     = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+QWEN_MODEL   = "qwen3.6-plus"
 
 ROOT           = Path(__file__).parent.parent
 SPEC_PATH      = ROOT / "spec.md"
 SCAFFOLD_JSON  = ROOT / "scaffold" / "scaffold.json"
 INSTRUCTIONS   = ROOT / "scaffold" / "instructions_qwen.txt"
 IMPL_RECORD    = ROOT / "scaffold" / "impl_qwen.json"
-
 
 def build_system_prompt(instructions: str) -> str:
     return f"""You are a senior TypeScript/React developer.
