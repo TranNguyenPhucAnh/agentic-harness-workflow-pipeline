@@ -30,7 +30,7 @@ REPORTS_DIR.mkdir(exist_ok=True)
 # ── API helpers ──────────────────────────────────────────────────────────────
 
 def call_qwen(messages: list) -> str:
-    api_key = os.environ["QWEN_API_KEY"]
+    api_key = os.environ["OPENROUTER_API_KEY"]
     r = httpx.post(
         "https://openrouter.ai/api/v1/chat/completions",
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
