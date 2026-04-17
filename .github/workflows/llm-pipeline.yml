@@ -1,10 +1,14 @@
 name: LLM Pipeline — Spec to Tested Code
 
 on:
-  push:
+  pull_request:
+    branches:
+      - main
     paths:
       - 'spec.md'
-  workflow_dispatch:   # manual trigger for debugging
+    types:
+      - closed
+  workflow_dispatch:
 
 concurrency:
   group: llm-pipeline-${{ github.ref }}
