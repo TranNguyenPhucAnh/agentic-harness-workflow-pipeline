@@ -37,12 +37,24 @@ python harness.py
 # Reuse existing scaffold (skip Gemini call)
 python harness.py --skip-scaffold
 
+# Skip scaffold + skip implement (reuse existing src/ / src_glm/)
+python harness.py --skip-scaffold --skip-impl
+python harness.py --skip-scaffold --skip-impl --only qwen
+
+# Test + iterate only (alias for --skip-scaffold --skip-impl)
+python harness.py --test-only
+python harness.py --test-only --only qwen
+python harness.py --test-only --only glm
+
 # Only test one model
 python harness.py --only qwen
 python harness.py --only glm
 
-# More iterations
+# Override iteration cap
 python harness.py --max-iter 5
+
+Typical debug loop after a failed test:
+python harness.py --test-only --only qwen --max-iter 3
 ```
 
 ---
