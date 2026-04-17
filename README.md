@@ -42,8 +42,8 @@ python harness.py --skip-scaffold --only qwen
 python harness.py --skip-scaffold --only glm
 
 # Skip scaffold + skip implement (reuse existing src/ / src_glm/)
-python harness.py --skip-scaffold --skip-impl
 python harness.py --skip-scaffold --skip-impl --only qwen
+python harness.py --skip-scaffold --skip-impl --only glm
 
 # Test + iterate only (alias for --skip-scaffold --skip-impl)
 python harness.py --test-only
