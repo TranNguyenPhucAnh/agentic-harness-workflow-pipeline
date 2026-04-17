@@ -1,10 +1,14 @@
 name: LLM Pipeline — Spec to Tested Code
 
 on:
-  push:
+  pull_request:
+    branches:
+      - main
     paths:
       - 'spec.md'
-  workflow_dispatch:   # manual trigger for debugging
+    types:
+      - closed
+  workflow_dispatch:
 
 concurrency:
   group: llm-pipeline-${{ github.ref }}
@@ -46,27 +50,27 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python pipeline/02_scaffold_gemini.py
 
-      # ── STEP 3: Qwen + DeepSeek implement in parallel ──────────────────
+      # ── STEP 3: Qwen + GLM implement in parallel ──────────────────
       - name: Step 3a — Qwen implement
         env:
-          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: python pipeline/03a_implement_qwen.py
 
-      - name: Step 3b — DeepSeek implement
+      - name: Step 3b — GLM implement
         env:
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-        run: python pipeline/03b_implement_deepseek.py
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: python pipeline/03b_implement_glm.py
 
       # ── STEP 4 + 5: Test with iteration ─────────────────────────────────
       - name: Step 4+5 — Test Qwen impl + iterate
         env:
-          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: python pipeline/04_test_and_iterate.py --impl qwen --max-iter 3
 
-      - name: Step 4+5 — Test DeepSeek impl + iterate
+      - name: Step 4+5 — Test GLM impl + iterate
         env:
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-        run: python pipeline/04_test_and_iterate.py --impl deepseek --max-iter 3
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: python pipeline/04_test_and_iterate.py --impl glm --max-iter 3
 
       # ── STEP 6: Report ────────────────────────────────────────────────────
       - name: Step 6 — Generate report

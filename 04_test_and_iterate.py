@@ -4,9 +4,9 @@ Step 4+5 — Run vitest against an implementation, iterate on failure.
 
 Usage:
     python pipeline/04_test_and_iterate.py --impl qwen      --max-iter 3
-    python pipeline/04_test_and_iterate.py --impl deepseek  --max-iter 3
+    python pipeline/04_test_and_iterate.py --impl glm       --max-iter 3
 
-For DeepSeek: temporarily copies src_deepseek/ → src/ before testing, restores after.
+For GLM: temporarily copies src_glm/ → src/ before testing, restores after.
 Writes:  reports/{impl}_iterations.json
 """
 
@@ -32,28 +32,28 @@ REPORTS_DIR.mkdir(exist_ok=True)
 def call_qwen(messages: list) -> str:
     api_key = os.environ["QWEN_API_KEY"]
     r = httpx.post(
-        "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        "https://openrouter.ai/api/v1/chat/completions",
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json={"model": "qwen3.6-plus", "messages": messages, "temperature": 0.1, "max_tokens": 32768},
+        json={"model": "qwen/qwen3.6-plus", "messages": messages, "temperature": 0.1, "max_tokens": 32768},
         timeout=180,
     )
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"]
 
 
-def call_deepseek(messages: list) -> str:
-    api_key = os.environ["DEEPSEEK_API_KEY"]
+def call_glm(messages: list) -> str:
+    api_key = os.environ["OPENROUTER_API_KEY"]
     r = httpx.post(
-        "https://api.deepseek.com",
+        "https://openrouter.ai/api/v1/chat/completions",
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json={"model": "deepseek-chat", "messages": messages, "temperature": 0.1, "max_tokens": 32768},
+        json={"model": "z-ai/glm-5.1", "messages": messages, "temperature": 0.1, "max_tokens": 32768},
         timeout=180,
     )
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"]
 
 
-CALLERS = {"qwen": call_qwen, "deepseek": call_deepseek}
+CALLERS = {"qwen": call_qwen, "glm": call_glm}
 
 
 # ── Test runner ───────────────────────────────────────────────────────────────
@@ -75,19 +75,19 @@ def run_vitest(src_dir: Path) -> tuple[bool, str]:
 
 
 def swap_src(impl: str) -> Path:
-    """For DeepSeek, copy src_deepseek/ → src/ (backup original first). Returns backup path."""
+    """For GLM, copy src_glm/ → src/ (backup original first). Returns backup path."""
     src = ROOT / "src"
-    if impl == "deepseek":
+    if impl == "glm":
         backup = ROOT / "_src_backup"
         if src.exists():
             shutil.copytree(src, backup, dirs_exist_ok=True)
-        shutil.copytree(ROOT / "src_deepseek", src, dirs_exist_ok=True)
+        shutil.copytree(ROOT / "src_glm", src, dirs_exist_ok=True)
         return backup
     return src   # qwen writes directly to src/, nothing to swap
 
 
 def restore_src(impl: str, backup: Path) -> None:
-    if impl == "deepseek" and backup != ROOT / "src":
+    if impl == "glm" and backup != ROOT / "src":
         shutil.rmtree(ROOT / "src", ignore_errors=True)
         if backup.exists():
             shutil.copytree(backup, ROOT / "src", dirs_exist_ok=True)
@@ -120,7 +120,7 @@ Rules:
 
 def collect_src_files(impl: str) -> dict:
     """Collect all non-test source files for the given impl."""
-    src_dir = ROOT / ("src_deepseek" if impl == "deepseek" else "src")
+    src_dir = ROOT / ("src_glm" if impl == "glm" else "src")
     files = {}
     for p in src_dir.rglob("*.ts"):
         files[str(p.relative_to(ROOT))] = p.read_text()
@@ -132,9 +132,9 @@ def collect_src_files(impl: str) -> dict:
 def apply_fix(impl: str, fix_result: dict) -> None:
     for entry in fix_result.get("files", []):
         rel = entry["file_path"]
-        # For DeepSeek, remap src/ → src_deepseek/
-        if impl == "deepseek" and rel.startswith("src/"):
-            rel = "src_deepseek/" + rel[len("src/"):]
+        # For GLM, remap src/ → src_glm/
+        if impl == "glm" and rel.startswith("src/"):
+            rel = "src_glm/" + rel[len("src/"):]
         path = ROOT / rel
         if path.exists():   # only overwrite existing files
             path.write_text(entry["code"])
@@ -172,7 +172,7 @@ def request_fix(impl: str, error_log: str, call_api) -> dict:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--impl",     required=True, choices=["qwen", "deepseek"])
+    parser.add_argument("--impl",     required=True, choices=["qwen", "glm"])
     parser.add_argument("--max-iter", type=int, default=3)
     args = parser.parse_args()
 
