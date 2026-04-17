@@ -53,7 +53,7 @@ python harness.py --only glm
 # Override iteration cap
 python harness.py --max-iter 5
 
-Typical debug loop after a failed test:
+# Typical debug loop after a failed test:
 python harness.py --test-only --only qwen --max-iter 3
 ```
 
