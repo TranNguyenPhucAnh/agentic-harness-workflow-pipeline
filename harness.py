@@ -10,12 +10,24 @@ Usage:
     # Skip scaffold (reuse existing scaffold/scaffold.json)
     python harness.py --skip-scaffold
 
-    # Only run one model
+    # Skip scaffold + skip implement (reuse existing src/ / src_glm/)
+    python harness.py --skip-scaffold --skip-impl
+    python harness.py --skip-scaffold --skip-impl --only qwen
+
+    # Test + iterate only (alias for --skip-scaffold --skip-impl)
+    python harness.py --test-only
+    python harness.py --test-only --only qwen
+    python harness.py --test-only --only glm
+
+    # Only run one model (implement + test)
     python harness.py --only qwen
     python harness.py --only glm
 
     # Override iteration cap
     python harness.py --max-iter 5
+
+Typical debug loop after a failed test:
+    python harness.py --test-only --only qwen --max-iter 3
 
 Requirements:
     pip install httpx
@@ -65,14 +77,36 @@ def check_env(keys: list[str]) -> bool:
     return True
 
 
+def check_impl_exists(model: str) -> bool:
+    """Verify that implementation files exist before skipping implement step."""
+    src_dir = ROOT / ("src_glm" if model == "glm" else "src")
+    if not src_dir.exists() or not any(src_dir.rglob("*.ts")):
+        print(f"[harness] --skip-impl set but {src_dir} is empty or missing.")
+        print(f"          Run without --skip-impl first to generate implementation.")
+        return False
+    return True
+
+
 def main():
     load_dotenv()
 
     parser = argparse.ArgumentParser(description="Local LLM pipeline runner")
-    parser.add_argument("--skip-scaffold", action="store_true", help="Reuse existing scaffold.json")
-    parser.add_argument("--only", choices=["qwen", "glm"], help="Run only one model")
-    parser.add_argument("--max-iter", type=int, default=3, help="Max fix iterations per model")
+    parser.add_argument("--skip-scaffold", action="store_true",
+                        help="Reuse existing scaffold/scaffold.json")
+    parser.add_argument("--skip-impl", action="store_true",
+                        help="Reuse existing src/ / src_glm/ — skip implement step")
+    parser.add_argument("--test-only", action="store_true",
+                        help="Alias for --skip-scaffold --skip-impl (jump straight to test)")
+    parser.add_argument("--only", choices=["qwen", "glm"],
+                        help="Run only one model")
+    parser.add_argument("--max-iter", type=int, default=3,
+                        help="Max fix iterations per model")
     args = parser.parse_args()
+
+    # --test-only is sugar for --skip-scaffold --skip-impl
+    if args.test_only:
+        args.skip_scaffold = True
+        args.skip_impl = True
 
     results: dict[str, bool] = {}
 
@@ -96,17 +130,24 @@ def main():
     models = ["qwen", "glm"] if args.only is None else [args.only]
 
     for model in models:
-        if model == "qwen" and not check_env(["OPENROUTER_API_KEY"]):
+        if not check_env(["OPENROUTER_API_KEY"]):
             results[f"impl_{model}"] = False
-            continue
-        if model == "glm" and not check_env(["OPENROUTER_API_KEY"]):
-            results[f"impl_{model}"] = False
+            print(f"[harness] Skipping {model.upper()} — missing OPENROUTER_API_KEY.")
             continue
 
         script_map = {"qwen": "03a_implement_qwen.py", "glm": "03b_implement_glm.py"}
-        ok = run_step(f"Step 3 — {model.upper()} implement", script_map[model])
-        results[f"impl_{model}"] = ok
 
+        # ── Step 3: Implement ────────────────────────────────────────────────
+        if args.skip_impl:
+            if not check_impl_exists(model):
+                sys.exit(1)
+            print(f"[harness] Skipping {model.upper()} implement (reusing existing src files)")
+            results[f"impl_{model}"] = True
+        else:
+            ok = run_step(f"Step 3 — {model.upper()} implement", script_map[model])
+            results[f"impl_{model}"] = ok
+
+        # ── Step 4+5: Test + iterate ─────────────────────────────────────────
         ok = run_step(
             f"Step 4+5 — {model.upper()} test + iterate",
             "04_test_and_iterate.py",
