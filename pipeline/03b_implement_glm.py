@@ -69,7 +69,7 @@ def call_glm(system: str, user_message: str) -> dict:
             {"role": "user",   "content": user_message},
         ],
         "temperature": 0.15,
-        "max_tokens": 32768,
+        "max_tokens": 65536,
     }
 
     print("[03b] Calling GLM5.1 …")
