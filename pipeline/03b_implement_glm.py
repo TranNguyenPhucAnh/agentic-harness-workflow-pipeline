@@ -127,9 +127,25 @@ def call_glm_planner(spec: str, stub_files: list) -> dict:
         r = client.post(OPENROUTER_URL, headers=headers, json=payload)
         r.raise_for_status()
 
-    raw = r.json()["choices"][0]["message"]["content"].strip()
+    #raw = r.json()["choices"][0]["message"]["content"].strip()
+    data = r.json()
+    choice = data["choices"][0]
+    msg = choice["message"]
+    
+    content = msg.get("content")
+    tool_calls = msg.get("tool_calls")
+    finish_reason = choice.get("finish_reason")
+    
+    if tool_calls:
+        raise RuntimeError(f"Model returned tool_calls instead of text: {tool_calls}")
+    
+    if not content:
+        raise RuntimeError(
+            f"Model returned empty content. finish_reason={finish_reason}, message={msg}"
+        )
+    
+    raw = content.strip()
     return _parse_json(raw, label="GLM planner response")
-
 
 # ── JSON extraction ───────────────────────────────────────────────────────────
 
