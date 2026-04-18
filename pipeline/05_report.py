@@ -1,7 +1,7 @@
 """
 pipeline/05_report.py
-Step 6 — Aggregate iteration JSON + GLM plan metadata into reports/summary.md
-         This file is printed to $GITHUB_STEP_SUMMARY for the Actions UI.
+Step 5b — Aggregate iteration JSON + GLM plan metadata into reports/summary.md
+          This file is printed to $GITHUB_STEP_SUMMARY for the Actions UI.
 """
 
 import json
