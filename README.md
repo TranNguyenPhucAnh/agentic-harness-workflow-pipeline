@@ -1,23 +1,31 @@
 # LLM Pipeline — How to use
 
-## Role split
+## Architecture
 
-| Who | Does what |
-|---|---|
-| **You** | Edit `spec.md` → push → GitHub Action runs automatically |
-| **Claude (Spec Agent)** | Normalise / generate `spec.md` on request |
-| **GitHub Action** | Gemini scaffold → Qwen + GLM implement → vitest → iterate → report |
+```
+spec.md  →  Gemini 2.5 Flash  →  GLM 5.1 (planner)  →  Qwen 3.6+ (executor)  →  vitest  →  DeepSeek R1 (judge)
+```
 
-Claude does **not** call any API. You copy Claude's `spec.md` response, commit it, push.
+| Layer | Model | Role | Output |
+|---|---|---|---|
+| Scaffold | Gemini 2.5 Flash | Generate stub files + test files from spec | `scaffold/scaffold.json` |
+| Plan | GLM 5.1 | Decompose scaffold into ordered per-file tasks | `scaffold/glm_plan.json` |
+| Implement | Qwen 3.6 Plus | Implement source files per-file (guided by plan) | `src/**` |
+| Test + Repair | vitest + Qwen | Run tests, targeted repair loop (max N iter) | `reports/qwen_iterations.json` |
+| Judge | DeepSeek R1 | Qualitative review + sign-off (runs only on green) | `reports/judge_report.md` |
+
+**You** edit `spec.md` → push → GitHub Action runs automatically.  
+**Claude (Spec Agent)** normalises / generates `spec.md` on request.  
+Claude does **not** call any API — you copy Claude's output, commit, push.
 
 ---
 
 ## Secrets required (GitHub → Settings → Secrets)
 
-| Secret | Value |
+| Secret | Used by |
 |---|---|
-| `GEMINI_API_KEY` | Google AI Studio key |
-| `OPENROUTER_API_KEY` | OpenRouter key |
+| `GEMINI_API_KEY` | Step 2 — Gemini scaffold |
+| `OPENROUTER_API_KEY` | Step 3b GLM plan, Step 3a Qwen implement, Step 6 DeepSeek judge |
 
 ---
 
@@ -29,32 +37,38 @@ pip install httpx
 npm install
 
 # Set keys
-cp .env.example .env   # fill in your keys
+cp .env.example .env   # fill in GEMINI_API_KEY and OPENROUTER_API_KEY
 
-# Full pipeline
+# Full pipeline (scaffold → plan → implement → test → report → judge)
 python harness.py
 
-# Reuse existing scaffold (skip Gemini call)
+# Skip GLM planning — Qwen single-call mode (judge still runs on green)
+python harness.py --only-qwen
+
+# Reuse existing scaffold.json (skip Gemini call)
 python harness.py --skip-scaffold
 
-# # Reuse existing scaffold (skip Gemini call) + implement + test one model
-python harness.py --skip-scaffold --only qwen
-python harness.py --skip-scaffold --only glm
+# Reuse existing glm_plan.json (skip GLM call)
+python harness.py --skip-scaffold --skip-plan
 
-# Skip scaffold + skip implement (reuse existing src/ / src_glm/)
-python harness.py --skip-scaffold --skip-impl --only qwen
-python harness.py --skip-scaffold --skip-impl --only glm
-
-# Test + iterate only (alias for --skip-scaffold --skip-impl)
+# Skip straight to test loop (reuse existing src/)
 python harness.py --test-only
-python harness.py --test-only --only qwen
-python harness.py --test-only --only glm
+
+# Skip judge (faster debug loop — no DeepSeek call)
+python harness.py --test-only --skip-judge
 
 # Override iteration cap
 python harness.py --max-iter 5
 
-# Typical debug loop after a failed test:
-python harness.py --test-only --only qwen --max-iter 3
+# Verbose cluster debug output during test loop
+python harness.py --test-only --verbose
+```
+
+**Typical debug loop after a failed test:**
+```bash
+python harness.py --test-only --skip-judge --max-iter 3
+# fix → repeat until green
+python harness.py --test-only --max-iter 3   # final run WITH judge
 ```
 
 ---
@@ -71,28 +85,33 @@ python harness.py --test-only --only qwen --max-iter 3
 ## Pipeline file map
 
 ```
-spec.md                          ← YOU edit this (via Claude)
-harness.py                       ← local runner
+spec.md                              ← YOU edit this (via Claude)
+harness.py                           ← local runner (mirrors GitHub Actions)
 .github/workflows/llm-pipeline.yml
 
 pipeline/
-  02_scaffold_gemini.py          ← Gemini 2.5 Flash → scaffold JSON
-  03a_implement_qwen.py          ← Qwen 3.6 Plus → src/ impl
-  03b_implement_glm.py           ← GLM 5.1 → src_glm/ impl
-  04_test_and_iterate.py         ← vitest + fix loop (max 3 iter)
-  05_report.py                   ← summary.md
+  02_scaffold_gemini.py              ← Gemini 2.5 Flash → scaffold JSON + stubs
+  03b_implement_glm.py               ← GLM 5.1 → glm_plan.json  (PLANNER)
+  03a_implement_qwen.py              ← Qwen 3.6 Plus → src/      (EXECUTOR)
+  04_test_and_iterate.py             ← vitest + targeted repair loop
+  05_report.py                       ← pipeline summary.md
+  06_judge_deepseek.py               ← DeepSeek R1 → judge_report.md (JUDGE)
 
 scaffold/
-  scaffold.json                  ← Gemini output
-  instructions_qwen.txt
-  instructions_deekseek.txt
-  impl_qwen.json
-  impl_glm.json
+  scaffold.json                      ← Gemini output (stubs + test files)
+  glm_plan.json                      ← GLM planner output
+  instructions_qwen.txt              ← executor hints for Qwen
+  instructions_glm.txt               ← planner hints for GLM
+  impl_qwen.json                     ← record of files written by Qwen
+
+src/                                 ← Qwen-implemented source files
+tests/                               ← Gemini-generated test files
 
 reports/
-  qwen_iterations.json
-  glm_iterations.json
-  summary.md                     ← shown in GitHub Actions summary tab
+  qwen_iterations.json               ← per-iteration test + repair log
+  summary.md                         ← pipeline summary (GitHub Actions tab)
+  judge_report.md                    ← DeepSeek R1 final review + sign-off
+  judge_raw.json                     ← raw judge response + metadata
 ```
 
 ---
@@ -113,3 +132,15 @@ Example prompts:
 ```
 
 Claude will return a full updated `spec.md`. Copy-paste, commit, push.
+
+---
+
+## Judge verdicts
+
+| Verdict | Meaning |
+|---|---|
+| `APPROVED` | No blocking issues, scores avg ≥ 3.5 |
+| `APPROVED_WITH_NOTES` | No blocking issues but non-trivial notes |
+| `NEEDS_REVISION` | Blocking issues found — review `reports/judge_report.md` |
+
+`NEEDS_REVISION` causes `harness.py` and the GitHub Actions step to exit non-zero.
