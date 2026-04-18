@@ -162,10 +162,16 @@ def main():
     # ── Step 3b: GLM plan ────────────────────────────────────────────────────
     glm_plan_path = ROOT / "scaffold" / "glm_plan.json"
 
-    if args.only_qwen or args.test_only:
-        skip_step("Step 3b — GLM 5.1 plan",
-                  "--only-qwen" if args.only_qwen else "--test-only")
+    if args.only_qwen:
+        skip_step("Step 3b — GLM 5.1 plan", "--only-qwen")
         plan_available = False
+
+    elif args.test_only:
+        # --test-only skips all generation, but if a plan file exists we still
+        # pass it to 03a so Qwen benefits from it (no extra API call needed).
+        plan_available = glm_plan_path.exists()
+        reason = "reusing existing glm_plan.json" if plan_available else "no glm_plan.json found"
+        skip_step("Step 3b — GLM 5.1 plan", f"--test-only ({reason})")
 
     elif args.skip_plan:
         if not check_file_exists(glm_plan_path, "--skip-plan"):
