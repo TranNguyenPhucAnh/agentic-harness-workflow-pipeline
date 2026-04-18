@@ -2,17 +2,16 @@
 pipeline/04_test_and_iterate.py
 Step 4+5 — Clustered repair pipeline (Phase B/C/D).
 
-Phase A  (upstream) : 03a/03b already wrote src/ or src_glm/.
+Phase A  (upstream) : 03a wrote src/ (Qwen executor).
 Phase B  (this file): run vitest, parse output → list[FailureCluster]
-Phase C  (this file): for each cluster → 1 targeted model call → patch files
+Phase C  (this file): for each cluster → 1 targeted Qwen call → patch src/
 Phase D  (this file): rerun full vitest after all clusters patched → repeat up to max_iter
 
 Usage:
-    python pipeline/04_test_and_iterate.py --impl qwen    --max-iter 3
-    python pipeline/04_test_and_iterate.py --impl glm     --max-iter 3
-    python pipeline/04_test_and_iterate.py --impl qwen    --max-iter 5 --verbose
+    python pipeline/04_test_and_iterate.py --max-iter 3
+    python pipeline/04_test_and_iterate.py --max-iter 5 --verbose
 
-Writes: reports/{impl}_iterations.json
+Writes: reports/qwen_iterations.json
 """
 
 from __future__ import annotations
@@ -21,7 +20,6 @@ import argparse
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import httpx
@@ -34,11 +32,7 @@ SPEC_PATH     = ROOT / "spec.md"
 REPORTS_DIR   = ROOT / "reports"
 REPORTS_DIR.mkdir(exist_ok=True)
 
-# ── model → src dir mapping ──────────────────────────────────────────────────
-SRC_DIRS: dict[str, str] = {
-    "qwen": "src",
-    "glm":  "src_glm",
-}
+SRC_DIR = "src"   # Qwen is the sole executor; all output goes to src/
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -101,13 +95,9 @@ def call_qwen(messages: list) -> str:
     return _openrouter_call("qwen/qwen3.6-plus", messages)
 
 
-def call_glm(messages: list) -> str:
-    return _openrouter_call("z-ai/glm-5.1", messages)
-
-
+# Repair always uses Qwen — GLM is a planner (03b), not a code fixer
 CALLERS: dict[str, Callable[[list], str]] = {
     "qwen": call_qwen,
-    "glm":  call_glm,
 }
 
 
@@ -139,20 +129,19 @@ _RE_ERROR_BLOCK = re.compile(
 )
 
 
-def _infer_src_file(impl: str, test_file: str) -> str:
+def _infer_src_file(test_file: str) -> str:
     """
     Derive the src file path from a test file path.
-      tests/components/Foo.test.tsx  ->  src[_glm]/components/Foo.tsx
-      tests/hooks/useBar.test.ts     ->  src[_glm]/hooks/useBar.ts
+      tests/components/Foo.test.tsx  ->  src/components/Foo.tsx
+      tests/hooks/useBar.test.ts     ->  src/hooks/useBar.ts
     """
-    src_dir = SRC_DIRS.get(impl, "src")
     rel = test_file.replace("tests/", "", 1)          # components/Foo.test.tsx
     rel = re.sub(r"\.test\.(tsx?)$", r".\1", rel)     # components/Foo.tsx
     rel = re.sub(r"\.test\.(ts)$",   r".\1", rel)     # hooks/useBar.ts
-    return f"{src_dir}/{rel}"
+    return f"{SRC_DIR}/{rel}"
 
 
-def parse_failures(impl: str, output: str) -> list[FailureCluster]:
+def parse_failures(output: str) -> list[FailureCluster]:
     """
     Phase B: parse vitest verbose output -> list[FailureCluster].
 
@@ -174,7 +163,7 @@ def parse_failures(impl: str, output: str) -> list[FailureCluster]:
         if status != "FAIL":
             continue
 
-        src_file = _infer_src_file(impl, test_file)
+        src_file = _infer_src_file(test_file)
         cluster  = clusters.setdefault(
             test_file,
             FailureCluster(test_file=test_file, src_file=src_file),
@@ -237,13 +226,12 @@ def _read_file_safe(path: Path) -> str:
 
 
 def repair_cluster(
-    impl: str,
     cluster: FailureCluster,
     call_api: Callable[[list], str],
     verbose: bool = False,
 ) -> bool:
     """
-    Phase C: call model once for this cluster, apply patch.
+    Phase C: call Qwen once for this cluster, apply patch to src/.
     Returns True if patch was applied successfully.
     """
     spec      = SPEC_PATH.read_text()
@@ -272,20 +260,14 @@ def repair_cluster(
 
     try:
         raw = call_api(messages).strip()
-        if raw.startswith("```"):
-            raw = "\n".join(raw.split("\n")[1:])
-        if raw.endswith("```"):
-            raw = "\n".join(raw.split("\n")[:-1])
+        raw = re.sub(r"^```[a-z]*\n?", "", raw)
+        raw = re.sub(r"\n?```$", "", raw)
         patch = json.loads(raw)
     except Exception as e:
         print(f"    [C] Parse error for cluster '{cluster.test_file}': {e}", file=sys.stderr)
         return False
 
-    # Safety remap: if model returns src/ but impl is glm, redirect to src_glm/
-    out_rel = patch.get("file_path", cluster.src_file)
-    if impl == "glm" and out_rel.startswith("src/"):
-        out_rel = "src_glm/" + out_rel[len("src/"):]
-
+    out_rel  = patch.get("file_path", cluster.src_file)
     out_path = ROOT / out_rel
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(patch["code"])
@@ -294,149 +276,114 @@ def repair_cluster(
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# src swap helpers
-# ════════════════════════════════════════════════════════════════════════════
-
-def swap_src(impl: str) -> Path:
-    src = ROOT / "src"
-    if impl == "glm":
-        backup = ROOT / "_src_backup"
-        if src.exists():
-            shutil.copytree(src, backup, dirs_exist_ok=True)
-        shutil.copytree(ROOT / "src_glm", src, dirs_exist_ok=True)
-        return backup
-    return src
-
-
-def restore_src(impl: str, backup: Path) -> None:
-    if impl == "glm" and backup != ROOT / "src":
-        shutil.rmtree(ROOT / "src", ignore_errors=True)
-        if backup.exists():
-            shutil.copytree(backup, ROOT / "src", dirs_exist_ok=True)
-            shutil.rmtree(backup, ignore_errors=True)
-
-
-# ════════════════════════════════════════════════════════════════════════════
 # Main — B / C / D loop
 # ════════════════════════════════════════════════════════════════════════════
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--impl",     required=True, choices=["qwen", "glm"])
     parser.add_argument("--max-iter", type=int, default=3,
                         help="Max outer B->C->D iterations")
     parser.add_argument("--verbose",  action="store_true",
                         help="Print extra debug info per cluster")
+    # --impl kept for harness.py backward compat but value is ignored (always qwen)
+    parser.add_argument("--impl", default="qwen", choices=["qwen"],
+                        help="Executor model (always qwen — GLM is planner only)")
     args = parser.parse_args()
 
-    impl     = args.impl
     max_iter = args.max_iter
-    call_api = CALLERS[impl]
     verbose  = args.verbose
+    call_api = CALLERS["qwen"]
 
     iteration_records: list[IterationRecord] = []
-    backup = swap_src(impl)
 
-    try:
-        for iteration in range(1, max_iter + 1):
-            tag = f"[04][{impl.upper()}][{iteration}/{max_iter}]"
+    for iteration in range(1, max_iter + 1):
+        tag = f"[04][QWEN][{iteration}/{max_iter}]"
 
-            # ── Phase B / D: full suite run ───────────────────────────────
-            print(f"\n{tag} Phase B — running full vitest suite …")
-            passed, output = run_vitest()
+        # ── Phase B / D: full suite run ───────────────────────────────────
+        print(f"\n{tag} Phase B — running full vitest suite …")
+        passed, output = run_vitest()
 
-            summary_line = next(
-                (l.strip() for l in output.splitlines()
-                 if ("passed" in l or "failed" in l) and "test" in l.lower()),
-                output.strip().splitlines()[-1] if output.strip() else "no output",
-            )
-            print(f"{tag} {summary_line}")
+        summary_line = next(
+            (l.strip() for l in output.splitlines()
+             if ("passed" in l or "failed" in l) and "test" in l.lower()),
+            output.strip().splitlines()[-1] if output.strip() else "no output",
+        )
+        print(f"{tag} {summary_line}")
 
-            if passed:
-                print(f"{tag} All tests passed.")
-                iteration_records.append(IterationRecord(
-                    iteration=iteration, passed=True, summary=summary_line,
-                    clusters_found=0, clusters_repaired=0, cluster_details=[],
-                    log_snippet="",
-                ))
-                break
+        if passed:
+            print(f"{tag} All tests passed.")
+            iteration_records.append(IterationRecord(
+                iteration=iteration, passed=True, summary=summary_line,
+                clusters_found=0, clusters_repaired=0, cluster_details=[],
+                log_snippet="",
+            ))
+            break
 
-            # ── Phase B: cluster the failures ─────────────────────────────
-            clusters = parse_failures(impl, output)
-            print(f"{tag} {len(clusters)} failing cluster(s):")
-            for c in clusters:
-                print(f"  * {c.test_file}  ({len(c.failures)} failure(s))")
+        # ── Phase B: cluster the failures ─────────────────────────────────
+        clusters = parse_failures(output)
+        print(f"{tag} {len(clusters)} failing cluster(s):")
+        for c in clusters:
+            print(f"  * {c.test_file}  ({len(c.failures)} failure(s))")
 
-            if not clusters:
-                print(f"{tag} Could not parse clusters (compile error?). Stopping.",
-                      file=sys.stderr)
-                iteration_records.append(IterationRecord(
-                    iteration=iteration, passed=False, summary=summary_line,
-                    clusters_found=0, clusters_repaired=0, cluster_details=[],
-                    log_snippet=output[-2000:],
-                ))
-                break
-
-            if iteration == max_iter:
-                # Last allowed iteration — record and exit
-                print(f"{tag} Reached max_iter with {len(clusters)} cluster(s) still failing.")
-                iteration_records.append(IterationRecord(
-                    iteration=iteration, passed=False, summary=summary_line,
-                    clusters_found=len(clusters), clusters_repaired=0,
-                    cluster_details=[{"cluster": c.key, "failures": len(c.failures)}
-                                     for c in clusters],
-                    log_snippet=output[-2000:],
-                ))
-                break
-
-            # ── Phase C: repair each cluster ──────────────────────────────
-            print(f"{tag} Phase C — targeted repair ({len(clusters)} cluster(s)) …")
-            repaired = 0
-            cluster_details = []
-
-            for cluster in clusters:
-                print(f"  -> {cluster.test_file}")
-                ok = repair_cluster(impl, cluster, call_api, verbose=verbose)
-                repaired += int(ok)
-                cluster_details.append({
-                    "cluster":  cluster.key,
-                    "src_file": cluster.src_file,
-                    "failures": len(cluster.failures),
-                    "repaired": ok,
-                })
-
-            print(f"{tag} Phase C done — {repaired}/{len(clusters)} patched.")
-
+        if not clusters:
+            print(f"{tag} Could not parse clusters (compile error?). Stopping.",
+                  file=sys.stderr)
             iteration_records.append(IterationRecord(
                 iteration=iteration, passed=False, summary=summary_line,
-                clusters_found=len(clusters), clusters_repaired=repaired,
-                cluster_details=cluster_details,
+                clusters_found=0, clusters_repaired=0, cluster_details=[],
                 log_snippet=output[-2000:],
             ))
+            break
 
-            # For GLM: sync src_glm/ patches back into src/ before Phase D rerun
-            if impl == "glm":
-                shutil.rmtree(ROOT / "src", ignore_errors=True)
-                shutil.copytree(ROOT / "src_glm", ROOT / "src", dirs_exist_ok=True)
-                if verbose:
-                    print(f"{tag} Synced src_glm/ -> src/ for Phase D rerun.")
+        if iteration == max_iter:
+            print(f"{tag} Reached max_iter with {len(clusters)} cluster(s) still failing.")
+            iteration_records.append(IterationRecord(
+                iteration=iteration, passed=False, summary=summary_line,
+                clusters_found=len(clusters), clusters_repaired=0,
+                cluster_details=[{"cluster": c.key, "failures": len(c.failures)}
+                                 for c in clusters],
+                log_snippet=output[-2000:],
+            ))
+            break
 
-            # Phase D: top of loop runs full suite again automatically
+        # ── Phase C: repair each cluster ──────────────────────────────────
+        print(f"{tag} Phase C — targeted repair ({len(clusters)} cluster(s)) …")
+        repaired = 0
+        cluster_details = []
 
-    finally:
-        restore_src(impl, backup)
+        for cluster in clusters:
+            print(f"  -> {cluster.test_file}")
+            ok = repair_cluster(cluster, call_api, verbose=verbose)
+            repaired += int(ok)
+            cluster_details.append({
+                "cluster":  cluster.key,
+                "src_file": cluster.src_file,
+                "failures": len(cluster.failures),
+                "repaired": ok,
+            })
+
+        print(f"{tag} Phase C done — {repaired}/{len(clusters)} patched.")
+
+        iteration_records.append(IterationRecord(
+            iteration=iteration, passed=False, summary=summary_line,
+            clusters_found=len(clusters), clusters_repaired=repaired,
+            cluster_details=cluster_details,
+            log_snippet=output[-2000:],
+        ))
+
+        # Phase D: top of loop reruns full suite automatically
 
     # ── Report ────────────────────────────────────────────────────────────────
     final_passed = bool(iteration_records and iteration_records[-1].passed)
     report = {
-        "impl":             impl,
+        "impl":             "qwen",
         "max_iter":         max_iter,
         "total_iterations": len(iteration_records),
         "final_status":     "PASS" if final_passed else "FAIL",
         "iterations":       [asdict(r) for r in iteration_records],
     }
-    (REPORTS_DIR / f"{impl}_iterations.json").write_text(json.dumps(report, indent=2))
-    print(f"\n[04] Report -> reports/{impl}_iterations.json")
+    (REPORTS_DIR / "qwen_iterations.json").write_text(json.dumps(report, indent=2))
+    print(f"\n[04] Report -> reports/qwen_iterations.json")
 
     if not final_passed:
         sys.exit(1)
