@@ -1,8 +1,8 @@
 # SPEC — IoT MLOps Landing Page
-# Version: 1.0.0
-# Last updated: 2025-04-16
+# Version: 1.1.0
+# Last updated: 2025-04-18
 # Agent: Claude (Spec Normalizer)
-# Downstream consumers: Gemini 2.5 Flash (scaffold), Qwen 3.6 Plus, GLM 5.1 (implement)
+# Downstream consumers: Gemini 2.5 Flash (scaffold), GLM 5.1 (planner), Qwen 3.6 Plus (executor), DeepSeek V3.2 (judge)
 
 ---
 
@@ -18,7 +18,9 @@ OUTPUT_DIRS     : src/, tests/
 ```
 
 Gemini: output MUST be a single JSON object matching schema in §8.
-Qwen / GLM: receive spec.md + scaffold JSON → implement ONLY the files listed in scaffold → do not add new files.
+GLM 5.1: receives spec.md + scaffold stubs → outputs glm_plan.json (implementation plan, no code).
+Qwen 3.6 Plus: receives spec.md + scaffold stubs + glm_plan.json → implements src/ files.
+DeepSeek V3.2: judge — runs only after all vitest tests pass, produces judge_report.md.
 
 ---
 
@@ -410,8 +412,7 @@ tests/
     }
   ],
   "implementation_instructions": {
-    "for_qwen": "string — specific hints for Qwen 3.6 Plus",
-    "for_glm": "string — specific hints for GLM 5.1"
+    "for_qwen": "string — specific executor hints for Qwen 3.6 Plus (per-file implementation guidance)"
   },
   "vite_config_notes": "string",
   "tailwind_config_notes": "string"
@@ -424,19 +425,33 @@ tests/
 - Every component must have a corresponding test file
 - Every hook must have a corresponding test file
 - Do not add files not listed in §7
+- `implementation_instructions.for_qwen`: write concrete executor hints (e.g. "use useMemo for point generation", "IAQ > 100 = anomaly visual cue"). GLM and DeepSeek have their own hardcoded system prompts — do NOT add `for_glm` or `for_deepseek` keys.
 
 ---
 
-## 9. Qwen / GLM implementation rules
+## 9. Model roles & rules
 
-- Receive: `spec.md` + full scaffold JSON from Gemini
-- Task: implement ONLY the function bodies in non-test files
+### Qwen 3.6 Plus — Executor
+- Receives: `spec.md` + scaffold stubs + `glm_plan.json` (if available)
+- Task: implement ONLY the function bodies in non-test files, one file per API call
 - Do NOT modify test files
 - Do NOT add new files
 - TypeScript strict mode — no `any`
 - All Recharts usage: import from `recharts` directly
 - Tailwind only — no inline styles, no CSS modules
 - On ambiguity: follow the spec, not your own judgment
+
+### GLM 5.1 — Planner
+- Receives: `spec.md` + scaffold stubs
+- Task: output `glm_plan.json` — an ordered plan with per-file sub-tasks, gotchas, Tailwind hints
+- Does NOT write any source code
+- Has its own hardcoded system prompt in `03b_implement_glm.py` — `instructions_glm.txt` is not used
+
+### DeepSeek V3.2 — Judge
+- Runs ONLY after all vitest tests pass
+- Receives: full pipeline briefing (spec + plan + impl record + source + tests)
+- Outputs: `reports/judge_report.md` with verdict APPROVED / APPROVED_WITH_NOTES / NEEDS_REVISION
+- Has its own hardcoded system prompt in `06_judge_deepseek.py`
 
 ---
 
@@ -459,3 +474,4 @@ tests/
 | Version | Date | Change | Author |
 |---|---|---|---|
 | 1.0.0 | 2025-04-16 | Initial spec | Claude (Spec Agent) |
+| 1.1.0 | 2025-04-18 | Reflect actual model roles: GLM→planner, DeepSeek→judge. Fix §8 schema (drop for_glm/for_deepseek). Rewrite §9 with accurate role split. | Claude (Spec Agent) |
