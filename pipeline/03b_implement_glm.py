@@ -1,18 +1,29 @@
 """
 pipeline/03b_implement_glm.py
-Step 3b — Call GLM5.1 to implement scaffold stubs.
-Reads:   spec.md, scaffold/scaffold.json
-Writes:  src_glm/**  (non-test files only)
-         scaffold/impl_glm.json
+Step 3b — GLM 5.1 as PLANNER (reasoning-heavy, no code output).
 
-NOTE: Runs in parallel with 03a via separate GitHub Actions steps.
-      Each model writes to its OWN directory to avoid race conditions:
-        Qwen     → src/           (canonical; swapped by 04_test_and_iterate.py)
-        glm → src_glm/  (isolated impl)
+Role change rationale:
+    GLM 5.1 burns its 32k token budget on chain-of-thought reasoning before
+    writing code, leaving too little room for actual output.  Instead of
+    fighting the token cap, we lean into it: GLM reasons deeply to produce a
+    *plan*, not code.  Qwen (03a) is the executor that turns the plan into src/.
+
+What this script does:
+    1. Read spec.md + scaffold/scaffold.json (stub files from Gemini).
+    2. Call GLM 5.1 with reasoning ON — task: decompose each stub file into
+       an ordered list of implementation tasks / sub-tasks.
+    3. Write scaffold/glm_plan.json  ← consumed by 03a_implement_qwen.py
+       when --use-glm-plan flag is passed.
+
+Writes:
+    scaffold/glm_plan.json
+
+Does NOT write any src/ files.  03a_implement_qwen.py is the sole executor.
 """
 
 import os
 import json
+import re
 import sys
 import httpx
 from pathlib import Path
@@ -21,101 +32,166 @@ OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions"
 MODEL              = "z-ai/glm-5.1"
 
-ROOT           = Path(__file__).parent.parent
-SPEC_PATH      = ROOT / "spec.md"
-SCAFFOLD_JSON  = ROOT / "scaffold" / "scaffold.json"
-INSTRUCTIONS   = ROOT / "scaffold" / "instructions_glm.txt"
-IMPL_RECORD    = ROOT / "scaffold" / "impl_glm.json"
-OUT_DIR        = ROOT / "src_glm"   # isolated; test runner swaps this in
+ROOT          = Path(__file__).parent.parent
+SPEC_PATH     = ROOT / "spec.md"
+SCAFFOLD_JSON = ROOT / "scaffold" / "scaffold.json"
+PLAN_OUT      = ROOT / "scaffold" / "glm_plan.json"
 
 
-def build_system_prompt(instructions: str) -> str:
-    return f"""You are a senior TypeScript/React developer.
-You will receive:
-1. A technical spec (spec.md)
-2. A scaffold JSON with stub files (interfaces + signatures, no bodies)
-3. Model-specific implementation instructions
+# ── Prompts ──────────────────────────────────────────────────────────────────
 
-Your task:
-- Implement ONLY the function bodies in the non-test source files.
-- Return a JSON object:
-  {{
-    "files": [
-      {{
-        "file_path": "src/hooks/useSensorData.ts",
-        "code": "<full file content>"
-      }}
-    ]
-  }}
-- Do NOT modify test files.
-- Do NOT add new files.
-- TypeScript strict mode — no `any`.
-- Tailwind only — no inline styles.
-- Output raw JSON only. No markdown fences.
+SYSTEM_PROMPT = """\
+You are a senior TypeScript/React architect acting as a PLANNER.
+You will receive a spec and a scaffold JSON (stub files with signatures only).
 
-Model-specific instructions:
-{instructions}"""
+Your job is NOT to write code.
+Your job is to reason carefully and produce an implementation plan.
+
+For each non-test stub file, output a task object describing:
+- What the file does and its role in the system
+- Ordered list of implementation sub-tasks (what to implement, in what order)
+- Key types / interfaces this file depends on (with their source file)
+- Gotchas or edge cases the implementer must handle
+- Tailwind class hints for visual components (colours, layout, states)
+
+Return a single JSON object — NO markdown fences, raw JSON only:
+{
+  "plan_version": "1.0.0",
+  "tasks": [
+    {
+      "file_path": "src/hooks/useSensorData.ts",
+      "role": "one-sentence role description",
+      "depends_on": ["src/types/sensor.ts", "src/data/demoConstants.ts"],
+      "sub_tasks": [
+        "1. Generate base SensorPoint array using POINTS_PER_DAY constant ...",
+        "2. Inject anomaly clusters at morning (07-09h) and evening (18-21h) ...",
+        "3. ..."
+      ],
+      "gotchas": [
+        "decisionScore must be negative for anomaly points (-0.05 to -0.45)",
+        "..."
+      ],
+      "tailwind_hints": null
+    }
+  ],
+  "implementation_order": [
+    "src/types/sensor.ts",
+    "src/data/demoConstants.ts",
+    "src/hooks/useSensorData.ts",
+    "src/hooks/useReplay.ts",
+    "src/components/SummaryStickyBar.tsx",
+    "src/components/ReplayControls.tsx",
+    "src/components/AnomalyFeed.tsx",
+    "src/components/ModelGates.tsx",
+    "src/App.tsx",
+    "src/main.tsx"
+  ],
+  "global_notes": "any cross-cutting concerns the implementer should know"
+}
+
+Rules:
+- Reason as deeply as needed — this is your reasoning budget well spent.
+- Be specific: reference exact constant names, prop names, type names from the spec.
+- implementation_order must respect dependency order (types before hooks before components).
+- tailwind_hints: include for visual components, null for hooks/types/data files.
+- Output raw JSON only. Absolutely no markdown fences or preamble text.
+"""
 
 
-def call_glm(system: str, user_message: str) -> dict:
+# ── API call ──────────────────────────────────────────────────────────────────
+
+def call_glm_planner(spec: str, stub_files: list) -> dict:
+    user_msg = (
+        f"### spec.md\n\n{spec}\n\n"
+        f"### scaffold stub files\n\n"
+        f"{json.dumps(stub_files, indent=2)}"
+    )
+
+    payload = {
+        "model": MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": user_msg},
+        ],
+        "temperature": 0.2,
+        "max_tokens": 32768,   # GLM spends this on reasoning → compact JSON output
+    }
+
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
     }
-    payload = {
-        "model": MODEL,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user",   "content": user_message},
-        ],
-        "temperature": 0.15,
-        "max_tokens": 32768,
-    }
 
-    print("[03b] Calling GLM5.1 …")
-    with httpx.Client(timeout=180) as client:
+    print("[03b] Calling GLM 5.1 (planner role) …")
+    with httpx.Client(timeout=240) as client:
         r = client.post(OPENROUTER_URL, headers=headers, json=payload)
         r.raise_for_status()
 
-    text = r.json()["choices"][0]["message"]["content"].strip()
-    if text.startswith("```"):
-        text = "\n".join(text.split("\n")[1:])
-    if text.endswith("```"):
-        text = "\n".join(text.split("\n")[:-1])
-
-    return json.loads(text)
+    raw = r.json()["choices"][0]["message"]["content"].strip()
+    return _parse_json(raw, label="GLM planner response")
 
 
-def main():
+# ── JSON extraction ───────────────────────────────────────────────────────────
+
+def _parse_json(raw: str, label: str) -> dict:
+    """Extract JSON from model output robustly (handles accidental fences)."""
+    # Strip markdown fences if present
+    raw = re.sub(r"^```[a-z]*\n?", "", raw.strip())
+    raw = re.sub(r"\n?```$", "", raw.strip())
+
+    # Try direct parse first
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+
+    # Fallback: find outermost { ... } block
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group())
+        except json.JSONDecodeError as e:
+            print(f"[03b] JSON parse failed for {label}: {e}", file=sys.stderr)
+            print(f"[03b] Raw output (first 500 chars):\n{raw[:500]}", file=sys.stderr)
+            sys.exit(1)
+
+    print(f"[03b] No JSON object found in {label}.", file=sys.stderr)
+    sys.exit(1)
+
+
+# ── Validation ────────────────────────────────────────────────────────────────
+
+def validate_plan(plan: dict, stub_files: list) -> None:
+    """Warn if any stub file is missing from the plan."""
+    planned = {t["file_path"] for t in plan.get("tasks", [])}
+    for f in stub_files:
+        fp = f["file_path"]
+        if fp not in planned:
+            print(f"[03b] WARNING: stub file not covered by plan: {fp}")
+
+    required_keys = {"plan_version", "tasks", "implementation_order"}
+    missing = required_keys - set(plan.keys())
+    if missing:
+        print(f"[03b] WARNING: plan missing keys: {missing}")
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main() -> None:
     spec     = SPEC_PATH.read_text()
     scaffold = json.loads(SCAFFOLD_JSON.read_text())
-    instrs   = INSTRUCTIONS.read_text() if INSTRUCTIONS.exists() else ""
 
     stub_files = [f for f in scaffold["files"] if not f.get("is_test")]
+    print(f"[03b] Planning {len(stub_files)} stub files …")
 
-    user_msg = (
-        f"### spec.md\n\n{spec}\n\n"
-        f"### scaffold (stub files to implement)\n\n"
-        f"{json.dumps(stub_files, indent=2)}"
-    )
+    plan = call_glm_planner(spec, stub_files)
+    validate_plan(plan, stub_files)
 
-    result = call_glm(build_system_prompt(instrs), user_msg)
-
-    written = []
-    for entry in result["files"]:
-        # Remap src/ → src_glm/ to isolate glm's impl
-        rel = entry["file_path"]
-        if rel.startswith("src/"):
-            rel = "src_glm/" + rel[len("src/"):]
-        path = ROOT / rel
-
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(entry["code"])
-        written.append(rel)
-        print(f"[03b] WROTE {rel}")
-
-    IMPL_RECORD.write_text(json.dumps({"model": "glm", "files": written}, indent=2))
-    print(f"[03b] Done — {len(written)} files written.")
+    PLAN_OUT.write_text(json.dumps(plan, indent=2))
+    print(f"[03b] Plan written → {PLAN_OUT}")
+    print(f"[03b] Tasks in plan: {len(plan.get('tasks', []))}")
+    print(f"[03b] Implementation order: {plan.get('implementation_order', [])}")
+    print(f"[03b] Done. Pass --use-glm-plan to 03a_implement_qwen.py to use this plan.")
 
 
 if __name__ == "__main__":
