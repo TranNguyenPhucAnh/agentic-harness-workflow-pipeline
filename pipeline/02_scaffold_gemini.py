@@ -7,7 +7,8 @@ Writes:
     src/**                          ← individual stub source files
     tests/**                        ← individual test files
     scaffold/instructions_qwen.txt  ← executor hints for Qwen (consumed by 03a)
-    scaffold/instructions_glm.txt   ← planner hints for GLM (consumed by 03b)
+    NOTE: GLM 5.1 is now a PLANNER (03b) with its own hardcoded system prompt.
+          No instructions file is written for GLM.
 """
 
 import os
@@ -117,15 +118,12 @@ def write_files(scaffold: dict) -> None:
     # Downstream model instructions
     instructions = scaffold.get("implementation_instructions", {})
 
-    # Qwen executor hints
+    # Qwen executor hints — read by 03a_implement_qwen.py
     (OUT_DIR / "instructions_qwen.txt").write_text(
         instructions.get("for_qwen", "No specific instructions.")
     )
-
-    # GLM planner hints — note: GLM's role is now PLANNER (03b), not implementer
-    (OUT_DIR / "instructions_glm.txt").write_text(
-        instructions.get("for_glm", "No specific instructions.")
-    )
+    # NOTE: GLM 5.1 uses a hardcoded SYSTEM_PROMPT in 03b_implement_glm.py (planner role).
+    # No instructions file is written for GLM — for_glm key in scaffold JSON is unused.
 
     print("[02] Done.")
 
