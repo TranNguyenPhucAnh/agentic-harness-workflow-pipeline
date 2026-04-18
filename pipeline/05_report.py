@@ -97,6 +97,7 @@ def main():
         summary = last.get("summary", "—")
         iters   = qwen_report["total_iterations"]
         max_i   = qwen_report.get("max_iter", 3)
+        max_ca  = qwen_report.get("max_cluster_attempts", 2)
 
         lines.append(
             f"| QWEN | {render_status(final)} | {iters} / {max_i} | {summary} |"
@@ -110,17 +111,22 @@ def main():
             details.append(f"**Iteration {it['iteration']}** {icon}  ")
             details.append(f"```\n{it['summary']}\n```")
 
-            # Cluster detail if available
             clusters = it.get("cluster_details", [])
             if clusters:
                 details.append("")
                 for c in clusters:
-                    repaired = "✅" if c.get("repaired") else "❌"
+                    repaired    = "✅" if c.get("repaired") else "❌"
+                    layer       = c.get("layer_used", "")
+                    layer_badge = f" `[{layer}]`" if layer else ""
+                    esc_badge   = " ⚠️ ESCALATED" if c.get("escalated") else ""
+                    note_str    = f" — {c['note']}" if c.get("note") else ""
                     details.append(
-                        f"  {repaired} `{c['cluster']}` — "
-                        f"{c['failures']} failure(s)"
+                        f"  {repaired}{layer_badge}{esc_badge} "
+                        f"`{c['cluster']}` — {c['failures']} failure(s){note_str}"
                     )
             details.append("")
+
+        details.append(f"\n_Config: max_iter={max_i}, max_cluster_attempts={max_ca}_\n")
 
     lines.append("")
     lines.append(
@@ -141,6 +147,25 @@ def main():
             f"- Source stubs generated: {n_src}",
             f"- Test files generated: {n_tests}",
         ]
+
+    # ── Escalated clusters ───────────────────────────────────────────────────
+    esc_json = REPORTS_DIR / "escalated_clusters.json"
+    if esc_json.exists():
+        esc = json.loads(esc_json.read_text())
+        n = esc.get("total_escalated", 0)
+        lines += [
+            "",
+            "## ⚠️ Escalated Clusters (require human review)",
+            "",
+            f"**{n} cluster(s) hit the give-up threshold.**",
+            "",
+            "| Cluster | Failures | Note |",
+            "|---|---|---|",
+        ]
+        for c in esc.get("clusters", []):
+            lines.append(
+                f"| `{c['cluster']}` | {c['failures']} | {c.get('note', '—')} |"
+            )
 
     # ── Impl record ──────────────────────────────────────────────────────────
     impl_record = ROOT / "scaffold" / "impl_qwen.json"
