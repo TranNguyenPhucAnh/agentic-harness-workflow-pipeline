@@ -1,38 +1,49 @@
 #!/usr/bin/env python3
 """
 harness.py — Local dev runner for the LLM pipeline.
-Mirrors the GitHub Actions workflow exactly, runs on your machine.
+Mirrors the GitHub Actions workflow, runs on your machine.
+
+Architecture:
+    Gemini       → scaffold JSON (stubs + signatures)
+    GLM 5.1      → planner: decomposes scaffold into glm_plan.json
+    Qwen 3.6+    → executor: implements src/ per-file (with plan) or single-call
+    vitest       → test + targeted repair loop (max N iterations)
+    DeepSeek R1  → judge: qualitative review + sign-off (runs only on green)
 
 Usage:
-    # Full pipeline (Gemini scaffold → Qwen + GLM implement → test → report)
+    # Full pipeline (scaffold → plan → implement → test → report → judge)
     python harness.py
 
-    # Skip scaffold (reuse existing scaffold/scaffold.json)
+    # Skip GLM planning — Qwen single-call mode, judge still runs
+    python harness.py --only-qwen
+
+    # Reuse existing scaffold.json
     python harness.py --skip-scaffold
 
-    # Skip scaffold + skip implement (reuse existing src/ / src_glm/)
-    python harness.py --skip-scaffold --skip-impl
-    python harness.py --skip-scaffold --skip-impl --only qwen
+    # Reuse existing glm_plan.json
+    python harness.py --skip-scaffold --skip-plan
 
-    # Test + iterate only (alias for --skip-scaffold --skip-impl)
+    # Skip everything up to test
     python harness.py --test-only
-    python harness.py --test-only --only qwen
-    python harness.py --test-only --only glm
 
-    # Only run one model (implement + test)
-    python harness.py --only qwen
-    python harness.py --only glm
+    # Skip judge (faster, no DeepSeek call)
+    python harness.py --skip-judge
+    python harness.py --test-only --skip-judge
 
     # Override iteration cap
     python harness.py --max-iter 5
 
-Typical debug loop after a failed test:
-    python harness.py --test-only --only qwen --max-iter 3
+    # Verbose cluster debug output
+    python harness.py --test-only --verbose
+
+Typical debug loops:
+    python harness.py --test-only --skip-judge --max-iter 3
+    python harness.py --skip-scaffold --skip-plan --skip-judge
 
 Requirements:
     pip install httpx
     GEMINI_API_KEY, OPENROUTER_API_KEY must be set as env vars
-    (or in a .env file — this script loads .env automatically)
+    (or in a .env file — loaded automatically)
 """
 
 import argparse
@@ -55,7 +66,7 @@ def load_dotenv():
                 os.environ.setdefault(k.strip(), v.strip())
 
 
-def run_step(label: str, script: str, extra_args: list[str] = None) -> bool:
+def run_step(label: str, script: str, extra_args: list[str] | None = None) -> bool:
     cmd = [sys.executable, str(ROOT / "pipeline" / script)] + (extra_args or [])
     print(f"\n{'='*60}")
     print(f"  {label}")
@@ -68,6 +79,12 @@ def run_step(label: str, script: str, extra_args: list[str] = None) -> bool:
     return result.returncode == 0
 
 
+def skip_step(label: str, reason: str) -> None:
+    print(f"\n{'='*60}")
+    print(f"  {label}  [SKIPPED — {reason}]")
+    print(f"{'='*60}")
+
+
 def check_env(keys: list[str]) -> bool:
     missing = [k for k in keys if not os.environ.get(k)]
     if missing:
@@ -77,12 +94,18 @@ def check_env(keys: list[str]) -> bool:
     return True
 
 
-def check_impl_exists(model: str) -> bool:
-    """Verify that implementation files exist before skipping implement step."""
-    src_dir = ROOT / ("src_glm" if model == "glm" else "src")
+def check_file_exists(path: Path, flag: str) -> bool:
+    if not path.exists():
+        print(f"[harness] {flag} set but {path} not found.")
+        return False
+    return True
+
+
+def check_src_exists() -> bool:
+    src_dir = ROOT / "src"
     if not src_dir.exists() or not any(src_dir.rglob("*.ts")):
-        print(f"[harness] --skip-impl set but {src_dir} is empty or missing.")
-        print(f"          Run without --skip-impl first to generate implementation.")
+        print("[harness] --test-only set but src/ is empty or missing.")
+        print("          Run without --test-only first to generate implementation.")
         return False
     return True
 
@@ -90,23 +113,30 @@ def check_impl_exists(model: str) -> bool:
 def main():
     load_dotenv()
 
-    parser = argparse.ArgumentParser(description="Local LLM pipeline runner")
+    parser = argparse.ArgumentParser(
+        description="Local LLM pipeline runner",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--skip-scaffold", action="store_true",
-                        help="Reuse existing scaffold/scaffold.json")
-    parser.add_argument("--skip-impl", action="store_true",
-                        help="Reuse existing src/ / src_glm/ — skip implement step")
+                        help="Reuse existing scaffold/scaffold.json — skip Gemini call")
+    parser.add_argument("--skip-plan", action="store_true",
+                        help="Reuse existing scaffold/glm_plan.json — skip GLM planning call")
+    parser.add_argument("--only-qwen", action="store_true",
+                        help="Skip GLM planning entirely; Qwen runs single-call mode")
     parser.add_argument("--test-only", action="store_true",
-                        help="Alias for --skip-scaffold --skip-impl (jump straight to test)")
-    parser.add_argument("--only", choices=["qwen", "glm"],
-                        help="Run only one model")
+                        help="Skip scaffold + plan + implement; jump straight to vitest")
+    parser.add_argument("--skip-judge", action="store_true",
+                        help="Skip DeepSeek R1 judge step (useful during debug loops)")
     parser.add_argument("--max-iter", type=int, default=3,
-                        help="Max fix iterations per model")
+                        help="Max fix iterations for test loop (default: 3)")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Pass --verbose to 04_test_and_iterate.py for cluster debug output")
     args = parser.parse_args()
 
-    # --test-only is sugar for --skip-scaffold --skip-impl
+    # --test-only implies skipping all generation steps
     if args.test_only:
         args.skip_scaffold = True
-        args.skip_impl = True
+        args.skip_plan = True
 
     results: dict[str, bool] = {}
 
@@ -120,43 +150,90 @@ def main():
             print("\n[harness] Scaffold failed. Stopping.")
             sys.exit(1)
     else:
-        scaffold_json = ROOT / "scaffold" / "scaffold.json"
-        if not scaffold_json.exists():
-            print("[harness] --skip-scaffold set but scaffold/scaffold.json not found.")
+        if not check_file_exists(ROOT / "scaffold" / "scaffold.json", "--skip-scaffold"):
             sys.exit(1)
-        print("[harness] Skipping scaffold (reusing existing scaffold.json)")
+        skip_step("Step 2 — Gemini scaffold", "reusing scaffold/scaffold.json")
 
-    # ── Step 3+4+5: Implement + test ─────────────────────────────────────────
-    models = ["qwen", "glm"] if args.only is None else [args.only]
+    # ── Step 3b: GLM plan ────────────────────────────────────────────────────
+    glm_plan_path = ROOT / "scaffold" / "glm_plan.json"
 
-    for model in models:
+    if args.only_qwen or args.test_only:
+        skip_step("Step 3b — GLM 5.1 plan",
+                  "--only-qwen" if args.only_qwen else "--test-only")
+        plan_available = False
+
+    elif args.skip_plan:
+        if not check_file_exists(glm_plan_path, "--skip-plan"):
+            print("          Tip: run without --skip-plan to regenerate, "
+                  "or use --only-qwen to skip planning entirely.")
+            sys.exit(1)
+        skip_step("Step 3b — GLM 5.1 plan", "reusing scaffold/glm_plan.json")
+        plan_available = True
+
+    else:
         if not check_env(["OPENROUTER_API_KEY"]):
-            results[f"impl_{model}"] = False
-            print(f"[harness] Skipping {model.upper()} — missing OPENROUTER_API_KEY.")
-            continue
+            sys.exit(1)
+        ok = run_step("Step 3b — GLM 5.1 plan", "03b_implement_glm.py")
+        results["glm_plan"] = ok
+        if not ok:
+            print("\n[harness] GLM planning failed.")
+            print("          Tip: --skip-plan to reuse last plan, "
+                  "or --only-qwen to skip planning entirely.")
+            sys.exit(1)
+        plan_available = True
 
-        script_map = {"qwen": "03a_implement_qwen.py", "glm": "03b_implement_glm.py"}
+    # ── Step 3a: Qwen implement ──────────────────────────────────────────────
+    if not args.test_only:
+        if not check_env(["OPENROUTER_API_KEY"]):
+            sys.exit(1)
 
-        # ── Step 3: Implement ────────────────────────────────────────────────
-        if args.skip_impl:
-            if not check_impl_exists(model):
-                sys.exit(1)
-            print(f"[harness] Skipping {model.upper()} implement (reusing existing src files)")
-            results[f"impl_{model}"] = True
-        else:
-            ok = run_step(f"Step 3 — {model.upper()} implement", script_map[model])
-            results[f"impl_{model}"] = ok
+        qwen_args: list[str] = []
+        if plan_available:
+            qwen_args.append("--use-glm-plan")
 
-        # ── Step 4+5: Test + iterate ─────────────────────────────────────────
+        mode_label = "per-file + GLM plan" if plan_available else "single-call"
         ok = run_step(
-            f"Step 4+5 — {model.upper()} test + iterate",
-            "04_test_and_iterate.py",
-            ["--impl", model, "--max-iter", str(args.max_iter)],
+            f"Step 3a — Qwen implement ({mode_label})",
+            "03a_implement_qwen.py",
+            qwen_args,
         )
-        results[f"test_{model}"] = ok
+        results["impl_qwen"] = ok
+    else:
+        if not check_src_exists():
+            sys.exit(1)
+        skip_step("Step 3a — Qwen implement", "reusing existing src/")
+        results["impl_qwen"] = True
 
-    # ── Step 6: Report ───────────────────────────────────────────────────────
-    run_step("Step 6 — Report", "05_report.py")
+    # ── Step 4+5: Test + iterate ─────────────────────────────────────────────
+    test_args = ["--impl", "qwen", "--max-iter", str(args.max_iter)]
+    if args.verbose:
+        test_args.append("--verbose")
+
+    ok = run_step("Step 4+5 — Qwen test + iterate", "04_test_and_iterate.py", test_args)
+    results["test_qwen"] = ok
+    tests_passed = ok
+
+    # ── Step 5b: Aggregate report ────────────────────────────────────────────
+    run_step("Step 5b — Aggregate report", "05_report.py")
+
+    # ── Step 6: DeepSeek R1 judge ────────────────────────────────────────────
+    # Judge runs ONLY when tests passed. Skipped entirely if tests failed or
+    # --skip-judge is set (avoids burning API budget on broken code).
+    if args.skip_judge:
+        skip_step("Step 6 — DeepSeek R1 judge", "--skip-judge")
+
+    elif not tests_passed:
+        skip_step(
+            "Step 6 — DeepSeek R1 judge",
+            "tests failed — fix tests first before requesting judge sign-off",
+        )
+
+    else:
+        if not check_env(["OPENROUTER_API_KEY"]):
+            print("[harness] WARNING: cannot run judge without OPENROUTER_API_KEY.")
+        else:
+            ok = run_step("Step 6 — DeepSeek R1 judge", "06_judge_deepseek.py")
+            results["judge"] = ok
 
     # ── Summary ──────────────────────────────────────────────────────────────
     print(f"\n{'='*60}")
@@ -168,7 +245,10 @@ def main():
 
     all_ok = all(results.values())
     print(f"\n  Overall: {'✅ PASS' if all_ok else '❌ FAIL'}")
-    print(f"\n  Full report → reports/summary.md")
+    print(f"\n  Reports:")
+    print(f"    Pipeline  → reports/summary.md")
+    if not args.skip_judge and tests_passed:
+        print(f"    Judge     → reports/judge_report.md")
     sys.exit(0 if all_ok else 1)
 
 
