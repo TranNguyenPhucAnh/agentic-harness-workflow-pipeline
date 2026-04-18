@@ -4,11 +4,11 @@ harness.py — Local dev runner for the LLM pipeline.
 Mirrors the GitHub Actions workflow, runs on your machine.
 
 Architecture:
-    Gemini       → scaffold JSON (stubs + signatures)
-    GLM 5.1      → planner: decomposes scaffold into glm_plan.json
-    Qwen 3.6+    → executor: implements src/ per-file (with plan) or single-call
-    vitest       → test + targeted repair loop (max N iterations)
-    DeepSeek R1  → judge: qualitative review + sign-off (runs only on green)
+    Gemini         → scaffold JSON (stubs + signatures)
+    GLM 5.1        → planner: decomposes scaffold into glm_plan.json
+    Qwen 3.6+      → executor: implements src/ per-file (with plan) or single-call
+    vitest         → test + targeted repair loop (max N iterations)
+    DeepSeek V3.2  → judge: qualitative review + sign-off (runs only on green)
 
 Usage:
     # Full pipeline (scaffold → plan → implement → test → report → judge)
@@ -35,6 +35,9 @@ Usage:
 
     # Verbose cluster debug output
     python harness.py --test-only --verbose
+
+    # Override per-cluster LLM attempt cap
+    python harness.py --test-only --max-cluster-attempts 3
 
 Typical debug loops:
     python harness.py --test-only --skip-judge --max-iter 3
@@ -126,9 +129,11 @@ def main():
     parser.add_argument("--test-only", action="store_true",
                         help="Skip scaffold + plan + implement; jump straight to vitest")
     parser.add_argument("--skip-judge", action="store_true",
-                        help="Skip DeepSeek R1 judge step (useful during debug loops)")
+                        help="Skip DeepSeek V3.2 judge step (useful during debug loops)")
     parser.add_argument("--max-iter", type=int, default=3,
                         help="Max fix iterations for test loop (default: 3)")
+    parser.add_argument("--max-cluster-attempts", type=int, default=2,
+                        help="Max LLM repair attempts per cluster before give-up (default: 2)")
     parser.add_argument("--verbose", action="store_true",
                         help="Pass --verbose to 04_test_and_iterate.py for cluster debug output")
     args = parser.parse_args()
@@ -205,7 +210,8 @@ def main():
         results["impl_qwen"] = True
 
     # ── Step 4+5: Test + iterate ─────────────────────────────────────────────
-    test_args = ["--impl", "qwen", "--max-iter", str(args.max_iter)]
+    test_args = ["--impl", "qwen", "--max-iter", str(args.max_iter),
+                 "--max-cluster-attempts", str(args.max_cluster_attempts)]
     if args.verbose:
         test_args.append("--verbose")
 
@@ -216,15 +222,15 @@ def main():
     # ── Step 5b: Aggregate report ────────────────────────────────────────────
     run_step("Step 5b — Aggregate report", "05_report.py")
 
-    # ── Step 6: DeepSeek R1 judge ────────────────────────────────────────────
+    # ── Step 6: DeepSeek V3.2 judge ────────────────────────────────────────────
     # Judge runs ONLY when tests passed. Skipped entirely if tests failed or
     # --skip-judge is set (avoids burning API budget on broken code).
     if args.skip_judge:
-        skip_step("Step 6 — DeepSeek R1 judge", "--skip-judge")
+        skip_step("Step 6 — DeepSeek V3.2 judge", "--skip-judge")
 
     elif not tests_passed:
         skip_step(
-            "Step 6 — DeepSeek R1 judge",
+            "Step 6 — DeepSeek V3.2 judge",
             "tests failed — fix tests first before requesting judge sign-off",
         )
 
@@ -232,7 +238,7 @@ def main():
         if not check_env(["OPENROUTER_API_KEY"]):
             print("[harness] WARNING: cannot run judge without OPENROUTER_API_KEY.")
         else:
-            ok = run_step("Step 6 — DeepSeek R1 judge", "06_judge_deepseek.py")
+            ok = run_step("Step 6 — DeepSeek V3.2 judge", "06_judge_deepseek.py")
             results["judge"] = ok
 
     # ── Summary ──────────────────────────────────────────────────────────────
