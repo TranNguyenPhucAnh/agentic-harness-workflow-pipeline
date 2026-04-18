@@ -1,10 +1,10 @@
 """
 pipeline/06_judge_deepseek.py
-Step 6 — DeepSeek R1 (deepseek-reasoner) as Judge / Validator.
+Step 6 — DeepSeek V3.2 (deepseek-reasoner) as Judge / Validator.
 
 Runs ONLY after all vitest tests have passed (called by harness after step 4+5
 exits 0).  Aggregates all pipeline artefacts into a single briefing, sends to
-DeepSeek R1 for deep review, writes reports/judge_report.md.
+DeepSeek V3.2 for deep review, writes reports/judge_report.md.
 
 Reads:
     spec.md
@@ -33,6 +33,7 @@ import httpx
 
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions"
+# deepseek-v3.2 with reasoning enabled via OpenRouter reasoning parameter
 MODEL              = "deepseek/deepseek-v3.2"
 
 ROOT        = Path(__file__).parent.parent
@@ -179,7 +180,7 @@ def build_briefing() -> str:
 
 # ── API call ──────────────────────────────────────────────────────────────────
 
-def call_deepseek_judge(briefing: str) -> str:
+def call_deepseek_judge(briefing: str) -> tuple[str, list | None]:
     payload = {
         "model": MODEL,
         "messages": [
@@ -195,12 +196,14 @@ def call_deepseek_judge(briefing: str) -> str:
         "Content-Type": "application/json",
     }
 
-    print("[06] Calling DeepSeek R1 (judge) …")
+    print("[06] Calling DeepSeek V3.2 (judge, reasoning ON) …")
     with httpx.Client(timeout=300) as client:
         r = client.post(OPENROUTER_URL, headers=headers, json=payload)
         r.raise_for_status()
 
-    return r.json()["choices"][0]["message"]["content"].strip()
+    message = r.json()["choices"][0]["message"]
+    # Preserve reasoning_details for transparency (saved to judge_raw.json)
+    return message.get("content", "").strip(), message.get("reasoning_details")
 
 
 # ── JSON extraction ───────────────────────────────────────────────────────────
@@ -237,7 +240,7 @@ def render_report(review: dict) -> str:
     }.get(verdict, "❓")
 
     lines = [
-        "# Judge Report — DeepSeek R1 Final Review",
+        "# Judge Report — DeepSeek V3.2 Final Review",
         f"_Generated: {now}_",
         f"_Model: {MODEL}_",
         "",
@@ -288,7 +291,7 @@ def render_report(review: dict) -> str:
     lines += [
         "",
         "---",
-        f"**Sign-off:** {review.get('sign_off', 'DeepSeek R1')}",
+        f"**Sign-off:** {review.get('sign_off', 'DeepSeek V3.2')}",
     ]
 
     return "\n".join(lines) + "\n"
@@ -301,16 +304,17 @@ def main() -> None:
     briefing = build_briefing()
     print(f"[06] Briefing size: {len(briefing):,} chars")
 
-    raw_response = call_deepseek_judge(briefing)
+    raw_response, reasoning_details = call_deepseek_judge(briefing)
 
-    # Save raw response
+    # Save raw response + reasoning chain
     raw_out = REPORTS_DIR / "judge_raw.json"
     raw_out.write_text(json.dumps({
-        "model":      MODEL,
-        "timestamp":  datetime.now(timezone.utc).isoformat(),
-        "response":   raw_response,
+        "model":            MODEL,
+        "timestamp":        datetime.now(timezone.utc).isoformat(),
+        "response":         raw_response,
+        "reasoning_details": reasoning_details,   # full chain-of-thought
     }, indent=2))
-    print(f"[06] Raw response saved → {raw_out}")
+    print(f"[06] Raw response + reasoning saved → {raw_out}")
 
     review = _parse_json(raw_response)
 
