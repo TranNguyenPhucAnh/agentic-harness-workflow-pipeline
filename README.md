@@ -3,7 +3,7 @@
 ## Architecture
 
 ```
-spec.md  →  Gemini 2.5 Flash  →  GLM 5.1 (planner)  →  Qwen 3.6+ (executor)  →  vitest  →  DeepSeek R1 (judge)
+spec.md  →  Gemini 2.5 Flash  →  GLM 5.1 (planner)  →  Qwen 3.6+ (executor)  →  vitest  →  DeepSeek V3.2 (judge)
 ```
 
 | Layer | Model | Role | Output |
@@ -12,7 +12,7 @@ spec.md  →  Gemini 2.5 Flash  →  GLM 5.1 (planner)  →  Qwen 3.6+ (executor
 | Plan | GLM 5.1 | Decompose scaffold into ordered per-file tasks | `scaffold/glm_plan.json` |
 | Implement | Qwen 3.6 Plus | Implement source files per-file (guided by plan) | `src/**` |
 | Test + Repair | vitest + Qwen | Run tests, targeted repair loop (max N iter) | `reports/qwen_iterations.json` |
-| Judge | DeepSeek R1 | Qualitative review + sign-off (runs only on green) | `reports/judge_report.md` |
+| Judge | DeepSeek V3.2 | Qualitative review + sign-off (runs only on green) | `reports/judge_report.md` |
 
 **You** edit `spec.md` → push → GitHub Action runs automatically.  
 **Claude (Spec Agent)** normalises / generates `spec.md` on request.  
@@ -95,7 +95,7 @@ pipeline/
   03a_implement_qwen.py              ← Qwen 3.6 Plus → src/      (EXECUTOR)
   04_test_and_iterate.py             ← vitest + targeted repair loop
   05_report.py                       ← pipeline summary.md
-  06_judge_deepseek.py               ← DeepSeek R1 → judge_report.md (JUDGE)
+  06_judge_deepseek.py               ← DeepSeek V3.2 → judge_report.md (JUDGE)
 
 scaffold/
   scaffold.json                      ← Gemini output (stubs + test files)
@@ -110,7 +110,7 @@ tests/                               ← Gemini-generated test files
 reports/
   qwen_iterations.json               ← per-iteration test + repair log
   summary.md                         ← pipeline summary (GitHub Actions tab)
-  judge_report.md                    ← DeepSeek R1 final review + sign-off
+  judge_report.md                    ← DeepSeek V3.2 final review + sign-off
   judge_raw.json                     ← raw judge response + metadata
 ```
 
