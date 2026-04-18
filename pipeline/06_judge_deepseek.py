@@ -186,6 +186,7 @@ def call_deepseek_judge(briefing: str) -> str:
             {"role": "system", "content": JUDGE_SYSTEM},
             {"role": "user",   "content": briefing},
         ],
+        "reasoning": {"enabled": True},
         "temperature": 0.1,
         "max_tokens": 16000,
     }
