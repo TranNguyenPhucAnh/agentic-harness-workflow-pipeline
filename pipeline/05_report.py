@@ -75,7 +75,7 @@ def main():
 
     # ── Qwen test results ────────────────────────────────────────────────────
     lines += [
-        "## Qwen 3.6 Plus — Executor results",
+        "## Qwen 3.6+ (surface) + Minimax 2.7 (logic) — Executor results",
         "",
         "| Model | Status | Iterations used | Final test summary |",
         "|---|---|---|---|",
@@ -117,16 +117,24 @@ def main():
                 for c in clusters:
                     repaired    = "✅" if c.get("repaired") else "❌"
                     layer       = c.get("layer_used", "")
+                    owner       = c.get("owner", "")
+                    esc_to      = c.get("escalated_to", "")
                     layer_badge = f" `[{layer}]`" if layer else ""
-                    esc_badge   = " ⚠️ ESCALATED" if c.get("escalated") else ""
+                    owner_badge = f" `{owner}`" if owner else ""
+                    esc_badge   = (
+                        f" ⚠️ ESCALATED→{esc_to}" if c.get("escalated") and esc_to
+                        else " ⚠️ ESCALATED" if c.get("escalated")
+                        else ""
+                    )
                     note_str    = f" — {c['note']}" if c.get("note") else ""
                     details.append(
-                        f"  {repaired}{layer_badge}{esc_badge} "
+                        f"  {repaired}{layer_badge}{owner_badge}{esc_badge} "
                         f"`{c['cluster']}` — {c['failures']} failure(s){note_str}"
                     )
             details.append("")
 
-        details.append(f"\n_Config: max_iter={max_i}, max_cluster_attempts={max_ca}_\n")
+        impl_label = qwen_report.get("impl", "qwen+minimax")
+        details.append(f"\n_Config: impl={impl_label}, max_iter={max_i}, max_cluster_attempts={max_ca}_\n")
 
     lines.append("")
     lines.append(
