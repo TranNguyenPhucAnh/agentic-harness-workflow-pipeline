@@ -33,7 +33,7 @@ OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions"
 MODEL              = "qwen/qwen3.6-plus"
 
 ROOT          = Path(__file__).parent.parent
-SPEC_PATH     = ROOT / "spec.md"
+SPEC_PATH     = ROOT / "scaffold" / "spec_compressed.md"
 SCAFFOLD_JSON = ROOT / "scaffold" / "scaffold.json"
 INSTRUCTIONS  = ROOT / "scaffold" / "instructions_qwen.txt"
 GLM_PLAN      = ROOT / "scaffold" / "glm_plan.json"
@@ -243,6 +243,9 @@ def main() -> None:
         help="Inject scaffold/glm_plan.json as per-file implementation guidance",
     )
     args = parser.parse_args()
+    
+    if not SPEC_PATH.exists():
+        SPEC_PATH = ROOT / "spec.md"   # fallback
 
     spec      = SPEC_PATH.read_text()
     scaffold  = json.loads(SCAFFOLD_JSON.read_text())
