@@ -39,6 +39,7 @@ MODEL              = "deepseek/deepseek-v3.2"
 ROOT        = Path(__file__).parent.parent
 REPORTS_DIR = ROOT / "reports"
 REPORTS_DIR.mkdir(exist_ok=True)
+PIPELINE_CTX = ROOT / "scaffold" / "pipeline_context.json"
 
 
 # ── Prompt ────────────────────────────────────────────────────────────────────
@@ -95,6 +96,10 @@ verdict NEEDS_REVISION  → one or more blocking issues found
 
 # ── Briefing builder ──────────────────────────────────────────────────────────
 
+def _load_spec() -> str:
+    compressed = ROOT / "scaffold" / "spec_compressed.md"
+    return compressed.read_text() if compressed.exists() else (ROOT / "spec.md").read_text()
+
 def _read_safe(path: Path, label: str) -> str:
     if not path.exists():
         return f"[{label}: file not found at {path}]"
@@ -102,6 +107,7 @@ def _read_safe(path: Path, label: str) -> str:
 
 
 def _collect_src_files(src_dir: Path) -> dict[str, str]:
+    """Full collect — dùng cho test files."""
     files: dict[str, str] = {}
     for ext in ("*.ts", "*.tsx"):
         for p in sorted(src_dir.rglob(ext)):
@@ -109,12 +115,34 @@ def _collect_src_files(src_dir: Path) -> dict[str, str]:
             files[rel] = p.read_text()
     return files
 
+def _collect_changed_files(src_dir: Path) -> dict[str, str]:
+    """
+    Chỉ collect source files có nội dung khác so với stub gốc.
+    Judge không cần xem file types/constants nếu chúng không thay đổi nhiều.
+    Tiết kiệm ~40% input tokens của judge call.
+    """
+    # Load stub_map từ pipeline_context để so sánh
+    stub_map: dict[str, str] = {}
+    if PIPELINE_CTX.exists():
+        ctx = json.loads(PIPELINE_CTX.read_text())
+        stub_map = ctx.get("stub_map", {})
+ 
+    changed: dict[str, str] = {}
+    for ext in ("*.ts", "*.tsx"):
+        for p in sorted(src_dir.rglob(ext)):
+            rel     = str(p.relative_to(ROOT))
+            current = p.read_text()
+            stub    = stub_map.get(rel, "")
+            # Coi là "changed" nếu không có stub (file mới) hoặc nội dung khác hẳn
+            if not stub or current.strip() != stub.strip():
+                changed[rel] = current
+    return changed
 
 def build_briefing() -> str:
     parts: list[str] = []
 
     # 1. Spec
-    parts.append("## 1. spec.md\n\n" + _read_safe(ROOT / "spec.md", "spec.md"))
+    parts.append("## 1. spec.md\n\n" + _load_spec())
 
     # 2. GLM plan (optional)
     glm_plan_path = ROOT / "scaffold" / "glm_plan.json"
@@ -160,15 +188,14 @@ def build_briefing() -> str:
         parts.append("\n".join(lines))
 
     # 5. Final source files
-    src_files = _collect_src_files(ROOT / "src")
+    src_files = _collect_changed_files(ROOT / "src")   # <-- đổi function
     src_block = "\n\n".join(
         f"### {fp}\n```typescript\n{code}\n```"
         for fp, code in src_files.items()
     )
-    parts.append(f"## 5. Final Source Files ({len(src_files)} files)\n\n{src_block}")
-
-    # 6. Test files
-    test_files = _collect_src_files(ROOT / "tests")
+    parts.append(f"## 5. Implemented Source Files ({len(src_files)} changed files)\n\n{src_block}")
+ 
+    test_files = _collect_src_files(ROOT / "tests")    # <-- giữ nguyên full
     test_block = "\n\n".join(
         f"### {fp}\n```typescript\n{code}\n```"
         for fp, code in test_files.items()

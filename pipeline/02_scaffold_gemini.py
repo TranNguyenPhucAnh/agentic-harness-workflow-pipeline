@@ -98,15 +98,35 @@ def _parse_json(raw: str) -> dict:
     print("[02] No JSON object found in Gemini response.", file=sys.stderr)
     sys.exit(1)
 
+def _compress_spec(spec: str) -> str:
+    """
+    Tạo bản rút gọn của spec.md để downstream models dùng thay full spec.
+    Bỏ §0 (meta/pipeline instructions dành cho Gemini) và §8 (Gemini output schema)
+    vì các bước sau không cần. Giữ §1-7, §9-11 (component specs, types, AC).
+    Tiết kiệm ~35% tokens trên mọi call downstream.
+    """
+    lines = spec.splitlines()
+    out: list[str] = []
+    skip = False
+    SKIP_HEADERS  = ("## 0.", "## 8.")
+    RESUME_PREFIX = "## "
+    for line in lines:
+        if any(line.startswith(h) for h in SKIP_HEADERS):
+            skip = True
+        elif skip and line.startswith(RESUME_PREFIX) and not any(line.startswith(h) for h in SKIP_HEADERS):
+            skip = False
+        if not skip:
+            out.append(line)
+    return "\n".join(out)
 
 # ── File writer ───────────────────────────────────────────────────────────────
 
-def write_files(scaffold: dict) -> None:
+def write_files(scaffold: dict, spec: str) -> None:   # <-- thêm param spec
     # scaffold.json
     json_path = OUT_DIR / "scaffold.json"
     json_path.write_text(json.dumps(scaffold, indent=2))
     print(f"[02] Scaffold JSON → {json_path}")
-
+ 
     # Individual source + test stubs
     for entry in scaffold["files"]:
         path = ROOT / entry["file_path"]
@@ -114,34 +134,50 @@ def write_files(scaffold: dict) -> None:
         path.write_text(entry["code"])
         tag = "TEST" if entry.get("is_test") else "SRC "
         print(f"[02] [{tag}] {entry['file_path']}")
-
-    # Downstream model instructions
+ 
+    # Downstream model instructions (Qwen only)
     instructions = scaffold.get("implementation_instructions", {})
-
-    # Qwen executor hints — read by 03a_implement_qwen.py
     (OUT_DIR / "instructions_qwen.txt").write_text(
         instructions.get("for_qwen", "No specific instructions.")
     )
-    # NOTE: GLM 5.1 uses a hardcoded SYSTEM_PROMPT in 03b_implement_glm.py (planner role).
-    # No instructions file is written for GLM — for_glm key in scaffold JSON is unused.
-
+ 
+    # ── NEW: compressed spec cho downstream models ────────────
+    compressed = _compress_spec(spec)
+    (OUT_DIR / "spec_compressed.md").write_text(compressed)
+    savings = round((1 - len(compressed) / len(spec)) * 100)
+    print(f"[02] Compressed spec → scaffold/spec_compressed.md  ({savings}% smaller)")
+ 
+    # ── NEW: pipeline_context.json — shared state file ────────
+    # 03b append implementation_order ke file ini setelah plan.
+    context = {
+        "spec_compressed_path": "scaffold/spec_compressed.md",
+        "scaffold_version":     scaffold["scaffold_version"],
+        "file_tree":            [f["file_path"] for f in scaffold["files"]],
+        "stub_map":             {                              # stub code keyed by path
+            f["file_path"]: f["code"]
+            for f in scaffold["files"] if not f.get("is_test")
+        },
+        "instructions_qwen":    instructions.get("for_qwen", ""),
+        "implementation_order": [],    # filled by 03b
+    }
+    (OUT_DIR / "pipeline_context.json").write_text(json.dumps(context, indent=2))
+    print("[02] Pipeline context → scaffold/pipeline_context.json")
+ 
     print("[02] Done.")
-
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     spec     = SPEC_PATH.read_text()
     scaffold = call_gemini(spec)
-
+ 
     required = {"scaffold_version", "files", "implementation_instructions"}
     missing  = required - set(scaffold.keys())
     if missing:
         print(f"[02] ERROR: scaffold JSON missing keys: {missing}", file=sys.stderr)
         sys.exit(1)
-
-    write_files(scaffold)
-
+ 
+    write_files(scaffold, spec)    # <-- thêm spec
 
 if __name__ == "__main__":
     main()

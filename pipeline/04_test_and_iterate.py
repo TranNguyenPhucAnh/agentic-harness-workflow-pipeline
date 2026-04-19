@@ -46,6 +46,7 @@ from typing import Callable
 
 ROOT        = Path(__file__).parent.parent
 SPEC_PATH   = ROOT / "spec.md"
+PIPELINE_CTX = ROOT / "scaffold" / "pipeline_context.json"
 GLM_PLAN    = ROOT / "scaffold" / "glm_plan.json"
 REPORTS_DIR = ROOT / "reports"
 REPORTS_DIR.mkdir(exist_ok=True)
@@ -129,6 +130,10 @@ class IterationRecord:
 # ════════════════════════════════════════════════════════════════════════════
 # API helpers
 # ════════════════════════════════════════════════════════════════════════════
+
+def _load_spec() -> str:
+    compressed = ROOT / "scaffold" / "spec_compressed.md"
+    return compressed.read_text() if compressed.exists() else SPEC_PATH.read_text()
 
 def _openrouter_call(model_id: str, messages: list, max_tokens: int = 32768) -> str:
     api_key = os.environ["OPENROUTER_API_KEY"]
@@ -219,12 +224,12 @@ def parse_failures(output: str) -> list[FailureCluster]:
             snippet = errors[j] if j < len(errors) else section[:500]
             cluster.failures.append(TestFailure(
                 test_file=test_file, test_name=name.strip(),
-                error_snippet=snippet.strip(),
+                error_snippet=snippet.strip()[:600],   # <-- thêm [:600]
             ))
         if not cluster.failures:
             cluster.failures.append(TestFailure(
                 test_file=test_file, test_name="(parse fallback)",
-                error_snippet=section[:1500].strip(),
+                error_snippet=section[:800].strip(),   # <-- giảm từ 1500 → 800
             ))
     return list(clusters.values())
 
@@ -370,22 +375,24 @@ TypeScript strict — no `any`. Raw JSON. No markdown fences.
 """
 
 
-def _build_state_timeline(test_code: str) -> str:
+def _build_state_timeline(test_code: str, max_entries: int = 12) -> str:
     lines    = test_code.splitlines()
     timeline: list[str] = []
-    in_test  = False
     for line in lines:
         s = line.strip()
-        if re.match(r"(it|test)\s*\(", s):
-            in_test = True
+        if not s or s.startswith("//") or s.startswith("import"):
+            continue
+        if s.startswith("describe(") or s.startswith("it(") or s.startswith("test("):
             timeline.append(f"TEST: {s[:100]}")
-        elif in_test and s.startswith("act("):
+        elif "render(" in s or "fireEvent" in s or "userEvent" in s or "act(" in s:
             timeline.append(f"  ACTION: {s[:100]}")
-        elif in_test and s.startswith("expect("):
+        elif s.startswith("expect("):
             timeline.append(f"  ASSERT: {s[:100]}")
-        elif in_test and s in ("});", "})"):
-            in_test = False
-            timeline.append("")
+        else:
+            continue
+        if len(timeline) >= max_entries * 3:    # <-- NEW: hard stop
+            timeline.append("  … (truncated)")
+            break
     return "\n".join(timeline) if timeline else "(could not extract timeline)"
 
 
@@ -411,7 +418,7 @@ def _call_repair(
     Returns (patched: bool, explanation: str).
     Special: if layer_name=="L1" and explanation contains "LOGIC_BUG", returns (False, "LOGIC_BUG").
     """
-    spec      = SPEC_PATH.read_text()
+    spec      = _load_spec()
     src_code  = _read_file_safe(ROOT / cluster.src_file)
     test_code = _read_file_safe(ROOT / cluster.test_file)
     error_log = cluster.error_block()
@@ -667,7 +674,7 @@ def main() -> None:
             iteration_records.append(IterationRecord(
                 iteration=iteration, passed=False, summary=summary_line,
                 clusters_found=0, clusters_repaired=0, cluster_details=[],
-                log_snippet=output[-2000:],
+                log_snippet=output[-1200:],
             ))
             break
 
@@ -681,7 +688,7 @@ def main() -> None:
                     "escalated": c.escalated, "owner": c.owner,
                     "attempts": c.attempt_count,
                 } for c in clusters],
-                log_snippet=output[-2000:],
+                log_snippet=output[-1200:],
             ))
             break
 
@@ -717,7 +724,7 @@ def main() -> None:
             iteration=iteration, passed=False, summary=summary_line,
             clusters_found=len(clusters), clusters_repaired=repaired,
             cluster_details=cluster_details,
-            log_snippet=output[-2000:],
+            log_snippet=output[-1200:],
         ))
 
     # ── Reports ───────────────────────────────────────────────────────────────

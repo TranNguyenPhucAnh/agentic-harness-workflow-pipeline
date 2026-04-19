@@ -36,6 +36,7 @@ ROOT          = Path(__file__).parent.parent
 SPEC_PATH     = ROOT / "spec.md"
 SCAFFOLD_JSON = ROOT / "scaffold" / "scaffold.json"
 PLAN_OUT      = ROOT / "scaffold" / "glm_plan.json"
+PIPELINE_CTX = ROOT / "scaffold" / "pipeline_context.json"
 
 
 # ── Prompts ──────────────────────────────────────────────────────────────────
@@ -99,6 +100,11 @@ Rules:
 
 
 # ── API call ──────────────────────────────────────────────────────────────────
+
+def _load_spec() -> str:
+    """Dùng compressed spec nếu có, fallback về full spec."""
+    compressed = ROOT / "scaffold" / "spec_compressed.md"
+    return compressed.read_text() if compressed.exists() else (ROOT / "spec.md").read_text()
 
 def call_glm_planner(spec: str, stub_files: list) -> dict:
     user_msg = (
@@ -194,21 +200,28 @@ def validate_plan(plan: dict, stub_files: list) -> None:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    spec     = SPEC_PATH.read_text()
+    spec     = _load_spec()                          # <-- đổi từ SPEC_PATH.read_text()
     scaffold = json.loads(SCAFFOLD_JSON.read_text())
-
+ 
     stub_files = [f for f in scaffold["files"] if not f.get("is_test")]
     print(f"[03b] Planning {len(stub_files)} stub files …")
-
+ 
     plan = call_glm_planner(spec, stub_files)
     validate_plan(plan, stub_files)
-
+ 
     PLAN_OUT.write_text(json.dumps(plan, indent=2))
     print(f"[03b] Plan written → {PLAN_OUT}")
     print(f"[03b] Tasks in plan: {len(plan.get('tasks', []))}")
     print(f"[03b] Implementation order: {plan.get('implementation_order', [])}")
-    print(f"[03b] Done. Pass --use-glm-plan to 03a_implement_qwen.py to use this plan.")
-
+ 
+    # ── NEW: append implementation_order to pipeline_context ──
+    if PIPELINE_CTX.exists():
+        ctx = json.loads(PIPELINE_CTX.read_text())
+        ctx["implementation_order"] = plan.get("implementation_order", [])
+        PIPELINE_CTX.write_text(json.dumps(ctx, indent=2))
+        print("[03b] Updated pipeline_context.json with implementation_order")
+ 
+    print("[03b] Done. Pass --use-glm-plan to 03a_implement_qwen.py to use this plan.")
 
 if __name__ == "__main__":
     main()

@@ -38,9 +38,13 @@ SCAFFOLD_JSON = ROOT / "scaffold" / "scaffold.json"
 INSTRUCTIONS  = ROOT / "scaffold" / "instructions_qwen.txt"
 GLM_PLAN      = ROOT / "scaffold" / "glm_plan.json"
 IMPL_RECORD   = ROOT / "scaffold" / "impl_qwen.json"
-
+PIPELINE_CTX  = ROOT / "scaffold" / "pipeline_context.json"
 
 # ── System prompts ────────────────────────────────────────────────────────────
+
+def _load_spec() -> str:
+    compressed = ROOT / "scaffold" / "spec_compressed.md"
+    return compressed.read_text() if compressed.exists() else (ROOT / "spec.md").read_text()
 
 def build_system_prompt_single(instructions: str) -> str:
     """Original single-call prompt — used when no GLM plan is available."""
@@ -165,27 +169,34 @@ def _build_task_block(task: dict | None) -> str:
         lines.append(f"**Tailwind hints:** {hints}\n")
     return "\n".join(lines)
 
-
 def implement_file(
     spec: str,
     stub: dict,
     task: dict | None,
     already_written: dict[str, str],
 ) -> dict:
-    """
-    Call Qwen once for a single stub file.
-    already_written: {file_path: code} of files already generated this run
-    (injected as context so Qwen can resolve imports).
-    """
-    file_path = stub["file_path"]
+    file_path  = stub["file_path"]
     task_block = _build_task_block(task)
-
+ 
+    # ── NEW: chỉ inject dependencies, không phải toàn bộ already_written ──
+    deps     = set(task.get("depends_on", [])) if task else set()
+    relevant = {fp: code for fp, code in already_written.items() if fp in deps}
+ 
     context_block = ""
-    if already_written:
-        context_block = "### Already-implemented files (for import reference)\n"
-        for fp, code in already_written.items():
+    if relevant:
+        context_block = "### Dependencies (already implemented — for import reference)\n"
+        for fp, code in relevant.items():
             context_block += f"\n#### {fp}\n```typescript\n{code}\n```\n"
-
+    # Nếu không có deps tường minh nhưng already_written có types/constants,
+    # inject chúng vì gần như mọi file đều cần.
+    elif already_written:
+        shared = {fp: code for fp, code in already_written.items()
+                  if "types/" in fp or "data/" in fp}
+        if shared:
+            context_block = "### Shared types & constants (for import reference)\n"
+            for fp, code in shared.items():
+                context_block += f"\n#### {fp}\n```typescript\n{code}\n```\n"
+ 
     user_msg = (
         f"### spec.md\n\n{spec}\n\n"
         f"{context_block}\n"
@@ -193,20 +204,17 @@ def implement_file(
         f"### Stub file to implement: {file_path}\n"
         f"```typescript\n{stub['code']}\n```"
     )
-
+ 
     print(f"[03a]   → Implementing {file_path} …")
-    raw = _call_qwen(build_system_prompt_per_file(), user_msg)
+    raw    = _call_qwen(build_system_prompt_per_file(), user_msg)
     result = _parse_json(raw, file_path)
-
-    # Normalise: model may return single object or {files: [...]} wrapper
+ 
     if "files" in result and isinstance(result["files"], list):
-        # Unwrap if model returned list format despite per-file prompt
         for entry in result["files"]:
             if entry.get("file_path") == file_path:
                 return entry
         return result["files"][0]
     return result
-
 
 # ── Ordering helpers ──────────────────────────────────────────────────────────
 
@@ -244,7 +252,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    spec      = SPEC_PATH.read_text()
+    spec      = spec = _load_spec()
     scaffold  = json.loads(SCAFFOLD_JSON.read_text())
     instrs    = INSTRUCTIONS.read_text() if INSTRUCTIONS.exists() else ""
 
