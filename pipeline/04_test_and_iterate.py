@@ -45,7 +45,7 @@ from pathlib import Path
 from typing import Callable
 
 ROOT        = Path(__file__).parent.parent
-SPEC_PATH   = ROOT / "spec.md"
+SPEC_PATH   = ROOT / "scaffold" / "spec_compressed.md"
 GLM_PLAN    = ROOT / "scaffold" / "glm_plan.json"
 REPORTS_DIR = ROOT / "reports"
 REPORTS_DIR.mkdir(exist_ok=True)
@@ -411,6 +411,9 @@ def _call_repair(
     Returns (patched: bool, explanation: str).
     Special: if layer_name=="L1" and explanation contains "LOGIC_BUG", returns (False, "LOGIC_BUG").
     """
+    if not SPEC_PATH.exists():
+        SPEC_PATH = ROOT / "spec.md"   # fallback
+        
     spec      = SPEC_PATH.read_text()
     src_code  = _read_file_safe(ROOT / cluster.src_file)
     test_code = _read_file_safe(ROOT / cluster.test_file)
