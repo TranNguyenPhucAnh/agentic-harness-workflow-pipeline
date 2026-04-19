@@ -7,7 +7,7 @@ Architecture:
     Gemini         → scaffold JSON (stubs + signatures)
     GLM 5.1        → planner: decomposes scaffold into glm_plan.json
     Qwen 3.6+      → executor: implements src/ per-file (with plan) or single-call
-    vitest         → test + targeted repair loop (max N iterations)
+    vitest         → test loop: Qwen fixes surface bugs, Minimax 2.7 fixes logic bugs
     DeepSeek V3.2  → judge: qualitative review + sign-off (runs only on green)
 
 Usage:
