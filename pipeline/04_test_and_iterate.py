@@ -144,6 +144,11 @@ def _openrouter_call(model_id: str, messages: list, max_tokens: int = 32768) -> 
         timeout=300,
     )
     r.raise_for_status()
+    data         = r.json()
+    usage        = data.get("usage", {})
+    prompt_t     = usage.get("prompt_tokens", "?")
+    completion_t = usage.get("completion_tokens", "?")
+    print(f"    [tokens] {model_id}: prompt={prompt_t}, completion={completion_t}")
     return r.json()["choices"][0]["message"]["content"]
 
 
