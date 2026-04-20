@@ -252,7 +252,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    spec      = spec = _load_spec()
+    spec      = _load_spec()
     scaffold  = json.loads(SCAFFOLD_JSON.read_text())
     instrs    = INSTRUCTIONS.read_text() if INSTRUCTIONS.exists() else ""
 
