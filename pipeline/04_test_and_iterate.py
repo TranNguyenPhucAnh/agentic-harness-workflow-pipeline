@@ -46,7 +46,6 @@ from typing import Callable
 
 ROOT        = Path(__file__).parent.parent
 SPEC_PATH   = ROOT / "spec.md"
-PIPELINE_CTX = ROOT / "scaffold" / "pipeline_context.json"
 GLM_PLAN    = ROOT / "scaffold" / "glm_plan.json"
 REPORTS_DIR = ROOT / "reports"
 REPORTS_DIR.mkdir(exist_ok=True)
