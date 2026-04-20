@@ -159,6 +159,19 @@ def write_files(scaffold: dict, spec: str) -> None:   # <-- thêm param spec
         },
         "instructions_qwen":    instructions.get("for_qwen", ""),
         "implementation_order": [],    # filled by 03b
+        "spec_hash": hashlib.sha256(spec.encode()).hexdigest()[:16],
+        "spec_version": _extract_version(spec),   # parse "# Version: 1.1.0" từ header
+        
+        # NEW: section → file mapping (Gemini tự generate khi scaffold)
+        # scaffold JSON nên có thêm field "owned_by_section": "§4.2"
+        "section_file_map": {
+            "§4.1": ["src/components/SummaryStickyBar.tsx"],
+            "§4.5": ["src/hooks/useSensorData.ts"],
+            # etc — Gemini điền vào khi scaffold
+        },
+        
+        # NEW: file dependency graph từ GLM plan
+        "file_deps": {},   # filled by 03b: {"src/hooks/useReplay.ts": ["src/types/sensor.ts"]}
     }
     (OUT_DIR / "pipeline_context.json").write_text(json.dumps(context, indent=2))
     print("[02] Pipeline context → scaffold/pipeline_context.json")
