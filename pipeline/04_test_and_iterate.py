@@ -20,6 +20,11 @@ Cluster ownership:
 Phase flow:
     Phase B : run vitest → parse output → list[FailureCluster]
     Phase C : per-cluster dispatch:
+        P0 — Consistency: cross-check test vs code vs spec (no file writes)
+             Verdicts: CODE_BUG | TEST_FRAGILE | SPEC_AMBIG | THRESHOLD_OK
+             TEST_FRAGILE / THRESHOLD_OK → allowed to patch test file (query/threshold only)
+             SPEC_AMBIG                  → escalate to human immediately, skip repair
+             CODE_BUG                   → normal repair flow below
         L0 — Static     : esbuild/float fixes (no LLM)
         L1 — Qwen       : surface bugs (components); skipped for hook/data files
         L2 — Minimax    : logic bugs (hooks/data); activated on stale/scope/LOGIC_BUG
@@ -104,15 +109,16 @@ class FailureCluster:
 
 @dataclass
 class ClusterRepairRecord:
-    cluster:       str
-    src_file:      str
-    failures:      int
-    repaired:      bool
-    layer_used:    str   # "static"|"qwen_targeted"|"minimax_logic"|"skipped"
-    escalated:     bool
-    escalated_to:  str   # ""|"minimax"|"human"
-    owner:         str   # "qwen"|"minimax"
-    note:          str = ""
+    cluster:              str
+    src_file:             str
+    failures:             int
+    repaired:             bool
+    layer_used:           str   # "static"|"qwen_targeted"|"minimax_logic"|"test_rewrite"|"skipped"
+    escalated:            bool
+    escalated_to:         str   # ""|"minimax"|"human"
+    owner:                str   # "qwen"|"minimax"
+    note:                 str = ""
+    consistency_verdict:  str = ""   # P0 verdict: CODE_BUG|TEST_FRAGILE|SPEC_AMBIG|THRESHOLD_OK|""
 
 
 @dataclass
@@ -135,21 +141,33 @@ def _load_spec() -> str:
     return compressed.read_text() if compressed.exists() else SPEC_PATH.read_text()
 
 def _openrouter_call(model_id: str, messages: list, max_tokens: int = 32768) -> str:
+    import time
     api_key = os.environ["OPENROUTER_API_KEY"]
-    r = httpx.post(
-        "https://openrouter.ai/api/v1/chat/completions",
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json={"model": model_id, "messages": messages,
-              "temperature": 0.1, "max_tokens": max_tokens},
-        timeout=300,
-    )
-    r.raise_for_status()
-    data         = r.json()
-    usage        = data.get("usage", {})
-    prompt_t     = usage.get("prompt_tokens", "?")
-    completion_t = usage.get("completion_tokens", "?")
-    print(f"    [tokens] {model_id}: prompt={prompt_t}, completion={completion_t}")
-    return r.json()["choices"][0]["message"]["content"]
+
+    for attempt in range(2):   # 1 retry on empty response
+        r = httpx.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={"model": model_id, "messages": messages,
+                  "temperature": 0.1, "max_tokens": max_tokens},
+            timeout=300,
+        )
+        r.raise_for_status()
+        data         = r.json()
+        usage        = data.get("usage", {})
+        prompt_t     = usage.get("prompt_tokens", "?")
+        completion_t = usage.get("completion_tokens", "?")
+        print(f"    [tokens] {model_id}: prompt={prompt_t}, completion={completion_t}")
+        content = data["choices"][0]["message"]["content"]
+        if content and content.strip():
+            return content
+        # Empty response — wait and retry once
+        if attempt == 0:
+            print(f"    [warn] {model_id} returned empty response, retrying in 3s …",
+                  file=sys.stderr)
+            time.sleep(3)
+
+    return ""   # caller handles empty string as parse error
 
 
 def call_qwen(messages: list) -> str:
@@ -405,6 +423,189 @@ def _read_file_safe(path: Path) -> str:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# Phase 0 — Consistency checker
+# ════════════════════════════════════════════════════════════════════════════
+
+CONSISTENCY_SYSTEM = """\
+You are a test-vs-code consistency auditor. You do NOT fix code or tests.
+Your only job: read the spec, the failing test, the source file, and the assertion,
+then classify who is wrong.
+
+Return raw JSON only — no markdown fences, no preamble:
+{
+  "verdict": "CODE_BUG" | "TEST_FRAGILE" | "SPEC_AMBIG" | "THRESHOLD_OK",
+  "confidence": "high" | "medium" | "low",
+  "reasoning": "one paragraph — cite the specific spec section, test line, and code line",
+  "test_patch_allowed": true | false,
+  "test_patch_rationale": "only if test_patch_allowed=true — exactly what to change and why"
+}
+
+Verdict definitions:
+  CODE_BUG      — code does not implement the spec correctly; test expectation is valid.
+                  test_patch_allowed MUST be false.
+  TEST_FRAGILE  — test query or assertion is brittle (wrong selector, DOM structure mismatch,
+                  text split across nodes, timing issue) but the INTENT is correct.
+                  The fix is to rewrite the query/assertion, NOT to change what is being tested.
+                  test_patch_allowed = true.
+  SPEC_AMBIG    — spec is genuinely ambiguous about this behaviour; test and code both have
+                  valid interpretations. Cannot be resolved automatically.
+                  test_patch_allowed MUST be false.
+  THRESHOLD_OK  — code behaviour is correct per spec, but test uses a threshold too strict
+                  for the implementation (e.g. spec says "~0.4% ± variance" but test asserts
+                  exact ≤ 1.5% when actual variance can exceed that).
+                  test_patch_allowed = true ONLY if relaxing the threshold does NOT mask a real bug.
+
+CRITICAL: never set test_patch_allowed=true for CODE_BUG. That would hide the real defect.
+"""
+
+TEST_REPAIR_SYSTEM = """\
+You are fixing a FRAGILE TEST or THRESHOLD. The test intent is correct — only the
+implementation of the assertion is brittle or too strict.
+
+Allowed changes ONLY:
+  TEST_FRAGILE  — fix DOM query selectors, async patterns, or text-content matchers:
+                  • Replace getByText(regex) that matches multiple elements with
+                    within(container).getByText(), getByRole(), or getByTestId()
+                  • Replace text split across nodes with:
+                    getByText((_, el) => el?.textContent?.includes('...'))
+                  • Fix missing act() wrappers for state updates
+  THRESHOLD_OK  — relax a numerical threshold WITH explicit spec citation:
+                  • e.g. change toBeLessThanOrEqual(0.015) to toBeLessThanOrEqual(0.025)
+                    citing "spec says ~0.4% with natural variance, no hard upper bound"
+
+NOT allowed — ANY of these voids the patch:
+  • Changing what behaviour is being tested
+  • Removing assertions or reducing assertion count
+  • Changing expected values to match wrong code behaviour
+  • Adding trivial pass-through assertions like expect(true).toBe(true)
+  • Touching src/ files
+
+Return raw JSON only:
+{
+  "file_path": "tests/components/AnomalyFeed.test.tsx",
+  "code": "<full corrected test file>",
+  "changes_made": ["one item per change, quoted verbatim before → after"],
+  "explanation": "one sentence"
+}
+"""
+
+
+def check_consistency(
+    cluster:  FailureCluster,
+    spec:     str,
+    verbose:  bool = False,
+) -> dict:
+    """
+    Phase 0: cross-check test vs code vs spec. Does NOT modify any files.
+    Returns verdict dict. Falls back to CODE_BUG on any error.
+    """
+    src_code  = _read_file_safe(ROOT / cluster.src_file)
+    test_code = _read_file_safe(ROOT / cluster.test_file)
+    error_log = cluster.error_block()
+
+    user_content = (
+        f"### spec.md\n\n{spec}\n\n"
+        f"### Test file: {cluster.test_file}\n"
+        f"```typescript\n{test_code}\n```\n\n"
+        f"### Source file: {cluster.src_file}\n"
+        f"```typescript\n{src_code}\n```\n\n"
+        f"### Failing assertions\n```\n{error_log}\n```"
+    )
+
+    messages = [
+        {"role": "system", "content": CONSISTENCY_SYSTEM},
+        {"role": "user",   "content": user_content},
+    ]
+
+    if verbose:
+        print(f"    [P0] Consistency check → Qwen ({cluster.test_file}) …")
+
+    try:
+        raw = call_qwen(messages).strip()
+        raw = re.sub(r"^```[a-z]*\n?", "", raw)
+        raw = re.sub(r"\n?```$",        "", raw)
+        result = json.loads(raw)
+        verdict = result.get("verdict", "CODE_BUG")
+        conf    = result.get("confidence", "low")
+        print(f"    [P0] verdict={verdict} confidence={conf}")
+        if verbose:
+            print(f"    [P0] reasoning: {result.get('reasoning','')[:200]}")
+        return result
+    except Exception as e:
+        print(f"    [P0] Check failed ({e}), defaulting to CODE_BUG.", file=sys.stderr)
+        return {
+            "verdict": "CODE_BUG", "confidence": "low",
+            "test_patch_allowed": False,
+            "reasoning": f"consistency check error: {e}",
+            "test_patch_rationale": "",
+        }
+
+
+def repair_test_file(
+    cluster:   FailureCluster,
+    verdict:   dict,
+    verbose:   bool = False,
+) -> bool:
+    """
+    P0 branch: rewrite fragile test query or relax threshold.
+    Returns True if patch was applied and file written.
+    """
+    spec      = _load_spec()
+    test_code = _read_file_safe(ROOT / cluster.test_file)
+    src_code  = _read_file_safe(ROOT / cluster.src_file)
+    error_log = cluster.error_block()
+
+    rationale_block = (
+        f"### Auditor rationale\n{verdict.get('test_patch_rationale', '')}\n\n"
+    )
+
+    user_content = (
+        f"### spec.md\n\n{spec}\n\n"
+        f"### Source file (DO NOT MODIFY): {cluster.src_file}\n"
+        f"```typescript\n{src_code}\n```\n\n"
+        f"### Test file to fix: {cluster.test_file}\n"
+        f"```typescript\n{test_code}\n```\n\n"
+        f"### Failing assertions\n```\n{error_log}\n```\n\n"
+        f"{rationale_block}"
+        f"Verdict: {verdict.get('verdict')} — fix ONLY what the rationale describes."
+    )
+
+    messages = [
+        {"role": "system", "content": TEST_REPAIR_SYSTEM},
+        {"role": "user",   "content": user_content},
+    ]
+
+    if verbose:
+        print(f"    [P0-fix] Rewriting test: {cluster.test_file} …")
+
+    try:
+        raw = call_qwen(messages).strip()
+        raw = re.sub(r"^```[a-z]*\n?", "", raw)
+        raw = re.sub(r"\n?```$",        "", raw)
+        patch = json.loads(raw)
+    except Exception as e:
+        print(f"    [P0-fix] Parse error: {e}", file=sys.stderr)
+        return False
+
+    out_path = ROOT / patch.get("file_path", cluster.test_file)
+
+    # Safety: only allow writes to tests/
+    if not str(out_path).startswith(str(ROOT / "tests")):
+        print(f"    [P0-fix] ⚠ Scope violation: tried to write {out_path}. Rejected.",
+              file=sys.stderr)
+        return False
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(patch["code"])
+
+    changes = patch.get("changes_made", [])
+    print(f"    [P0-fix] ✓ Test updated — {patch.get('explanation', '(no explanation)')}")
+    for ch in changes:
+        print(f"      • {ch}")
+    return True
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # Shared repair executor
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -493,18 +694,19 @@ def repair_cluster(
     verbose:              bool = False,
 ) -> ClusterRepairRecord:
     """
-    Dispatch cluster through L0 → L1/L2 → L3.
+    Dispatch cluster through P0 → L0 → L1/L2 → L3.
 
     Routing rules:
-      - Hook/data files (MINIMAX_SCOPE) → skip L1 Qwen, go straight to L2 Minimax
-      - Component files → L1 Qwen first
-          * Qwen fixes it                 → done, owner stays "qwen"
-          * Qwen signals LOGIC_BUG        → transfer to L2 Minimax (if in scope)
-          * stale fingerprint             → L2 Minimax (if in scope)
-          * unfixable + out of scope      → ESCALATED→human
-      - Once cluster.owner == "minimax"   → always go to L2, Qwen locked out
+      P0 — Consistency check (first attempt only, not on retries):
+          TEST_FRAGILE / THRESHOLD_OK → repair_test_file() → done (test rewrite)
+          SPEC_AMBIG                  → escalate human immediately
+          CODE_BUG                   → continue to L0/L1/L2 below
+      L0 — Static pre-pass (no LLM)
+      L1 — Qwen surface fix (components)
+      L2 — Minimax logic fix (hooks/data)
+      L3 — Give-up escalation
     """
-    # L3 guard
+    # ── L3 guard ─────────────────────────────────────────────────────────────
     if cluster.escalated:
         print(f"    [SKIP] {cluster.test_file} — ESCALATED→{cluster.owner}, skipping.")
         return ClusterRepairRecord(
@@ -515,7 +717,46 @@ def repair_cluster(
             note="previously escalated",
         )
 
-    # L0: static pre-pass
+    # ── Phase 0: consistency check (only on first attempt per cluster) ────────
+    spec = _load_spec()
+    if cluster.attempt_count == 0:
+        cv = check_consistency(cluster, spec, verbose=verbose)
+        verdict = cv.get("verdict", "CODE_BUG")
+
+        if verdict == "SPEC_AMBIG":
+            cluster.escalated = True
+            return ClusterRepairRecord(
+                cluster=cluster.key, src_file=cluster.src_file,
+                failures=len(cluster.failures), repaired=False,
+                layer_used="skipped", escalated=True,
+                escalated_to="human", owner=cluster.owner,
+                note=f"spec ambiguous: {cv.get('reasoning','')[:150]}",
+                consistency_verdict=verdict,
+            )
+
+        if verdict in ("TEST_FRAGILE", "THRESHOLD_OK") and cv.get("test_patch_allowed"):
+            ok = repair_test_file(cluster, cv, verbose=verbose)
+            cluster.attempt_count += 1
+            cluster.last_fingerprint = cluster.fingerprint()
+            return ClusterRepairRecord(
+                cluster=cluster.key, src_file=cluster.src_file,
+                failures=len(cluster.failures), repaired=ok,
+                layer_used="test_rewrite", escalated=not ok,
+                escalated_to="human" if not ok else "",
+                owner=cluster.owner,
+                note=(
+                    cv.get("test_patch_rationale", "")[:150]
+                    if ok else "test rewrite failed"
+                ),
+                consistency_verdict=verdict,
+            )
+
+        # CODE_BUG or low-confidence → fall through to normal repair
+        consistency_verdict_label = verdict
+    else:
+        consistency_verdict_label = ""   # skip P0 on retries
+
+    # ── L0: static pre-pass ───────────────────────────────────────────────────
     l0_fixed, l0_desc = layer0_static_prepass(cluster, verbose)
     if l0_fixed:
         cluster.attempt_count   += 1
@@ -525,9 +766,10 @@ def repair_cluster(
             failures=len(cluster.failures), repaired=True,
             layer_used="static", escalated=False,
             escalated_to="", owner=cluster.owner, note=l0_desc,
+            consistency_verdict=consistency_verdict_label,
         )
 
-    # Give-up check
+    # ── Give-up check ─────────────────────────────────────────────────────────
     if cluster.attempt_count >= max_cluster_attempts:
         cluster.escalated = True
         esc_to = "human"
@@ -539,6 +781,7 @@ def repair_cluster(
             layer_used="skipped", escalated=True, escalated_to=esc_to,
             owner=cluster.owner,
             note=f"gave up after {cluster.attempt_count} LLM attempts",
+            consistency_verdict=consistency_verdict_label,
         )
 
     current_fp = cluster.fingerprint()
@@ -567,6 +810,7 @@ def repair_cluster(
                 failures=len(cluster.failures), repaired=True,
                 layer_used="qwen_targeted", escalated=False,
                 escalated_to="", owner="qwen",
+                consistency_verdict=consistency_verdict_label,
             )
 
         # Qwen failed: escalate to Minimax if file is in scope
@@ -582,10 +826,11 @@ def repair_cluster(
                 layer_used="qwen_targeted", escalated=True,
                 escalated_to="human", owner="qwen",
                 note=f"Qwen failed on component outside Minimax scope: {note}",
+                consistency_verdict=consistency_verdict_label,
             )
 
-    # ── L2: Minimax logic debugger ───────────────────────────────────────────
-    cluster.owner = "minimax"
+    # ── L2: Minimax logic debugger ────────────────────────────────────────────
+    cluster.owner  = "minimax"
     test_code      = _read_file_safe(ROOT / cluster.test_file)
     timeline       = _build_state_timeline(test_code)
     minimax_system = _build_minimax_system(global_notes)
@@ -605,6 +850,7 @@ def repair_cluster(
         failures=len(cluster.failures), repaired=ok,
         layer_used="minimax_logic", escalated=False,
         escalated_to="", owner="minimax", note=note,
+        consistency_verdict=consistency_verdict_label,
     )
 
 
@@ -709,15 +955,16 @@ def main() -> None:
             cluster_state[cluster.key] = cluster
             repaired += int(record.repaired)
             detail = {
-                "cluster":      record.cluster,
-                "src_file":     record.src_file,
-                "failures":     record.failures,
-                "repaired":     record.repaired,
-                "layer_used":   record.layer_used,
-                "escalated":    record.escalated,
-                "escalated_to": record.escalated_to,
-                "owner":        record.owner,
-                "note":         record.note,
+                "cluster":              record.cluster,
+                "src_file":             record.src_file,
+                "failures":             record.failures,
+                "repaired":             record.repaired,
+                "layer_used":           record.layer_used,
+                "escalated":            record.escalated,
+                "escalated_to":         record.escalated_to,
+                "owner":                record.owner,
+                "note":                 record.note,
+                "consistency_verdict":  record.consistency_verdict,
             }
             cluster_details.append(detail)
             if record.escalated:
