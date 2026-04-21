@@ -100,24 +100,69 @@ Your task:
 
 # ── API call ──────────────────────────────────────────────────────────────────
 
+def _extract_chat_text_response(data: dict, label: str) -> str:
+    choice = data["choices"][0]
+    msg = choice["message"]
+
+    content = msg.get("content")
+    tool_calls = msg.get("tool_calls")
+    finish_reason = choice.get("finish_reason")
+
+    if tool_calls:
+        raise RuntimeError(
+            f"{label} returned tool_calls instead of text: {tool_calls}"
+        )
+
+    if not content or not content.strip():
+        raise RuntimeError(
+            f"{label} returned empty content. "
+            f"finish_reason={finish_reason}, message={msg}"
+        )
+
+    return content.strip()
+
+
 def _call_qwen(system: str, user_message: str) -> str:
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
     }
+
     payload = {
         "model": MODEL,
         "messages": [
             {"role": "system", "content": system},
-            {"role": "user",   "content": user_message},
+            {"role": "user", "content": user_message},
         ],
         "temperature": 0.15,
         "max_tokens": 32768,
     }
+
+    last_error = None
+
     with httpx.Client(timeout=180) as client:
-        r = client.post(OPENROUTER_URL, headers=headers, json=payload)
-        r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"].strip()
+        for attempt in range(2):
+            r = client.post(OPENROUTER_URL, headers=headers, json=payload)
+            r.raise_for_status()
+
+            data = r.json()
+
+            usage = data.get("usage", {})
+            prompt_t = usage.get("prompt_tokens", "?")
+            completion_t = usage.get("completion_tokens", "?")
+            print(f"[qwen] Tokens: prompt={prompt_t}, completion={completion_t}")
+
+            try:
+                return _extract_chat_text_response(data, label="Qwen")
+            except RuntimeError as e:
+                last_error = e
+                print(f"[qwen] {e}", file=sys.stderr)
+
+                if attempt == 0:
+                    print("[qwen] Retrying in 3s …", file=sys.stderr)
+                    time.sleep(3)
+
+    raise RuntimeError(f"Qwen call failed after retries: {last_error}")
 
 
 # ── JSON extraction ───────────────────────────────────────────────────────────
