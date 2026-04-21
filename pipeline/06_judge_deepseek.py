@@ -224,14 +224,47 @@ def call_deepseek_judge(briefing: str) -> tuple[str, list | None]:
     }
 
     print("[06] Calling DeepSeek V3.2 (judge, reasoning ON) …")
+
+    last_error = None
+
     with httpx.Client(timeout=300) as client:
-        r = client.post(OPENROUTER_URL, headers=headers, json=payload)
-        r.raise_for_status()
+        for attempt in range(2):  # 1 retry on empty response
+            r = client.post(OPENROUTER_URL, headers=headers, json=payload)
+            r.raise_for_status()
 
-    message = r.json()["choices"][0]["message"]
-    # Preserve reasoning_details for transparency (saved to judge_raw.json)
-    return message.get("content", "").strip(), message.get("reasoning_details")
+            data = r.json()
 
+            usage = data.get("usage", {})
+            prompt_t     = usage.get("prompt_tokens", "?")
+            completion_t = usage.get("completion_tokens", "?")
+            print(f"[06] Tokens: prompt={prompt_t}, completion={completion_t}")
+
+            choice        = data["choices"][0]
+            msg           = choice["message"]
+            content       = msg.get("content")
+            tool_calls    = msg.get("tool_calls")
+            finish_reason = choice.get("finish_reason")
+            # Preserve reasoning_details for transparency (saved to judge_raw.json)
+            reasoning_details = msg.get("reasoning_details")
+
+            if tool_calls:
+                raise RuntimeError(
+                    f"DeepSeek judge returned tool_calls instead of text: {tool_calls}"
+                )
+
+            if content and content.strip():
+                return content.strip(), reasoning_details
+
+            last_error = (
+                f"Empty content. finish_reason={finish_reason}, message={msg}"
+            )
+            print(f"[06] {last_error}", file=sys.stderr)
+
+            if attempt == 0:
+                print("[06] Retrying in 3s …", file=sys.stderr)
+                time.sleep(3)
+
+    raise RuntimeError(f"DeepSeek judge failed after retries: {last_error}")
 
 # ── JSON extraction ───────────────────────────────────────────────────────────
 
