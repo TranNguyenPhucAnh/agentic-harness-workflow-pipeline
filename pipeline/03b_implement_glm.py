@@ -105,6 +105,28 @@ def _load_spec() -> str:
     """Dùng compressed spec nếu có, fallback về full spec."""
     compressed = ROOT / "scaffold" / "spec_compressed.md"
     return compressed.read_text() if compressed.exists() else (ROOT / "spec.md").read_text()
+    
+
+def _extract_chat_json_response(data: dict, label: str) -> dict:
+    choice = data["choices"][0]
+    msg = choice["message"]
+
+    content = msg.get("content")
+    tool_calls = msg.get("tool_calls")
+    finish_reason = choice.get("finish_reason")
+
+    if tool_calls:
+        raise RuntimeError(
+            f"Model returned tool_calls instead of text: {tool_calls}"
+        )
+
+    if not content or not content.strip():
+        raise RuntimeError(
+            f"Model returned empty content. finish_reason={finish_reason}, message={msg}"
+        )
+
+    return _parse_json(content.strip(), label=label)
+
 
 def call_glm_planner(spec: str, stub_files: list) -> dict:
     user_msg = (
@@ -117,10 +139,10 @@ def call_glm_planner(spec: str, stub_files: list) -> dict:
         "model": MODEL,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": user_msg},
+            {"role": "user", "content": user_msg},
         ],
         "temperature": 0.2,
-        "max_tokens": 32768,   # GLM spends this on reasoning → compact JSON output
+        "max_tokens": 32768,
     }
 
     headers = {
@@ -129,29 +151,32 @@ def call_glm_planner(spec: str, stub_files: list) -> dict:
     }
 
     print("[03b] Calling GLM 5.1 (planner role) …")
-    with httpx.Client(timeout=240) as client:
-        r = client.post(OPENROUTER_URL, headers=headers, json=payload)
-        r.raise_for_status()
 
-    #raw = r.json()["choices"][0]["message"]["content"].strip()
-    data = r.json()
-    choice = data["choices"][0]
-    msg = choice["message"]
-    
-    content = msg.get("content")
-    tool_calls = msg.get("tool_calls")
-    finish_reason = choice.get("finish_reason")
-    
-    if tool_calls:
-        raise RuntimeError(f"Model returned tool_calls instead of text: {tool_calls}")
-    
-    if not content:
-        raise RuntimeError(
-            f"Model returned empty content. finish_reason={finish_reason}, message={msg}"
-        )
-    
-    raw = content.strip()
-    return _parse_json(raw, label="GLM planner response")
+    last_error = None
+
+    with httpx.Client(timeout=240) as client:
+        for attempt in range(2):
+            r = client.post(OPENROUTER_URL, headers=headers, json=payload)
+            r.raise_for_status()
+
+            data = r.json()
+
+            usage = data.get("usage", {})
+            prompt_t = usage.get("prompt_tokens", "?")
+            completion_t = usage.get("completion_tokens", "?")
+            print(f"[03b] Tokens: prompt={prompt_t}, completion={completion_t}")
+
+            try:
+                return _extract_chat_json_response(data, label="GLM planner response")
+            except RuntimeError as e:
+                last_error = e
+                print(f"[03b] {e}", file=sys.stderr)
+
+                if attempt == 0:
+                    print("[03b] Retrying in 3s …", file=sys.stderr)
+                    time.sleep(3)
+
+    raise RuntimeError(f"Planner failed after retries: {last_error}")
 
 # ── JSON extraction ───────────────────────────────────────────────────────────
 
