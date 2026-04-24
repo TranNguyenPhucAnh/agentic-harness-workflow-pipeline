@@ -763,23 +763,37 @@ def repair_cluster(
     """
     Dispatch cluster through P0 → L0 → L1/L2 → L3.
 
-    Routing rules:
-      P0 — Consistency check (first attempt only, not on retries):
-          TEST_FRAGILE / THRESHOLD_OK → repair_test_file() → done (test rewrite)
-          SPEC_AMBIG                  → escalate human immediately
-          CODE_BUG                   → continue to L0/L1/L2 below
-      L0 — Static pre-pass (no LLM)
-      L1 — Qwen surface fix (components)
-      L2 — Minimax logic fix (hooks/data)
-      L3 — Give-up escalation
-      
-      - Hook/data files (MINIMAX_SCOPE) → skip L1 Qwen, go straight to L2 Minimax
-      - Component files → L1 Qwen first
-          * Qwen fixes it                 → done, owner stays "qwen"
-          * Qwen signals LOGIC_BUG        → transfer to L2 Minimax (if in scope)
-          * stale fingerprint             → L2 Minimax (if in scope)
-          * unfixable + out of scope      → ESCALATED→human
-      - Once cluster.owner == "minimax"   → always go to L2, Qwen locked out
+    Full decision tree (top to bottom, first match wins):
+
+      P0  Consistency check — FIRST ATTEMPT ONLY (skipped on retries):
+            SPEC_AMBIG                        → ESCALATED→human immediately
+            TEST_FRAGILE / THRESHOLD_OK
+              + test_patch_allowed=true       → repair_test_file() → done
+            CODE_BUG (or low confidence)      → fall through to L0 below
+
+      L3  Give-up guard — checked before every LLM call:
+            cluster.escalated=True            → SKIP (already given up)
+            attempt_count >= max_attempts     → ESCALATED→human
+
+      L0  Static pre-pass (no LLM):
+            esbuild transform error           → patch test file (JSX generic fix)
+            float precision in src            → Math.round() patch
+            matched                           → done
+            no match                          → fall through
+
+      L1  Qwen surface fix — COMPONENTS ONLY:
+            cluster.owner == "minimax"        → skip L1 (Qwen locked out)
+            cluster.is_minimax_scope()        → skip L1 (hook/data → straight to L2)
+            is_stale (fingerprint unchanged)  → skip L1 (→ L2)
+            otherwise → call Qwen:
+              fix applied                     → done, owner stays "qwen"
+              LOGIC_BUG signal + in scope     → transfer owner→"minimax", → L2
+              LOGIC_BUG + out of scope        → ESCALATED→human
+
+      L2  Minimax logic fix — HOOKS / DATA ONLY (scope-locked):
+            scope_check: rejects patches outside src/hooks/, src/data/, src/types/, src/utils/
+            fix applied                       → done, owner stays "minimax"
+            patch rejected / parse error      → repaired=False (will retry next iteration)
     """
     # ── L3 guard ─────────────────────────────────────────────────────────────
     if cluster.escalated:
