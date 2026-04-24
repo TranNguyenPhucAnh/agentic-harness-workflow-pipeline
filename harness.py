@@ -12,47 +12,40 @@ Architecture:
     07_fix         → auto-fix blocking issues from judge (runs on NEEDS_REVISION)
     07_knowledge   → long-term knowledge distillation (run manually after human review)
 
+Delta-aware execution (Step 1):
+    spec_diff.py runs first, compares current spec.md against last snapshot, writes
+    scaffold/spec_delta.json. harness auto-skips unchanged steps and copies unaffected
+    src/ files from prev_src/ instead of re-implementing them.
+    Manual flags always OVERRIDE delta decisions. --force ignores delta entirely.
+
 Usage:
-    # Full pipeline (scaffold → plan → implement → test → report → judge → fix → re-judge)
+    # Smart run — spec_diff decides what actually runs
     python harness.py
 
-    # Skip GLM planning — Qwen single-call mode, judge still runs
-    python harness.py --only-qwen
+    # Force full re-run regardless of delta
+    python harness.py --force
 
-    # Reuse existing scaffold.json
+    # Inspect what would run without executing
+    python harness.py --dry-run
+
+    # Manual overrides (always override delta)
     python harness.py --skip-scaffold
-
-    # Reuse existing glm_plan.json
     python harness.py --skip-scaffold --skip-plan
-
-    # Skip everything up to test
+    python harness.py --only-qwen
     python harness.py --test-only
-
-    # Skip judge entirely (faster, no DeepSeek call)
     python harness.py --skip-judge
-    python harness.py --test-only --skip-judge
-
-    # Skip auto-fix step 7 (run judge but stop there)
-    python harness.py --skip-fix
-
-    # Cap how many times judge→fix can loop (default: 2)
+    python harness.py --skip-fix          # run judge but no auto-fix
     python harness.py --max-judge-rounds 3
-
-    # Override iteration cap
     python harness.py --max-iter 5
-
-    # Verbose cluster debug output
+    python harness.py --max-cluster-attempts 3
     python harness.py --test-only --verbose
-
-    # Override per-cluster LLM attempt cap
-    python harness.py --test-only --max-cluster-attempts 3
 
 Typical debug loops:
     python harness.py --test-only --skip-judge --max-iter 3
     python harness.py --skip-scaffold --skip-plan --skip-judge
 
-After pipeline completes with judge APPROVED_WITH_NOTES or NEEDS_REVISION:
-    python pipeline/07_update_knowledge.py          # interactive knowledge distillation
+After judge completes with APPROVED_WITH_NOTES or NEEDS_REVISION:
+    python pipeline/07_update_knowledge.py           # knowledge distillation
     python pipeline/07_update_knowledge.py --dry-run  # preview only
 
 Requirements:
@@ -62,7 +55,10 @@ Requirements:
 """
 
 import argparse
+import json
 import os
+import re as _re
+import shutil
 import subprocess
 import sys
 import time
@@ -70,8 +66,15 @@ from pathlib import Path
 
 ROOT = Path(__file__).parent
 
+DELTA_PATH   = ROOT / "scaffold" / "spec_delta.json"
+PREV_SRC_DIR = ROOT / "scaffold" / "prev_src"
 
-def load_dotenv():
+
+# ════════════════════════════════════════════════════════════════════════════
+# Core helpers
+# ════════════════════════════════════════════════════════════════════════════
+
+def load_dotenv() -> None:
     env_file = ROOT / ".env"
     if env_file.exists():
         for line in env_file.read_text().splitlines():
@@ -119,15 +122,96 @@ def check_file_exists(path: Path, flag: str) -> bool:
 def check_src_exists() -> bool:
     src_dir = ROOT / "src"
     if not src_dir.exists() or not any(src_dir.rglob("*.ts")):
-        print("[harness] --test-only set but src/ is empty or missing.")
+        print("[harness] src/ is empty or missing.")
         print("          Run without --test-only first to generate implementation.")
         return False
     return True
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# Delta helpers
+# ════════════════════════════════════════════════════════════════════════════
+
+def load_delta() -> dict | None:
+    if not DELTA_PATH.exists():
+        return None
+    try:
+        return json.loads(DELTA_PATH.read_text())
+    except Exception:
+        return None
+
+
+def delta_requires(delta: dict | None, step: str) -> bool:
+    """True if delta says step must re-run, or delta unavailable."""
+    if delta is None:
+        return True
+    return delta.get("rerun_steps", {}).get(step, True)
+
+
+def print_delta_summary(delta: dict) -> None:
+    fv  = delta.get("from_version") or "(none)"
+    tv  = delta.get("to_version", "?")
+    print(f"\n[harness] Spec: {fv} → {tv}")
+    if delta.get("is_first_run"):
+        print("[harness] First run — full pipeline.")
+        return
+    changed  = delta.get("changed_sections", [])
+    affected = delta.get("affected_files", [])
+    rerun    = [k for k, v in delta.get("rerun_steps", {}).items() if v]
+    skip     = [k for k, v in delta.get("rerun_steps", {}).items() if not v]
+    sums     = delta.get("section_summaries", {})
+    if changed:
+        print(f"[harness] Changed §: {changed}")
+        for sec in changed:
+            if sec in sums:
+                print(f"    §{sec}: {sums[sec]}")
+    print(f"[harness] Affected files  : {len(affected)}")
+    print(f"[harness] Steps to re-run : {rerun or '(none)'}")
+    print(f"[harness] Steps to skip   : {skip or '(none)'}")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# src/ snapshot + restore
+# ════════════════════════════════════════════════════════════════════════════
+
+def snapshot_src() -> None:
+    """Save current src/ as prev_src/ for future delta partial restores."""
+    src = ROOT / "src"
+    if not src.exists():
+        return
+    if PREV_SRC_DIR.exists():
+        shutil.rmtree(PREV_SRC_DIR)
+    shutil.copytree(src, PREV_SRC_DIR)
+    print(f"[harness] src/ snapshot → {PREV_SRC_DIR.relative_to(ROOT)}")
+
+
+def restore_unaffected_files(delta: dict) -> int:
+    """
+    Copy unaffected src/ files from prev_src/ so Qwen only implements
+    the files that changed. Returns number of files restored.
+    """
+    unaffected = [f for f in delta.get("unaffected_files", []) if f.startswith("src/")]
+    if not unaffected or not PREV_SRC_DIR.exists():
+        return 0
+    restored = 0
+    for rel in unaffected:
+        prev = PREV_SRC_DIR / rel[len("src/"):]
+        dest = ROOT / rel
+        if prev.exists():
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(prev, dest)
+            restored += 1
+    if restored:
+        print(f"[harness] Restored {restored} unaffected file(s) from prev_src/")
+    return restored
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Judge helpers
+# ════════════════════════════════════════════════════════════════════════════
+
 def _read_judge_verdict() -> str:
     """Read current judge verdict from reports/judge_raw.json. Returns '' if not found."""
-    import json, re as _re
     raw_path = ROOT / "reports" / "judge_raw.json"
     if not raw_path.exists():
         return ""
@@ -143,29 +227,28 @@ def _read_judge_verdict() -> str:
 
 def _run_judge_fix_loop(args, results: dict) -> None:
     """
-    Runs the judge → fix → re-judge loop up to args.max_judge_rounds times.
+    Judge → fix → re-judge loop, up to args.max_judge_rounds times.
 
     Round structure:
         1. Run 06_judge_deepseek.py
         2. Read verdict from judge_raw.json
-        3. If APPROVED or APPROVED_WITH_NOTES → done
-        4. If NEEDS_REVISION and not --skip-fix:
+        3. APPROVED / APPROVED_WITH_NOTES → done ✓
+        4. NEEDS_REVISION + not --skip-fix:
              a. Run 07_fix_from_judge.py
-             b. If fix script exits 0 (vitest still green) → re-run judge
-             c. If fix script exits 1 (vitest now failing) → stop, mark failed
-        5. If --skip-fix → stop after first judge regardless of verdict
-        6. After max_judge_rounds → stop, report final verdict
+             b. Exit 0 (vitest still green) → re-run aggregate report → re-judge
+             c. Exit 1 (vitest now failing) → stop, mark failed
+        5. --skip-fix → stop after first judge
+        6. max_judge_rounds exceeded → stop, report final verdict
     """
-    max_rounds   = args.max_judge_rounds
-    skip_fix     = args.skip_fix
+    max_rounds = args.max_judge_rounds
+    skip_fix   = args.skip_fix
 
     for round_num in range(1, max_rounds + 1):
-        round_label = f"round {round_num}/{max_rounds}" if max_rounds > 1 else ""
-        label_suffix = f" ({round_label})" if round_label else ""
+        round_sfx = f" (round {round_num}/{max_rounds})" if max_rounds > 1 else ""
 
         # ── Judge ──────────────────────────────────────────────────────────
         ok = run_step(
-            f"Step 6 — DeepSeek V3.2 judge{label_suffix}",
+            f"Step 6 — DeepSeek V3.2 judge{round_sfx}",
             "06_judge_deepseek.py",
         )
         results[f"judge_r{round_num}"] = ok
@@ -173,89 +256,134 @@ def _run_judge_fix_loop(args, results: dict) -> None:
         verdict = _read_judge_verdict()
         print(f"\n[harness] Judge verdict: {verdict or '(unknown)'}")
 
-        # APPROVED → done
         if verdict in ("APPROVED", "APPROVED_WITH_NOTES"):
             print(f"[harness] ✅ Judge {verdict} — pipeline complete.")
             break
 
-        # NEEDS_REVISION but last round → stop
         if round_num == max_rounds:
             print(f"[harness] ⚠ Reached max_judge_rounds ({max_rounds}) "
                   f"with verdict {verdict}.")
             print(f"[harness] Run manually: python pipeline/07_update_knowledge.py")
             break
 
-        # NEEDS_REVISION and --skip-fix → stop
         if skip_fix:
             skip_step(
-                f"Step 7 — Fix from judge{label_suffix}",
+                f"Step 7 — Fix from judge{round_sfx}",
                 "--skip-fix set — review judge_report.md manually",
             )
             break
 
-        # NEEDS_REVISION → trigger 07_fix_from_judge
         if verdict == "NEEDS_REVISION":
             fix_ok = run_step(
-                f"Step 7 — Fix from judge{label_suffix}",
+                f"Step 7 — Fix from judge{round_sfx}",
                 "07_fix_from_judge.py",
             )
             results[f"judge_fix_r{round_num}"] = fix_ok
 
             if not fix_ok:
-                # 07_fix exits 1 when vitest still failing after patches
-                print(f"\n[harness] ⚠ Judge fix step failed "
-                      f"(vitest still failing after patches).")
-                print(f"[harness] Human review required — "
-                      f"see reports/judge_fix_report.json")
+                print(f"\n[harness] ⚠ Judge fix failed (vitest still failing after patches).")
+                print(f"[harness] Human review required — see reports/judge_fix_report.json")
                 break
 
-            # Fix applied and vitest green → loop back for re-judge
+            # Fix applied and vitest green → refresh report + re-judge
             print(f"\n[harness] Fix applied successfully — re-running judge …")
-            # Re-run aggregate report before re-judge so judge sees fresh state
             run_step("Step 5b — Aggregate report (post-fix)", "05_report.py")
             continue
 
-        # Judge exited non-zero for a reason other than NEEDS_REVISION
-        # (e.g. API error, parse failure) — don't loop
+        # Judge exited non-zero for non-verdict reason (API error, parse failure)
         print(f"[harness] Judge step failed (non-verdict error) — stopping.")
         break
 
 
-def main():
+# ════════════════════════════════════════════════════════════════════════════
+# Main
+# ════════════════════════════════════════════════════════════════════════════
+
+def main() -> None:
     load_dotenv()
 
     parser = argparse.ArgumentParser(
         description="Local LLM pipeline runner",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    # Delta-aware flags
+    parser.add_argument("--force", action="store_true",
+                        help="Ignore spec_delta.json — re-run all steps unconditionally")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Show what would run without executing anything")
+    # Generation override flags
     parser.add_argument("--skip-scaffold", action="store_true",
-                        help="Reuse existing scaffold/scaffold.json — skip Gemini call")
+                        help="Skip Gemini scaffold (overrides delta)")
     parser.add_argument("--skip-plan", action="store_true",
-                        help="Reuse existing scaffold/glm_plan.json — skip GLM planning call")
+                        help="Skip GLM planning (overrides delta)")
     parser.add_argument("--only-qwen", action="store_true",
-                        help="Skip GLM planning entirely; Qwen runs single-call mode")
+                        help="Skip GLM planning entirely; Qwen single-call mode")
     parser.add_argument("--test-only", action="store_true",
                         help="Skip scaffold + plan + implement; jump straight to vitest")
+    # Judge flags
     parser.add_argument("--skip-judge", action="store_true",
-                        help="Skip DeepSeek V3.2 judge step (useful during debug loops)")
+                        help="Skip judge entirely (overrides delta)")
     parser.add_argument("--skip-fix", action="store_true",
                         help="Run judge but skip 07_fix_from_judge even on NEEDS_REVISION")
     parser.add_argument("--max-judge-rounds", type=int, default=2,
                         help="Max judge→fix→re-judge rounds before giving up (default: 2)")
+    # Test loop flags
     parser.add_argument("--max-iter", type=int, default=3,
                         help="Max fix iterations for test loop (default: 3)")
     parser.add_argument("--max-cluster-attempts", type=int, default=2,
                         help="Max LLM repair attempts per cluster before give-up (default: 2)")
     parser.add_argument("--verbose", action="store_true",
-                        help="Pass --verbose to 04_test_and_iterate.py for cluster debug output")
+                        help="Pass --verbose to 04_test_and_iterate.py")
     args = parser.parse_args()
 
-    # --test-only implies skipping all generation steps
     if args.test_only:
         args.skip_scaffold = True
-        args.skip_plan = True
+        args.skip_plan     = True
 
     results: dict[str, bool] = {}
+
+    # ── Step 1: Spec diff ────────────────────────────────────────────────────
+    # Always fast (no LLM). Skipped only with --test-only (no spec change expected).
+    delta: dict | None = None
+
+    if args.test_only:
+        skip_step("Step 1 — Spec diff", "--test-only")
+    else:
+        run_step("Step 1 — Spec diff", "spec_diff.py")
+        delta = load_delta()
+        if delta:
+            print_delta_summary(delta)
+        if args.force:
+            print("[harness] --force: delta loaded for info only — all steps will re-run.")
+            delta = None   # treat as no delta → everything re-runs
+
+    # ── Auto-skip from delta (manual flags take priority) ────────────────────
+    if delta and not delta.get("is_first_run"):
+        if not delta_requires(delta, "scaffold") and not args.skip_scaffold:
+            args.skip_scaffold = True
+            print("[harness] delta: §7/§8 unchanged → scaffold skipped")
+        if (not delta_requires(delta, "plan")
+                and not args.skip_plan and not args.only_qwen):
+            args.skip_plan = True
+            print("[harness] delta: no affected files → plan skipped")
+
+    # ── Dry run ──────────────────────────────────────────────────────────────
+    if args.dry_run:
+        print("\n[harness] DRY RUN — nothing executed.")
+        plan_str = ("skip (only-qwen)" if args.only_qwen
+                    else "skip" if args.skip_plan else "run")
+        steps = [
+            ("scaffold",       "skip" if args.skip_scaffold else "run"),
+            ("plan",           plan_str),
+            ("implement",      "skip" if args.test_only else "run"),
+            ("test",           "run"),
+            ("report",         "run"),
+            ("judge+fix loop", "skip" if args.skip_judge else f"run (max {args.max_judge_rounds} rounds)"),
+        ]
+        for name, action in steps:
+            icon = "▶" if "run" in action else "⏭"
+            print(f"  {icon}  {name:20}  {action}")
+        return
 
     # ── Step 2: Gemini scaffold ──────────────────────────────────────────────
     if not args.skip_scaffold:
@@ -279,10 +407,9 @@ def main():
         plan_available = False
 
     elif args.test_only:
-        # --test-only skips all generation, but if a plan file exists we still
-        # pass it to 03a so Qwen benefits from it (no extra API call needed).
         plan_available = glm_plan_path.exists()
-        reason = "reusing existing glm_plan.json" if plan_available else "no glm_plan.json found"
+        reason = ("reusing existing glm_plan.json" if plan_available
+                  else "no glm_plan.json found")
         skip_step("Step 3b — GLM 5.1 plan", f"--test-only ({reason})")
 
     elif args.skip_plan:
@@ -310,17 +437,39 @@ def main():
         if not check_env(["OPENROUTER_API_KEY"]):
             sys.exit(1)
 
+        # Delta: restore unaffected files before Qwen runs
+        if delta and not delta.get("is_first_run"):
+            restore_unaffected_files(delta)
+
         qwen_args: list[str] = []
         if plan_available:
             qwen_args.append("--use-glm-plan")
 
+        # Pass affected-only list so Qwen skips already-restored stubs
+        if delta and not delta.get("is_first_run"):
+            src_affected = [f for f in delta.get("affected_files", [])
+                            if f.startswith("src/")]
+            if src_affected:
+                qwen_args += ["--only-files", ",".join(src_affected)]
+                print(f"[harness] Qwen will implement {len(src_affected)} "
+                      f"affected file(s) only.")
+
         mode_label = "per-file + GLM plan" if plan_available else "single-call"
+        if delta and not delta.get("is_first_run"):
+            n = len([f for f in delta.get("affected_files", []) if f.startswith("src/")])
+            mode_label += f" | {n} affected"
+
         ok = run_step(
             f"Step 3a — Qwen implement ({mode_label})",
             "03a_implement_qwen.py",
             qwen_args,
         )
         results["impl_qwen"] = ok
+
+        # Snapshot src/ after successful implement for future delta runs
+        if ok:
+            snapshot_src()
+
     else:
         if not check_src_exists():
             sys.exit(1)
@@ -340,19 +489,7 @@ def main():
     # ── Step 5b: Aggregate report ────────────────────────────────────────────
     run_step("Step 5b — Aggregate report", "05_report.py")
 
-    # ── Step 6 + 7: Judge → fix → re-judge loop ──────────────────────────────
-    # Flow:
-    #   tests green → judge runs
-    #     APPROVED / APPROVED_WITH_NOTES → done ✓
-    #     NEEDS_REVISION → 07_fix_from_judge → re-run vitest → re-judge
-    #     repeat up to --max-judge-rounds
-    #
-    # Guard rails:
-    #   - judge never runs on failed tests
-    #   - 07_fix can only write to src/ (scope-locked in the script)
-    #   - loop exits after max_judge_rounds regardless of verdict
-    #   - --skip-fix: run judge but never trigger auto-fix
-
+    # ── Step 6 + 7: Judge → fix → re-judge loop ─────────────────────────────
     if args.skip_judge:
         skip_step("Step 6 — DeepSeek V3.2 judge", "--skip-judge")
 
@@ -372,6 +509,11 @@ def main():
     print(f"\n{'='*60}")
     print("  PIPELINE SUMMARY")
     print(f"{'='*60}")
+    if delta and not delta.get("is_first_run"):
+        fv = delta.get("from_version") or "?"
+        tv = delta.get("to_version", "?")
+        n  = len(delta.get("affected_files", []))
+        print(f"  Spec: {fv} → {tv}  ({n} file(s) affected)")
     for key, passed in results.items():
         icon = "✅" if passed else "❌"
         print(f"  {icon}  {key}")
@@ -387,7 +529,7 @@ def main():
             print(f"\n  Judge verdict: {judge_verdict}")
             print(f"  Run knowledge update when ready:")
             print(f"    python pipeline/07_update_knowledge.py")
-            print(f"    python pipeline/07_update_knowledge.py --dry-run  # preview")
+            print(f"    python pipeline/07_update_knowledge.py --dry-run")
     sys.exit(0 if all_ok else 1)
 
 

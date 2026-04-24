@@ -289,19 +289,60 @@ def implement_all_single_call(spec: str, stub_files: list, instructions: str) ->
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def _load_restored_files(only_set: set[str]) -> dict[str, str]:
+    """
+    Read already-restored src/ files (copied by harness from prev_src/) into
+    memory so they can be used as import context for Qwen in delta mode.
+    Loads only files NOT in only_set (i.e. the unaffected/restored ones).
+    """
+    restored: dict[str, str] = {}
+    src_dir = ROOT / "src"
+    if not src_dir.exists():
+        return restored
+    all_src = sorted(src_dir.rglob("*.ts")) + sorted(src_dir.rglob("*.tsx"))
+    for p in all_src:
+        rel = str(p.relative_to(ROOT))
+        if rel not in only_set:
+            try:
+                restored[rel] = p.read_text()
+            except Exception:
+                pass
+    return restored
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--use-glm-plan", action="store_true",
         help="Inject scaffold/glm_plan.json as per-file implementation guidance",
     )
+    
+    parser.add_argument(
+    "--only-files",
+    default="",
+    help="Comma-separated src/ paths to implement (delta mode). "
+         "All other stubs are skipped — assumed already restored by harness.",
+    )
+
     args = parser.parse_args()
 
     spec      = _load_spec()
     scaffold  = json.loads(SCAFFOLD_JSON.read_text())
     instrs    = INSTRUCTIONS.read_text() if INSTRUCTIONS.exists() else ""
 
-    stub_files = [f for f in scaffold["files"] if not f.get("is_test")]
+    all_stubs = [f for f in scaffold["files"] if not f.get("is_test")]
+
+    # ── Delta filtering ───────────────────────────────────────────────────────
+    only_set: set[str] = set()
+    if args.only_files.strip():
+        only_set  = {fp.strip() for fp in args.only_files.split(",") if fp.strip()}
+        stub_files = [f for f in all_stubs if f["file_path"] in only_set]
+        skipped    = [f["file_path"] for f in all_stubs if f["file_path"] not in only_set]
+        print(f"[03a] Delta mode — {len(stub_files)} file(s) to implement, "
+              f"{len(skipped)} unaffected (skipped).")
+        for fp in skipped:
+            print(f"[03a]   SKIP (unaffected): {fp}")
+    else:
+        stub_files = all_stubs
 
     # ── Load GLM plan if requested ────────────────────────────────────────────
     plan: dict | None = None
@@ -325,7 +366,15 @@ def main() -> None:
     if plan:
         # Per-file generation in plan order
         ordered = order_stubs(stub_files, plan)
-        already_written: dict[str, str] = {}
+        
+        # In delta mode, seed already_written with restored (unaffected) files
+        # so Qwen has full import context without re-implementing them.
+        already_written: dict[str, str] = (
+            _load_restored_files(only_set) if only_set else {}
+        )
+        if already_written:
+            print(f"[03a] Import context seeded with {len(already_written)} "
+                  f"restored file(s).")
 
         for stub in ordered:
             fp   = stub["file_path"]
@@ -333,7 +382,7 @@ def main() -> None:
             try:
                 entry = implement_file(spec, stub, task, already_written)
             except SystemExit:
-                print(f"[03a] FAILED to implement {fp}, continuing with remaining files.",
+                print(f"[03a] FAILED to implement {fp}, continuing.",
                       file=sys.stderr)
                 continue
 
@@ -349,7 +398,7 @@ def main() -> None:
             print(f"[03a] WROTE {fp}")
 
     else:
-        # Original single-call mode
+        # Single-call: only send affected stubs, Qwen doesn't need the rest
         entries = implement_all_single_call(spec, stub_files, instrs)
         for entry in entries:
             fp = entry["file_path"]
@@ -362,10 +411,20 @@ def main() -> None:
             written.append(fp)
             print(f"[03a] WROTE {fp}")
 
+    mode = "per-file-with-glm-plan" if plan else "single-call"
+    if only_set:
+        mode += "-delta"
+
+    # skipped_delta: stubs that were in scaffold but not re-implemented this run
+    skipped_delta = sorted(
+        {f["file_path"] for f in all_stubs} - only_set
+    ) if only_set else []
+    
     IMPL_RECORD.write_text(json.dumps({
-        "model": "qwen",
-        "mode": "per-file-with-glm-plan" if plan else "single-call",
-        "files": written,
+        "model":         "qwen",
+        "mode":          mode,
+        "files":         written,
+        "skipped_delta": skipped_delta,
     }, indent=2))
     print(f"[03a] Done — {len(written)} files written.")
 
