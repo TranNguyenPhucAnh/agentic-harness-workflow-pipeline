@@ -1,57 +1,112 @@
 #!/usr/bin/env python3
 """
 harness.py — Local dev runner for the LLM pipeline.
-Mirrors the GitHub Actions workflow, runs on your machine.
-
-Architecture:
-    Gemini         → scaffold JSON (stubs + signatures)
-    GLM 5.1        → planner: decomposes scaffold into glm_plan.json
-    Qwen 3.6+      → executor: implements src/ per-file (with plan) or single-call
-    vitest         → test loop: Qwen fixes surface bugs, Minimax 2.7 fixes logic bugs
-    DeepSeek V3.2  → judge: qualitative review + sign-off (runs only on green)
-    07_fix         → auto-fix blocking issues from judge (runs on NEEDS_REVISION)
-    07_knowledge   → long-term knowledge distillation (run manually after human review)
-
-Delta-aware execution (Step 1):
-    spec_diff.py runs first, compares current spec.md against last snapshot, writes
-    scaffold/spec_delta.json. harness auto-skips unchanged steps and copies unaffected
-    src/ files from prev_src/ instead of re-implementing them.
-    Manual flags always OVERRIDE delta decisions. --force ignores delta entirely.
-
-Usage:
-    # Smart run — spec_diff decides what actually runs
+ 
+Pipeline stages (run in order):
+    Step 1  spec_diff        — detect spec changes, write spec_delta.json (no LLM)
+    Step 2  Gemini           — generate scaffold stubs + test files
+    Step 3b GLM 5.1          — plan: decompose each stub into ordered sub-tasks
+    Step 3a Qwen 3.6+        — implement src/ files guided by plan
+    Step 4  vitest loop      — run tests; Qwen fixes surface bugs, Minimax fixes logic
+    Step 5b report           — aggregate summary.md
+    Step 6  DeepSeek V3.2    — judge: qualitative review + sign-off (green only)
+    Step 7  07_fix_from_judge — auto-patch blocking issues from judge (NEEDS_REVISION only)
+            └─ re-runs Step 5b + Step 6 after each fix, up to --max-judge-rounds
+ 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PARAMETER REFERENCE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 
+Generation flags (control Steps 1–3):
+ 
+  --force                Re-run ALL steps even if spec_delta says nothing changed.
+                         Use when you want a clean slate regardless of history.
+ 
+  --dry-run              Print what WOULD run without executing anything.
+                         Useful to verify delta decisions before committing.
+ 
+  --skip-scaffold        Skip Step 2 (Gemini). Reuse existing scaffold/scaffold.json.
+                         Use when spec §7/§8 (file tree + schema) did NOT change.
+ 
+  --skip-plan            Skip Step 3b (GLM). Reuse existing scaffold/glm_plan.json.
+                         Use when you want to re-implement but keep the same plan.
+ 
+  --only-qwen            Skip Step 3b entirely (no GLM plan at all).
+                         Qwen runs in single-call mode instead of per-file mode.
+                         Faster and cheaper; lower quality for complex specs.
+ 
+  --test-only            Skip Steps 1–3a entirely. Jump straight to vitest (Step 4).
+                         Reuses whatever is currently in src/.
+                         Use during debug loops when src/ is already populated.
+ 
+Test loop flags (control Step 4):
+ 
+  --max-iter N           Max number of full vitest→repair→vitest outer loops.
+                         Default: 3. Raise to 5+ for stubborn clusters.
+                         Each iteration = run vitest + repair all failing clusters.
+ 
+  --max-cluster-attempts N
+                         Max LLM repair calls per individual failing cluster before
+                         giving up and marking it ESCALATED.
+                         Default: 2. First attempt uses Qwen (surface), second
+                         uses Minimax (logic). Raise to 3 if Minimax needs more tries.
+ 
+  --verbose              Print per-cluster debug output: which layer ran, token counts,
+                         state timeline extracted, scope violations, etc.
+ 
+Judge flags (control Steps 6–7):
+ 
+  --skip-judge           Skip Step 6 (DeepSeek) and Step 7 entirely.
+                         Use during active debug loops to save API cost.
+                         Run without this flag for final sign-off.
+ 
+  --skip-fix             Run Step 6 (judge) but skip Step 7 (auto-fix).
+                         Judge report is written; you review it manually.
+                         Use when you want judge feedback without automated patches.
+ 
+  --max-judge-rounds N   How many times the judge→fix→re-judge loop can repeat.
+                         Default: 2 (judge once, fix once, re-judge once).
+                         Each round: judge runs → if NEEDS_REVISION → fix → re-judge.
+                         Stops early on APPROVED or APPROVED_WITH_NOTES.
+ 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+COMMON WORKFLOWS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 
+First run / spec changed:
     python harness.py
-
-    # Force full re-run regardless of delta
-    python harness.py --force
-
-    # Inspect what would run without executing
-    python harness.py --dry-run
-
-    # Manual overrides (always override delta)
+    # spec_diff detects changes automatically; full pipeline runs
+ 
+Spec changed, scaffold still valid (only component props changed):
     python harness.py --skip-scaffold
-    python harness.py --skip-scaffold --skip-plan
-    python harness.py --only-qwen
+    # Reuses scaffold.json; re-plans + re-implements + tests + judges
+ 
+Debug loop (tests failing, iterate quickly without spending on judge):
+    python harness.py --test-only --skip-judge --max-iter 5
+    # Runs vitest loop only; increase --max-iter if clusters keep failing
+ 
+Debug loop with more attempts per stubborn cluster:
+    python harness.py --test-only --skip-judge --max-iter 5 --max-cluster-attempts 3
+ 
+Final sign-off after debug loop passes:
     python harness.py --test-only
-    python harness.py --skip-judge
-    python harness.py --skip-fix          # run judge but no auto-fix
-    python harness.py --max-judge-rounds 3
-    python harness.py --max-iter 5
-    python harness.py --max-cluster-attempts 3
-    python harness.py --test-only --verbose
-
-Typical debug loops:
-    python harness.py --test-only --skip-judge --max-iter 3
-    python harness.py --skip-scaffold --skip-plan --skip-judge
-
-After judge completes with APPROVED_WITH_NOTES or NEEDS_REVISION:
-    python pipeline/07_update_knowledge.py           # knowledge distillation
+    # Runs vitest (should pass) → report → judge → auto-fix if needed
+ 
+Force clean re-run (ignore all cached state):
+    python harness.py --force
+ 
+Preview what would run without executing:
+    python harness.py --dry-run
+    python harness.py --test-only --dry-run
+ 
+After judge reports APPROVED_WITH_NOTES or NEEDS_REVISION:
+    python pipeline/07_update_knowledge.py           # distill findings to knowledge base
     python pipeline/07_update_knowledge.py --dry-run  # preview only
-
+ 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Requirements:
     pip install httpx
-    GEMINI_API_KEY, OPENROUTER_API_KEY must be set as env vars
-    (or in a .env file — loaded automatically)
+    GEMINI_API_KEY, OPENROUTER_API_KEY in .env or exported as env vars
 """
 
 import argparse
