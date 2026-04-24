@@ -175,18 +175,61 @@ def main():
                 f"| `{c['cluster']}` | {c['failures']} | {c.get('note', '—')} |"
             )
 
+    # ── Spec delta summary ───────────────────────────────────────────────────
+    delta_json = ROOT / "scaffold" / "spec_delta.json"
+    if delta_json.exists():
+        delta = json.loads(delta_json.read_text())
+        fv = delta.get("from_version") or "(none)"
+        tv = delta.get("to_version", "?")
+        is_first = delta.get("is_first_run", False)
+        changed  = delta.get("changed_sections", [])
+        affected = delta.get("affected_files", [])
+        skipped  = delta.get("unaffected_files", [])
+        sums     = delta.get("section_summaries", {})
+        rerun    = {k: v for k, v in delta.get("rerun_steps", {}).items() if v}
+        lines += [
+            "",
+            "## Spec delta",
+            "",
+            f"| From | To | Mode | Changed §| Affected files |",
+            f"|---|---|---|---|---|",
+            f"| `{fv}` | `{tv}` "
+            f"| {'full' if is_first else 'partial'} "
+            f"| {', '.join(f'§{s}' for s in changed) or '—'} "
+            f"| {len(affected)} |",
+            "",
+        ]
+        if changed and not is_first:
+            lines.append("**Changed sections:**")
+            for sec in changed:
+                note = sums.get(sec, "")
+                lines.append(f"- §{sec}{': ' + note if note else ''}")
+            lines.append("")
+        if skipped:
+            lines += [
+                f"<details><summary>{len(skipped)} unaffected file(s) reused from prev run</summary>",
+                "",
+            ]
+            for fp in skipped:
+                lines.append(f"- `{fp}`")
+            lines += ["", "</details>", ""]
+
     # ── Impl record ──────────────────────────────────────────────────────────
     impl_record = ROOT / "scaffold" / "impl_qwen.json"
     if impl_record.exists():
-        rec = json.loads(impl_record.read_text())
-        mode = rec.get("mode", "unknown")
-        written = rec.get("files", [])
+        rec          = json.loads(impl_record.read_text())
+        mode         = rec.get("mode", "unknown")
+        written      = rec.get("files", [])
+        skipped_d    = rec.get("skipped_delta", [])
+        is_delta     = "delta" in mode
         lines += [
             "",
             "## Implementation record",
             f"- Mode: `{mode}`",
-            f"- Files written: {len(written)}",
+            f"- Files implemented this run: {len(written)}",
         ]
+        if is_delta and skipped_d:
+            lines.append(f"- Files reused (delta, not re-implemented): {len(skipped_d)}")
 
     summary_md = "\n".join(lines) + "\n"
     out = REPORTS_DIR / "summary.md"
