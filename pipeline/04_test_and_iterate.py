@@ -645,7 +645,8 @@ def repair_test_file(
         print(f"    [P0-fix] Rewriting test: {cluster.test_file} …")
 
     try:
-        raw = call_qwen(messages).strip()
+        caller = call_minimax if cluster.owner == "minimax" else call_qwen
+        raw = caller(messages).strip()
         raw = re.sub(r"^```[a-z]*\n?", "", raw)
         raw = re.sub(r"\n?```$",        "", raw)
         patch = json.loads(raw)
