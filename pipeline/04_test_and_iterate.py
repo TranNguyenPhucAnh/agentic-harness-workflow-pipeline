@@ -189,7 +189,28 @@ def _load_glm_global_notes() -> str:
         return json.loads(GLM_PLAN.read_text()).get("global_notes", "")
     except Exception:
         return ""
+        
+# ════════════════════════════════════════════════════════════════════════════
+# Judge findings loader — cross-run regression prevention
+# ════════════════════════════════════════════════════════════════════════════
 
+FINDINGS_PATH = ROOT / "scaffold" / "judge_findings.md"
+
+
+def _load_judge_findings() -> str:
+    """
+    Load scaffold/judge_findings.md written by 07_fix_from_judge.py.
+    Returns empty string if file doesn't exist (first run, no judge yet).
+    Injected into both Minimax and Qwen prompts so the same mistakes
+    from previous runs are not repeated.
+    """
+    if not FINDINGS_PATH.exists():
+        return ""
+    try:
+        content = FINDINGS_PATH.read_text().strip()
+        return content if content else ""
+    except Exception:
+        return ""
 
 # ════════════════════════════════════════════════════════════════════════════
 # Phase B — run vitest + parse failures
@@ -356,15 +377,60 @@ Return JSON (no other keys):
 TypeScript strict — no `any`. Tailwind only. Raw JSON. No markdown fences.
 """
 
+def _build_qwen_system_with_findings(findings: str) -> str:
+    """
+    Wrap FIX_SYSTEM_QWEN with judge findings block when available.
+    Findings are placed BEFORE the task instructions so they act as
+    a negative-example primer — model reads 'do not do X' before the task.
+    """
+    if not findings:
+        return FIX_SYSTEM_QWEN
 
-def _build_minimax_system(global_notes: str) -> str:
+    # Extract only the non-blocking + patterns sections for Qwen
+    # (Qwen handles surface/Tailwind issues — filter to relevant lines)
+    relevant_lines: list[str] = []
+    capture = False
+    for line in findings.splitlines():
+        if "## Non-blocking" in line or "## Patterns to avoid" in line:
+            capture = True
+        elif line.startswith("## ") and capture:
+            # Stop at next major section that isn't relevant
+            if "Blocking" in line:
+                capture = False
+        if capture:
+            relevant_lines.append(line)
+
+    findings_block = "\n".join(relevant_lines).strip()
+    if not findings_block:
+        return FIX_SYSTEM_QWEN
+
+    return (
+        f"## Previous run — do NOT repeat these mistakes\n"
+        f"{findings_block}\n\n"
+        f"---\n\n"
+        + FIX_SYSTEM_QWEN
+    )
+
+def _build_minimax_system(global_notes: str, judge_findings: str = "") -> str:
     notes_block = (
         f"\n## GLM Architect's Global Notes (MUST follow)\n{global_notes}\n"
         if global_notes else ""
     )
+    
+    # Judge findings block: show blocking issues (already fixed) as a
+    # "do not reintroduce" checklist, and non-blocking as watch-outs.
+    # Placed after global_notes so it acts as a second reinforcement layer.
+    findings_block = ""
+    if judge_findings:
+        # Extract all sections — Minimax gets the full picture
+        findings_block = (
+            f"\n## Judge findings from previous run — do NOT reintroduce\n"
+            f"{judge_findings}\n"
+        )
+
     return f"""\
 You are a senior TypeScript logic debugger specialising in hooks and data generation.
-{notes_block}
+{notes_block}{findings_block}
 You receive a failing cluster for a hook or data file.
 Fix the LOGIC — not the UI, not the styling.
 
@@ -691,6 +757,7 @@ def repair_cluster(
     cluster:              FailureCluster,
     global_notes:         str,
     max_cluster_attempts: int,
+    judge_findings:       str = "",
     verbose:              bool = False,
 ) -> ClusterRepairRecord:
     """
@@ -705,6 +772,14 @@ def repair_cluster(
       L1 — Qwen surface fix (components)
       L2 — Minimax logic fix (hooks/data)
       L3 — Give-up escalation
+      
+      - Hook/data files (MINIMAX_SCOPE) → skip L1 Qwen, go straight to L2 Minimax
+      - Component files → L1 Qwen first
+          * Qwen fixes it                 → done, owner stays "qwen"
+          * Qwen signals LOGIC_BUG        → transfer to L2 Minimax (if in scope)
+          * stale fingerprint             → L2 Minimax (if in scope)
+          * unfixable + out of scope      → ESCALATED→human
+      - Once cluster.owner == "minimax"   → always go to L2, Qwen locked out
     """
     # ── L3 guard ─────────────────────────────────────────────────────────────
     if cluster.escalated:
@@ -798,7 +873,7 @@ def repair_cluster(
         # ── L1: Qwen surface fix ─────────────────────────────────────────────
         ok, note = _call_repair(
             cluster, call_qwen,
-            system=FIX_SYSTEM_QWEN,
+            system=_build_qwen_system_with_findings(judge_findings),
             verbose=verbose, layer_name="L1",
         )
         cluster.attempt_count   += 1
@@ -833,7 +908,7 @@ def repair_cluster(
     cluster.owner  = "minimax"
     test_code      = _read_file_safe(ROOT / cluster.test_file)
     timeline       = _build_state_timeline(test_code)
-    minimax_system = _build_minimax_system(global_notes)
+    minimax_system = _build_minimax_system(global_notes, judge_findings)
 
     ok, note = _call_repair(
         cluster, call_minimax,
@@ -875,6 +950,11 @@ def main() -> None:
     if global_notes:
         print(f"[04] GLM global_notes loaded ({len(global_notes)} chars) "
               f"— will be injected into Minimax prompts")
+
+    judge_findings = _load_judge_findings()
+    if judge_findings:
+        print(f"[04] Judge findings loaded ({len(judge_findings)} chars) "
+              f"— injected into Minimax + Qwen prompts (regression prevention)")
 
     iteration_records: list[IterationRecord]     = []
     cluster_state:     dict[str, FailureCluster] = {}
@@ -950,7 +1030,8 @@ def main() -> None:
             print(f"  -> {cluster.test_file} "
                   f"(owner={cluster.owner}, attempt #{cluster.attempt_count + 1})")
             record = repair_cluster(
-                cluster, global_notes, max_cluster_attempts, verbose=verbose,
+                cluster, global_notes, max_cluster_attempts,
+                judge_findings=judge_findings, verbose=verbose,
             )
             cluster_state[cluster.key] = cluster
             repaired += int(record.repaired)
