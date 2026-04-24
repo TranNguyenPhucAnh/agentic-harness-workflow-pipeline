@@ -18,6 +18,8 @@ import sys
 import textwrap
 import httpx
 from pathlib import Path
+import random
+import time
 
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 GEMINI_MODEL   = "gemini-2.5-flash"
@@ -48,7 +50,7 @@ SYSTEM_PROMPT = textwrap.dedent("""
 
 # ── API call ──────────────────────────────────────────────────────────────────
 
-def call_gemini(spec_content: str) -> dict:
+def call_gemini(spec_content: str, max_retries: int = 5) -> dict:
     payload = {
         "system_instruction": {
             "parts": [{"text": SYSTEM_PROMPT}]
@@ -67,14 +69,31 @@ def call_gemini(spec_content: str) -> dict:
     }
 
     print("[02] Calling Gemini 2.5 Flash …")
-    with httpx.Client(timeout=120) as client:
-        r = client.post(GEMINI_URL, json=payload)
-        r.raise_for_status()
 
-    raw  = r.json()
-    text = raw["candidates"][0]["content"]["parts"][0]["text"]
-    return _parse_json(text)
+    timeout = httpx.Timeout(120.0, connect=30.0)
 
+    with httpx.Client(timeout=timeout) as client:
+        for attempt in range(1, max_retries + 1):
+            try:
+                r = client.post(GEMINI_URL, json=payload)
+                r.raise_for_status()
+
+                raw = r.json()
+                text = raw["candidates"][0]["content"]["parts"][0]["text"]
+                return _parse_json(text)
+
+            except httpx.HTTPStatusError as e:
+                status = e.response.status_code if e.response else None
+
+                if status == 503 and attempt < max_retries:
+                    wait = (2 ** (attempt - 1)) + random.uniform(0, 1)
+                    print(f"[02] Gemini 503 overloaded, retry {attempt}/{max_retries} in {wait:.1f}s …")
+                    time.sleep(wait)
+                    continue
+
+                raise
+
+    raise RuntimeError("Gemini call failed after retries")
 
 # ── JSON extraction ───────────────────────────────────────────────────────────
 
