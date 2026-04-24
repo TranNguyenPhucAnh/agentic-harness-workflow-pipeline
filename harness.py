@@ -63,6 +63,14 @@ Judge flags (control Steps 6–7):
   --skip-fix             Run Step 6 (judge) but skip Step 7 (auto-fix).
                          Judge report is written; you review it manually.
                          Use when you want judge feedback without automated patches.
+
+  --from-judge           Skip Steps 1–6 entirely. Assumes tests are already green
+                         and judge_raw.json already exists from a previous run.
+                         Feeds that existing review into Step 7 (07_fix_from_judge)
+                         without calling the judge API again, then re-judges once
+                         after the fix to confirm. No API cost for the first judge call.
+                         Use after: tests passed + judge already ran + you want to
+                         act on the review without paying for another judge call.
  
   --max-judge-rounds N   How many times the judge→fix→re-judge loop can repeat.
                          Default: 2 (judge once, fix once, re-judge once).
@@ -102,6 +110,13 @@ Preview what would run without executing:
 After judge reports APPROVED_WITH_NOTES or NEEDS_REVISION:
     python pipeline/07_update_knowledge.py           # distill findings to knowledge base
     python pipeline/07_update_knowledge.py --dry-run  # preview only
+
+Tests green + judge already ran, act on existing review without re-calling judge API:
+    python harness.py --from-judge
+    # Skip Steps 1–6, feed judge_raw.json into fix loop, re-judge once after fix
+
+    python harness.py --from-judge --skip-fix
+    # Same but only print existing verdict — no auto-fix
  
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Requirements:
@@ -350,6 +365,75 @@ def _run_judge_fix_loop(args, results: dict) -> None:
         break
 
 
+def _run_fix_from_existing_judge(args, results: dict) -> None:
+    """
+    Feed an existing judge_raw.json into the fix loop without calling the API.
+    Used when --from-judge is set.
+
+    Flow:
+        1. Verify reports/judge_raw.json exists
+        2. Read verdict
+        3. APPROVED / APPROVED_WITH_NOTES → nothing to fix, done
+        4. NEEDS_REVISION + not --skip-fix:
+             a. Run 07_fix_from_judge.py (applies patches, re-runs vitest internally)
+             b. If fix OK → refresh report → re-judge ONCE for final sign-off
+             c. If fix fails → stop, report for human review
+        5. NEEDS_REVISION + --skip-fix → print verdict, done
+    """
+    raw_path = ROOT / "reports" / "judge_raw.json"
+    if not raw_path.exists():
+        print("[harness] --from-judge: reports/judge_raw.json not found.")
+        print("          Run the full pipeline first to generate a judge report.")
+        results["judge_from_existing"] = False
+        return
+
+    verdict = _read_judge_verdict()
+    print(f"\n[harness] Existing judge verdict: {verdict or '(unknown)'}")
+    results["judge_from_existing"] = True
+
+    if verdict in ("APPROVED", "APPROVED_WITH_NOTES"):
+        print(f"[harness] ✅ Already {verdict} — nothing to fix.")
+        return
+
+    if verdict != "NEEDS_REVISION":
+        print(f"[harness] ⚠ Unrecognised verdict '{verdict}' — stopping.")
+        results["judge_from_existing"] = False
+        return
+
+    if args.skip_fix:
+        skip_step(
+            "Step 7 — Fix from judge (existing review)",
+            "--skip-fix set — review judge_report.md manually",
+        )
+        return
+
+    # Apply fix
+    fix_ok = run_step(
+        "Step 7 — Fix from judge (existing review)",
+        "07_fix_from_judge.py",
+    )
+    results["judge_fix"] = fix_ok
+
+    if not fix_ok:
+        print(f"\n[harness] ⚠ Fix failed (vitest still failing after patches).")
+        print(f"[harness] Human review required — see reports/judge_fix_report.json")
+        return
+
+    # Fix applied → refresh report → re-judge once for final sign-off
+    print(f"\n[harness] Fix applied — refreshing report + re-judging …")
+    run_step("Step 5b — Aggregate report (post-fix)", "05_report.py")
+
+    if not check_env(["OPENROUTER_API_KEY"]):
+        print("[harness] WARNING: cannot re-judge without OPENROUTER_API_KEY.")
+        return
+
+    ok = run_step("Step 6 — DeepSeek V3.2 judge (post-fix)", "06_judge_deepseek.py")
+    results["judge_post_fix"] = ok
+    final = _read_judge_verdict()
+    if final:
+        print(f"\n[harness] Post-fix verdict: {final}")
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # Main
 # ════════════════════════════════════════════════════════════════════════════
@@ -380,6 +464,9 @@ def main() -> None:
                         help="Skip judge entirely (overrides delta)")
     parser.add_argument("--skip-fix", action="store_true",
                         help="Run judge but skip 07_fix_from_judge even on NEEDS_REVISION")
+    parser.add_argument("--from-judge", action="store_true",
+                        help="Skip Steps 1–6; feed existing reports/judge_raw.json "
+                             "into fix loop directly, then re-judge once after fix")
     parser.add_argument("--max-judge-rounds", type=int, default=2,
                         help="Max judge→fix→re-judge rounds before giving up (default: 2)")
     # Test loop flags
@@ -394,6 +481,13 @@ def main() -> None:
     if args.test_only:
         args.skip_scaffold = True
         args.skip_plan     = True
+
+    # --from-judge: skip everything up to judge, feed existing review
+    if args.from_judge:
+        args.skip_scaffold = True
+        args.skip_plan     = True
+        args.test_only     = True   # skip Steps 1–5a
+        args.skip_judge    = True   # skip Step 6 (judge API call)
 
     results: dict[str, bool] = {}
 
@@ -545,7 +639,7 @@ def main() -> None:
     run_step("Step 5b — Aggregate report", "05_report.py")
 
     # ── Step 6 + 7: Judge → fix → re-judge loop ─────────────────────────────
-    if args.skip_judge:
+    if args.skip_judge and not args.from_judge:
         skip_step("Step 6 — DeepSeek V3.2 judge", "--skip-judge")
 
     elif not tests_passed:
@@ -553,6 +647,12 @@ def main() -> None:
             "Step 6 — DeepSeek V3.2 judge",
             "tests failed — fix tests first before requesting judge sign-off",
         )
+
+    elif args.from_judge:
+        # --from-judge: skip_judge was set to suppress Step 6 above;
+        # now feed the existing review into the fix loop instead.
+        skip_step("Step 6 — DeepSeek V3.2 judge", "--from-judge (reusing judge_raw.json)")
+        _run_fix_from_existing_judge(args, results)
 
     else:
         if not check_env(["OPENROUTER_API_KEY"]):
