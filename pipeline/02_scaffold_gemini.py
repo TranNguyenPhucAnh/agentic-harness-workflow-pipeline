@@ -40,15 +40,36 @@ SYSTEM_PROMPT = textwrap.dedent("""
     Your task:
     1. Read the spec carefully, especially §7 (file tree) and §8 (output schema).
     2. Produce a SINGLE valid JSON object matching the schema in §8 EXACTLY.
-    3. For non-test files: output interfaces + function signatures + JSDoc only.
+    3. The JSON MUST be valid and parseable by JSON.parse / json.loads.
+        Requirements:
+        - Use double quotes " for all JSON strings.
+        - Escape any internal " characters as \".
+        - If you output TypeScript code in a "code" field, it MUST be a single JSON string value with all newlines as \n and all quotes properly escaped.
+        - Do NOT use single quotes ' for JSON string delimiters.
+        - Do NOT include comments or trailing commas in the JSON.
+    4. For non-test files: output interfaces + function signatures + JSDoc only.
        Use `throw new Error('not implemented')` for all function bodies.
-    4. For test files: output complete, runnable vitest tests.
-    5. Do NOT wrap your response in markdown fences. Output raw JSON only.
-    6. Do NOT add files not listed in §7 of the spec.
+    5. For test files: output complete, runnable vitest tests.
+    6. Do NOT wrap your response in markdown fences. Output raw JSON only.
+    7. Do NOT add files not listed in §7 of the spec.
 """).strip()
 
 
 # ── API call ──────────────────────────────────────────────────────────────────
+
+def _extract_gemini_text(raw: dict) -> str:
+    try:
+        parts = raw["candidates"][0]["content"]["parts"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise ValueError(f"Unexpected Gemini response shape: {raw}") from exc
+
+    texts = [p.get("text", "") for p in parts if isinstance(p, dict)]
+    text = "\n".join(t for t in texts if t).strip()
+
+    if not text:
+        raise ValueError(f"Gemini returned no text parts: {raw}")
+
+    return text
 
 def call_gemini(spec_content: str, max_retries: int = 5) -> dict:
     payload = {
@@ -79,7 +100,7 @@ def call_gemini(spec_content: str, max_retries: int = 5) -> dict:
                 r.raise_for_status()
 
                 raw = r.json()
-                text = raw["candidates"][0]["content"]["parts"][0]["text"]
+                text = _extract_gemini_text(raw)
                 return _parse_json(text)
 
             except httpx.HTTPStatusError as e:
@@ -99,24 +120,34 @@ def call_gemini(spec_content: str, max_retries: int = 5) -> dict:
 
 def _parse_json(raw: str) -> dict:
     """Robust JSON extraction — handles accidental markdown fences."""
-    raw = re.sub(r"^```[a-z]*\n?", "", raw.strip())
-    raw = re.sub(r"\n?```$", "", raw.strip())
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        pass
-    # Fallback: find outermost { ... } block
-    match = re.search(r"\{.*\}", raw, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group())
-        except json.JSONDecodeError as e:
-            print(f"[02] JSON parse failed: {e}", file=sys.stderr)
-            print(f"[02] Raw output (first 500 chars):\n{raw[:500]}", file=sys.stderr)
-            sys.exit(1)
-    print("[02] No JSON object found in Gemini response.", file=sys.stderr)
-    sys.exit(1)
+    cleaned = re.sub(r"^```[a-z]*\n?", "", raw.strip())
+    cleaned = re.sub(r"\n?```$", "", cleaned.strip())
 
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError as e:
+        print(f" Primary JSON parse failed: {e}", file=sys.stderr)
+
+    # Fallback: find outermost { ... } block
+    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+    if match:
+        candidate = match.group()
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError as e:
+            print(f" JSON parse failed even after extracting outer {{...}} block: {e}", file=sys.stderr)
+            # Heuristic hint
+            if "'LOW' | 'MED' | 'HIGH'" in candidate or "export type" in candidate:
+                print(" Hint: Gemini likely emitted raw TypeScript with single quotes "
+                      "inside the JSON string. Tighten SYSTEM_PROMPT to require valid JSON "
+                      "and escaped code strings.", file=sys.stderr)
+            print(f" Raw output (first 500 chars):\n{cleaned[:500]}", file=sys.stderr)
+            sys.exit(1)
+
+    print(" No JSON object found in Gemini response.", file=sys.stderr)
+    print(f" Raw output (first 500 chars):\n{cleaned[:500]}", file=sys.stderr)
+    sys.exit(1)
+    
 def _compress_spec(spec: str) -> str:
     """
     Tạo bản rút gọn của spec.md để downstream models dùng thay full spec.
