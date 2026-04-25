@@ -209,6 +209,13 @@ def build_briefing() -> str:
 
     # 1. Spec
     parts.append("## 1. spec.md\n\n" + _load_spec())
+    
+    addendum_path = ROOT / "scaffold" / "spec_addendum.md"
+    if addendum_path.exists():
+        parts.append(
+            "## 1b. Spec Addendum (edge cases & invariants from previous runs)\n\n"
+            + addendum_path.read_text()
+        )
 
     # 2. GLM plan (optional)
     glm_plan_path = ROOT / "scaffold" / "glm_plan.json"
