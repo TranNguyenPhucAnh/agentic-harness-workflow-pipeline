@@ -25,6 +25,7 @@ import json
 import os
 import re
 import sys
+import time
 import httpx
 from pathlib import Path
 
@@ -183,6 +184,7 @@ def _call_qwen(system: str, user_message: str) -> str:
 # ── JSON extraction ───────────────────────────────────────────────────────────
 
 def _parse_json(raw: str, label: str) -> dict:
+    """Parse JSON from LLM response. Raises RuntimeError on failure."""
     raw = re.sub(r"^```[a-z]*\n?", "", raw.strip())
     raw = re.sub(r"\n?```$", "", raw.strip())
     try:
@@ -194,11 +196,11 @@ def _parse_json(raw: str, label: str) -> dict:
         try:
             return json.loads(match.group())
         except json.JSONDecodeError as e:
-            print(f"[03a] JSON parse failed for {label}: {e}", file=sys.stderr)
-            print(f"[03a] Raw (first 500):\n{raw[:500]}", file=sys.stderr)
-            sys.exit(1)
-    print(f"[03a] No JSON found in response for {label}.", file=sys.stderr)
-    sys.exit(1)
+            raise RuntimeError(
+                f"JSON parse failed for {label}: {e}\n"
+                f"Raw (first 500):\n{raw[:500]}"
+            )
+    raise RuntimeError(f"No JSON found in response for {label}.")
 
 
 # ── Per-file generation ───────────────────────────────────────────────────────
@@ -400,6 +402,7 @@ def main() -> None:
 
     # ── Choose execution mode ─────────────────────────────────────────────────
     written: list[str] = []
+    failed_files: list[str] = []
 
     if plan:
         # Per-file generation in plan order
@@ -419,9 +422,9 @@ def main() -> None:
             task = task_index.get(fp)
             try:
                 entry = implement_file(spec, stub, task, already_written)
-            except SystemExit:
-                print(f"[03a] FAILED to implement {fp}, continuing.",
-                      file=sys.stderr)
+            except Exception as e:
+                print(f"[03a] FAILED to implement {fp}: {e}", file=sys.stderr)
+                failed_files.append(fp)
                 continue
 
             out_path = ROOT / fp
@@ -437,7 +440,14 @@ def main() -> None:
 
     else:
         # Single-call: only send affected stubs, Qwen doesn't need the rest
-        entries = implement_all_single_call(spec, stub_files, instrs)
+        try:
+            entries = implement_all_single_call(spec, stub_files, instrs)
+        except Exception as e:
+            print(f"[03a] FAILED single-call generation: {e}", file=sys.stderr)
+            # In single-call mode, failure means all requested files are failed
+            failed_files.extend([f["file_path"] for f in stub_files])
+            entries = []
+
         for entry in entries:
             fp = entry["file_path"]
             out_path = ROOT / fp
@@ -463,8 +473,14 @@ def main() -> None:
         "mode":          mode,
         "files":         written,
         "skipped_delta": skipped_delta,
+        "failed_files":  failed_files,
     }, indent=2))
-    print(f"[03a] Done — {len(written)} files written.")
+    
+    if failed_files:
+        print(f"[03a] Done with {len(written)} files written, {len(failed_files)} failed: {failed_files}", file=sys.stderr)
+        sys.exit(1)
+    else:
+        print(f"[03a] Done — {len(written)} files written.")
 
 
 if __name__ == "__main__":
