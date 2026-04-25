@@ -142,28 +142,43 @@ def _call_qwen(system: str, user_message: str) -> str:
 
     with httpx.Client(timeout=180) as client:
         for attempt in range(2):
-            r = client.post(OPENROUTER_URL, headers=headers, json=payload)
-            r.raise_for_status()
-
-            data = r.json()
-
-            usage = data.get("usage", {})
-            prompt_t = usage.get("prompt_tokens", "?")
-            completion_t = usage.get("completion_tokens", "?")
-            print(f"[qwen] Tokens: prompt={prompt_t}, completion={completion_t}")
-
             try:
+                r = client.post(OPENROUTER_URL, headers=headers, json=payload)
+                r.raise_for_status()
+
+                try:
+                    data = r.json()
+                except json.JSONDecodeError as e:
+                    body_preview = r.text[:1000] if r.text else "<empty body>"
+                    raise RuntimeError(
+                        f"OpenRouter returned non-JSON response: {e}\n"
+                        f"Response body (first 1000 chars):\n{body_preview}"
+                    ) from e
+
+                usage = data.get("usage", {})
+                prompt_t = usage.get("prompt_tokens", "?")
+                completion_t = usage.get("completion_tokens", "?")
+                print(f"[qwen] Tokens: prompt={prompt_t}, completion={completion_t}")
+
                 return _extract_chat_text_response(data, label="Qwen")
-            except RuntimeError as e:
+
+            except httpx.HTTPStatusError as e:
+                body_preview = e.response.text[:1000] if e.response is not None and e.response.text else "<empty body>"
+                last_error = RuntimeError(
+                    f"HTTP error from OpenRouter: {e}\n"
+                    f"Response body (first 1000 chars):\n{body_preview}"
+                )
+                print(f"[qwen] {last_error}", file=sys.stderr)
+
+            except (httpx.HTTPError, RuntimeError) as e:
                 last_error = e
                 print(f"[qwen] {e}", file=sys.stderr)
 
-                if attempt == 0:
-                    print("[qwen] Retrying in 3s …", file=sys.stderr)
-                    time.sleep(3)
+            if attempt == 0:
+                print("[qwen] Retrying in 3s …", file=sys.stderr)
+                time.sleep(3)
 
     raise RuntimeError(f"Qwen call failed after retries: {last_error}")
-
 
 # ── JSON extraction ───────────────────────────────────────────────────────────
 
