@@ -455,6 +455,10 @@ def main() -> None:
                         help="Skip Gemini scaffold (overrides delta)")
     parser.add_argument("--skip-plan", action="store_true",
                         help="Skip GLM planning (overrides delta)")
+    parser.add_argument("--retry-impl", action="store_true",
+                        help="Retry only failed files from last impl run "
+                         "(reads impl_qwen.json failed_files). "
+                         "Implies --skip-scaffold --skip-plan.")
     parser.add_argument("--only-qwen", action="store_true",
                         help="Skip GLM planning entirely; Qwen single-call mode")
     parser.add_argument("--test-only", action="store_true",
@@ -482,6 +486,11 @@ def main() -> None:
         args.skip_scaffold = True
         args.skip_plan     = True
 
+    if args.retry_impl:
+       args.skip_scaffold = True
+       args.skip_plan     = True
+       # --only-files sẽ được build từ impl_qwen.json bên dưới
+ 
     # --from-judge: skip everything up to judge, feed existing review
     if args.from_judge:
         args.skip_scaffold = True
@@ -585,36 +594,73 @@ def main() -> None:
     if not args.test_only:
         if not check_env(["OPENROUTER_API_KEY"]):
             sys.exit(1)
-
+    
         # Delta: restore unaffected files before Qwen runs
-        if delta and not delta.get("is_first_run"):
+        # Skip restore on --retry-impl — prev_src/ already applied from last run
+        if delta and not delta.get("is_first_run") and not args.retry_impl:
             restore_unaffected_files(delta)
-
+    
         qwen_args: list[str] = []
         if plan_available:
             qwen_args.append("--use-glm-plan")
-
-        # Pass affected-only list so Qwen skips already-restored stubs
-        if delta and not delta.get("is_first_run"):
+    
+        # --retry-impl overrides delta --only-files
+        if args.retry_impl:
+            impl_rec_path = ROOT / "scaffold" / "impl_qwen.json"
+            if impl_rec_path.exists():
+                try:
+                    rec    = json.loads(impl_rec_path.read_text())
+                    failed = rec.get("failed_files", [])
+                    if failed:
+                        qwen_args += ["--only-files", ",".join(failed)]
+                        print(f"[harness] --retry-impl: retrying {len(failed)} failed file(s).")
+                    else:
+                        print("[harness] --retry-impl: no failed_files in impl_qwen.json — nothing to retry.")
+                        sys.exit(0)
+                except Exception:
+                    print("[harness] --retry-impl: could not read impl_qwen.json.")
+                    sys.exit(1)
+            else:
+                print("[harness] --retry-impl: impl_qwen.json not found — run full impl first.")
+                sys.exit(1)
+    
+        # Delta --only-files (skipped when --retry-impl already set --only-files)
+        elif delta and not delta.get("is_first_run"):
             src_affected = [f for f in delta.get("affected_files", [])
                             if f.startswith("src/")]
             if src_affected:
                 qwen_args += ["--only-files", ",".join(src_affected)]
                 print(f"[harness] Qwen will implement {len(src_affected)} "
                       f"affected file(s) only.")
-
+    
         mode_label = "per-file + GLM plan" if plan_available else "single-call"
-        if delta and not delta.get("is_first_run"):
+        if args.retry_impl:
+            mode_label += " | retry-impl"
+        elif delta and not delta.get("is_first_run"):
             n = len([f for f in delta.get("affected_files", []) if f.startswith("src/")])
             mode_label += f" | {n} affected"
-
+    
         ok = run_step(
             f"Step 3a — Qwen implement ({mode_label})",
             "03a_implement_qwen.py",
             qwen_args,
         )
         results["impl_qwen"] = ok
-
+    
+        if not ok:
+            impl_rec_path = ROOT / "scaffold" / "impl_qwen.json"
+            if impl_rec_path.exists():
+                try:
+                    rec    = json.loads(impl_rec_path.read_text())
+                    failed = rec.get("failed_files", [])
+                    if failed:
+                        print(f"\n[harness] {len(failed)} file(s) failed to implement:")
+                        for fp in failed:
+                            print(f"    {fp}")
+                        print(f"\n[harness] Retry: python harness.py --retry-impl")
+                except Exception:
+                    pass
+             
         # Snapshot src/ after successful implement for future delta runs
         if ok:
             snapshot_src()
