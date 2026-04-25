@@ -27,6 +27,7 @@ import re
 import sys
 import httpx
 from pathlib import Path
+import time
 
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions"
