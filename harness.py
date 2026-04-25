@@ -685,6 +685,32 @@ def main() -> None:
             print(f"  Run knowledge update when ready:")
             print(f"    python pipeline/07_update_knowledge.py")
             print(f"    python pipeline/07_update_knowledge.py --dry-run")
+    
+    # ── Persist apply record (cross-run state tracking) ──────────────────────
+    # Write spec_applied.json so next spec_diff run knows what was last applied.
+    # Only written on overall PASS — failed runs don't count as "applied".
+    if all_ok and delta:
+        try:
+            from pipeline.spec_diff import write_applied
+        except ImportError:
+            # spec_diff.py lives in pipeline/ subdirectory
+            import importlib.util, sys as _sys
+            _spec = importlib.util.spec_from_file_location(
+                "spec_diff", ROOT / "pipeline" / "spec_diff.py"
+            )
+            _mod = importlib.util.module_from_spec(_spec)
+            _spec.loader.exec_module(_mod)
+            write_applied = _mod.write_applied
+
+        applied_steps = [k for k, v in results.items() if v]
+        write_applied(
+            version=delta.get("to_version", "unknown"),
+            steps=applied_steps,
+            status="PASS",
+        )
+        print(f"\n  Apply record → scaffold/spec_applied.json  "
+              f"(v{delta.get('to_version', '?')} marked as applied)")
+
     sys.exit(0 if all_ok else 1)
 
 
