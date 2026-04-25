@@ -176,7 +176,7 @@ def call_qwen(messages: list) -> str:
 
 
 def call_minimax(messages: list) -> str:
-    return _openrouter_call("minimax/minimax-m2.7", messages)
+    return _openrouter_call("moonshotai/kimi-k2.6", messages)
 
 
 # ════════════════════════════════════════════════════════════════════════════
