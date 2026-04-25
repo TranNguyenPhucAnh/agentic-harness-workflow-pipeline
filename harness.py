@@ -344,9 +344,16 @@ def _run_judge_fix_loop(args, results: dict) -> None:
             break
 
         if verdict == "NEEDS_REVISION":
+            fix_args = []
+            if args.verbose:
+                fix_args.append("--verbose")
+            if getattr(args, "fix_non_blocking", False):
+                fix_args.append("--fix-non-blocking")
+
             fix_ok = run_step(
                 f"Step 7 — Fix from judge{round_sfx}",
                 "07_fix_from_judge.py",
+                fix_args or None,
             )
             results[f"judge_fix_r{round_num}"] = fix_ok
 
@@ -407,10 +414,17 @@ def _run_fix_from_existing_judge(args, results: dict) -> None:
         )
         return
 
+    fix_args = []
+    if args.verbose:
+        fix_args.append("--verbose")
+    if getattr(args, "fix_non_blocking", False):
+        fix_args.append("--fix-non-blocking")
+        
     # Apply fix
     fix_ok = run_step(
         "Step 7 — Fix from judge (existing review)",
         "07_fix_from_judge.py",
+        fix_args or None,
     )
     results["judge_fix"] = fix_ok
 
