@@ -237,26 +237,43 @@ def implement_file(
 ) -> dict:
     file_path  = stub["file_path"]
     task_block = _build_task_block(task)
- 
-    # ── NEW: chỉ inject dependencies, không phải toàn bộ already_written ──
+
+    # ── Context injection: deps only, not all already_written ────────────────
     deps     = set(task.get("depends_on", [])) if task else set()
     relevant = {fp: code for fp, code in already_written.items() if fp in deps}
- 
+
+    if not relevant and already_written:
+        # Fallback: types + constants only (small, always needed)
+        relevant = {fp: code for fp, code in already_written.items()
+                    if "types/" in fp or "data/" in fp}
+
+    # ── Signature-only for App.tsx / main.tsx ─────────────────────────────────
+    # These files only need to know hook/component public APIs to import them.
+    # Injecting full implementations (200+ lines each) pushes prompt past 32k
+    # tokens and causes OpenRouter to return a truncated (non-JSON) response.
+    _SIGNATURE_ONLY_FOR = {"src/App.tsx", "src/main.tsx"}
+    if file_path in _SIGNATURE_ONLY_FOR:
+        relevant = {
+            fp: "\n".join(
+                l for l in code.splitlines()
+                if l.strip() and not l.strip().startswith("//")
+            )[:1500]   # cap at ~1500 chars per file
+            for fp, code in already_written.items()
+            if "types/" in fp or "data/" in fp or "hooks/" in fp
+        }
+
     context_block = ""
     if relevant:
-        context_block = "### Dependencies (already implemented — for import reference)\n"
+        if file_path in _SIGNATURE_ONLY_FOR:
+            label = "API reference (signatures only — full implementations omitted)"
+        elif deps:
+            label = "Dependencies (already implemented — for import reference)"
+        else:
+            label = "Shared types & constants (for import reference)"
+        context_block = f"### {label}\n"
         for fp, code in relevant.items():
             context_block += f"\n#### {fp}\n```typescript\n{code}\n```\n"
-    # Nếu không có deps tường minh nhưng already_written có types/constants,
-    # inject chúng vì gần như mọi file đều cần.
-    elif already_written:
-        shared = {fp: code for fp, code in already_written.items()
-                  if "types/" in fp or "data/" in fp}
-        if shared:
-            context_block = "### Shared types & constants (for import reference)\n"
-            for fp, code in shared.items():
-                context_block += f"\n#### {fp}\n```typescript\n{code}\n```\n"
- 
+
     user_msg = (
         f"### spec.md\n\n{spec}\n\n"
         f"{context_block}\n"
@@ -264,6 +281,12 @@ def implement_file(
         f"### Stub file to implement: {file_path}\n"
         f"```typescript\n{stub['code']}\n```"
     )
+
+    # ── Prompt size guard ─────────────────────────────────────────────────────
+    approx_tokens = len(user_msg) // 4
+    if approx_tokens > 28000:
+        print(f"[03a] ⚠ Large prompt for {file_path}: ~{approx_tokens:,} tokens "
+              f"(limit ~32k). Response may be truncated.", file=sys.stderr)
  
     print(f"[03a]   → Implementing {file_path} …")
     raw    = _call_qwen(build_system_prompt_per_file(), user_msg)
