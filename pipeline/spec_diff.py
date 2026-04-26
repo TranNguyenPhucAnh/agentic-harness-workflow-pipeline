@@ -77,11 +77,10 @@ from pathlib import Path
 
 ROOT         = Path(__file__).parent.parent
 SPEC_PATH    = ROOT / "spec.md"
-HISTORY_DIR  = ROOT / "scaffold" / "spec_history"
-DELTA_OUT    = ROOT / "scaffold" / "spec_delta.json"
-APPLIED_PATH = ROOT / "scaffold" / "spec_applied.json"
-CHANGELOG    = ROOT / "spec.changelog"
-
+HISTORY_DIR  = ROOT / "derived" / "spec" / "history"
+DELTA_OUT    = ROOT / "derived" / "spec" / "spec_delta.json"
+APPLIED_PATH = ROOT / "derived" / "spec" / "spec_applied.json"
+CHANGELOG    = ROOT / "derived" / "spec" / "spec.changelog"
 
 # ════════════════════════════════════════════════════════════════════════════
 # Section parser
