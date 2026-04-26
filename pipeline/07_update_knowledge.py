@@ -58,7 +58,6 @@ from pathlib import Path
 from textwrap import indent
 
 ROOT         = Path(__file__).parent.parent
-REPORTS_DIR  = ROOT / "reports"
 
 # New artifact paths
 STATE_DIR     = ROOT / "artifacts" / "state"
@@ -71,7 +70,7 @@ CURRENT_DIR   = KNOWLEDGE_DIR / "current"
 for d in (STATE_DIR, CACHE_DIR, RUN_DIR, KNOWLEDGE_DIR, HISTORY_DIR, CURRENT_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
-JUDGE_RAW_PATH      = REPORTS_DIR / "judge_raw.json"
+JUDGE_RAW_PATH      = RUN_DIR / "judge_raw.json"
 GLM_PLAN_PATH       = STATE_DIR / "plan.json"
 FINDINGS_PATH       = CURRENT_DIR / "findings.md"
 ADDENDUM_PATH       = CURRENT_DIR / "spec_addendum.md"
