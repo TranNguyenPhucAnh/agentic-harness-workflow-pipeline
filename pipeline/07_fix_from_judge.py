@@ -54,14 +54,15 @@ REPORTS_DIR.mkdir(exist_ok=True)
 STATE_DIR     = ROOT / "artifacts" / "state"
 CACHE_DIR     = ROOT / "artifacts" / "cache"
 RUN_DIR       = ROOT / "artifacts" / "run"
-KNOWLEDGE_DIR =  ROOT / "artifacts" / "knowledge"
+KNOWLEDGE_DIR = ROOT / "artifacts" / "knowledge"
 CURRENT_DIR   = KNOWLEDGE_DIR / "current"
+HISTORY_DIR   = KNOWLEDGE_DIR / "history"
 
-for d in (STATE_DIR, CACHE_DIR, RUN_DIR, KNOWLEDGE_DIR, CURRENT_DIR):
+for d in (STATE_DIR, CACHE_DIR, RUN_DIR, KNOWLEDGE_DIR, CURRENT_DIR, HISTORY_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
-JUDGE_RAW_PATH   = REPORTS_DIR / "judge_raw.json"
-FIX_REPORT_PATH  = RUN_DIR / "update_log.json"
+JUDGE_RAW_PATH   = RUN_DIR / "judge_raw.json"
+FIX_REPORT_PATH  = HISTORY_DIR / "update_log.json"
 FINDINGS_PATH    = CURRENT_DIR / "findings.md"
 KNOWLEDGE_BASE   = CURRENT_DIR / "base.md"
 SPEC_COMPRESSED  = CACHE_DIR / "spec_compressed.md"
