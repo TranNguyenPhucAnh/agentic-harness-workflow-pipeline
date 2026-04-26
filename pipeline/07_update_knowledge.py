@@ -6,13 +6,13 @@ Two modes:
 
   A) JUDGE-DRIVEN (original behaviour):
      Run after reviewing judge_report.md. Processes judge findings → writes
-     spec_addendum.md, glm_plan.json global_notes, judge_findings.md.
+     spec_addendum.md, glm_plan.json global_notes, findings.md.
 
   B) HUMAN-FIX CAPTURE (new):
      Run after you manually fix code that AI couldn't fix.
      Uses `git diff` to capture what you changed, links it to escalated clusters,
-     and distils a Pattern entry into scaffold/knowledge_base.md.
-     On next run, knowledge_base.md is injected into Minimax L2 system prompt.
+     and distills a Pattern entry into derived/knowledge/base.md.
+     On next run, base.md is injected into Minimax L2 system prompt.
 
 Usage
 ─────
@@ -30,17 +30,17 @@ Usage
 
 Writes (judge mode)
 ───────────────────
-  scaffold/judge_findings.md
-  scaffold/spec_addendum.md
-  scaffold/glm_plan.json        (global_notes patched)
-  scaffold/knowledge_base.md    (pattern entries from judge blocking issues)
-  reports/knowledge_update_log.json
+  derived/knowledge/findings.md
+  derived/spec/spec_addendum.md
+  generated/plan.json                    (global_notes patched)
+  derived/knowledge/base.md              (pattern entries from judge blocking issues)
+  derived/run/update_log.json            (merged log)
 
 Writes (human-fix capture mode)
 ────────────────────────────────
-  reports/human_fix_record.json  ← diff + cluster context + root cause
-  scaffold/knowledge_base.md     ← new Pattern entry appended
-  scaffold/judge_findings.md     ← human fix note appended (regression prevention)
+  derived/run/update_log.json            ← diff + cluster context + root cause
+  derived/knowledge/base.md              ← new Pattern entry appended
+  derived/knowledge/findings.md          ← human fix note appended (regression prevention)
 """
 
 from __future__ import annotations
@@ -56,18 +56,24 @@ from pathlib import Path
 from textwrap import indent
 
 ROOT         = Path(__file__).parent.parent
-SCAFFOLD_DIR = ROOT / "scaffold"
+DERIVED_RUN  = ROOT / "derived" / "run"
+DERIVED_KNOW = ROOT / "derived" / "knowledge"
+DERIVED_SPEC = ROOT / "derived" / "spec"
+GENERATED    = ROOT / "generated"
 REPORTS_DIR  = ROOT / "reports"
 
+DERIVED_RUN.mkdir(parents=True, exist_ok=True)
+DERIVED_KNOW.mkdir(parents=True, exist_ok=True)
+DERIVED_SPEC.mkdir(parents=True, exist_ok=True)
+
 JUDGE_RAW_PATH      = REPORTS_DIR / "judge_raw.json"
-FIX_REPORT_PATH     = REPORTS_DIR / "judge_fix_report.json"
-HUMAN_FIX_PATH      = REPORTS_DIR / "human_fix_record.json"
-GLM_PLAN_PATH       = SCAFFOLD_DIR / "glm_plan.json"
-FINDINGS_PATH       = SCAFFOLD_DIR / "judge_findings.md"
-ADDENDUM_PATH       = SCAFFOLD_DIR / "spec_addendum.md"
-KNOWLEDGE_BASE_PATH = SCAFFOLD_DIR / "knowledge_base.md"
-UPDATE_LOG_PATH     = REPORTS_DIR / "knowledge_update_log.json"
-ESCALATED_PATH      = REPORTS_DIR / "escalated_clusters.json"
+HUMAN_FIX_PATH      = DERIVED_RUN / "update_log.json"   # merged log
+GLM_PLAN_PATH       = GENERATED / "plan.json"
+FINDINGS_PATH       = DERIVED_KNOW / "findings.md"
+ADDENDUM_PATH       = DERIVED_SPEC / "spec_addendum.md"
+KNOWLEDGE_BASE_PATH = DERIVED_KNOW / "base.md"
+UPDATE_LOG_PATH     = DERIVED_RUN / "update_log.json"   # merged log
+TEST_REPORT_PATH    = DERIVED_RUN / "test_report.json"
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -119,10 +125,12 @@ def _parse_changed_files_from_diff(diff: str) -> list[str]:
 
 
 def _load_escalated_clusters() -> list[dict]:
-    if not ESCALATED_PATH.exists():
+    """Read escalated clusters from test_report.json."""
+    if not TEST_REPORT_PATH.exists():
         return []
     try:
-        return json.loads(ESCALATED_PATH.read_text()).get("clusters", [])
+        report = json.loads(TEST_REPORT_PATH.read_text())
+        return report.get("escalated", [])
     except Exception:
         return []
 
@@ -202,9 +210,9 @@ def capture_human_fix(dry_run: bool) -> None:
     """
     Tầng 1: capture human intervention.
     - git diff src/ → find changed files
-    - match against escalated_clusters.json
+    - match against escalated clusters from test_report.json
     - prompt for root_cause
-    - write human_fix_record.json + knowledge_base.md entry
+    - write update_log.json + knowledge_base.md entry
     """
     print("\n[07b] HUMAN FIX CAPTURE MODE")
     print("[07b] Scanning git diff for src/ changes …")
@@ -273,25 +281,27 @@ def capture_human_fix(dry_run: bool) -> None:
         _apply_findings(regression_note, dry_run=False)
         print(f"  ✓ Regression note appended to {FINDINGS_PATH}")
 
-    # Write human_fix_record.json
+    # Write update_log.json (merged log) — human fix record
     if not dry_run:
         record = {
             "timestamp":        datetime.now(timezone.utc).isoformat(),
+            "mode":             "human_fix_capture",
             "spec_version":     spec_version,
             "changed_files":    changed_files,
             "root_cause":       root_cause,
             "matched_clusters": matched,
             "diff_size_lines":  len(diff.splitlines()),
         }
+        # Merge with existing update_log.json
         existing_records: list[dict] = []
-        if HUMAN_FIX_PATH.exists():
+        if UPDATE_LOG_PATH.exists():
             try:
-                existing_records = json.loads(HUMAN_FIX_PATH.read_text())
+                existing_records = json.loads(UPDATE_LOG_PATH.read_text())
             except Exception:
                 pass
         existing_records.append(record)
-        HUMAN_FIX_PATH.write_text(json.dumps(existing_records, indent=2))
-        print(f"  ✓ Fix record → {HUMAN_FIX_PATH}")
+        UPDATE_LOG_PATH.write_text(json.dumps(existing_records, indent=2))
+        print(f"  ✓ Fix record appended to {UPDATE_LOG_PATH}")
 
     print(f"\n[07b] Human fix captured. Minimax will use this pattern on next run.")
     print(f"[07b] To verify: python harness.py --test-only --skip-judge")
@@ -327,10 +337,15 @@ def _load_verdict() -> dict:
     return json.loads(raw)
 
 
-def _load_fix_report() -> dict:
-    if not FIX_REPORT_PATH.exists():
+def _load_previous_fixes() -> dict:
+    """Load any existing fix records from update_log.json (not used for decisions)."""
+    if not UPDATE_LOG_PATH.exists():
         return {}
-    return json.loads(FIX_REPORT_PATH.read_text())
+    try:
+        logs = json.loads(UPDATE_LOG_PATH.read_text())
+        return {"total_records": len(logs)}
+    except Exception:
+        return {}
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -365,14 +380,14 @@ def _suggest_action(finding: str, severity: str, section_notes: str) -> tuple[st
 
     if any(kw in text for kw in _SPEC_EDGE_KEYWORDS):
         content = f"## Edge case: {finding[:80]}\n\nBehaviour: define exact behaviour for: {finding}\n"
-        return ACTION_ADDENDUM, "scaffold/spec_addendum.md", content
+        return ACTION_ADDENDUM, "derived/spec/spec_addendum.md", content
 
     if any(kw in text for kw in _GLM_NOTE_KEYWORDS) or severity == "blocking":
         content = finding
-        return ACTION_GLM_NOTE, "scaffold/glm_plan.json (global_notes)", content
+        return ACTION_GLM_NOTE, "generated/plan.json (global_notes)", content
 
     content = f"- {finding}"
-    return ACTION_FINDINGS_ADD, "scaffold/judge_findings.md", content
+    return ACTION_FINDINGS_ADD, "derived/knowledge/findings.md", content
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -474,18 +489,22 @@ def _prompt_action(
 
 def show_knowledge() -> None:
     if not KNOWLEDGE_BASE_PATH.exists():
-        print("[07b] No knowledge_base.md yet.")
-        return
-    print(KNOWLEDGE_BASE_PATH.read_text())
+        print("[07b] No knowledge base yet.")
+    else:
+        print(KNOWLEDGE_BASE_PATH.read_text())
 
-    # Also show human_fix_record summary
-    if HUMAN_FIX_PATH.exists():
-        records = json.loads(HUMAN_FIX_PATH.read_text())
-        print(f"\n── Human fix records: {len(records)} total ──")
-        for r in records[-5:]:   # last 5
-            print(f"  {r['timestamp'][:10]}  v{r['spec_version']}  "
-                  f"{len(r['changed_files'])} file(s)  "
-                  f"{r.get('root_cause', '')[:60]}")
+    # Also show update_log.json summary (merged)
+    if UPDATE_LOG_PATH.exists():
+        logs = json.loads(UPDATE_LOG_PATH.read_text())
+        print(f"\n── Update log: {len(logs)} total records ──")
+        # Show last 5 records, whichever type
+        for r in logs[-5:]:
+            mode = r.get("mode", "unknown")
+            ts = r.get("timestamp", "")[:10] if "timestamp" in r else "?"
+            if mode == "human_fix_capture":
+                print(f"  {ts}  {mode}  {len(r.get('changed_files', []))} file(s)  {r.get('root_cause', '')[:60]}")
+            else:
+                print(f"  {ts}  {mode}  {r.get('judge_verdict', '?')}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -500,7 +519,7 @@ def main() -> None:
     parser.add_argument("--capture-human-fix", action="store_true",
                         help="Capture manual human fix via git diff → knowledge_base.md")
     parser.add_argument("--show-knowledge", action="store_true",
-                        help="Print knowledge_base.md and human fix history, then exit")
+                        help="Print knowledge_base.md and update log, then exit")
     parser.add_argument("--accept-all",        action="store_true",
                         help="Accept all suggested actions without prompting")
     parser.add_argument("--dry-run",           action="store_true",
@@ -523,7 +542,7 @@ def main() -> None:
     interactive = not args.accept_all and not args.dry_run
 
     verdict    = _load_verdict()
-    fix_report = _load_fix_report()
+    _ = _load_previous_fixes()   # just for context, not used in decisions
 
     if verdict.get("verdict") not in ("NEEDS_REVISION", "APPROVED_WITH_NOTES"):
         print(f"[07b] Judge verdict is {verdict.get('verdict')} — "
@@ -619,18 +638,9 @@ def main() -> None:
         else:
             print(f"  [warn] Unknown action: {final_action}")
 
-    # Inject spec_addendum into pipeline_context
-    if not args.dry_run:
-        if any(a.action == ACTION_ADDENDUM for a in actions
-               if a.human_approved and a.action != ACTION_SKIP):
-            ctx_path = SCAFFOLD_DIR / "pipeline_context.json"
-            if ctx_path.exists():
-                ctx = json.loads(ctx_path.read_text())
-                ctx["spec_addendum_path"] = "scaffold/spec_addendum.md"
-                ctx_path.write_text(json.dumps(ctx, indent=2))
-                print(f"\n[07b] pipeline_context.json updated with spec_addendum_path")
+    # No pipeline_context.json update — removed as requested.
 
-    # Audit log
+    # Audit log — append to existing update_log.json (merged)
     if not args.dry_run:
         log_entry = {
             "timestamp":       now,
@@ -651,7 +661,7 @@ def main() -> None:
                 existing_log = []
         existing_log.append(log_entry)
         UPDATE_LOG_PATH.write_text(json.dumps(existing_log, indent=2))
-        print(f"\n[07b] Audit log → {UPDATE_LOG_PATH}")
+        print(f"\n[07b] Audit log appended to {UPDATE_LOG_PATH}")
 
     applied    = sum(1 for a in actions if a.human_approved and a.action not in (ACTION_SKIP, ACTION_SPEC_BUMP))
     skipped    = sum(1 for a in actions if a.action == ACTION_SKIP)
