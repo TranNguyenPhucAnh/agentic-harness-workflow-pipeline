@@ -75,7 +75,7 @@ GLM_PLAN_PATH       = STATE_DIR / "plan.json"
 FINDINGS_PATH       = CURRENT_DIR / "findings.md"
 ADDENDUM_PATH       = CURRENT_DIR / "spec_addendum.md"
 KNOWLEDGE_BASE_PATH = CURRENT_DIR / "base.md"
-UPDATE_LOG_PATH     = RUN_DIR / "update_log.json"               # merged log
+UPDATE_LOG_PATH     = HISTORY_DIR / "update_log.json"
 TEST_REPORT_PATH    = RUN_DIR / "test_report.json"
 
 
