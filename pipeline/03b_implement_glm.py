@@ -9,14 +9,16 @@ Role change rationale:
     *plan*, not code.  Qwen (03a) is the executor that turns the plan into src/.
 
 What this script does:
-    1. Read spec.md + scaffold/scaffold.json (stub files from Gemini).
+    1. Read spec.md + generated/scaffold.json (stub files from Gemini).
     2. Call GLM 5.1 with reasoning ON — task: decompose each stub file into
        an ordered list of implementation tasks / sub-tasks.
-    3. Write scaffold/glm_plan.json  ← consumed by 03a_implement_qwen.py
+    3. Write generated/plan.json  ← consumed by 03a_implement_qwen.py
        when --use-glm-plan flag is passed.
+    4. Merge implementation_order into generated/scaffold.json.
 
 Writes:
-    scaffold/glm_plan.json
+    generated/plan.json
+    updates generated/scaffold.json (adds "implementation_order")
 
 Does NOT write any src/ files.  03a_implement_qwen.py is the sole executor.
 """
@@ -35,9 +37,8 @@ MODEL              = "z-ai/glm-5.1"
 
 ROOT          = Path(__file__).parent.parent
 SPEC_PATH     = ROOT / "spec.md"
-SCAFFOLD_JSON = ROOT / "scaffold" / "scaffold.json"
-PLAN_OUT      = ROOT / "scaffold" / "glm_plan.json"
-PIPELINE_CTX = ROOT / "scaffold" / "pipeline_context.json"
+SCAFFOLD_JSON = ROOT / "generated" / "scaffold.json"
+PLAN_OUT      = ROOT / "generated" / "plan.json"
 
 
 # ── Prompts ──────────────────────────────────────────────────────────────────
@@ -103,10 +104,11 @@ Rules:
 # ── API call ──────────────────────────────────────────────────────────────────
 
 def _load_spec() -> str:
-    """Dùng compressed spec nếu có, fallback về full spec."""
-    compressed = ROOT / "scaffold" / "spec_compressed.md"
-    return compressed.read_text() if compressed.exists() else (ROOT / "spec.md").read_text()
-    
+    """Use compressed spec if available (derived/spec/), fallback to full spec."""
+    compressed = ROOT / "derived" / "spec" / "spec_compressed.md"
+    if compressed.exists():
+        return compressed.read_text()
+    return SPEC_PATH.read_text()
 
 def _extract_chat_json_response(data: dict, label: str) -> dict:
     choice = data["choices"][0]
@@ -226,27 +228,26 @@ def validate_plan(plan: dict, stub_files: list) -> None:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    spec     = _load_spec()                          # <-- đổi từ SPEC_PATH.read_text()
+    spec     = _load_spec()
     scaffold = json.loads(SCAFFOLD_JSON.read_text())
- 
+
     stub_files = [f for f in scaffold["files"] if not f.get("is_test")]
     print(f"[03b] Planning {len(stub_files)} stub files …")
- 
+
     plan = call_glm_planner(spec, stub_files)
     validate_plan(plan, stub_files)
- 
+
+    # Write GLM plan to generated/plan.json
     PLAN_OUT.write_text(json.dumps(plan, indent=2))
     print(f"[03b] Plan written → {PLAN_OUT}")
     print(f"[03b] Tasks in plan: {len(plan.get('tasks', []))}")
     print(f"[03b] Implementation order: {plan.get('implementation_order', [])}")
- 
-    # ── NEW: append implementation_order to pipeline_context ──
-    if PIPELINE_CTX.exists():
-        ctx = json.loads(PIPELINE_CTX.read_text())
-        ctx["implementation_order"] = plan.get("implementation_order", [])
-        PIPELINE_CTX.write_text(json.dumps(ctx, indent=2))
-        print("[03b] Updated pipeline_context.json with implementation_order")
- 
+
+    # Merge implementation_order into generated/scaffold.json
+    scaffold["implementation_order"] = plan.get("implementation_order", [])
+    SCAFFOLD_JSON.write_text(json.dumps(scaffold, indent=2))
+    print(f"[03b] Updated {SCAFFOLD_JSON} with implementation_order")
+
     print("[03b] Done. Pass --use-glm-plan to 03a_implement_qwen.py to use this plan.")
 
 if __name__ == "__main__":
