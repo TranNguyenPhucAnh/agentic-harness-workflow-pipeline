@@ -329,7 +329,7 @@ def _append_changelog(delta: "SpecDelta") -> None:
     entry = "\n".join(lines)
 
     # Append to aggregated spec.changelog
-    changelog_path = KNOWLEDGE_HISTORY_DIR / "spec.changelog"
+    CHANGELOG = KNOWLEDGE_HISTORY_DIR / "spec.changelog"
     existing = changelog_path.read_text() if changelog_path.exists() else ""
     changelog_path.write_text(existing + entry)
 
@@ -339,7 +339,7 @@ def _append_changelog(delta: "SpecDelta") -> None:
 
 
 def print_changelog(n: int = 0) -> None:
-    changelog_path = KNOWLEDGE_HISTORY_DIR / "spec.changelog"
+    CHANGELOG = KNOWLEDGE_HISTORY_DIR / "spec.changelog"
     if not changelog_path.exists():
         print("[spec_diff] No changelog yet.")
         return
