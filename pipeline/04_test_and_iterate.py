@@ -55,21 +55,23 @@ ROOT        = Path(__file__).parent.parent
 SPEC_PATH   = ROOT / "spec.md"
 
 # New artifact paths
-STATE_DIR   = ROOT / "artifacts" / "state"
-CACHE_DIR   = ROOT / "artifacts" / "cache"
-RUN_DIR     = ROOT / "artifacts" / "run"
-KNOWLEDGE_DIR = ROOT / "artifacts" / "knowledge"
+STATE_DIR      = ROOT / "artifacts" / "state"
+CACHE_DIR      = ROOT / "artifacts" / "cache"
+RUN_DIR        = ROOT / "artifacts" / "run"
+KNOWLEDGE_DIR  = ROOT / "artifacts" / "knowledge"
+CURRENT_DIR    = KNOWLEDGE_DIR / "current"
 
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 RUN_DIR.mkdir(parents=True, exist_ok=True)
 KNOWLEDGE_DIR.mkdir(parents=True, exist_ok=True)
+CURRENT_DIR.mkdir(parents=True, exist_ok=True)
 
 GLM_PLAN    = STATE_DIR / "plan.json"
 TEST_REPORT = RUN_DIR   / "test_report.json"
 # Knowledge files
-FINDINGS_PATH   = KNOWLEDGE_DIR / "findings.md"
-KNOWLEDGE_BASE  = KNOWLEDGE_DIR / "base.md"
+FINDINGS_PATH  = CURRENT_DIR / "findings.md"
+KNOWLEDGE_BASE = CURRENT_DIR / "base.md"
 
 SRC_DIR = "src"
 
