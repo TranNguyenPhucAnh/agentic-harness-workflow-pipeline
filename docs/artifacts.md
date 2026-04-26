@@ -4,7 +4,7 @@ This document describes the purpose, lifecycle, and relationships of all artifac
 All paths are relative to the project root.
 
 ## Directory Overview
-
+```
 artifacts/
 ├── state/
 │   ├── scaffold.json
@@ -30,7 +30,7 @@ artifacts/
 └── reports/
     ├── summary.md
     └── judge_report.md
-
+```
 > The `src/` and `tests/` directories are **build outputs**, not part of `artifacts/`. They are written by `02_scaffold_gemini.py` and `03a_implement_qwen.py`.
 
 ## Lifecycle Table
