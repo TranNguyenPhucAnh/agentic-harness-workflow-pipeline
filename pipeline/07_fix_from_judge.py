@@ -14,14 +14,14 @@ What this script does
      spec + affected src files + judge's exact description
 4. Apply patches (scope-locked to src/ only — never tests/)
 5. Run vitest to confirm fixes (exit 1 if still failing)
-6. Write artifacts/knowledge/findings.md — injected into Minimax/Qwen prompts on
+6. Write artifacts/knowledge/current/findings.md — injected into Minimax/Qwen prompts on
    future runs so the same mistakes are not repeated
 
 Writes
 ──────
-    artifacts/knowledge/findings.md      ← persistent cross-run memory
-    artifacts/run/update_log.json        ← this run's fix log (merged)
-    src/**                               ← patched files
+    artifacts/knowledge/current/findings.md     ← persistent cross-run memory
+    artifacts/run/update_log.json               ← this run's fix log (merged)
+    src/**                                      ← patched files
 
 Does NOT
 ────────
@@ -51,18 +51,19 @@ REPORTS_DIR  = ROOT / "reports"
 REPORTS_DIR.mkdir(exist_ok=True)
 
 # New artifact paths
-STATE_DIR   = ROOT / "artifacts" / "state"
-CACHE_DIR   = ROOT / "artifacts" / "cache"
-RUN_DIR     = ROOT / "artifacts" / "run"
-KNOWLEDGE_DIR = ROOT / "artifacts" / "knowledge"
+STATE_DIR     = ROOT / "artifacts" / "state"
+CACHE_DIR     = ROOT / "artifacts" / "cache"
+RUN_DIR       = ROOT / "artifacts" / "run"
+KNOWLEDGE_DIR =  ROOT / "artifacts" / "knowledge"
+CURRENT_DIR   = KNOWLEDGE_DIR / "current"
 
-for d in (STATE_DIR, CACHE_DIR, RUN_DIR, KNOWLEDGE_DIR):
+for d in (STATE_DIR, CACHE_DIR, RUN_DIR, KNOWLEDGE_DIR, CURRENT_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
 JUDGE_RAW_PATH   = REPORTS_DIR / "judge_raw.json"
 FIX_REPORT_PATH  = RUN_DIR / "update_log.json"
-FINDINGS_PATH    = KNOWLEDGE_DIR / "findings.md"
-KNOWLEDGE_BASE   = KNOWLEDGE_DIR / "base.md"
+FINDINGS_PATH    = CURRENT_DIR / "findings.md"
+KNOWLEDGE_BASE   = CURRENT_DIR / "base.md"
 SPEC_COMPRESSED  = CACHE_DIR / "spec_compressed.md"
 GLM_PLAN_PATH    = STATE_DIR / "plan.json"      # not used directly but kept for consistency
 

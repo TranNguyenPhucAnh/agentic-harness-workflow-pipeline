@@ -142,7 +142,7 @@ SCAFFOLD_JSON = ROOT / "artifacts" / "state" / "scaffold.json"
 GLM_PLAN_PATH = ROOT / "artifacts" / "state" / "plan.json"
 IMPL_RECORD_PATH = ROOT / "artifacts" / "run" / "impl_record.json"
 UPDATE_LOG_PATH = ROOT / "artifacts" / "run" / "update_log.json"   # used in messages
-PREV_SRC_DIR = ROOT / "scaffold" / "prev_src"   # scratch, remains under scaffold
+PREV_SRC_DIR = ROOT / "artifacts" / "state" / "prev_src"
 
 # Ensure directories exist
 DELTA_PATH.parent.mkdir(parents=True, exist_ok=True)

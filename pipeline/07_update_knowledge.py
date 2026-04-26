@@ -33,13 +33,13 @@ Writes (judge mode)
   artifacts/knowledge/findings.md
   artifacts/knowledge/current/spec_addendum.md
   artifacts/state/plan.json                    (global_notes patched)
-  artifacts/knowledge/base.md                  (pattern entries from judge blocking issues)
+  artifacts/knowledge/current/base.md          (pattern entries from judge blocking issues)
   artifacts/run/update_log.json                (merged log)
 
 Writes (human-fix capture mode)
 ────────────────────────────────
   artifacts/run/update_log.json                ← diff + cluster context + root cause
-  artifacts/knowledge/base.md                  ← new Pattern entry appended
+  artifacts/knowledge/current/base.md          ← new Pattern entry appended
   artifacts/knowledge/findings.md              ← human fix note appended (regression prevention)
 
 For taxonomy details see docs/artifacts.md
@@ -72,11 +72,10 @@ for d in (STATE_DIR, CACHE_DIR, RUN_DIR, KNOWLEDGE_DIR, HISTORY_DIR, CURRENT_DIR
     d.mkdir(parents=True, exist_ok=True)
 
 JUDGE_RAW_PATH      = REPORTS_DIR / "judge_raw.json"
-HUMAN_FIX_PATH      = RUN_DIR / "update_log.json"               # merged log
 GLM_PLAN_PATH       = STATE_DIR / "plan.json"
-FINDINGS_PATH       = KNOWLEDGE_DIR / "findings.md"
+FINDINGS_PATH       = CURRENT_DIR / "findings.md"
 ADDENDUM_PATH       = CURRENT_DIR / "spec_addendum.md"
-KNOWLEDGE_BASE_PATH = KNOWLEDGE_DIR / "base.md"
+KNOWLEDGE_BASE_PATH = CURRENT_DIR / "base.md"
 UPDATE_LOG_PATH     = RUN_DIR / "update_log.json"               # merged log
 TEST_REPORT_PATH    = RUN_DIR / "test_report.json"
 
