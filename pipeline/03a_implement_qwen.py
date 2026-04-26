@@ -8,14 +8,16 @@ Modes:
         Falls back to original single-call behaviour if only 1 file.
 
     With GLM plan (--use-glm-plan):
-        Reads generated/plan.json produced by 03b_implement_glm.py.
+        Reads artifacts/state/plan.json produced by 03b_implement_glm.py.
         For each file, injects the matching GLM task (sub_tasks, gotchas,
         tailwind_hints, depends_on) into the prompt before generating.
         Files are generated in implementation_order from the plan.
 
 Writes:
-    src/**  (non-test files only)
-    derived/run/impl_record.json
+    src/**                                    (non-test files only)
+    artifacts/run/impl_record.json
+
+For taxonomy details see docs/artifacts.md
 """
 
 from __future__ import annotations
@@ -33,16 +35,27 @@ OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions"
 MODEL              = "qwen/qwen3.6-plus"
 
-ROOT          = Path(__file__).parent.parent
+ROOT = Path(__file__).parent.parent
+
+# New artifact paths
+STATE_DIR = ROOT / "artifacts" / "state"
+CACHE_DIR = ROOT / "artifacts" / "cache"
+RUN_DIR   = ROOT / "artifacts" / "run"
+
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+RUN_DIR.mkdir(parents=True, exist_ok=True)
+
 SPEC_PATH     = ROOT / "spec.md"
-SCAFFOLD_JSON = ROOT / "generated" / "scaffold.json"
-GLM_PLAN      = ROOT / "generated" / "plan.json"
-IMPL_RECORD   = ROOT / "derived" / "run" / "impl_record.json"
+SCAFFOLD_JSON = STATE_DIR / "scaffold.json"
+GLM_PLAN      = STATE_DIR / "plan.json"
+IMPL_RECORD   = RUN_DIR   / "impl_record.json"
+
 
 # ── System prompts ────────────────────────────────────────────────────────────
 
 def _load_spec() -> str:
-    compressed = ROOT / "derived" / "spec" / "spec_compressed.md"
+    compressed = CACHE_DIR / "spec_compressed.md"
     return compressed.read_text() if compressed.exists() else SPEC_PATH.read_text()
 
 def build_system_prompt_single(instructions: str) -> str:
@@ -248,9 +261,6 @@ def implement_file(
                     if "types/" in fp or "data/" in fp}
 
     # ── Signature-only for App.tsx / main.tsx ─────────────────────────────────
-    # These files only need to know hook/component public APIs to import them.
-    # Injecting full implementations (200+ lines each) pushes prompt past 32k
-    # tokens and causes OpenRouter to return a truncated (non-JSON) response.
     _SIGNATURE_ONLY_FOR = {"src/App.tsx", "src/main.tsx"}
     if file_path in _SIGNATURE_ONLY_FOR:
         relevant = {
@@ -329,7 +339,7 @@ def implement_all_single_call(spec: str, stub_files: list, instructions: str) ->
 
 def _load_restored_files(only_set: set[str]) -> dict[str, str]:
     """
-    Read already-restored src/ files (copied by harness from prev_src/) into
+    Read already-restored src/ files (copied by harness from scaffold/prev_src/) into
     memory so they can be used as import context for Qwen in delta mode.
     Loads only files NOT in only_set (i.e. the unaffected/restored ones).
     """
@@ -351,7 +361,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--use-glm-plan", action="store_true",
-        help="Inject generated/plan.json as per-file implementation guidance",
+        help="Inject artifacts/state/plan.json as per-file implementation guidance",
     )
     parser.add_argument(
         "--only-files",
@@ -387,7 +397,7 @@ def main() -> None:
 
     if args.use_glm_plan:
         if not GLM_PLAN.exists():
-            print("[03a] ERROR: --use-glm-plan set but generated/plan.json not found.")
+            print("[03a] ERROR: --use-glm-plan set but artifacts/state/plan.json not found.")
             print("             Run 03b_implement_glm.py first.")
             sys.exit(1)
         plan = json.loads(GLM_PLAN.read_text())
@@ -465,8 +475,8 @@ def main() -> None:
         {f["file_path"] for f in all_stubs} - only_set
     ) if only_set else []
 
-    # Ensure output directory exists
-    IMPL_RECORD.parent.mkdir(parents=True, exist_ok=True)
+    # Write run record
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
     IMPL_RECORD.write_text(json.dumps({
         "model":         "qwen",
         "mode":          mode,

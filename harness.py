@@ -25,10 +25,10 @@ Generation flags (control Steps 1–3):
   --dry-run              Print what WOULD run without executing anything.
                          Useful to verify delta decisions before committing.
  
-  --skip-scaffold        Skip Step 2 (Gemini). Reuse existing generated/scaffold.json.
+  --skip-scaffold        Skip Step 2 (Gemini). Reuse existing artifacts/state/scaffold.json.
                          Use when spec §7/§8 (file tree + schema) did NOT change.
  
-  --skip-plan            Skip Step 3b (GLM). Reuse existing generated/plan.json.
+  --skip-plan            Skip Step 3b (GLM). Reuse existing artifacts/state/plan.json.
                          Use when you want to re-implement but keep the same plan.
  
   --only-qwen            Skip Step 3b entirely (no GLM plan at all).
@@ -136,13 +136,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).parent
 
-# New paths
-DELTA_PATH   = ROOT / "derived" / "spec" / "spec_delta.json"
+# New artifact paths
+DELTA_PATH   = ROOT / "artifacts" / "cache" / "spec_delta.json"
+SCAFFOLD_JSON = ROOT / "artifacts" / "state" / "scaffold.json"
+GLM_PLAN_PATH = ROOT / "artifacts" / "state" / "plan.json"
+IMPL_RECORD_PATH = ROOT / "artifacts" / "run" / "impl_record.json"
+UPDATE_LOG_PATH = ROOT / "artifacts" / "run" / "update_log.json"   # used in messages
 PREV_SRC_DIR = ROOT / "scaffold" / "prev_src"   # scratch, remains under scaffold
-SCAFFOLD_JSON = ROOT / "generated" / "scaffold.json"
-GLM_PLAN_PATH = ROOT / "generated" / "plan.json"
-IMPL_RECORD_PATH = ROOT / "derived" / "run" / "impl_record.json"
-UPDATE_LOG_PATH = ROOT / "derived" / "run" / "update_log.json"  # judge fix log
 
 # Ensure directories exist
 DELTA_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -481,7 +481,7 @@ def main() -> None:
                         help="Skip GLM planning (overrides delta)")
     parser.add_argument("--retry-impl", action="store_true",
                         help="Retry only failed files from last impl run "
-                        "(reads impl_qwen.json failed_files). "
+                        "(reads impl_record.json failed_files). "
                         "Implies --skip-scaffold --skip-plan.")
     parser.add_argument("--only-qwen", action="store_true",
                         help="Skip GLM planning entirely; Qwen single-call mode")
@@ -513,7 +513,7 @@ def main() -> None:
     if args.retry_impl:
        args.skip_scaffold = True
        args.skip_plan     = True
-       # --only-files sẽ được build từ impl_qwen.json bên dưới
+       # --only-files sẽ được build từ impl_record.json bên dưới
  
     # --from-judge: skip everything up to judge, feed existing review
     if args.from_judge:
@@ -588,7 +588,7 @@ def main() -> None:
 
     elif args.test_only:
         plan_available = GLM_PLAN_PATH.exists()
-        reason = ("reusing existing glm_plan.json" if plan_available
+        reason = ("reusing existing plan.json" if plan_available
                   else "no plan.json found")
         skip_step("Step 3b — GLM 5.1 plan", f"--test-only ({reason})")
 
@@ -774,7 +774,7 @@ def main() -> None:
             steps=applied_steps,
             status="PASS",
         )
-        print(f"\n  Apply record → scaffold/spec_applied.json  "
+        print(f"\n  Apply record → artifacts/state/spec_applied.json  "
               f"(v{delta.get('to_version', '?')} marked as applied)")
 
     sys.exit(0 if all_ok else 1)

@@ -8,18 +8,20 @@ DeepSeek V3.2 for deep review, writes reports/judge_report.md.
 
 Reads:
     spec.md
-    generated/scaffold.json
-    generated/plan.json (optional — present if GLM planner ran)
-    derived/run/impl_record.json
-    derived/run/test_report.json
+    artifacts/state/scaffold.json
+    artifacts/state/plan.json (optional — present if GLM planner ran)
+    artifacts/run/impl_record.json
+    artifacts/run/test_report.json
     src/**/*.ts  src/**/*.tsx        (final implemented source)
     tests/**/*.ts  tests/**/*.tsx    (test files for reference)
-    derived/spec/spec_delta.json (if partial run)
-    derived/spec/spec_addendum.md (if exists)
+    artifacts/cache/spec_delta.json (if partial run)
+    artifacts/knowledge/current/spec_addendum.md (if exists)
 
 Writes:
     reports/judge_report.md         ← human-readable final report
     reports/judge_raw.json          ← full model response + metadata
+
+For taxonomy details see docs/artifacts.md
 """
 
 from __future__ import annotations
@@ -41,14 +43,26 @@ ROOT        = Path(__file__).parent.parent
 REPORTS_DIR = ROOT / "reports"
 REPORTS_DIR.mkdir(exist_ok=True)
 
-# New paths
-SCAFFOLD_JSON = ROOT / "generated" / "scaffold.json"
-GLM_PLAN_PATH = ROOT / "generated" / "plan.json"
-IMPL_RECORD   = ROOT / "derived" / "run" / "impl_record.json"
-TEST_REPORT   = ROOT / "derived" / "run" / "test_report.json"
-SPEC_DELTA    = ROOT / "derived" / "spec" / "spec_delta.json"
-SPEC_ADDENDUM = ROOT / "derived" / "spec" / "spec_addendum.md"
-SPEC_COMPRESSED = ROOT / "derived" / "spec" / "spec_compressed.md"
+# Artifact paths
+STATE_DIR   = ROOT / "artifacts" / "state"
+CACHE_DIR   = ROOT / "artifacts" / "cache"
+RUN_DIR     = ROOT / "artifacts" / "run"
+KNOWLEDGE_DIR = ROOT / "artifacts" / "knowledge"
+CURRENT_KNOWLEDGE = KNOWLEDGE_DIR / "current"
+
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+RUN_DIR.mkdir(parents=True, exist_ok=True)
+KNOWLEDGE_DIR.mkdir(parents=True, exist_ok=True)
+CURRENT_KNOWLEDGE.mkdir(parents=True, exist_ok=True)
+
+SCAFFOLD_JSON = STATE_DIR / "scaffold.json"
+GLM_PLAN_PATH = STATE_DIR / "plan.json"
+IMPL_RECORD   = RUN_DIR   / "impl_record.json"
+TEST_REPORT   = RUN_DIR   / "test_report.json"
+SPEC_DELTA    = CACHE_DIR / "spec_delta.json"
+SPEC_ADDENDUM = CURRENT_KNOWLEDGE / "spec_addendum.md"
+SPEC_COMPRESSED = CACHE_DIR / "spec_compressed.md"
 
 
 # ── Prompt ────────────────────────────────────────────────────────────────────
@@ -108,7 +122,6 @@ def _load_spec() -> str:
 
 
 def _load_delta() -> dict | None:
-    """Load spec_delta.json if present — used to scope judge review."""
     if not SPEC_DELTA.exists():
         return None
     try:
@@ -118,10 +131,6 @@ def _load_delta() -> dict | None:
 
 
 def _affected_src_set(delta: dict | None) -> set[str]:
-    """
-    Return set of src/ files that were affected this run.
-    Empty set means full run — judge reviews everything.
-    """
     if delta is None or delta.get("is_first_run", True):
         return set()
     return {f for f in delta.get("affected_files", []) if f.startswith("src/")}
@@ -134,7 +143,6 @@ def _read_safe(path: Path, label: str) -> str:
 
 
 def _collect_src_files(src_dir: Path) -> dict[str, str]:
-    """Full collect — used for test files and fallback."""
     files: dict[str, str] = {}
     for ext in ("*.ts", "*.tsx"):
         for p in sorted(src_dir.rglob(ext)):
@@ -146,10 +154,8 @@ def _collect_src_files(src_dir: Path) -> dict[str, str]:
 def _collect_changed_files(src_dir: Path) -> dict[str, str]:
     """
     Collect source files whose content differs from the original stub.
-    Reads stub_map from generated/scaffold.json to detect changes.
-    Saves ~40% input tokens for the judge.
+    Reads stub_map from artifacts/state/scaffold.json to detect changes.
     """
-    # Load stub_map from scaffold.json
     stub_map: dict[str, str] = {}
     if SCAFFOLD_JSON.exists():
         try:
@@ -166,7 +172,6 @@ def _collect_changed_files(src_dir: Path) -> dict[str, str]:
                 continue
             current = p.read_text()
             stub = stub_map.get(rel, "")
-            # Consider changed if stub missing or content differs
             if not stub or current.strip() != stub.strip():
                 changed[rel] = current
     return changed
@@ -177,7 +182,7 @@ def build_briefing() -> str:
 
     delta = _load_delta()
     affected_set = _affected_src_set(delta)
-    is_partial = bool(affected_set)   # True = only some files changed this run
+    is_partial = bool(affected_set)
 
     # 0. Run context header
     if is_partial and delta:
@@ -205,7 +210,6 @@ def build_briefing() -> str:
             "",
             "**Files reused from previous run (unchanged — secondary review):**",
         ]
-        # Read skipped files from implementation record
         skipped = []
         if IMPL_RECORD.exists():
             try:
@@ -288,7 +292,6 @@ def build_briefing() -> str:
     # 5. Source files — scope to affected only on partial runs
     src_dir = ROOT / "src"
     if is_partial and affected_set:
-        # Primary: re-implemented files (full content)
         primary: dict[str, str] = {}
         for fp in sorted(affected_set):
             p = ROOT / fp
@@ -302,7 +305,7 @@ def build_briefing() -> str:
             f"## 5. Re-implemented Source Files ({len(primary)} files)\n\n{src_block}"
         )
 
-        # Secondary: reused files — signatures only to save tokens
+        # Secondary: reused files — signatures only
         skipped_paths = []
         if IMPL_RECORD.exists():
             try:
@@ -315,22 +318,19 @@ def build_briefing() -> str:
             for fp in skipped_paths:
                 p = ROOT / fp
                 if p.exists():
-                    # Emit only non‑blank, non‑body lines as a lightweight signature view
                     sig_lines = [
                         l for l in p.read_text().splitlines()
                         if l.strip() and not l.strip().startswith("//")
                         and "throw new Error" not in l
-                    ][:30]   # cap at 30 lines per file
+                    ][:30]
                     secondary_lines.append(f"### {fp}")
                     secondary_lines.append("```typescript")
                     secondary_lines.extend(sig_lines)
                     secondary_lines.append("```\n")
             parts.append("\n".join(secondary_lines))
     else:
-        # Full run — collect all changed files using stub comparison
         src_files = _collect_changed_files(src_dir)
         if not src_files:
-            # Fallback: if stub_map not present, collect everything
             src_files = _collect_src_files(src_dir)
         src_block = "\n\n".join(
             f"### {fp}\n```typescript\n{code}\n```"
@@ -340,7 +340,7 @@ def build_briefing() -> str:
             f"## 5. Implemented Source Files ({len(src_files)} changed files)\n\n{src_block}"
         )
 
-    # 6. Test files — always full (judge needs to verify test quality)
+    # 6. Test files — always full
     test_files = _collect_src_files(ROOT / "tests")
     test_block = "\n\n".join(
         f"### {fp}\n```typescript\n{code}\n```"
@@ -374,7 +374,7 @@ def call_deepseek_judge(briefing: str) -> tuple[str, list | None]:
     last_error = None
 
     with httpx.Client(timeout=300) as client:
-        for attempt in range(2):  # 1 retry on empty response
+        for attempt in range(2):
             r = client.post(OPENROUTER_URL, headers=headers, json=payload)
             r.raise_for_status()
 
@@ -517,7 +517,7 @@ def main() -> None:
     raw_response, reasoning_details = call_deepseek_judge(briefing)
 
     # Save raw response + reasoning chain
-    raw_out = REPORTS_DIR / "judge_raw.json"
+    raw_out = RUN_DIR / "judge_raw.json"
     raw_out.write_text(json.dumps({
         "model": MODEL,
         "timestamp": datetime.now(timezone.utc).isoformat(),

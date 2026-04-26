@@ -11,7 +11,7 @@ Two modes:
   B) HUMAN-FIX CAPTURE (new):
      Run after you manually fix code that AI couldn't fix.
      Uses `git diff` to capture what you changed, links it to escalated clusters,
-     and distills a Pattern entry into derived/knowledge/base.md.
+     and distills a Pattern entry into artifacts/knowledge/base.md.
      On next run, base.md is injected into Minimax L2 system prompt.
 
 Usage
@@ -30,17 +30,19 @@ Usage
 
 Writes (judge mode)
 ───────────────────
-  derived/knowledge/findings.md
-  derived/spec/spec_addendum.md
-  generated/plan.json                    (global_notes patched)
-  derived/knowledge/base.md              (pattern entries from judge blocking issues)
-  derived/run/update_log.json            (merged log)
+  artifacts/knowledge/findings.md
+  artifacts/knowledge/current/spec_addendum.md
+  artifacts/state/plan.json                    (global_notes patched)
+  artifacts/knowledge/base.md                  (pattern entries from judge blocking issues)
+  artifacts/run/update_log.json                (merged log)
 
 Writes (human-fix capture mode)
 ────────────────────────────────
-  derived/run/update_log.json            ← diff + cluster context + root cause
-  derived/knowledge/base.md              ← new Pattern entry appended
-  derived/knowledge/findings.md          ← human fix note appended (regression prevention)
+  artifacts/run/update_log.json                ← diff + cluster context + root cause
+  artifacts/knowledge/base.md                  ← new Pattern entry appended
+  artifacts/knowledge/findings.md              ← human fix note appended (regression prevention)
+
+For taxonomy details see docs/artifacts.md
 """
 
 from __future__ import annotations
@@ -56,24 +58,27 @@ from pathlib import Path
 from textwrap import indent
 
 ROOT         = Path(__file__).parent.parent
-DERIVED_RUN  = ROOT / "derived" / "run"
-DERIVED_KNOW = ROOT / "derived" / "knowledge"
-DERIVED_SPEC = ROOT / "derived" / "spec"
-GENERATED    = ROOT / "generated"
 REPORTS_DIR  = ROOT / "reports"
 
-DERIVED_RUN.mkdir(parents=True, exist_ok=True)
-DERIVED_KNOW.mkdir(parents=True, exist_ok=True)
-DERIVED_SPEC.mkdir(parents=True, exist_ok=True)
+# New artifact paths
+STATE_DIR     = ROOT / "artifacts" / "state"
+CACHE_DIR     = ROOT / "artifacts" / "cache"
+RUN_DIR       = ROOT / "artifacts" / "run"
+KNOWLEDGE_DIR = ROOT / "artifacts" / "knowledge"
+HISTORY_DIR   = KNOWLEDGE_DIR / "history"
+CURRENT_DIR   = KNOWLEDGE_DIR / "current"
+
+for d in (STATE_DIR, CACHE_DIR, RUN_DIR, KNOWLEDGE_DIR, HISTORY_DIR, CURRENT_DIR):
+    d.mkdir(parents=True, exist_ok=True)
 
 JUDGE_RAW_PATH      = REPORTS_DIR / "judge_raw.json"
-HUMAN_FIX_PATH      = DERIVED_RUN / "update_log.json"   # merged log
-GLM_PLAN_PATH       = GENERATED / "plan.json"
-FINDINGS_PATH       = DERIVED_KNOW / "findings.md"
-ADDENDUM_PATH       = DERIVED_SPEC / "spec_addendum.md"
-KNOWLEDGE_BASE_PATH = DERIVED_KNOW / "base.md"
-UPDATE_LOG_PATH     = DERIVED_RUN / "update_log.json"   # merged log
-TEST_REPORT_PATH    = DERIVED_RUN / "test_report.json"
+HUMAN_FIX_PATH      = RUN_DIR / "update_log.json"               # merged log
+GLM_PLAN_PATH       = STATE_DIR / "plan.json"
+FINDINGS_PATH       = KNOWLEDGE_DIR / "findings.md"
+ADDENDUM_PATH       = CURRENT_DIR / "spec_addendum.md"
+KNOWLEDGE_BASE_PATH = KNOWLEDGE_DIR / "base.md"
+UPDATE_LOG_PATH     = RUN_DIR / "update_log.json"               # merged log
+TEST_REPORT_PATH    = RUN_DIR / "test_report.json"
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -139,10 +144,7 @@ def _match_clusters_to_files(
     changed_files: list[str],
     escalated: list[dict],
 ) -> list[dict]:
-    """
-    Find escalated clusters whose src_file matches one of the changed files.
-    These are clusters the AI couldn't fix — human just fixed them.
-    """
+    """Find escalated clusters whose src_file matches one of the changed files."""
     matched = []
     for cluster in escalated:
         src = cluster.get("src_file", "")
@@ -158,9 +160,7 @@ def _build_knowledge_pattern(
     root_cause: str,
     spec_version: str,
 ) -> str:
-    """
-    Build a markdown Pattern entry for knowledge_base.md.
-    """
+    """Build a markdown Pattern entry for knowledge_base.md."""
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     files_str = "\n".join(f"- `{f}`" for f in changed_files)
 
@@ -175,7 +175,6 @@ def _build_knowledge_pattern(
                 f"({attempts} AI attempt(s)) — {note}\n"
             )
 
-    # Extract a short diff summary (only + lines, cap at 40 lines)
     added_lines = [l for l in diff.splitlines() if l.startswith("+") and not l.startswith("+++")]
     diff_preview = "\n".join(added_lines[:40])
     if len(added_lines) > 40:
@@ -207,13 +206,7 @@ def _append_knowledge_base(entry: str, dry_run: bool) -> None:
 
 
 def capture_human_fix(dry_run: bool) -> None:
-    """
-    Tầng 1: capture human intervention.
-    - git diff src/ → find changed files
-    - match against escalated clusters from test_report.json
-    - prompt for root_cause
-    - write update_log.json + knowledge_base.md entry
-    """
+    """Capture human intervention via git diff, update knowledge base."""
     print("\n[07b] HUMAN FIX CAPTURE MODE")
     print("[07b] Scanning git diff for src/ changes …")
 
@@ -243,7 +236,6 @@ def capture_human_fix(dry_run: bool) -> None:
         print("\n[07b] No matching escalated clusters found "
               "(fix may be proactive or from judge review).")
 
-    # Prompt for root cause
     print("\n[07b] Briefly describe the root cause of the bug you fixed.")
     print("      (Press Enter to skip)")
     try:
@@ -251,7 +243,6 @@ def capture_human_fix(dry_run: bool) -> None:
     except (EOFError, KeyboardInterrupt):
         root_cause = ""
 
-    # Load current spec version
     spec_version = "unknown"
     spec_path = ROOT / "spec.md"
     if spec_path.exists():
@@ -259,7 +250,6 @@ def capture_human_fix(dry_run: bool) -> None:
         if m:
             spec_version = m.group(1)
 
-    # Build knowledge pattern
     pattern = _build_knowledge_pattern(
         diff=diff,
         changed_files=changed_files,
@@ -268,10 +258,8 @@ def capture_human_fix(dry_run: bool) -> None:
         spec_version=spec_version,
     )
 
-    # Write knowledge_base.md
     _append_knowledge_base(pattern, dry_run)
 
-    # Append short note to judge_findings.md for regression prevention
     if not dry_run and matched:
         regression_note = (
             f"\n## Human fix — {datetime.now(timezone.utc).strftime('%Y-%m-%d')}\n"
@@ -281,7 +269,6 @@ def capture_human_fix(dry_run: bool) -> None:
         _apply_findings(regression_note, dry_run=False)
         print(f"  ✓ Regression note appended to {FINDINGS_PATH}")
 
-    # Write update_log.json (merged log) — human fix record
     if not dry_run:
         record = {
             "timestamp":        datetime.now(timezone.utc).isoformat(),
@@ -292,7 +279,6 @@ def capture_human_fix(dry_run: bool) -> None:
             "matched_clusters": matched,
             "diff_size_lines":  len(diff.splitlines()),
         }
-        # Merge with existing update_log.json
         existing_records: list[dict] = []
         if UPDATE_LOG_PATH.exists():
             try:
@@ -312,7 +298,6 @@ def capture_human_fix(dry_run: bool) -> None:
 # ════════════════════════════════════════════════════════════════════════════
 
 def _blocking_to_knowledge_pattern(finding: str, spec_version: str) -> str:
-    """Convert a judge blocking issue into a knowledge_base.md Pattern entry."""
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     return (
         f"## Pattern — {now} (spec {spec_version})\n\n"
@@ -349,7 +334,7 @@ def _load_previous_fixes() -> dict:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Classify findings → suggested actions (unchanged from original)
+# Classify findings → suggested actions
 # ════════════════════════════════════════════════════════════════════════════
 
 _SPEC_EDGE_KEYWORDS = {
@@ -380,14 +365,14 @@ def _suggest_action(finding: str, severity: str, section_notes: str) -> tuple[st
 
     if any(kw in text for kw in _SPEC_EDGE_KEYWORDS):
         content = f"## Edge case: {finding[:80]}\n\nBehaviour: define exact behaviour for: {finding}\n"
-        return ACTION_ADDENDUM, "derived/spec/spec_addendum.md", content
+        return ACTION_ADDENDUM, "artifacts/knowledge/current/spec_addendum.md", content
 
     if any(kw in text for kw in _GLM_NOTE_KEYWORDS) or severity == "blocking":
         content = finding
-        return ACTION_GLM_NOTE, "generated/plan.json (global_notes)", content
+        return ACTION_GLM_NOTE, "artifacts/state/plan.json (global_notes)", content
 
     content = f"- {finding}"
-    return ACTION_FINDINGS_ADD, "derived/knowledge/findings.md", content
+    return ACTION_FINDINGS_ADD, "artifacts/knowledge/findings.md", content
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -493,11 +478,9 @@ def show_knowledge() -> None:
     else:
         print(KNOWLEDGE_BASE_PATH.read_text())
 
-    # Also show update_log.json summary (merged)
     if UPDATE_LOG_PATH.exists():
         logs = json.loads(UPDATE_LOG_PATH.read_text())
         print(f"\n── Update log: {len(logs)} total records ──")
-        # Show last 5 records, whichever type
         for r in logs[-5:]:
             mode = r.get("mode", "unknown")
             ts = r.get("timestamp", "")[:10] if "timestamp" in r else "?"
@@ -578,7 +561,6 @@ def main() -> None:
 
     print(f"\n[07b] Processing {len(all_findings)} finding(s) …\n")
 
-    # Load spec version for knowledge patterns
     spec_version = "unknown"
     spec_path = ROOT / "spec.md"
     if spec_path.exists():
@@ -622,7 +604,6 @@ def main() -> None:
             _print_spec_bump_advice(final_content)
             continue
 
-        # Blocking issues also get a knowledge_base.md entry
         if severity == "blocking" and final_action != ACTION_SKIP:
             kb_entry = _blocking_to_knowledge_pattern(finding, spec_version)
             _append_knowledge_base(kb_entry, dry_run=args.dry_run)
@@ -638,9 +619,8 @@ def main() -> None:
         else:
             print(f"  [warn] Unknown action: {final_action}")
 
-    # No pipeline_context.json update — removed as requested.
+    # No pipeline_context.json update — removed.
 
-    # Audit log — append to existing update_log.json (merged)
     if not args.dry_run:
         log_entry = {
             "timestamp":       now,

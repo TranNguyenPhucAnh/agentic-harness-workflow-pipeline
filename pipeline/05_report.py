@@ -1,7 +1,9 @@
 """
 pipeline/05_report.py
-Step 5b — Aggregate test_report.json + GLM plan metadata + other derived data
+Step 5b — Aggregate test_report.json + GLM plan metadata + other artifacts
           into reports/summary.md printed to $GITHUB_STEP_SUMMARY for the Actions UI.
+
+For taxonomy details see docs/artifacts.md
 """
 
 import json
@@ -12,12 +14,16 @@ ROOT        = Path(__file__).parent.parent
 REPORTS_DIR = ROOT / "reports"
 REPORTS_DIR.mkdir(exist_ok=True)
 
-# New paths
-GLM_PLAN_PATH = ROOT / "generated" / "plan.json"
-TEST_REPORT   = ROOT / "derived" / "run" / "test_report.json"
-SCAFFOLD_JSON = ROOT / "generated" / "scaffold.json"
-DELTA_JSON    = ROOT / "derived" / "spec" / "spec_delta.json"
-IMPL_RECORD   = ROOT / "derived" / "run" / "impl_record.json"
+# New artifact paths
+STATE_DIR  = ROOT / "artifacts" / "state"
+CACHE_DIR  = ROOT / "artifacts" / "cache"
+RUN_DIR    = ROOT / "artifacts" / "run"
+
+GLM_PLAN_PATH   = STATE_DIR / "plan.json"
+TEST_REPORT     = RUN_DIR   / "test_report.json"
+SCAFFOLD_JSON   = STATE_DIR / "scaffold.json"
+DELTA_JSON      = CACHE_DIR / "spec_delta.json"
+IMPL_RECORD     = RUN_DIR   / "impl_record.json"
 
 
 def load_test_report() -> dict | None:

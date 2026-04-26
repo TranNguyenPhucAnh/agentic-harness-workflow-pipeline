@@ -32,7 +32,9 @@ Phase flow:
     Phase D : rerun vitest → repeat
 
 Writes:
-    derived/run/test_report.json   (merged report with iteration details + escalated clusters)
+    artifacts/run/test_report.json   (merged report with iteration details + escalated clusters)
+
+For taxonomy details see docs/artifacts.md
 """
 
 from __future__ import annotations
@@ -51,9 +53,23 @@ import time
 
 ROOT        = Path(__file__).parent.parent
 SPEC_PATH   = ROOT / "spec.md"
-GLM_PLAN    = ROOT / "generated" / "plan.json"
-REPORTS_DIR = ROOT / "derived" / "run"
-REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+
+# New artifact paths
+STATE_DIR   = ROOT / "artifacts" / "state"
+CACHE_DIR   = ROOT / "artifacts" / "cache"
+RUN_DIR     = ROOT / "artifacts" / "run"
+KNOWLEDGE_DIR = ROOT / "artifacts" / "knowledge"
+
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+RUN_DIR.mkdir(parents=True, exist_ok=True)
+KNOWLEDGE_DIR.mkdir(parents=True, exist_ok=True)
+
+GLM_PLAN    = STATE_DIR / "plan.json"
+TEST_REPORT = RUN_DIR   / "test_report.json"
+# Knowledge files
+FINDINGS_PATH   = KNOWLEDGE_DIR / "findings.md"
+KNOWLEDGE_BASE  = KNOWLEDGE_DIR / "base.md"
 
 SRC_DIR = "src"
 
@@ -137,7 +153,7 @@ class IterationRecord:
 # ════════════════════════════════════════════════════════════════════════════
 
 def _load_spec() -> str:
-    compressed = ROOT / "derived" / "spec" / "spec_compressed.md"
+    compressed = CACHE_DIR / "spec_compressed.md"
     return compressed.read_text() if compressed.exists() else SPEC_PATH.read_text()
 
 def _openrouter_call(model_id: str, messages: list, max_tokens: int = 32768) -> str:
@@ -194,16 +210,8 @@ def _load_glm_global_notes() -> str:
 # Judge findings loader — cross-run regression prevention
 # ════════════════════════════════════════════════════════════════════════════
 
-FINDINGS_PATH = ROOT / "derived" / "knowledge" / "findings.md"
-
-
 def _load_judge_findings() -> str:
-    """
-    Load derived/knowledge/findings.md written by 07_fix_from_judge.py.
-    Returns empty string if file doesn't exist (first run, no judge yet).
-    Injected into both Minimax and Qwen prompts so the same mistakes
-    from previous runs are not repeated.
-    """
+    """Load artifacts/knowledge/findings.md written by 07_fix_from_judge.py."""
     if not FINDINGS_PATH.exists():
         return ""
     try:
@@ -412,11 +420,10 @@ def _build_qwen_system_with_findings(findings: str) -> str:
     )
 
 def _load_knowledge_base() -> str:
-    """Load derived/knowledge/base.md if it exists — accumulated human fix patterns."""
-    kb = ROOT / "derived" / "knowledge" / "base.md"
-    if not kb.exists():
+    """Load artifacts/knowledge/base.md if it exists — accumulated human fix patterns."""
+    if not KNOWLEDGE_BASE.exists():
         return ""
-    content = kb.read_text().strip()
+    content = KNOWLEDGE_BASE.read_text().strip()
     # Strip the file header (first 3 lines) — only pass the entries
     lines = content.splitlines()
     body_lines = [l for l in lines if not l.startswith("# ") and not l.startswith("_")]
@@ -438,8 +445,6 @@ def _build_minimax_system(global_notes: str, judge_findings: str = "") -> str:
         )
 
     # Knowledge base: accumulated patterns from human fixes
-    # Each entry documents a bug pattern that AI failed to fix autonomously.
-    # Injected here so Minimax learns from human interventions over time.
     kb_content = _load_knowledge_base()
     kb_block = (
         f"\n## Accumulated knowledge from human fixes — study these patterns\n"
@@ -1096,7 +1101,7 @@ def main() -> None:
             log_snippet=output[-1200:],
         ))
 
-    # ── Single merged report: derived/run/test_report.json ─────────────────────
+    # ── Single merged report: artifacts/run/test_report.json ─────────────────────
     final_passed = bool(iteration_records and iteration_records[-1].passed)
     report = {
         "impl":                 "qwen+minimax",
@@ -1107,9 +1112,9 @@ def main() -> None:
         "iterations":           [asdict(r) for r in iteration_records],
         "escalated":            escalated_log,    # merged here
     }
-    test_report_path = REPORTS_DIR / "test_report.json"
-    test_report_path.write_text(json.dumps(report, indent=2))
-    print(f"\n[04] Merged report → {test_report_path}")
+    TEST_REPORT.parent.mkdir(parents=True, exist_ok=True)
+    TEST_REPORT.write_text(json.dumps(report, indent=2))
+    print(f"\n[04] Merged report → {TEST_REPORT}")
     if escalated_log:
         print(f"[04] ⚠ {len(escalated_log)} cluster(s) escalated (see report['escalated'])")
 
