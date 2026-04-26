@@ -3,66 +3,17 @@ pipeline/spec_diff.py
 Spec diff engine — detect what changed between spec versions and map to affected files.
 
 Reads:
-    spec.md                          ← current spec (single source of truth)
-    derived/spec/spec_applied.json   ← last successfully applied version (harness writes this)
-    derived/spec/history/            ← raw spec snapshots per version
+    spec.md                              ← current spec (single source of truth)
+    artifacts/state/spec_applied.json    ← last successfully applied version
+    artifacts/knowledge/history/         ← raw spec snapshots per version
 
 Writes:
-    derived/spec/spec_delta.json     ← delta for this run (consumed by harness + downstream)
-    derived/spec/history/<ver>.md    ← raw snapshot of current spec
-    derived/spec/history/<ver>.changelog.md  ← human-readable changelog entry for this version
-    derived/spec/spec.changelog      ← aggregated changelog across all versions (git-style)
+    artifacts/cache/spec_delta.json      ← delta for this run
+    artifacts/knowledge/history/<ver>.md ← raw snapshot of current spec
+    artifacts/knowledge/history/<ver>.changelog.md ← changelog entry
+    artifacts/knowledge/history/spec.changelog    ← aggregated changelog
 
-Key design:
-    spec_diff compares current spec against the LAST SUCCESSFULLY APPLIED version
-    (from spec_applied.json), NOT simply the latest snapshot. This ensures that if a
-    run fails mid-way, the next run correctly re-applies all unapplied changes.
-
-    harness.py writes spec_applied.json at the end of each successful run.
-
-spec_delta.json schema:
-{
-  "from_version": "1.0.0",
-  "to_version":   "1.1.0",
-  "is_first_run": false,
-  "changed_sections":   ["4.3", "10"],
-  "unchanged_sections": ["1", "2", ...],
-  "new_sections":       [],
-  "removed_sections":   [],
-  "affected_files":     ["src/components/AnomalyFeed.tsx", ...],
-  "unaffected_files":   ["src/types/sensor.ts", ...],
-  "rerun_steps": {
-    "scaffold": true, "plan": true, "implement": true, "test": true, "judge": true
-  },
-  "section_summaries":  { "4.3": "added sensorId prop", "10": "AC-4 point count fix" }
-}
-
-spec.changelog format (appended, newest last):
-    ## [1.1.0] — 2026-04-25
-    ### Changed
-    - §4.3 AnomalyFeed: added sensorId prop
-    - §10 AC-4: updated point count from 2880 to 2016
-    ### Affected files
-    - src/components/AnomalyFeed.tsx
-    - tests/components/AnomalyFeed.test.tsx
-
-spec_applied.json schema:
-{
-  "last_applied_version": "1.1.0",
-  "applied_at": "2026-04-25T10:30:00Z",
-  "applied_steps": ["scaffold", "plan", "implement", "test"],
-  "final_status": "PASS",
-  "run_history": [
-    { "version": "1.0.0", "applied_at": "...", "status": "PASS", "steps": [...] },
-    { "version": "1.1.0", "applied_at": "...", "status": "PASS", "steps": [...] }
-  ]
-}
-
-Usage:
-    python pipeline/spec_diff.py              # called by harness before any step
-    python pipeline/spec_diff.py --show       # print delta, no writes
-    python pipeline/spec_diff.py --from 1.0.0 # force compare against specific version
-    python pipeline/spec_diff.py --history    # print aggregated changelog
+For taxonomy details see docs/artifacts.md
 """
 
 from __future__ import annotations
@@ -75,16 +26,25 @@ import sys
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
-ROOT         = Path(__file__).parent.parent
-SPEC_PATH    = ROOT / "spec.md"
-HISTORY_DIR  = ROOT / "derived" / "spec" / "history"
-DELTA_OUT    = ROOT / "derived" / "spec" / "spec_delta.json"
-APPLIED_PATH = ROOT / "derived" / "spec" / "spec_applied.json"
-CHANGELOG    = ROOT / "derived" / "spec" / "spec.changelog"
+ROOT = Path(__file__).parent.parent
+
+# New artifact paths
+SPEC_PATH = ROOT / "spec.md"
+STATE_DIR = ROOT / "artifacts" / "state"
+CACHE_DIR = ROOT / "artifacts" / "cache"
+KNOWLEDGE_HISTORY_DIR = ROOT / "artifacts" / "knowledge" / "history"
+
+DELTA_OUT = CACHE_DIR / "spec_delta.json"
+APPLIED_PATH = STATE_DIR / "spec_applied.json"
+
+# Ensure directories exist
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+KNOWLEDGE_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Section parser
+# Section parser (unchanged)
 # ════════════════════════════════════════════════════════════════════════════
 
 @dataclass
@@ -110,7 +70,6 @@ def parse_sections(text: str) -> dict[str, SpecSection]:
     Parse spec.md into sections keyed by number (e.g. "4", "4.3", "10").
     Handles both ## N. Title and ### N.M Title formats.
     """
-    # Match section headers: ## 0. Title or ## 4. Title or ### 4.3 Title
     header_re = re.compile(
         r"^(#{2,3})\s+(\d+(?:\.\d+)?)\.\s+(.+)$", re.MULTILINE
     )
@@ -133,13 +92,10 @@ def parse_sections(text: str) -> dict[str, SpecSection]:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# File→section mapping
+# File→section mapping (unchanged)
 # ════════════════════════════════════════════════════════════════════════════
 
-# Maps section keys to src/test files they govern.
-# Built from spec's "File:" declarations + known structural sections.
 _STATIC_SECTION_FILE_MAP: dict[str, list[str]] = {
-    # Component specs
     "4.1": ["src/components/SummaryStickyBar.tsx",
             "tests/components/SummaryStickyBar.test.tsx"],
     "4.2": ["src/components/ReplayControls.tsx",
@@ -152,31 +108,19 @@ _STATIC_SECTION_FILE_MAP: dict[str, list[str]] = {
             "tests/hooks/useSensorData.test.ts"],
     "4.6": ["src/hooks/useReplay.ts",
             "tests/hooks/useReplay.test.ts"],
-    # Shared types — affects all files that import from sensor.ts
     "5":   ["src/types/sensor.ts"],
-    # Constants — affects hooks that import from demoConstants
     "6":   ["src/data/demoConstants.ts"],
-    # File tree — scaffold re-run if this changes
-    "7":   [],   # handled separately as scaffold_trigger
-    # AC changes affect test files and judge
-    "10":  [],   # handled separately as test_trigger
-    # App shell
+    "7":   [],
+    "10":  [],
     "3":   ["src/App.tsx", "src/main.tsx"],
 }
 
-# Sections that trigger scaffold re-run regardless
 _SCAFFOLD_TRIGGER_SECTIONS = {"7", "8"}
-# Sections that trigger test re-run but not re-implement
 _TEST_ONLY_TRIGGER_SECTIONS = {"10"}
-# Sections that can be ignored for code generation
 _IGNORED_SECTIONS = {"0", "1", "2", "9", "11"}
 
 
 def _extract_file_map_from_spec(sections: dict[str, SpecSection]) -> dict[str, list[str]]:
-    """
-    Augment static map by scanning spec sections for `**File:** src/...` declarations.
-    This handles new components added to spec without updating the static map.
-    """
     file_map = {k: list(v) for k, v in _STATIC_SECTION_FILE_MAP.items()}
     file_re  = re.compile(r"\*\*File:\*\*\s+`(src/[^`]+)`")
 
@@ -186,7 +130,6 @@ def _extract_file_map_from_spec(sections: dict[str, SpecSection]) -> dict[str, l
             existing = file_map.setdefault(key, [])
             if fp not in existing:
                 existing.append(fp)
-                # Auto-add test file
                 test_fp = fp.replace("src/", "tests/", 1)
                 test_fp = re.sub(r"\.(tsx?)$", r".test.\1", test_fp)
                 test_fp = re.sub(r"\.(ts)$",   r".test.\1", test_fp)
@@ -201,10 +144,6 @@ def _files_for_changed_sections(
     file_map: dict[str, list[str]],
     all_known_files: list[str],
 ) -> tuple[list[str], list[str]]:
-    """
-    Given changed section keys, return (affected_files, unaffected_files).
-    Propagates: if §5 (types) changes, all files that import types are affected.
-    """
     affected: set[str] = set()
 
     for key in changed:
@@ -213,18 +152,15 @@ def _files_for_changed_sections(
         for fp in file_map.get(key, []):
             affected.add(fp)
 
-    # Propagation: §5 types change → all hooks + components affected
     if "5" in changed:
         for fp in all_known_files:
             if fp.startswith("src/hooks/") or fp.startswith("src/components/"):
                 affected.add(fp)
-            # corresponding test files
             test = fp.replace("src/", "tests/", 1)
             test = re.sub(r"\.(tsx?)$", r".test.\1", test)
             test = re.sub(r"\.(ts)$",   r".test.\1", test)
             affected.add(test)
 
-    # §6 constants change → hooks affected (they import constants)
     if "6" in changed:
         for fp in all_known_files:
             if fp.startswith("src/hooks/"):
@@ -246,10 +182,7 @@ def _decide_rerun_steps(
         return {"scaffold": True, "plan": True, "implement": True,
                 "test": True, "judge": True}
 
-    scaffold = (
-        bool(affected_files)
-        or any(k in _SCAFFOLD_TRIGGER_SECTIONS for k in changed)
-    )
+    scaffold = bool(affected_files) or any(k in _SCAFFOLD_TRIGGER_SECTIONS for k in changed)
     plan      = bool(affected_files)
     implement = bool(affected_files)
     test      = implement or any(k in _TEST_ONLY_TRIGGER_SECTIONS for k in changed)
@@ -265,20 +198,20 @@ def _decide_rerun_steps(
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# History management
+# History management (writing to knowledge/history/)
 # ════════════════════════════════════════════════════════════════════════════
 
 def _save_snapshot(version: str, text: str) -> None:
-    HISTORY_DIR.mkdir(parents=True, exist_ok=True)
-    path = HISTORY_DIR / f"{version}.md"
+    """Save raw spec snapshot to knowledge/history/<ver>.md"""
+    path = KNOWLEDGE_HISTORY_DIR / f"{version}.md"
     path.write_text(text)
 
 
 def _load_latest_snapshot(exclude_version: str) -> tuple[str | None, str | None]:
     """Return (version, text) of the most recent snapshot != exclude_version."""
-    if not HISTORY_DIR.exists():
+    if not KNOWLEDGE_HISTORY_DIR.exists():
         return None, None
-    snapshots = sorted(HISTORY_DIR.glob("*.md"), key=lambda p: p.stem)
+    snapshots = sorted(KNOWLEDGE_HISTORY_DIR.glob("*.md"), key=lambda p: p.stem)
     for snap in reversed(snapshots):
         ver = snap.stem
         if ver != exclude_version:
@@ -287,16 +220,15 @@ def _load_latest_snapshot(exclude_version: str) -> tuple[str | None, str | None]
 
 
 def _load_snapshot(version: str) -> str | None:
-    path = HISTORY_DIR / f"{version}.md"
+    path = KNOWLEDGE_HISTORY_DIR / f"{version}.md"
     return path.read_text() if path.exists() else None
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# spec_applied.json — last successfully applied version
+# Applied state (state/)
 # ════════════════════════════════════════════════════════════════════════════
 
 def load_applied() -> dict | None:
-    """Load spec_applied.json. Returns None if not present (first run)."""
     if not APPLIED_PATH.exists():
         return None
     try:
@@ -306,20 +238,11 @@ def load_applied() -> dict | None:
 
 
 def get_last_applied_version() -> str | None:
-    """Return the version string of the last successfully applied run."""
     applied = load_applied()
     return applied.get("last_applied_version") if applied else None
 
 
-def write_applied(
-    version: str,
-    steps: list[str],
-    status: str,
-) -> None:
-    """
-    Called by harness at end of successful run.
-    Appends to run_history and updates last_applied_version.
-    """
+def write_applied(version: str, steps: list[str], status: str) -> None:
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc).isoformat()
 
@@ -343,7 +266,6 @@ def write_applied(
 
 
 def print_run_history() -> None:
-    """Print run history from spec_applied.json."""
     applied = load_applied()
     if not applied:
         print("[spec_diff] No run history yet.")
@@ -357,14 +279,10 @@ def print_run_history() -> None:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# spec.changelog — aggregated human-readable changelog
+# Changelog management (knowledge/history/)
 # ════════════════════════════════════════════════════════════════════════════
 
 def _append_changelog(delta: "SpecDelta") -> None:
-    """
-    Append a git-style changelog entry to spec.changelog.
-    Also saves a per-version .changelog.md to spec_history/.
-    """
     from datetime import datetime, timezone
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
@@ -374,7 +292,6 @@ def _append_changelog(delta: "SpecDelta") -> None:
         "",
     ]
 
-    # Changed sections
     if delta.changed_sections or delta.new_sections or delta.removed_sections:
         if delta.new_sections:
             lines.append("### Added")
@@ -386,8 +303,6 @@ def _append_changelog(delta: "SpecDelta") -> None:
             lines.append("### Changed")
             for sec in delta.changed_sections:
                 note = delta.section_summaries.get(sec, "")
-                title = ""
-                # Try to get section title from current spec
                 lines.append(f"- §{sec}{': ' + note if note else ''}")
             lines.append("")
         if delta.removed_sections:
@@ -398,14 +313,12 @@ def _append_changelog(delta: "SpecDelta") -> None:
     else:
         lines += ["### No section changes detected", ""]
 
-    # Affected files
     if delta.affected_files:
         lines.append("### Affected files")
         for fp in delta.affected_files:
             lines.append(f"- `{fp}`")
         lines.append("")
 
-    # Re-run steps
     rerun = [k for k, v in delta.rerun_steps.items() if v]
     if rerun:
         lines.append(f"### Steps re-run: {', '.join(rerun)}")
@@ -416,26 +329,24 @@ def _append_changelog(delta: "SpecDelta") -> None:
     entry = "\n".join(lines)
 
     # Append to aggregated spec.changelog
-    CHANGELOG.parent.mkdir(parents=True, exist_ok=True)
-    existing = CHANGELOG.read_text() if CHANGELOG.exists() else ""
-    CHANGELOG.write_text(existing + entry)
+    changelog_path = KNOWLEDGE_HISTORY_DIR / "spec.changelog"
+    existing = changelog_path.read_text() if changelog_path.exists() else ""
+    changelog_path.write_text(existing + entry)
 
-    # Also save per-version changelog to history dir
-    HISTORY_DIR.mkdir(parents=True, exist_ok=True)
-    cl_path = HISTORY_DIR / f"{delta.to_version}.changelog.md"
+    # Also save per-version changelog
+    cl_path = KNOWLEDGE_HISTORY_DIR / f"{delta.to_version}.changelog.md"
     cl_path.write_text(entry)
 
 
 def print_changelog(n: int = 0) -> None:
-    """Print aggregated changelog. n=0 means all."""
-    if not CHANGELOG.exists():
+    changelog_path = KNOWLEDGE_HISTORY_DIR / "spec.changelog"
+    if not changelog_path.exists():
         print("[spec_diff] No changelog yet.")
         return
-    content = CHANGELOG.read_text()
+    content = changelog_path.read_text()
     if not n:
         print(content)
         return
-    # Print last n entries (split on "## [")
     entries = re.split(r"(?=^## \[)", content, flags=re.MULTILINE)
     entries = [e for e in entries if e.strip()]
     for entry in entries[-n:]:
@@ -443,20 +354,15 @@ def print_changelog(n: int = 0) -> None:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Section summary generator (one-liner per changed section)
+# Section summary generator (unchanged)
 # ════════════════════════════════════════════════════════════════════════════
 
 def _summarise_change(key: str, old_content: str, new_content: str) -> str:
-    """
-    Produce a terse one-line human-readable summary of what changed in a section.
-    Uses simple heuristics — no LLM call.
-    """
     old_lines = set(old_content.splitlines())
     new_lines = set(new_content.splitlines())
     added   = [l.strip() for l in (new_lines - old_lines) if l.strip()]
     removed = [l.strip() for l in (old_lines - new_lines) if l.strip()]
 
-    # Prioritise interface/type/prop changes
     prop_added   = [l for l in added   if l.startswith(("export ", "interface ", "type ", "  ")) and ":" in l]
     prop_removed = [l for l in removed if l.startswith(("export ", "interface ", "type ", "  ")) and ":" in l]
 
@@ -476,7 +382,7 @@ def _summarise_change(key: str, old_content: str, new_content: str) -> str:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Core diff logic
+# Core diff logic (unchanged)
 # ════════════════════════════════════════════════════════════════════════════
 
 @dataclass
@@ -486,12 +392,12 @@ class SpecDelta:
     is_first_run:       bool
     changed_sections:   list[str]
     unchanged_sections: list[str]
-    new_sections:       list[str]          # sections in new spec not in old
-    removed_sections:   list[str]          # sections in old spec not in new
+    new_sections:       list[str]
+    removed_sections:   list[str]
     affected_files:     list[str]
     unaffected_files:   list[str]
     rerun_steps:        dict[str, bool]
-    section_summaries:  dict[str, str]     # key → one-liner
+    section_summaries:  dict[str, str]
 
 
 def compute_delta(
@@ -506,7 +412,6 @@ def compute_delta(
     prev_ver     = parse_spec_version(previous_text) if previous_text else None
     prev_secs    = parse_sections(previous_text) if previous_text else {}
 
-    # Detect changed, new, removed sections
     changed:   list[str] = []
     unchanged: list[str] = []
     new_secs:  list[str] = []
@@ -529,15 +434,11 @@ def compute_delta(
         else:
             unchanged.append(key)
 
-    # All sections changed on first run
     if is_first_run:
         changed   = sorted(current_secs.keys(), key=lambda k: [int(x) for x in k.split(".")])
         unchanged = []
 
-    # Build file map from current spec
     file_map = _extract_file_map_from_spec(current_secs)
-
-    # Gather all known files
     if all_known_files is None:
         all_known_files = []
         for files in file_map.values():
@@ -581,7 +482,6 @@ def main() -> None:
                         help="With --history: show only last N changelog entries (0=all)")
     args = parser.parse_args()
 
-    # ── --history: show changelog + run history, no diff ─────────────────────
     if args.history:
         print_changelog(n=args.last)
         print_run_history()
@@ -594,10 +494,7 @@ def main() -> None:
     current_text = SPEC_PATH.read_text()
     current_ver  = parse_spec_version(current_text)
 
-    # ── Determine baseline version ────────────────────────────────────────────
-    # Priority: --from flag > last applied version > latest snapshot
-    # Using last APPLIED (not just latest snapshot) ensures failed runs don't
-    # cause the next run to miss unapplied changes.
+    # Determine baseline
     if args.from_version:
         prev_text = _load_snapshot(args.from_version)
         if prev_text is None:
@@ -611,7 +508,6 @@ def main() -> None:
             prev_text = _load_snapshot(last_applied)
             baseline_source = f"last applied ({last_applied})"
         else:
-            # Fall back to latest snapshot (handles case where applied == current)
             _, prev_text = _load_latest_snapshot(exclude_version=current_ver)
             baseline_source = "latest snapshot"
 
@@ -619,7 +515,6 @@ def main() -> None:
 
     delta = compute_delta(current_text, prev_text)
 
-    # ── Print summary ─────────────────────────────────────────────────────────
     print(f"[spec_diff] {delta.from_version or '(none)'} → {delta.to_version}")
     if delta.is_first_run:
         print("[spec_diff] First run — full pipeline required.")
@@ -641,19 +536,17 @@ def main() -> None:
     if args.show:
         return
 
-    # ── Write outputs ─────────────────────────────────────────────────────────
+    # Write outputs
     DELTA_OUT.parent.mkdir(parents=True, exist_ok=True)
     DELTA_OUT.write_text(json.dumps(asdict(delta), indent=2))
     print(f"[spec_diff] Delta     → {DELTA_OUT}")
 
-    # Raw snapshot
     _save_snapshot(current_ver, current_text)
-    print(f"[spec_diff] Snapshot  → {HISTORY_DIR}/{current_ver}.md")
+    print(f"[spec_diff] Snapshot  → {KNOWLEDGE_HISTORY_DIR}/{current_ver}.md")
 
-    # Changelog entry (only on actual version change, not same-version re-runs)
     if delta.from_version != delta.to_version or delta.is_first_run:
         _append_changelog(delta)
-        print(f"[spec_diff] Changelog → {CHANGELOG}  "
+        print(f"[spec_diff] Changelog → {KNOWLEDGE_HISTORY_DIR}/spec.changelog  "
               f"(entry for {delta.to_version})")
 
 
