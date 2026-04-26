@@ -1,7 +1,7 @@
 """
 pipeline/05_report.py
-Step 5b — Aggregate iteration JSON + GLM plan metadata into reports/summary.md
-          This file is printed to $GITHUB_STEP_SUMMARY for the Actions UI.
+Step 5b — Aggregate test_report.json + GLM plan metadata + other derived data
+          into reports/summary.md printed to $GITHUB_STEP_SUMMARY for the Actions UI.
 """
 
 import json
@@ -12,14 +12,19 @@ ROOT        = Path(__file__).parent.parent
 REPORTS_DIR = ROOT / "reports"
 REPORTS_DIR.mkdir(exist_ok=True)
 
-GLM_PLAN_PATH = ROOT / "scaffold" / "glm_plan.json"
+# New paths
+GLM_PLAN_PATH = ROOT / "generated" / "plan.json"
+TEST_REPORT   = ROOT / "derived" / "run" / "test_report.json"
+SCAFFOLD_JSON = ROOT / "generated" / "scaffold.json"
+DELTA_JSON    = ROOT / "derived" / "spec" / "spec_delta.json"
+IMPL_RECORD   = ROOT / "derived" / "run" / "impl_record.json"
 
 
-def load_report(impl: str) -> dict | None:
-    p = REPORTS_DIR / f"{impl}_iterations.json"
-    if not p.exists():
+def load_test_report() -> dict | None:
+    """Load the merged test report (iterations + escalated)."""
+    if not TEST_REPORT.exists():
         return None
-    return json.loads(p.read_text())
+    return json.loads(TEST_REPORT.read_text())
 
 
 def load_glm_plan() -> dict | None:
@@ -69,11 +74,11 @@ def main():
         lines += [
             "## GLM 5.1 — Planner output",
             "",
-            "_No glm_plan.json found — pipeline ran in `--only-qwen` mode._",
+            "_No plan.json found — pipeline ran without GLM planner._",
             "",
         ]
 
-    # ── Qwen test results ────────────────────────────────────────────────────
+    # ── Qwen + Minimax test results ──────────────────────────────────────────
     lines += [
         "## Qwen 3.6+ (surface) + Minimax 2.7 (logic) — Executor results",
         "",
@@ -81,31 +86,31 @@ def main():
         "|---|---|---|---|",
     ]
 
-    qwen_report = load_report("qwen")
+    test_report = load_test_report()
     all_passed = True
     details: list[str] = []
 
-    if qwen_report is None:
-        lines.append("| QWEN | ⚠️ No report | — | Report file missing |")
+    if test_report is None:
+        lines.append("| QWEN+MINIMAX | ⚠️ No report | — | Report file missing |")
         all_passed = False
     else:
-        final = qwen_report["final_status"] == "PASS"
+        final = test_report["final_status"] == "PASS"
         if not final:
             all_passed = False
 
-        last    = qwen_report["iterations"][-1] if qwen_report["iterations"] else {}
+        last    = test_report["iterations"][-1] if test_report["iterations"] else {}
         summary = last.get("summary", "—")
-        iters   = qwen_report["total_iterations"]
-        max_i   = qwen_report.get("max_iter", 3)
-        max_ca  = qwen_report.get("max_cluster_attempts", 2)
+        iters   = test_report["total_iterations"]
+        max_i   = test_report.get("max_iter", 3)
+        max_ca  = test_report.get("max_cluster_attempts", 2)
 
         lines.append(
-            f"| QWEN | {render_status(final)} | {iters} / {max_i} | {summary} |"
+            f"| QWEN+MINIMAX | {render_status(final)} | {iters} / {max_i} | {summary} |"
         )
 
         # Detailed iteration breakdown
-        details.append("\n### QWEN — iteration detail\n")
-        for it in qwen_report["iterations"]:
+        details.append("\n### Iteration details\n")
+        for it in test_report["iterations"]:
             is_last = it["iteration"] == iters
             icon = "✅" if it["passed"] else ("❌" if is_last else "🔄")
             details.append(f"**Iteration {it['iteration']}** {icon}  ")
@@ -133,7 +138,7 @@ def main():
                     )
             details.append("")
 
-        impl_label = qwen_report.get("impl", "qwen+minimax")
+        impl_label = test_report.get("impl", "qwen+minimax")
         details.append(f"\n_Config: impl={impl_label}, max_iter={max_i}, max_cluster_attempts={max_ca}_\n")
 
     lines.append("")
@@ -143,9 +148,8 @@ def main():
     lines += details
 
     # ── Scaffold summary ─────────────────────────────────────────────────────
-    scaffold_json = ROOT / "scaffold" / "scaffold.json"
-    if scaffold_json.exists():
-        scaffold = json.loads(scaffold_json.read_text())
+    if SCAFFOLD_JSON.exists():
+        scaffold = json.loads(SCAFFOLD_JSON.read_text())
         n_src   = sum(1 for f in scaffold["files"] if not f.get("is_test"))
         n_tests = sum(1 for f in scaffold["files"] if f.get("is_test"))
         lines += [
@@ -156,11 +160,10 @@ def main():
             f"- Test files generated: {n_tests}",
         ]
 
-    # ── Escalated clusters ───────────────────────────────────────────────────
-    esc_json = REPORTS_DIR / "escalated_clusters.json"
-    if esc_json.exists():
-        esc = json.loads(esc_json.read_text())
-        n = esc.get("total_escalated", 0)
+    # ── Escalated clusters (from test_report.json["escalated"]) ───────────────
+    if test_report and test_report.get("escalated"):
+        esc = test_report["escalated"]
+        n = len(esc)
         lines += [
             "",
             "## ⚠️ Escalated Clusters (require human review)",
@@ -170,15 +173,14 @@ def main():
             "| Cluster | Failures | Note |",
             "|---|---|---|",
         ]
-        for c in esc.get("clusters", []):
+        for c in esc:
             lines.append(
                 f"| `{c['cluster']}` | {c['failures']} | {c.get('note', '—')} |"
             )
 
     # ── Spec delta summary ───────────────────────────────────────────────────
-    delta_json = ROOT / "scaffold" / "spec_delta.json"
-    if delta_json.exists():
-        delta = json.loads(delta_json.read_text())
+    if DELTA_JSON.exists():
+        delta = json.loads(DELTA_JSON.read_text())
         fv = delta.get("from_version") or "(none)"
         tv = delta.get("to_version", "?")
         is_first = delta.get("is_first_run", False)
@@ -214,10 +216,9 @@ def main():
                 lines.append(f"- `{fp}`")
             lines += ["", "</details>", ""]
 
-    # ── Impl record ──────────────────────────────────────────────────────────
-    impl_record = ROOT / "scaffold" / "impl_qwen.json"
-    if impl_record.exists():
-        rec          = json.loads(impl_record.read_text())
+    # ── Implementation record ─────────────────────────────────────────────────
+    if IMPL_RECORD.exists():
+        rec          = json.loads(IMPL_RECORD.read_text())
         mode         = rec.get("mode", "unknown")
         written      = rec.get("files", [])
         skipped_d    = rec.get("skipped_delta", [])

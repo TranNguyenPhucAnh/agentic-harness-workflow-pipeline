@@ -25,10 +25,10 @@ Generation flags (control Steps 1–3):
   --dry-run              Print what WOULD run without executing anything.
                          Useful to verify delta decisions before committing.
  
-  --skip-scaffold        Skip Step 2 (Gemini). Reuse existing scaffold/scaffold.json.
+  --skip-scaffold        Skip Step 2 (Gemini). Reuse existing generated/scaffold.json.
                          Use when spec §7/§8 (file tree + schema) did NOT change.
  
-  --skip-plan            Skip Step 3b (GLM). Reuse existing scaffold/glm_plan.json.
+  --skip-plan            Skip Step 3b (GLM). Reuse existing generated/plan.json.
                          Use when you want to re-implement but keep the same plan.
  
   --only-qwen            Skip Step 3b entirely (no GLM plan at all).
@@ -136,9 +136,19 @@ from pathlib import Path
 
 ROOT = Path(__file__).parent
 
-DELTA_PATH   = ROOT / "scaffold" / "spec_delta.json"
-PREV_SRC_DIR = ROOT / "scaffold" / "prev_src"
+# New paths
+DELTA_PATH   = ROOT / "derived" / "spec" / "spec_delta.json"
+PREV_SRC_DIR = ROOT / "scaffold" / "prev_src"   # scratch, remains under scaffold
+SCAFFOLD_JSON = ROOT / "generated" / "scaffold.json"
+GLM_PLAN_PATH = ROOT / "generated" / "plan.json"
+IMPL_RECORD_PATH = ROOT / "derived" / "run" / "impl_record.json"
+UPDATE_LOG_PATH = ROOT / "derived" / "run" / "update_log.json"  # judge fix log
 
+# Ensure directories exist
+DELTA_PATH.parent.mkdir(parents=True, exist_ok=True)
+SCAFFOLD_JSON.parent.mkdir(parents=True, exist_ok=True)
+IMPL_RECORD_PATH.parent.mkdir(parents=True, exist_ok=True)
+UPDATE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 # ════════════════════════════════════════════════════════════════════════════
 # Core helpers
@@ -359,7 +369,7 @@ def _run_judge_fix_loop(args, results: dict) -> None:
 
             if not fix_ok:
                 print(f"\n[harness] ⚠ Judge fix failed (vitest still failing after patches).")
-                print(f"[harness] Human review required — see reports/judge_fix_report.json")
+                print(f"[harness] Human review required — see {UPDATE_LOG_PATH}")
                 break
 
             # Fix applied and vitest green → refresh report + re-judge
@@ -430,7 +440,7 @@ def _run_fix_from_existing_judge(args, results: dict) -> None:
 
     if not fix_ok:
         print(f"\n[harness] ⚠ Fix failed (vitest still failing after patches).")
-        print(f"[harness] Human review required — see reports/judge_fix_report.json")
+        print(f"[harness] Human review required — see {UPDATE_LOG_PATH}")
         return
 
     # Fix applied → refresh report → re-judge once for final sign-off
@@ -471,8 +481,8 @@ def main() -> None:
                         help="Skip GLM planning (overrides delta)")
     parser.add_argument("--retry-impl", action="store_true",
                         help="Retry only failed files from last impl run "
-                         "(reads impl_qwen.json failed_files). "
-                         "Implies --skip-scaffold --skip-plan.")
+                        "(reads impl_qwen.json failed_files). "
+                        "Implies --skip-scaffold --skip-plan.")
     parser.add_argument("--only-qwen", action="store_true",
                         help="Skip GLM planning entirely; Qwen single-call mode")
     parser.add_argument("--test-only", action="store_true",
@@ -567,29 +577,27 @@ def main() -> None:
             print("\n[harness] Scaffold failed. Stopping.")
             sys.exit(1)
     else:
-        if not check_file_exists(ROOT / "scaffold" / "scaffold.json", "--skip-scaffold"):
+        if not check_file_exists(SCAFFOLD_JSON, "--skip-scaffold"):
             sys.exit(1)
-        skip_step("Step 2 — Gemini scaffold", "reusing scaffold/scaffold.json")
+        skip_step("Step 2 — Gemini scaffold", f"reusing {SCAFFOLD_JSON.relative_to(ROOT)}")
 
     # ── Step 3b: GLM plan ────────────────────────────────────────────────────
-    glm_plan_path = ROOT / "scaffold" / "glm_plan.json"
-
     if args.only_qwen:
         skip_step("Step 3b — GLM 5.1 plan", "--only-qwen")
         plan_available = False
 
     elif args.test_only:
-        plan_available = glm_plan_path.exists()
+        plan_available = GLM_PLAN_PATH.exists()
         reason = ("reusing existing glm_plan.json" if plan_available
-                  else "no glm_plan.json found")
+                  else "no plan.json found")
         skip_step("Step 3b — GLM 5.1 plan", f"--test-only ({reason})")
 
     elif args.skip_plan:
-        if not check_file_exists(glm_plan_path, "--skip-plan"):
+        if not check_file_exists(GLM_PLAN_PATH, "--skip-plan"):
             print("          Tip: run without --skip-plan to regenerate, "
                   "or use --only-qwen to skip planning entirely.")
             sys.exit(1)
-        skip_step("Step 3b — GLM 5.1 plan", "reusing scaffold/glm_plan.json")
+        skip_step("Step 3b — GLM 5.1 plan", f"reusing {GLM_PLAN_PATH.relative_to(ROOT)}")
         plan_available = True
 
     else:
@@ -620,22 +628,21 @@ def main() -> None:
     
         # --retry-impl overrides delta --only-files
         if args.retry_impl:
-            impl_rec_path = ROOT / "scaffold" / "impl_qwen.json"
-            if impl_rec_path.exists():
+            if IMPL_RECORD_PATH.exists():
                 try:
-                    rec    = json.loads(impl_rec_path.read_text())
+                    rec    = json.loads(IMPL_RECORD_PATH.read_text())
                     failed = rec.get("failed_files", [])
                     if failed:
                         qwen_args += ["--only-files", ",".join(failed)]
                         print(f"[harness] --retry-impl: retrying {len(failed)} failed file(s).")
                     else:
-                        print("[harness] --retry-impl: no failed_files in impl_qwen.json — nothing to retry.")
+                        print("[harness] --retry-impl: no failed_files in impl_record.json — nothing to retry.")
                         sys.exit(0)
                 except Exception:
-                    print("[harness] --retry-impl: could not read impl_qwen.json.")
+                    print("[harness] --retry-impl: could not read impl_record.json.")
                     sys.exit(1)
             else:
-                print("[harness] --retry-impl: impl_qwen.json not found — run full impl first.")
+                print("[harness] --retry-impl: impl_record.json not found — run full impl first.")
                 sys.exit(1)
     
         # Delta --only-files (skipped when --retry-impl already set --only-files)
@@ -662,10 +669,9 @@ def main() -> None:
         results["impl_qwen"] = ok
     
         if not ok:
-            impl_rec_path = ROOT / "scaffold" / "impl_qwen.json"
-            if impl_rec_path.exists():
+            if IMPL_RECORD_PATH.exists():
                 try:
-                    rec    = json.loads(impl_rec_path.read_text())
+                    rec    = json.loads(IMPL_RECORD_PATH.read_text())
                     failed = rec.get("failed_files", [])
                     if failed:
                         print(f"\n[harness] {len(failed)} file(s) failed to implement:")

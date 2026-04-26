@@ -8,14 +8,14 @@ Modes:
         Falls back to original single-call behaviour if only 1 file.
 
     With GLM plan (--use-glm-plan):
-        Reads scaffold/glm_plan.json produced by 03b_implement_glm.py.
+        Reads generated/plan.json produced by 03b_implement_glm.py.
         For each file, injects the matching GLM task (sub_tasks, gotchas,
         tailwind_hints, depends_on) into the prompt before generating.
         Files are generated in implementation_order from the plan.
 
 Writes:
     src/**  (non-test files only)
-    scaffold/impl_qwen.json
+    derived/run/impl_record.json
 """
 
 from __future__ import annotations
@@ -35,17 +35,15 @@ MODEL              = "qwen/qwen3.6-plus"
 
 ROOT          = Path(__file__).parent.parent
 SPEC_PATH     = ROOT / "spec.md"
-SCAFFOLD_JSON = ROOT / "scaffold" / "scaffold.json"
-INSTRUCTIONS  = ROOT / "scaffold" / "instructions_qwen.txt"
-GLM_PLAN      = ROOT / "scaffold" / "glm_plan.json"
-IMPL_RECORD   = ROOT / "scaffold" / "impl_qwen.json"
-PIPELINE_CTX  = ROOT / "scaffold" / "pipeline_context.json"
+SCAFFOLD_JSON = ROOT / "generated" / "scaffold.json"
+GLM_PLAN      = ROOT / "generated" / "plan.json"
+IMPL_RECORD   = ROOT / "derived" / "run" / "impl_record.json"
 
 # ── System prompts ────────────────────────────────────────────────────────────
 
 def _load_spec() -> str:
-    compressed = ROOT / "scaffold" / "spec_compressed.md"
-    return compressed.read_text() if compressed.exists() else (ROOT / "spec.md").read_text()
+    compressed = ROOT / "derived" / "spec" / "spec_compressed.md"
+    return compressed.read_text() if compressed.exists() else SPEC_PATH.read_text()
 
 def build_system_prompt_single(instructions: str) -> str:
     """Original single-call prompt — used when no GLM plan is available."""
@@ -289,11 +287,11 @@ def implement_file(
     if approx_tokens > 28000:
         print(f"[03a] ⚠ Large prompt for {file_path}: ~{approx_tokens:,} tokens "
               f"(limit ~32k). Response may be truncated.", file=sys.stderr)
- 
+
     print(f"[03a]   → Implementing {file_path} …")
     raw    = _call_qwen(build_system_prompt_per_file(), user_msg)
     result = _parse_json(raw, file_path)
- 
+
     if "files" in result and isinstance(result["files"], list):
         for entry in result["files"]:
             if entry.get("file_path") == file_path:
@@ -353,21 +351,20 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--use-glm-plan", action="store_true",
-        help="Inject scaffold/glm_plan.json as per-file implementation guidance",
+        help="Inject generated/plan.json as per-file implementation guidance",
     )
-    
     parser.add_argument(
-    "--only-files",
-    default="",
-    help="Comma-separated src/ paths to implement (delta mode). "
-         "All other stubs are skipped — assumed already restored by harness.",
+        "--only-files",
+        default="",
+        help="Comma-separated src/ paths to implement (delta mode). "
+             "All other stubs are skipped — assumed already restored by harness.",
     )
-
     args = parser.parse_args()
 
     spec      = _load_spec()
     scaffold  = json.loads(SCAFFOLD_JSON.read_text())
-    instrs    = INSTRUCTIONS.read_text() if INSTRUCTIONS.exists() else ""
+    # Read instructions from scaffold.json instead of separate file
+    instrs    = scaffold.get("implementation_instructions", {}).get("for_qwen", "")
 
     all_stubs = [f for f in scaffold["files"] if not f.get("is_test")]
 
@@ -390,7 +387,7 @@ def main() -> None:
 
     if args.use_glm_plan:
         if not GLM_PLAN.exists():
-            print("[03a] ERROR: --use-glm-plan set but scaffold/glm_plan.json not found.")
+            print("[03a] ERROR: --use-glm-plan set but generated/plan.json not found.")
             print("             Run 03b_implement_glm.py first.")
             sys.exit(1)
         plan = json.loads(GLM_PLAN.read_text())
@@ -407,7 +404,7 @@ def main() -> None:
     if plan:
         # Per-file generation in plan order
         ordered = order_stubs(stub_files, plan)
-        
+
         # In delta mode, seed already_written with restored (unaffected) files
         # so Qwen has full import context without re-implementing them.
         already_written: dict[str, str] = (
@@ -467,7 +464,9 @@ def main() -> None:
     skipped_delta = sorted(
         {f["file_path"] for f in all_stubs} - only_set
     ) if only_set else []
-    
+
+    # Ensure output directory exists
+    IMPL_RECORD.parent.mkdir(parents=True, exist_ok=True)
     IMPL_RECORD.write_text(json.dumps({
         "model":         "qwen",
         "mode":          mode,
@@ -475,7 +474,7 @@ def main() -> None:
         "skipped_delta": skipped_delta,
         "failed_files":  failed_files,
     }, indent=2))
-    
+
     if failed_files:
         print(f"[03a] Done with {len(written)} files written, {len(failed_files)} failed: {failed_files}", file=sys.stderr)
         sys.exit(1)

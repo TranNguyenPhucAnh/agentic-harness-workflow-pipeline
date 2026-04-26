@@ -4,14 +4,14 @@ Spec diff engine — detect what changed between spec versions and map to affect
 
 Reads:
     spec.md                          ← current spec (single source of truth)
-    scaffold/spec_applied.json       ← last successfully applied version (harness writes this)
-    scaffold/spec_history/           ← raw spec snapshots per version
+    derived/spec/spec_applied.json   ← last successfully applied version (harness writes this)
+    derived/spec/history/            ← raw spec snapshots per version
 
 Writes:
-    scaffold/spec_delta.json         ← delta for this run (consumed by harness + downstream)
-    scaffold/spec_history/<ver>.md   ← raw snapshot of current spec
-    scaffold/spec_history/<ver>.changelog.md  ← human-readable changelog entry for this version
-    spec.changelog                   ← aggregated changelog across all versions (git-style)
+    derived/spec/spec_delta.json     ← delta for this run (consumed by harness + downstream)
+    derived/spec/history/<ver>.md    ← raw snapshot of current spec
+    derived/spec/history/<ver>.changelog.md  ← human-readable changelog entry for this version
+    derived/spec/spec.changelog      ← aggregated changelog across all versions (git-style)
 
 Key design:
     spec_diff compares current spec against the LAST SUCCESSFULLY APPLIED version
@@ -77,10 +77,10 @@ from pathlib import Path
 
 ROOT         = Path(__file__).parent.parent
 SPEC_PATH    = ROOT / "spec.md"
-HISTORY_DIR  = ROOT / "scaffold" / "spec_history"
-DELTA_OUT    = ROOT / "scaffold" / "spec_delta.json"
-APPLIED_PATH = ROOT / "scaffold" / "spec_applied.json"
-CHANGELOG    = ROOT / "spec.changelog"
+HISTORY_DIR  = ROOT / "derived" / "spec" / "history"
+DELTA_OUT    = ROOT / "derived" / "spec" / "spec_delta.json"
+APPLIED_PATH = ROOT / "derived" / "spec" / "spec_applied.json"
+CHANGELOG    = ROOT / "derived" / "spec" / "spec.changelog"
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -416,6 +416,7 @@ def _append_changelog(delta: "SpecDelta") -> None:
     entry = "\n".join(lines)
 
     # Append to aggregated spec.changelog
+    CHANGELOG.parent.mkdir(parents=True, exist_ok=True)
     existing = CHANGELOG.read_text() if CHANGELOG.exists() else ""
     CHANGELOG.write_text(existing + entry)
 
