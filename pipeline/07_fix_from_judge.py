@@ -47,7 +47,7 @@ import time
 
 ROOT         = Path(__file__).parent.parent
 SPEC_PATH    = ROOT / "spec.md"
-REPORTS_DIR  = ROOT / "reports"
+REPORTS_DIR = ROOT / "artifacts" / "reports"
 REPORTS_DIR.mkdir(exist_ok=True)
 
 # New artifact paths
