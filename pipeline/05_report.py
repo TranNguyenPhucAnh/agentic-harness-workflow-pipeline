@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT        = Path(__file__).parent.parent
-REPORTS_DIR = ROOT / "reports"
+REPORTS_DIR = ROOT / "artifacts" / "reports"
 REPORTS_DIR.mkdir(exist_ok=True)
 
 # New artifact paths
