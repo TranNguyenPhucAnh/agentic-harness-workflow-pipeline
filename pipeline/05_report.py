@@ -25,6 +25,8 @@ SCAFFOLD_JSON   = STATE_DIR / "scaffold.json"
 DELTA_JSON      = CACHE_DIR / "spec_delta.json"
 IMPL_RECORD     = RUN_DIR   / "impl_record.json"
 
+SUMMARY_PATH    = REPORTS_DIR / "summary.md"
+JUDGE_REPORT    = REPORTS_DIR / "judge_report.md"
 
 def load_test_report() -> dict | None:
     """Load the merged test report (iterations + escalated)."""
