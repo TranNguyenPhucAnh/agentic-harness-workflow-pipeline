@@ -412,26 +412,48 @@ def _build_qwen_system_with_findings(findings: str) -> str:
         + FIX_SYSTEM_QWEN
     )
 
+def _load_knowledge_base() -> str:
+    """Load knowledge_base.md if it exists — accumulated human fix patterns."""
+    kb = ROOT / "scaffold" / "knowledge_base.md"
+    if not kb.exists():
+        return ""
+    content = kb.read_text().strip()
+    # Strip the file header (first 3 lines) — only pass the entries
+    lines = content.splitlines()
+    body_lines = [l for l in lines if not l.startswith("# ") and not l.startswith("_")]
+    return "\n".join(body_lines).strip()
+
+
 def _build_minimax_system(global_notes: str, judge_findings: str = "") -> str:
     notes_block = (
         f"\n## GLM Architect's Global Notes (MUST follow)\n{global_notes}\n"
         if global_notes else ""
     )
-    
-    # Judge findings block: show blocking issues (already fixed) as a
-    # "do not reintroduce" checklist, and non-blocking as watch-outs.
-    # Placed after global_notes so it acts as a second reinforcement layer.
+
+    # Judge findings: blocking issues as "do not reintroduce" checklist
     findings_block = ""
     if judge_findings:
-        # Extract all sections — Minimax gets the full picture
         findings_block = (
             f"\n## Judge findings from previous run — do NOT reintroduce\n"
             f"{judge_findings}\n"
         )
 
+    # Knowledge base: accumulated patterns from human fixes
+    # Each entry documents a bug pattern that AI failed to fix autonomously.
+    # Injected here so Minimax learns from human interventions over time.
+    kb_content = _load_knowledge_base()
+    kb_block = (
+        f"\n## Accumulated knowledge from human fixes — study these patterns\n"
+        f"These are bugs that the AI repair loop could NOT fix — a human had to\n"
+        f"intervene. Pay close attention: if the current cluster resembles any of\n"
+        f"these patterns, apply the same fix strategy.\n\n"
+        f"{kb_content}\n"
+        if kb_content else ""
+    )
+
     return f"""\
 You are a senior TypeScript logic debugger specialising in hooks and data generation.
-{notes_block}{findings_block}
+{notes_block}{findings_block}{kb_block}
 You receive a failing cluster for a hook or data file.
 Fix the LOGIC — not the UI, not the styling.
 
@@ -450,8 +472,9 @@ WHAT TO FIX:
 HOW:
   1. Read each test assertion as a hard requirement.
   2. Trace the state timeline step by step.
-  3. Identify the root cause — one specific line or function.
-  4. Rewrite ONLY the broken function(s). Leave everything else intact.
+  3. If this cluster resembles a pattern in the knowledge base above, apply that fix.
+  4. Identify the root cause — one specific line or function.
+  5. Rewrite ONLY the broken function(s). Leave everything else intact.
 
 Return JSON:
 {{
