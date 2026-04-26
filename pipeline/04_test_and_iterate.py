@@ -32,8 +32,7 @@ Phase flow:
     Phase D : rerun vitest → repeat
 
 Writes:
-    reports/qwen_iterations.json
-    reports/escalated_clusters.json
+    derived/run/test_report.json   (merged report with iteration details + escalated clusters)
 """
 
 from __future__ import annotations
@@ -52,9 +51,9 @@ import time
 
 ROOT        = Path(__file__).parent.parent
 SPEC_PATH   = ROOT / "spec.md"
-GLM_PLAN    = ROOT / "scaffold" / "glm_plan.json"
-REPORTS_DIR = ROOT / "reports"
-REPORTS_DIR.mkdir(exist_ok=True)
+GLM_PLAN    = ROOT / "generated" / "plan.json"
+REPORTS_DIR = ROOT / "derived" / "run"
+REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
 SRC_DIR = "src"
 
@@ -138,7 +137,7 @@ class IterationRecord:
 # ════════════════════════════════════════════════════════════════════════════
 
 def _load_spec() -> str:
-    compressed = ROOT / "scaffold" / "spec_compressed.md"
+    compressed = ROOT / "derived" / "spec" / "spec_compressed.md"
     return compressed.read_text() if compressed.exists() else SPEC_PATH.read_text()
 
 def _openrouter_call(model_id: str, messages: list, max_tokens: int = 32768) -> str:
@@ -195,12 +194,12 @@ def _load_glm_global_notes() -> str:
 # Judge findings loader — cross-run regression prevention
 # ════════════════════════════════════════════════════════════════════════════
 
-FINDINGS_PATH = ROOT / "scaffold" / "judge_findings.md"
+FINDINGS_PATH = ROOT / "derived" / "knowledge" / "findings.md"
 
 
 def _load_judge_findings() -> str:
     """
-    Load scaffold/judge_findings.md written by 07_fix_from_judge.py.
+    Load derived/knowledge/findings.md written by 07_fix_from_judge.py.
     Returns empty string if file doesn't exist (first run, no judge yet).
     Injected into both Minimax and Qwen prompts so the same mistakes
     from previous runs are not repeated.
@@ -268,12 +267,12 @@ def parse_failures(output: str) -> list[FailureCluster]:
             snippet = errors[j] if j < len(errors) else section[:500]
             cluster.failures.append(TestFailure(
                 test_file=test_file, test_name=name.strip(),
-                error_snippet=snippet.strip()[:600],   # <-- thêm [:600]
+                error_snippet=snippet.strip()[:600],
             ))
         if not cluster.failures:
             cluster.failures.append(TestFailure(
                 test_file=test_file, test_name="(parse fallback)",
-                error_snippet=section[:800].strip(),   # <-- giảm từ 1500 → 800
+                error_snippet=section[:800].strip(),
             ))
     return list(clusters.values())
 
@@ -413,8 +412,8 @@ def _build_qwen_system_with_findings(findings: str) -> str:
     )
 
 def _load_knowledge_base() -> str:
-    """Load knowledge_base.md if it exists — accumulated human fix patterns."""
-    kb = ROOT / "scaffold" / "knowledge_base.md"
+    """Load derived/knowledge/base.md if it exists — accumulated human fix patterns."""
+    kb = ROOT / "derived" / "knowledge" / "base.md"
     if not kb.exists():
         return ""
     content = kb.read_text().strip()
@@ -502,7 +501,7 @@ def _build_state_timeline(test_code: str, max_entries: int = 12) -> str:
             timeline.append(f"  ASSERT: {s[:100]}")
         else:
             continue
-        if len(timeline) >= max_entries * 3:    # <-- NEW: hard stop
+        if len(timeline) >= max_entries * 3:
             timeline.append("  … (truncated)")
             break
     return "\n".join(timeline) if timeline else "(could not extract timeline)"
@@ -1097,7 +1096,7 @@ def main() -> None:
             log_snippet=output[-1200:],
         ))
 
-    # ── Reports ───────────────────────────────────────────────────────────────
+    # ── Single merged report: derived/run/test_report.json ─────────────────────
     final_passed = bool(iteration_records and iteration_records[-1].passed)
     report = {
         "impl":                 "qwen+minimax",
@@ -1106,17 +1105,13 @@ def main() -> None:
         "total_iterations":     len(iteration_records),
         "final_status":         "PASS" if final_passed else "FAIL",
         "iterations":           [asdict(r) for r in iteration_records],
+        "escalated":            escalated_log,    # merged here
     }
-    (REPORTS_DIR / "qwen_iterations.json").write_text(json.dumps(report, indent=2))
-    print(f"\n[04] Report → reports/qwen_iterations.json")
-
+    test_report_path = REPORTS_DIR / "test_report.json"
+    test_report_path.write_text(json.dumps(report, indent=2))
+    print(f"\n[04] Merged report → {test_report_path}")
     if escalated_log:
-        esc_path = REPORTS_DIR / "escalated_clusters.json"
-        esc_path.write_text(json.dumps({
-            "total_escalated": len(escalated_log),
-            "clusters":        escalated_log,
-        }, indent=2))
-        print(f"[04] ⚠ Escalated → {esc_path} ({len(escalated_log)} cluster(s))")
+        print(f"[04] ⚠ {len(escalated_log)} cluster(s) escalated (see report['escalated'])")
 
     if not final_passed:
         sys.exit(1)
