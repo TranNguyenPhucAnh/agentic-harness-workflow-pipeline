@@ -3,10 +3,12 @@ pipeline/02_scaffold_gemini.py
 Step 2 — Call Gemini 2.5 Flash to generate scaffold JSON from spec.md
 
 Writes:
-    generated/scaffold.json          ← full scaffold with stubs + test files
-    src/**                           ← individual stub source files
-    tests/**                         ← individual test files
-    derived/spec/spec_compressed.md  ← compressed spec for downstream use
+    artifacts/state/scaffold.json          ← full scaffold with stubs + test files
+    src/**                                 ← individual stub source files
+    tests/**                               ← individual test files
+    artifacts/cache/spec_compressed.md     ← compressed spec for downstream use
+
+For taxonomy details see docs/artifacts.md
 """
 
 import os
@@ -28,8 +30,16 @@ GEMINI_URL     = (
 
 ROOT      = Path(__file__).parent.parent
 SPEC_PATH = ROOT / "spec.md"
-OUT_DIR   = ROOT / "generated"                 # changed from "scaffold"
-OUT_DIR.mkdir(exist_ok=True)
+
+# New artifact paths
+STATE_DIR = ROOT / "artifacts" / "state"
+CACHE_DIR = ROOT / "artifacts" / "cache"
+
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+SCAFFOLD_JSON = STATE_DIR / "scaffold.json"
+SPEC_COMPRESSED = CACHE_DIR / "spec_compressed.md"
 
 SYSTEM_PROMPT = textwrap.dedent("""
     You are a senior TypeScript/React architect.
@@ -145,10 +155,10 @@ def _parse_json(raw: str) -> dict:
     print(" No JSON object found in Gemini response.", file=sys.stderr)
     print(f" Raw output (first 500 chars):\n{cleaned[:500]}", file=sys.stderr)
     sys.exit(1)
-
+    
 def _compress_spec(spec: str) -> str:
     """
-    Create a compressed version of spec.md for downstream models.
+    Create compressed version of spec.md for downstream models.
     Removes §0 (meta/pipeline instructions for Gemini) and §8 (Gemini output schema).
     Keeps §1-7, §9-11 (component specs, types, AC).
     Saves ~35% tokens on every downstream call.
@@ -170,10 +180,9 @@ def _compress_spec(spec: str) -> str:
 # ── File writer ───────────────────────────────────────────────────────────────
 
 def write_files(scaffold: dict, spec: str) -> None:
-    # Write scaffold.json to generated/
-    json_path = OUT_DIR / "scaffold.json"
-    json_path.write_text(json.dumps(scaffold, indent=2))
-    print(f"[02] Scaffold JSON → {json_path}")
+    # Write scaffold.json to state/
+    SCAFFOLD_JSON.write_text(json.dumps(scaffold, indent=2))
+    print(f"[02] Scaffold JSON → {SCAFFOLD_JSON}")
 
     # Write individual source and test stubs
     for entry in scaffold["files"]:
@@ -183,17 +192,15 @@ def write_files(scaffold: dict, spec: str) -> None:
         tag = "TEST" if entry.get("is_test") else "SRC "
         print(f"[02] [{tag}] {entry['file_path']}")
 
-    # Write compressed spec to derived/spec/ (instead of scaffold/)
+    # Write compressed spec to cache/
     compressed = _compress_spec(spec)
-    spec_compressed_path = ROOT / "derived" / "spec" / "spec_compressed.md"
-    spec_compressed_path.parent.mkdir(parents=True, exist_ok=True)
-    spec_compressed_path.write_text(compressed)
+    SPEC_COMPRESSED.parent.mkdir(parents=True, exist_ok=True)
+    SPEC_COMPRESSED.write_text(compressed)
     savings = round((1 - len(compressed) / len(spec)) * 100)
-    print(f"[02] Compressed spec → {spec_compressed_path}  ({savings}% smaller)")
+    print(f"[02] Compressed spec → {SPEC_COMPRESSED}  ({savings}% smaller)")
 
     # NOTE: instructions_qwen.txt and pipeline_context.json are removed.
     # Qwen will read from scaffold.json["implementation_instructions"]["for_qwen"].
-    # The pipeline context is now expected to be inside scaffold.json.
 
     print("[02] Done.")
 
