@@ -14,20 +14,22 @@ What this script does
      spec + affected src files + judge's exact description
 4. Apply patches (scope-locked to src/ only — never tests/)
 5. Run vitest to confirm fixes (exit 1 if still failing)
-6. Write derived/knowledge/findings.md — injected into Minimax/Qwen prompts on
+6. Write artifacts/knowledge/findings.md — injected into Minimax/Qwen prompts on
    future runs so the same mistakes are not repeated
 
 Writes
 ──────
-    derived/knowledge/findings.md      ← persistent cross-run memory
-    derived/run/update_log.json        ← this run's fix log (merged)
-    src/**                             ← patched files
+    artifacts/knowledge/findings.md      ← persistent cross-run memory
+    artifacts/run/update_log.json        ← this run's fix log (merged)
+    src/**                               ← patched files
 
 Does NOT
 ────────
     - Modify test files
     - Modify spec.md  (spec changes require human + version bump)
     - Re-run the judge (harness.py does that after this script exits 0)
+
+For taxonomy details see docs/artifacts.md
 """
 
 from __future__ import annotations
@@ -46,16 +48,23 @@ import time
 ROOT         = Path(__file__).parent.parent
 SPEC_PATH    = ROOT / "spec.md"
 REPORTS_DIR  = ROOT / "reports"
-DERIVED_RUN  = ROOT / "derived" / "run"
-DERIVED_KNOW = ROOT / "derived" / "knowledge"
-DERIVED_SPEC = ROOT / "derived" / "spec"
-DERIVED_RUN.mkdir(parents=True, exist_ok=True)
-DERIVED_KNOW.mkdir(parents=True, exist_ok=True)
 REPORTS_DIR.mkdir(exist_ok=True)
 
+# New artifact paths
+STATE_DIR   = ROOT / "artifacts" / "state"
+CACHE_DIR   = ROOT / "artifacts" / "cache"
+RUN_DIR     = ROOT / "artifacts" / "run"
+KNOWLEDGE_DIR = ROOT / "artifacts" / "knowledge"
+
+for d in (STATE_DIR, CACHE_DIR, RUN_DIR, KNOWLEDGE_DIR):
+    d.mkdir(parents=True, exist_ok=True)
+
 JUDGE_RAW_PATH   = REPORTS_DIR / "judge_raw.json"
-FIX_REPORT_PATH  = DERIVED_RUN / "update_log.json"
-FINDINGS_PATH    = DERIVED_KNOW / "findings.md"
+FIX_REPORT_PATH  = RUN_DIR / "update_log.json"
+FINDINGS_PATH    = KNOWLEDGE_DIR / "findings.md"
+KNOWLEDGE_BASE   = KNOWLEDGE_DIR / "base.md"
+SPEC_COMPRESSED  = CACHE_DIR / "spec_compressed.md"
+GLM_PLAN_PATH    = STATE_DIR / "plan.json"      # not used directly but kept for consistency
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -143,10 +152,8 @@ def load_judge_verdict() -> dict:
 # File mapping — which src files does each finding affect?
 # ════════════════════════════════════════════════════════════════════════════
 
-# Explicit path pattern in judge text (e.g. "src/hooks/useReplay.ts")
 _RE_SRC_PATH = re.compile(r"src/[\w/]+\.(?:ts|tsx)")
 
-# Keyword → likely files heuristic (fallback when no explicit path in text)
 _KEYWORD_FILES: dict[str, list[str]] = {
     "useSensorData":  ["src/hooks/useSensorData.ts", "src/data/demoConstants.ts"],
     "useReplay":      ["src/hooks/useReplay.ts"],
@@ -161,21 +168,17 @@ _KEYWORD_FILES: dict[str, list[str]] = {
     "duplicate":      ["src/hooks/useSensorData.ts", "src/data/demoConstants.ts"],
 }
 
-# Component-wide scan for theme/Tailwind issues
 _COMPONENT_SCAN_KEYWORDS = {"theme", "tailwind", "bg-white", "text-gray-800",
                              "dark theme", "light theme", "colour", "color"}
 
 
 def _infer_files(text: str) -> list[str]:
-    """Extract src/ file paths from finding text using explicit paths + keywords."""
     found: list[str] = []
 
-    # 1. Explicit paths in text
     for m in _RE_SRC_PATH.findall(text):
         if m not in found:
             found.append(m)
 
-    # 2. Keyword heuristics
     text_lower = text.lower()
     for kw, files in _KEYWORD_FILES.items():
         if kw.lower() in text_lower:
@@ -183,7 +186,6 @@ def _infer_files(text: str) -> list[str]:
                 if f not in found and (ROOT / f).exists():
                     found.append(f)
 
-    # 3. Component scan for theme issues
     if any(kw in text_lower for kw in _COMPONENT_SCAN_KEYWORDS):
         comp_dir = ROOT / "src" / "components"
         if comp_dir.exists():
@@ -192,19 +194,15 @@ def _infer_files(text: str) -> list[str]:
                 if rel not in found:
                     found.append(rel)
 
-    # Filter: only existing files
     return [f for f in found if (ROOT / f).exists()]
 
 
 def extract_findings(verdict: dict) -> tuple[list[JudgeFinding], list[JudgeFinding]]:
-    """Return (blocking, non_blocking) as JudgeFinding lists with file mappings."""
-    # Extract section notes for richer context
     sections = verdict.get("sections", {})
     section_notes = {k: v.get("notes", "") for k, v in sections.items()}
 
     blocking: list[JudgeFinding] = []
     for desc in verdict.get("blocking_issues", []):
-        # Find which section mentioned this issue
         section_hint = ""
         for sec_name, notes in section_notes.items():
             if any(word in notes.lower() for word in desc.lower().split()[:4]):
@@ -292,8 +290,9 @@ Rules:
 
 
 def _load_spec() -> str:
-    compressed = DERIVED_SPEC / "spec_compressed.md"
-    return compressed.read_text() if compressed.exists() else SPEC_PATH.read_text()
+    if SPEC_COMPRESSED.exists():
+        return SPEC_COMPRESSED.read_text()
+    return SPEC_PATH.read_text()
 
 
 def _read_safe(path: Path) -> str:
@@ -315,14 +314,11 @@ def _parse_fix_response(raw: str, label: str) -> dict | None:
 # Fix executor
 # ════════════════════════════════════════════════════════════════════════════
 
-# Blocking issues whose nature is architectural/logic → Minimax
-# Non-blocking theme/Tailwind issues → Qwen
 _SURFACE_KEYWORDS = {"theme", "tailwind", "colour", "color", "bg-", "text-",
                      "dark", "light", "class"}
 
 
 def _choose_agent(finding: JudgeFinding) -> tuple[str, str]:
-    """Return (agent_label, system_prompt) for this finding."""
     text_lower = finding.description.lower()
     if finding.severity == "non_blocking" and \
             any(kw in text_lower for kw in _SURFACE_KEYWORDS):
@@ -336,8 +332,6 @@ def fix_finding(
     verdict: dict,
     verbose: bool,
 ) -> FixRecord:
-    """Call the appropriate agent, apply patch, return FixRecord."""
-
     if not finding.files:
         print(f"  [07] No files mapped for: {finding.description[:60]}… — skipping")
         return FixRecord(
@@ -349,13 +343,11 @@ def fix_finding(
     agent_label, system = _choose_agent(finding)
     call_fn = call_minimax if agent_label == "minimax" else call_qwen
 
-    # Build context block: all affected files
     files_block = ""
     for fp in finding.files:
         code = _read_safe(ROOT / fp)
         files_block += f"\n### {fp}\n```typescript\n{code}\n```\n"
 
-    # Include relevant section notes for richer context
     sections_block = ""
     if finding.section:
         sec = verdict.get("sections", {}).get(finding.section, {})
@@ -398,7 +390,6 @@ def fix_finding(
             note="JSON parse failed",
         )
 
-    # Apply patches — scope guard: never write to tests/
     written: list[str] = []
     for entry in patch.get("files", []):
         out_rel  = entry.get("file_path", "")
@@ -464,11 +455,6 @@ def write_judge_findings(
     fix_records:  list[FixRecord],
     verdict:      dict,
 ) -> None:
-    """
-    Write derived/knowledge/findings.md.
-    This file is injected into Minimax and Qwen system prompts on future runs
-    so the same mistakes are not repeated.
-    """
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     scores = {k: v.get("score", "?")
               for k, v in verdict.get("sections", {}).items() if "score" in v}
@@ -506,7 +492,6 @@ def write_judge_findings(
         "### Architecture",
     ]
 
-    # Extract architecture notes from judge sections
     arch_notes = verdict.get("sections", {}).get("architecture", {}).get("notes", "")
     if arch_notes:
         lines.append(arch_notes)
@@ -526,6 +511,7 @@ def write_judge_findings(
         "_To clear findings, delete this file before next run._",
     ]
 
+    FINDINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
     FINDINGS_PATH.write_text("\n".join(lines) + "\n")
     print(f"\n[07] Findings written → {FINDINGS_PATH}")
     print("[07] Injected into Minimax + Qwen prompts on next run.")
@@ -547,7 +533,6 @@ def main() -> None:
                         help="Skip vitest confirm after fixes (for debugging)")
     args = parser.parse_args()
 
-    # ── Load verdict ──────────────────────────────────────────────────────────
     verdict = load_judge_verdict()
 
     if verdict.get("verdict") == "APPROVED":
@@ -571,8 +556,7 @@ def main() -> None:
         print(f"  • {f.description[:80]}")
         print(f"    files: {mapped}, agent: {_choose_agent(f)[0]}")
 
-    # ── Fix ───────────────────────────────────────────────────────────────────
-    spec         = _load_spec()
+    spec = _load_spec()
     fix_records: list[FixRecord] = []
 
     to_fix: list[JudgeFinding] = []
@@ -589,7 +573,6 @@ def main() -> None:
             record = fix_finding(finding, spec, verdict, verbose=args.verbose)
             fix_records.append(record)
 
-    # ── vitest confirm ────────────────────────────────────────────────────────
     vitest_passed = False
     vitest_summary = "skipped"
 
@@ -598,12 +581,10 @@ def main() -> None:
         vitest_summary = vitest_output[-800:]
     elif args.skip_vitest:
         print("\n[07] Skipping vitest (--skip-vitest)")
-        vitest_passed = True   # let harness decide
+        vitest_passed = True
 
-    # ── Write findings.md ─────────────────────────────────────────────────────
     write_judge_findings(blocking, non_blocking, fix_records, verdict)
 
-    # ── Fix report (update_log.json) ──────────────────────────────────────────
     n_patched = sum(1 for r in fix_records if r.patched)
     report = {
         "timestamp":        datetime.now(timezone.utc).isoformat(),
@@ -616,10 +597,10 @@ def main() -> None:
         "vitest_summary":   vitest_summary,
         "records":          [asdict(r) for r in fix_records],
     }
+    FIX_REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
     FIX_REPORT_PATH.write_text(json.dumps(report, indent=2))
     print(f"\n[07] Fix report (merged) → {FIX_REPORT_PATH}")
 
-    # ── Summary ───────────────────────────────────────────────────────────────
     print(f"\n{'='*50}")
     print(f"  STEP 7 SUMMARY")
     print(f"{'='*50}")
@@ -643,8 +624,6 @@ def main() -> None:
             print(f"     • {r.finding[:80]}")
             print(f"       {r.note}")
 
-    # Exit code: 0 only if vitest passed (or skipped)
-    # harness.py uses this to decide whether to re-run judge
     if not vitest_passed and not args.skip_vitest:
         print("\n[07] Tests still failing after judge fixes — human review needed.")
         sys.exit(1)
