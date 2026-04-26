@@ -7,6 +7,7 @@ All paths are relative to the project root.
 ```
 artifacts/
 ├── state/
+│   ├── prev_src/
 │   ├── scaffold.json
 │   ├── plan.json
 │   └── spec_applied.json

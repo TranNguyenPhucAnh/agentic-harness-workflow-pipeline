@@ -40,7 +40,7 @@ OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions"
 MODEL              = "deepseek/deepseek-v3.2"
 
 ROOT        = Path(__file__).parent.parent
-REPORTS_DIR = ROOT / "reports"
+REPORTS_DIR = ROOT / "artifacts" / "reports"
 REPORTS_DIR.mkdir(exist_ok=True)
 
 # Artifact paths
