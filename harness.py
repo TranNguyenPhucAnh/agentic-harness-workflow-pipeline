@@ -143,6 +143,7 @@ GLM_PLAN_PATH = ROOT / "artifacts" / "state" / "plan.json"
 IMPL_RECORD_PATH = ROOT / "artifacts" / "run" / "impl_record.json"
 UPDATE_LOG_PATH = ROOT / "artifacts" / "knowledge" / "history" / "update_log.json"
 PREV_SRC_DIR = ROOT / "artifacts" / "state" / "prev_src"
+JUDGE_RAW_PATH   = ROOT / "artifacts" / "run" / "judge_raw.json"
 
 # Ensure directories exist
 DELTA_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -291,8 +292,8 @@ def restore_unaffected_files(delta: dict) -> int:
 # ════════════════════════════════════════════════════════════════════════════
 
 def _read_judge_verdict() -> str:
-    """Read current judge verdict from reports/judge_raw.json. Returns '' if not found."""
-    raw_path = ROOT / "reports" / "judge_raw.json"
+    """Read current judge verdict from JUDGE_RAW_PATH. Returns '' if not found."""
+    raw_path = JUDGE_RAW_PATH
     if not raw_path.exists():
         return ""
     try:
