@@ -14,14 +14,14 @@ What this script does
      spec + affected src files + judge's exact description
 4. Apply patches (scope-locked to src/ only — never tests/)
 5. Run vitest to confirm fixes (exit 1 if still failing)
-6. Write scaffold/judge_findings.md — injected into Minimax/Qwen prompts on
+6. Write derived/knowledge/findings.md — injected into Minimax/Qwen prompts on
    future runs so the same mistakes are not repeated
 
 Writes
 ──────
-    scaffold/judge_findings.md      ← persistent cross-run memory
-    reports/judge_fix_report.json   ← this run's fix log
-    src/**                          ← patched files
+    derived/knowledge/findings.md      ← persistent cross-run memory
+    derived/run/update_log.json        ← this run's fix log (merged)
+    src/**                             ← patched files
 
 Does NOT
 ────────
@@ -46,12 +46,16 @@ import time
 ROOT         = Path(__file__).parent.parent
 SPEC_PATH    = ROOT / "spec.md"
 REPORTS_DIR  = ROOT / "reports"
-SCAFFOLD_DIR = ROOT / "scaffold"
+DERIVED_RUN  = ROOT / "derived" / "run"
+DERIVED_KNOW = ROOT / "derived" / "knowledge"
+DERIVED_SPEC = ROOT / "derived" / "spec"
+DERIVED_RUN.mkdir(parents=True, exist_ok=True)
+DERIVED_KNOW.mkdir(parents=True, exist_ok=True)
 REPORTS_DIR.mkdir(exist_ok=True)
 
 JUDGE_RAW_PATH   = REPORTS_DIR / "judge_raw.json"
-FIX_REPORT_PATH  = REPORTS_DIR / "judge_fix_report.json"
-FINDINGS_PATH    = SCAFFOLD_DIR / "judge_findings.md"
+FIX_REPORT_PATH  = DERIVED_RUN / "update_log.json"
+FINDINGS_PATH    = DERIVED_KNOW / "findings.md"
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -288,7 +292,7 @@ Rules:
 
 
 def _load_spec() -> str:
-    compressed = SCAFFOLD_DIR / "spec_compressed.md"
+    compressed = DERIVED_SPEC / "spec_compressed.md"
     return compressed.read_text() if compressed.exists() else SPEC_PATH.read_text()
 
 
@@ -461,7 +465,7 @@ def write_judge_findings(
     verdict:      dict,
 ) -> None:
     """
-    Write scaffold/judge_findings.md.
+    Write derived/knowledge/findings.md.
     This file is injected into Minimax and Qwen system prompts on future runs
     so the same mistakes are not repeated.
     """
@@ -596,10 +600,10 @@ def main() -> None:
         print("\n[07] Skipping vitest (--skip-vitest)")
         vitest_passed = True   # let harness decide
 
-    # ── Write judge_findings.md ───────────────────────────────────────────────
+    # ── Write findings.md ─────────────────────────────────────────────────────
     write_judge_findings(blocking, non_blocking, fix_records, verdict)
 
-    # ── Fix report ────────────────────────────────────────────────────────────
+    # ── Fix report (update_log.json) ──────────────────────────────────────────
     n_patched = sum(1 for r in fix_records if r.patched)
     report = {
         "timestamp":        datetime.now(timezone.utc).isoformat(),
@@ -613,7 +617,7 @@ def main() -> None:
         "records":          [asdict(r) for r in fix_records],
     }
     FIX_REPORT_PATH.write_text(json.dumps(report, indent=2))
-    print(f"\n[07] Fix report → {FIX_REPORT_PATH}")
+    print(f"\n[07] Fix report (merged) → {FIX_REPORT_PATH}")
 
     # ── Summary ───────────────────────────────────────────────────────────────
     print(f"\n{'='*50}")
