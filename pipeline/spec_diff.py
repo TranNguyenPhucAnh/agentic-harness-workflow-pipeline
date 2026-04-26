@@ -33,6 +33,7 @@ SPEC_PATH = ROOT / "spec.md"
 STATE_DIR = ROOT / "artifacts" / "state"
 CACHE_DIR = ROOT / "artifacts" / "cache"
 KNOWLEDGE_HISTORY_DIR = ROOT / "artifacts" / "knowledge" / "history"
+CHANGELOG = KNOWLEDGE_HISTORY_DIR / "spec.changelog"
 
 DELTA_OUT = CACHE_DIR / "spec_delta.json"
 APPLIED_PATH = STATE_DIR / "spec_applied.json"
