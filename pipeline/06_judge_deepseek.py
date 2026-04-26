@@ -8,12 +8,14 @@ DeepSeek V3.2 for deep review, writes reports/judge_report.md.
 
 Reads:
     spec.md
-    scaffold/scaffold.json
-    scaffold/glm_plan.json          (optional — present if GLM planner ran)
-    scaffold/impl_qwen.json
-    reports/qwen_iterations.json
+    generated/scaffold.json
+    generated/plan.json (optional — present if GLM planner ran)
+    derived/run/impl_record.json
+    derived/run/test_report.json
     src/**/*.ts  src/**/*.tsx        (final implemented source)
     tests/**/*.ts  tests/**/*.tsx    (test files for reference)
+    derived/spec/spec_delta.json (if partial run)
+    derived/spec/spec_addendum.md (if exists)
 
 Writes:
     reports/judge_report.md         ← human-readable final report
@@ -33,13 +35,20 @@ import httpx
 
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions"
-# deepseek-v3.2 with reasoning enabled via OpenRouter reasoning parameter
 MODEL              = "deepseek/deepseek-v3.2"
 
 ROOT        = Path(__file__).parent.parent
 REPORTS_DIR = ROOT / "reports"
 REPORTS_DIR.mkdir(exist_ok=True)
-PIPELINE_CTX = ROOT / "scaffold" / "pipeline_context.json"
+
+# New paths
+SCAFFOLD_JSON = ROOT / "generated" / "scaffold.json"
+GLM_PLAN_PATH = ROOT / "generated" / "plan.json"
+IMPL_RECORD   = ROOT / "derived" / "run" / "impl_record.json"
+TEST_REPORT   = ROOT / "derived" / "run" / "test_report.json"
+SPEC_DELTA    = ROOT / "derived" / "spec" / "spec_delta.json"
+SPEC_ADDENDUM = ROOT / "derived" / "spec" / "spec_addendum.md"
+SPEC_COMPRESSED = ROOT / "derived" / "spec" / "spec_compressed.md"
 
 
 # ── Prompt ────────────────────────────────────────────────────────────────────
@@ -93,17 +102,17 @@ NEEDS_REVISION  → one or more blocking issues found
 # ── Briefing builder ──────────────────────────────────────────────────────────
 
 def _load_spec() -> str:
-    compressed = ROOT / "scaffold" / "spec_compressed.md"
-    return compressed.read_text() if compressed.exists() else (ROOT / "spec.md").read_text()
+    if SPEC_COMPRESSED.exists():
+        return SPEC_COMPRESSED.read_text()
+    return (ROOT / "spec.md").read_text()
 
 
 def _load_delta() -> dict | None:
     """Load spec_delta.json if present — used to scope judge review."""
-    p = ROOT / "scaffold" / "spec_delta.json"
-    if not p.exists():
+    if not SPEC_DELTA.exists():
         return None
     try:
-        return json.loads(p.read_text())
+        return json.loads(SPEC_DELTA.read_text())
     except Exception:
         return None
 
@@ -117,6 +126,7 @@ def _affected_src_set(delta: dict | None) -> set[str]:
         return set()
     return {f for f in delta.get("affected_files", []) if f.startswith("src/")}
 
+
 def _read_safe(path: Path, label: str) -> str:
     if not path.exists():
         return f"[{label}: file not found at {path}]"
@@ -124,7 +134,7 @@ def _read_safe(path: Path, label: str) -> str:
 
 
 def _collect_src_files(src_dir: Path) -> dict[str, str]:
-    """Full collect — dùng cho test files."""
+    """Full collect — used for test files and fallback."""
     files: dict[str, str] = {}
     for ext in ("*.ts", "*.tsx"):
         for p in sorted(src_dir.rglob(ext)):
@@ -132,37 +142,44 @@ def _collect_src_files(src_dir: Path) -> dict[str, str]:
             files[rel] = p.read_text()
     return files
 
+
 def _collect_changed_files(src_dir: Path) -> dict[str, str]:
     """
-    Chỉ collect source files có nội dung khác so với stub gốc.
-    Judge không cần xem file types/constants nếu chúng không thay đổi nhiều.
-    Tiết kiệm ~40% input tokens của judge call.
+    Collect source files whose content differs from the original stub.
+    Reads stub_map from generated/scaffold.json to detect changes.
+    Saves ~40% input tokens for the judge.
     """
-    # Load stub_map từ pipeline_context để so sánh
+    # Load stub_map from scaffold.json
     stub_map: dict[str, str] = {}
-    if PIPELINE_CTX.exists():
-        ctx = json.loads(PIPELINE_CTX.read_text())
-        stub_map = ctx.get("stub_map", {})
- 
+    if SCAFFOLD_JSON.exists():
+        try:
+            scaffold = json.loads(SCAFFOLD_JSON.read_text())
+            stub_map = scaffold.get("stub_map", {})
+        except Exception:
+            pass
+
     changed: dict[str, str] = {}
     for ext in ("*.ts", "*.tsx"):
         for p in sorted(src_dir.rglob(ext)):
-            rel     = str(p.relative_to(ROOT))
+            rel = str(p.relative_to(ROOT))
+            if not rel.startswith("src/"):
+                continue
             current = p.read_text()
-            stub    = stub_map.get(rel, "")
-            # Coi là "changed" nếu không có stub (file mới) hoặc nội dung khác hẳn
+            stub = stub_map.get(rel, "")
+            # Consider changed if stub missing or content differs
             if not stub or current.strip() != stub.strip():
                 changed[rel] = current
     return changed
 
+
 def build_briefing() -> str:
     parts: list[str] = []
 
-    delta        = _load_delta()
+    delta = _load_delta()
     affected_set = _affected_src_set(delta)
-    is_partial   = bool(affected_set)   # True = only some files changed this run
+    is_partial = bool(affected_set)   # True = only some files changed this run
 
-    # 0. Run context header — tells judge whether this is full or partial
+    # 0. Run context header
     if is_partial and delta:
         fv = delta.get("from_version") or "?"
         tv = delta.get("to_version", "?")
@@ -188,10 +205,14 @@ def build_briefing() -> str:
             "",
             "**Files reused from previous run (unchanged — secondary review):**",
         ]
-        impl_rec = ROOT / "scaffold" / "impl_qwen.json"
+        # Read skipped files from implementation record
         skipped = []
-        if impl_rec.exists():
-            skipped = json.loads(impl_rec.read_text()).get("skipped_delta", [])
+        if IMPL_RECORD.exists():
+            try:
+                rec = json.loads(IMPL_RECORD.read_text())
+                skipped = rec.get("skipped_delta", [])
+            except Exception:
+                pass
         for fp in skipped:
             ctx_lines.append(f"- `{fp}`")
         ctx_lines += [
@@ -209,18 +230,17 @@ def build_briefing() -> str:
 
     # 1. Spec
     parts.append("## 1. spec.md\n\n" + _load_spec())
-    
-    addendum_path = ROOT / "scaffold" / "spec_addendum.md"
-    if addendum_path.exists():
+
+    # 1b. Spec addendum
+    if SPEC_ADDENDUM.exists():
         parts.append(
             "## 1b. Spec Addendum (edge cases & invariants from previous runs)\n\n"
-            + addendum_path.read_text()
+            + SPEC_ADDENDUM.read_text()
         )
 
     # 2. GLM plan (optional)
-    glm_plan_path = ROOT / "scaffold" / "glm_plan.json"
-    if glm_plan_path.exists():
-        plan = json.loads(glm_plan_path.read_text())
+    if GLM_PLAN_PATH.exists():
+        plan = json.loads(GLM_PLAN_PATH.read_text())
         parts.append(
             "## 2. GLM 5.1 Architectural Plan\n\n"
             f"```json\n{json.dumps(plan, indent=2)}\n```"
@@ -228,10 +248,9 @@ def build_briefing() -> str:
     else:
         parts.append("## 2. GLM 5.1 Architectural Plan\n\n_Not available (--only-qwen mode)_")
 
-    # 3. Qwen impl record
-    impl_record_path = ROOT / "scaffold" / "impl_qwen.json"
-    if impl_record_path.exists():
-        rec = json.loads(impl_record_path.read_text())
+    # 3. Qwen implementation record
+    if IMPL_RECORD.exists():
+        rec = json.loads(IMPL_RECORD.read_text())
         skipped_d = rec.get("skipped_delta", [])
         rec_lines = [
             "## 3. Qwen Implementation Record\n",
@@ -246,13 +265,12 @@ def build_briefing() -> str:
                 rec_lines.append(f"  - `{f}` _(reused)_")
         parts.append("\n".join(rec_lines))
 
-    # 4. Iteration history (condensed)
-    iter_path = REPORTS_DIR / "qwen_iterations.json"
-    if iter_path.exists():
-        report = json.loads(iter_path.read_text())
-        iters  = report.get("iterations", [])
-        lines  = [
-            "## 4. Qwen Test Iteration History\n",
+    # 4. Test iteration history (from test_report.json)
+    if TEST_REPORT.exists():
+        report = json.loads(TEST_REPORT.read_text())
+        iters = report.get("iterations", [])
+        lines = [
+            "## 4. Test Iteration History (Qwen+Minimax)\n",
             f"- Final status: **{report.get('final_status', '?')}**",
             f"- Total iterations: {report.get('total_iterations', '?')} / "
             f"{report.get('max_iter', 3)}",
@@ -268,6 +286,7 @@ def build_briefing() -> str:
         parts.append("\n".join(lines))
 
     # 5. Source files — scope to affected only on partial runs
+    src_dir = ROOT / "src"
     if is_partial and affected_set:
         # Primary: re-implemented files (full content)
         primary: dict[str, str] = {}
@@ -284,16 +303,19 @@ def build_briefing() -> str:
         )
 
         # Secondary: reused files — signatures only to save tokens
-        impl_rec = ROOT / "scaffold" / "impl_qwen.json"
         skipped_paths = []
-        if impl_rec.exists():
-            skipped_paths = json.loads(impl_rec.read_text()).get("skipped_delta", [])
+        if IMPL_RECORD.exists():
+            try:
+                rec = json.loads(IMPL_RECORD.read_text())
+                skipped_paths = rec.get("skipped_delta", [])
+            except Exception:
+                pass
         if skipped_paths:
             secondary_lines = ["## 5b. Reused Files — signatures only (not re-implemented)\n"]
             for fp in skipped_paths:
                 p = ROOT / fp
                 if p.exists():
-                    # Emit only non-blank, non-body lines as a lightweight signature view
+                    # Emit only non‑blank, non‑body lines as a lightweight signature view
                     sig_lines = [
                         l for l in p.read_text().splitlines()
                         if l.strip() and not l.strip().startswith("//")
@@ -305,8 +327,11 @@ def build_briefing() -> str:
                     secondary_lines.append("```\n")
             parts.append("\n".join(secondary_lines))
     else:
-        # Full run — collect all changed files as before
-        src_files = _collect_changed_files(ROOT / "src")
+        # Full run — collect all changed files using stub comparison
+        src_files = _collect_changed_files(src_dir)
+        if not src_files:
+            # Fallback: if stub_map not present, collect everything
+            src_files = _collect_src_files(src_dir)
         src_block = "\n\n".join(
             f"### {fp}\n```typescript\n{code}\n```"
             for fp, code in src_files.items()
@@ -345,7 +370,7 @@ def call_deepseek_judge(briefing: str) -> tuple[str, list | None]:
     }
 
     print("[06] Calling DeepSeek V3.2 (judge, reasoning ON) …")
-    
+
     last_error = None
 
     with httpx.Client(timeout=300) as client:
@@ -356,16 +381,15 @@ def call_deepseek_judge(briefing: str) -> tuple[str, list | None]:
             data = r.json()
 
             usage = data.get("usage", {})
-            prompt_t     = usage.get("prompt_tokens", "?")
+            prompt_t = usage.get("prompt_tokens", "?")
             completion_t = usage.get("completion_tokens", "?")
             print(f"[06] Tokens: prompt={prompt_t}, completion={completion_t}")
 
-            choice        = data["choices"][0]
-            msg           = choice["message"]
-            content       = msg.get("content")
-            tool_calls    = msg.get("tool_calls")
+            choice = data["choices"][0]
+            msg = choice["message"]
+            content = msg.get("content")
+            tool_calls = msg.get("tool_calls")
             finish_reason = choice.get("finish_reason")
-            # Preserve reasoning_details for transparency (saved to judge_raw.json)
             reasoning_details = msg.get("reasoning_details")
 
             if tool_calls:
@@ -376,16 +400,15 @@ def call_deepseek_judge(briefing: str) -> tuple[str, list | None]:
             if content and content.strip():
                 return content.strip(), reasoning_details
 
-            last_error = (
-                f"Empty content. finish_reason={finish_reason}, message={msg}"
-            )
+            last_error = f"Empty content. finish_reason={finish_reason}, message={msg}"
             print(f"[06] {last_error}", file=sys.stderr)
 
             if attempt == 0:
                 print("[06] Retrying in 3s …", file=sys.stderr)
                 time.sleep(3)
-                
+
     raise RuntimeError(f"DeepSeek judge failed after retries: {last_error}")
+
 
 # ── JSON extraction ───────────────────────────────────────────────────────────
 
@@ -411,13 +434,13 @@ def _parse_json(raw: str) -> dict:
 # ── Report renderer ───────────────────────────────────────────────────────────
 
 def render_report(review: dict) -> str:
-    now     = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     verdict = review.get("verdict", "UNKNOWN")
 
     verdict_icon = {
-        "APPROVED":             "✅",
-        "APPROVED_WITH_NOTES":  "⚠️",
-        "NEEDS_REVISION":       "❌",
+        "APPROVED": "✅",
+        "APPROVED_WITH_NOTES": "⚠️",
+        "NEEDS_REVISION": "❌",
     }.get(verdict, "❓")
 
     lines = [
@@ -445,7 +468,7 @@ def render_report(review: dict) -> str:
         "gaps_risks":      "Gaps / Risks",
     }
     for key, label in dimension_labels.items():
-        sec   = sections.get(key, {})
+        sec = sections.get(key, {})
         score = sec.get("score", "—")
         notes = sec.get("notes", "—").replace("\n", " ")
         score_str = f"{score}/5" if isinstance(score, int) else str(score)
@@ -496,10 +519,10 @@ def main() -> None:
     # Save raw response + reasoning chain
     raw_out = REPORTS_DIR / "judge_raw.json"
     raw_out.write_text(json.dumps({
-        "model":            MODEL,
-        "timestamp":        datetime.now(timezone.utc).isoformat(),
-        "response":         raw_response,
-        "reasoning_details": reasoning_details,   # full chain-of-thought
+        "model": MODEL,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "response": raw_response,
+        "reasoning_details": reasoning_details,
     }, indent=2))
     print(f"[06] Raw response + reasoning saved → {raw_out}")
 
