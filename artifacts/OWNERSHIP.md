@@ -22,6 +22,7 @@
 | `artifacts/reports/judge_report.md` | `06_judge_deepseek` | `05` |
 | `knowledge/current/base.md` | `07_update_knowledge` | `04`, `06`, `07_fix` |
 | `knowledge/history/update_log.json` | `07_update_knowledge` | `harness` |
+| `knowledge/history/fix_log.json` | `07_fix_from_judge` | — |
 | `artifacts/reports/summary.md` | `05_report` | — |
 
 ## Data Flow
@@ -43,8 +44,8 @@ spec.md
                │
         [06_judge]─────────► judge_raw.json, spec_addendum.md, judge_report.md
                │
-        [07_update]────────► base.md, update_log.json
-        [07_fix]───────────► (fixes src/, reads: judge_raw, findings, base)
+        [07_update]────────► base.md, knowledge/history/update_log.json
+        [07_fix]───────────► fix_log.json  (fixes src/, reads: judge_raw, findings, base)
                │
         [05_report]────────► summary.md
 ```
