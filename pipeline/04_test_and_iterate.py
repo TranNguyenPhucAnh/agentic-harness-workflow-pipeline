@@ -53,8 +53,10 @@ import time
 
 # === WRITE AUTHORITY: 04_test_and_iterate ===
 # OWNS  : artifacts/run/test_report.json
-#         artifacts/knowledge/current/findings.md
-# READS : spec.md, artifacts/state/plan.json, artifacts/knowledge/current/base.md
+# READS : spec.md, artifacts/state/plan.json, artifacts/state/plan_notes.json,
+#         artifacts/knowledge/current/findings.md (from 07_fix),
+#         artifacts/knowledge/current/findings_notes.md (from 07_update),
+#         artifacts/knowledge/current/base.md
 
 import sys as _sys
 _sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent))
@@ -196,26 +198,40 @@ def call_minimax(messages: list) -> str:
 # ════════════════════════════════════════════════════════════════════════════
 
 def _load_glm_global_notes() -> str:
-    if not GLM_PLAN.exists():
-        return ""
-    try:
-        return json.loads(GLM_PLAN.read_text()).get("global_notes", "")
-    except Exception:
-        return ""
+    """Merge global_notes from plan.json (03b) + plan_notes.json (07_update)."""
+    parts: list[str] = []
+    if GLM_PLAN.exists():
+        try:
+            note = json.loads(GLM_PLAN.read_text()).get("global_notes", "")
+            if note:
+                parts.append(note)
+        except Exception:
+            pass
+    if GLM_PLAN_NOTES.exists():
+        try:
+            for e in json.loads(GLM_PLAN_NOTES.read_text()):
+                if e.get("note"):
+                    parts.append(e["note"])
+        except Exception:
+            pass
+    return "\n\n---\n\n".join(parts)
         
 # ════════════════════════════════════════════════════════════════════════════
 # Judge findings loader — cross-run regression prevention
 # ════════════════════════════════════════════════════════════════════════════
 
 def _load_judge_findings() -> str:
-    """Load artifacts/knowledge/findings.md written by 07_fix_from_judge.py."""
-    if not FINDINGS_PATH.exists():
-        return ""
-    try:
-        content = FINDINGS_PATH.read_text().strip()
-        return content if content else ""
-    except Exception:
-        return ""
+    """Merge findings.md (07_fix snapshot) + findings_notes.md (07_update regression notes)."""
+    parts: list[str] = []
+    for fpath in (FINDINGS_PATH, FINDINGS_NOTES_PATH):
+        if fpath.exists():
+            try:
+                txt = fpath.read_text().strip()
+                if txt:
+                    parts.append(txt)
+            except Exception:
+                pass
+    return "\n\n---\n\n".join(parts)
 
 # ════════════════════════════════════════════════════════════════════════════
 # Phase B — run vitest + parse failures
