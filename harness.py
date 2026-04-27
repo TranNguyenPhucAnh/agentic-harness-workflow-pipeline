@@ -134,22 +134,27 @@ import sys
 import time
 from pathlib import Path
 
+# harness.py lives at ROOT level — same level as artifacts/
 ROOT = Path(__file__).parent
 
-# New artifact paths
-DELTA_PATH   = ROOT / "artifacts" / "cache" / "spec_delta.json"
-SCAFFOLD_JSON = ROOT / "artifacts" / "state" / "scaffold.json"
-GLM_PLAN_PATH = ROOT / "artifacts" / "state" / "plan.json"
-IMPL_RECORD_PATH = ROOT / "artifacts" / "run" / "impl_record.json"
-UPDATE_LOG_PATH = ROOT / "artifacts" / "knowledge" / "history" / "update_log.json"
-PREV_SRC_DIR = ROOT / "artifacts" / "state" / "prev_src"
-JUDGE_RAW_PATH   = ROOT / "artifacts" / "run" / "judge_raw.json"
+# === WRITE AUTHORITY: harness ===
+# OWNS  : (no artifact ownership — orchestrator only)
+# READS : all artifacts (coordinates pipeline steps)
 
-# Ensure directories exist
-DELTA_PATH.parent.mkdir(parents=True, exist_ok=True)
-SCAFFOLD_JSON.parent.mkdir(parents=True, exist_ok=True)
-IMPL_RECORD_PATH.parent.mkdir(parents=True, exist_ok=True)
-UPDATE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+import sys as _sys
+_sys.path.insert(0, str(ROOT))
+from artifacts.paths import (
+    SPEC_DELTA as DELTA_PATH,
+    SCAFFOLD_JSON,
+    PLAN_JSON as GLM_PLAN_PATH,
+    IMPL_RECORD as IMPL_RECORD_PATH,
+    UPDATE_LOG as UPDATE_LOG_PATH,
+    JUDGE_RAW as JUDGE_RAW_PATH,
+    ensure_dirs,
+)
+ensure_dirs()
+# NOTE: prev_src is a transient staging dir, not a pipeline artifact
+PREV_SRC_DIR = ROOT / "artifacts" / "state" / "prev_src"
 
 # ════════════════════════════════════════════════════════════════════════════
 # Core helpers
