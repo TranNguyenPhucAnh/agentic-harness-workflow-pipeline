@@ -10,6 +10,7 @@ artifacts/
 │   ├── prev_src/
 │   ├── scaffold.json
 │   ├── plan.json
+│   ├── plan_notes.json
 │   └── spec_applied.json
 ├── cache/
 │   ├── spec_compressed.md
@@ -18,6 +19,7 @@ artifacts/
 │   ├── current/
 │   │   ├── base.md
 │   │   ├── findings.md
+│   │   ├── findings_notes.md 
 │   │   └── spec_addendum.md
 │   └── history/
 │       ├── spec.changelog
