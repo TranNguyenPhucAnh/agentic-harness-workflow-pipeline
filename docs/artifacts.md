@@ -21,7 +21,8 @@ artifacts/
 │   │   └── spec_addendum.md
 │   └── history/
 │       ├── spec.changelog
-│       ├── update_log.json
+│       ├── fix_log.json         ← fix actions (07_fix)  ← ADD
+│       ├── update_log.json      ← knowledge evolution (07_update)
 │       ├── <version>.md
 │       └── <version>.changelog.md
 ├── run/
