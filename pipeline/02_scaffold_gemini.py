@@ -28,18 +28,19 @@ GEMINI_URL     = (
     f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
 )
 
-ROOT      = Path(__file__).parent.parent
-SPEC_PATH = ROOT / "spec.md"
+# === WRITE AUTHORITY: 02_scaffold_gemini ===
+# OWNS  : artifacts/state/scaffold.json
+#         artifacts/cache/spec_compressed.md
+# READS : spec.md
 
-# New artifact paths
-STATE_DIR = ROOT / "artifacts" / "state"
-CACHE_DIR = ROOT / "artifacts" / "cache"
-
-STATE_DIR.mkdir(parents=True, exist_ok=True)
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-SCAFFOLD_JSON = STATE_DIR / "scaffold.json"
-SPEC_COMPRESSED = CACHE_DIR / "spec_compressed.md"
+import sys
+sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent.parent))
+from artifacts.paths import (
+    ROOT, SPEC_PATH,
+    SCAFFOLD_JSON, SPEC_COMPRESSED,
+    ensure_dirs,
+)
+ensure_dirs()
 
 SYSTEM_PROMPT = textwrap.dedent("""
     You are a senior TypeScript/React architect.
