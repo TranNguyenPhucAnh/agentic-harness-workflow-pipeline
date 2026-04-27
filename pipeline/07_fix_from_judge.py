@@ -47,12 +47,13 @@ import time
 
 # === WRITE AUTHORITY: 07_fix_from_judge ===
 # OWNS  : artifacts/knowledge/history/fix_log.json
+#         artifacts/knowledge/current/findings.md
 # READS : artifacts/run/judge_raw.json,
-#         artifacts/knowledge/current/findings.md,
+#         artifacts/knowledge/current/findings_notes.md,
 #         artifacts/knowledge/current/base.md,
 #         artifacts/cache/spec_compressed.md,
-#         artifacts/state/plan.json
-# NOTE  : FIX_REPORT_PATH writes to history/fix_log.json (append-only per run)
+#         artifacts/state/plan.json,
+#         artifacts/state/plan_notes.json
 
 import sys as _sys
 _sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent))
@@ -64,6 +65,7 @@ from artifacts.paths import (
     KNOWLEDGE_BASE,
     SPEC_COMPRESSED,
     PLAN_JSON as GLM_PLAN_PATH,
+    PLAN_NOTES as PLAN_NOTES_PATH,
     ensure_dirs,
 )
 ensure_dirs()
