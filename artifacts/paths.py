@@ -43,6 +43,7 @@ PLAN_JSON       = STATE_DIR / "plan.json"            # owner: 03b_implement_glm
 
 SPEC_DELTA      = CACHE_DIR / "spec_delta.json"      # owner: spec_diff
 SPEC_APPLIED    = STATE_DIR / "spec_applied.json"    # owner: spec_diff
+PLAN_NOTES      = STATE_DIR / "plan_notes.json"      # owner: 07_update_knowledge
 
 # ── run/ ─────────────────────────────────────────────────────────────────────
 IMPL_RECORD     = RUN_DIR / "impl_record.json"       # owner: 03a_implement_qwen
@@ -50,13 +51,14 @@ TEST_REPORT     = RUN_DIR / "test_report.json"       # owner: 04_test_and_iterat
 JUDGE_RAW       = RUN_DIR / "judge_raw.json"         # owner: 06_judge_deepseek
 
 # ── knowledge/current/ ────────────────────────────────────────────────────────
-FINDINGS        = CURRENT_DIR / "findings.md"        # owner: 04_test_and_iterate
+FINDINGS        = CURRENT_DIR / "findings.md"        # owner: 07_fix_from_judge
+FINDINGS_NOTES  = CURRENT_DIR / "findings_notes.md"  # owner: 07_update_knowledge
 SPEC_ADDENDUM   = CURRENT_DIR / "spec_addendum.md"   # owner: 06_judge_deepseek
 KNOWLEDGE_BASE  = CURRENT_DIR / "base.md"            # owner: 07_update_knowledge
 
 # ── knowledge/history/ ───────────────────────────────────────────────────────
 UPDATE_LOG      = HISTORY_DIR / "update_log.json"    # owner: 07_update_knowledge
-FIX_LOG         = HISTORY_DIR / "fix_log.json"       # owner: 07_fix_from_judge
+FIX_LOG         = HISTORY_DIR / "fix_log.json"        # owner: 07_fix_from_judge
 SPEC_CHANGELOG  = HISTORY_DIR / "spec.changelog"     # owner: spec_diff
 
 # ── reports/ ─────────────────────────────────────────────────────────────────
