@@ -57,26 +57,31 @@ from datetime import datetime, timezone
 from pathlib import Path
 from textwrap import indent
 
-ROOT         = Path(__file__).parent.parent
+# === WRITE AUTHORITY: 07_update_knowledge ===
+# OWNS  : artifacts/knowledge/current/base.md
+#         artifacts/knowledge/current/findings_notes.md
+#         artifacts/knowledge/history/update_log.json
+#         artifacts/state/plan_notes.json
+# READS : artifacts/run/judge_raw.json, artifacts/state/plan.json,
+#         artifacts/knowledge/current/findings.md,
+#         artifacts/knowledge/current/spec_addendum.md,
+#         artifacts/run/test_report.json
 
-# New artifact paths
-STATE_DIR     = ROOT / "artifacts" / "state"
-CACHE_DIR     = ROOT / "artifacts" / "cache"
-RUN_DIR       = ROOT / "artifacts" / "run"
-KNOWLEDGE_DIR = ROOT / "artifacts" / "knowledge"
-HISTORY_DIR   = KNOWLEDGE_DIR / "history"
-CURRENT_DIR   = KNOWLEDGE_DIR / "current"
-
-for d in (STATE_DIR, CACHE_DIR, RUN_DIR, KNOWLEDGE_DIR, HISTORY_DIR, CURRENT_DIR):
-    d.mkdir(parents=True, exist_ok=True)
-
-JUDGE_RAW_PATH      = RUN_DIR / "judge_raw.json"
-GLM_PLAN_PATH       = STATE_DIR / "plan.json"
-FINDINGS_PATH       = CURRENT_DIR / "findings.md"
-ADDENDUM_PATH       = CURRENT_DIR / "spec_addendum.md"
-KNOWLEDGE_BASE_PATH = CURRENT_DIR / "base.md"
-UPDATE_LOG_PATH     = HISTORY_DIR / "update_log.json"
-TEST_REPORT_PATH    = RUN_DIR / "test_report.json"
+import sys as _sys
+_sys.path.insert(0, str(Path(__file__).parent.parent))
+from artifacts.paths import (
+    ROOT,
+    JUDGE_RAW as JUDGE_RAW_PATH,
+    PLAN_JSON as GLM_PLAN_PATH,
+    PLAN_NOTES as PLAN_NOTES_PATH,
+    FINDINGS_NOTES as FINDINGS_PATH,
+    SPEC_ADDENDUM as ADDENDUM_PATH,
+    KNOWLEDGE_BASE as KNOWLEDGE_BASE_PATH,
+    UPDATE_LOG as UPDATE_LOG_PATH,
+    TEST_REPORT as TEST_REPORT_PATH,
+    ensure_dirs,
+)
+ensure_dirs()
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -396,12 +401,19 @@ def _apply_glm_note(content: str, dry_run: bool) -> None:
     if not GLM_PLAN_PATH.exists():
         print(f"  [warn] glm_plan.json not found — skipping GLM note.")
         return
-    plan = json.loads(GLM_PLAN_PATH.read_text())
-    existing = plan.get("global_notes", "")
-    separator = " | " if existing else ""
-    plan["global_notes"] = existing + separator + content
-    GLM_PLAN_PATH.write_text(json.dumps(plan, indent=2))
-    print(f"  ✓ Patched glm_plan.json global_notes")
+    # Append to plan_notes.json (owned by 07_update) instead of
+    # mutating plan.json (owned by 03b — immutable after planning step)
+    import datetime as _dt
+    notes: list = []
+    if PLAN_NOTES_PATH.exists():
+        try:
+            notes = __import__("json").loads(PLAN_NOTES_PATH.read_text())
+        except Exception:
+            notes = []
+    notes.append({"note": content, "added": _dt.datetime.utcnow().isoformat()})
+    PLAN_NOTES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    PLAN_NOTES_PATH.write_text(__import__("json").dumps(notes, indent=2))
+    print(f"  ✓ Appended to plan_notes.json")
 
 
 def _apply_findings(content: str, dry_run: bool) -> None:
@@ -409,6 +421,7 @@ def _apply_findings(content: str, dry_run: bool) -> None:
     if dry_run:
         print(f"  [DRY RUN] Would append to {FINDINGS_PATH}:\n{indent(block, '    ')}")
         return
+    # findings_notes.md = human-approved regression notes (append-only)
     mode = "a" if FINDINGS_PATH.exists() else "w"
     with open(FINDINGS_PATH, mode) as f:
         if mode == "w":
