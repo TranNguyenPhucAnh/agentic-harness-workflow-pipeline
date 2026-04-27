@@ -14,11 +14,8 @@ What this script does:
        an ordered list of implementation tasks / sub-tasks.
     3. Write artifacts/state/plan.json  ← consumed by 03a_implement_qwen.py
        when --use-glm-plan flag is passed.
-    4. Merge implementation_order into artifacts/state/scaffold.json.
-
 Writes:
     artifacts/state/plan.json
-    updates artifacts/state/scaffold.json (adds "implementation_order")
 
 Does NOT write any src/ files.  03a_implement_qwen.py is the sole executor.
 
@@ -255,11 +252,8 @@ def main() -> None:
     print(f"[03b] Tasks in plan: {len(plan.get('tasks', []))}")
     print(f"[03b] Implementation order: {plan.get('implementation_order', [])}")
 
-    # Merge implementation_order into scaffold.json
-    scaffold["implementation_order"] = plan.get("implementation_order", [])
-    SCAFFOLD_JSON.write_text(json.dumps(scaffold, indent=2))
-    print(f"[03b] Updated {SCAFFOLD_JSON} with implementation_order")
-
+    # NOTE: implementation_order lives in plan.json — consumers read it from there.
+    # scaffold.json is immutable after 02_scaffold_gemini.
     print("[03b] Done. Pass --use-glm-plan to 03a_implement_qwen.py to use this plan.")
 
 
