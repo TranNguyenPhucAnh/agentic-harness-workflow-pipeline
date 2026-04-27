@@ -39,30 +39,31 @@ OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions"
 MODEL              = "deepseek/deepseek-v3.2"
 
-ROOT        = Path(__file__).parent.parent
-REPORTS_DIR = ROOT / "artifacts" / "reports"
-REPORTS_DIR.mkdir(exist_ok=True)
+# === WRITE AUTHORITY: 06_judge_deepseek ===
+# OWNS  : artifacts/run/judge_raw.json
+#         artifacts/knowledge/current/spec_addendum.md
+#         artifacts/reports/judge_report.md
+# READS : artifacts/state/scaffold.json, artifacts/state/plan.json,
+#         artifacts/run/impl_record.json, artifacts/run/test_report.json,
+#         artifacts/cache/spec_delta.json, artifacts/cache/spec_compressed.md
 
-# Artifact paths
-STATE_DIR   = ROOT / "artifacts" / "state"
-CACHE_DIR   = ROOT / "artifacts" / "cache"
-RUN_DIR     = ROOT / "artifacts" / "run"
-KNOWLEDGE_DIR = ROOT / "artifacts" / "knowledge"
-CURRENT_KNOWLEDGE = KNOWLEDGE_DIR / "current"
-
-STATE_DIR.mkdir(parents=True, exist_ok=True)
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
-RUN_DIR.mkdir(parents=True, exist_ok=True)
-KNOWLEDGE_DIR.mkdir(parents=True, exist_ok=True)
-CURRENT_KNOWLEDGE.mkdir(parents=True, exist_ok=True)
-
-SCAFFOLD_JSON = STATE_DIR / "scaffold.json"
-GLM_PLAN_PATH = STATE_DIR / "plan.json"
-IMPL_RECORD   = RUN_DIR   / "impl_record.json"
-TEST_REPORT   = RUN_DIR   / "test_report.json"
-SPEC_DELTA    = CACHE_DIR / "spec_delta.json"
-SPEC_ADDENDUM = CURRENT_KNOWLEDGE / "spec_addendum.md"
-SPEC_COMPRESSED = CACHE_DIR / "spec_compressed.md"
+import sys as _sys
+_sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent))
+from artifacts.paths import (
+    ROOT, REPORTS_DIR,
+    SCAFFOLD_JSON,
+    PLAN_JSON as GLM_PLAN_PATH,
+    IMPL_RECORD,
+    TEST_REPORT,
+    SPEC_DELTA,
+    SPEC_ADDENDUM,
+    SPEC_COMPRESSED,
+    JUDGE_RAW,
+    JUDGE_REPORT,
+    ensure_dirs,
+)
+ensure_dirs()
+CURRENT_KNOWLEDGE = __import__("artifacts.paths", fromlist=["CURRENT_DIR"]).CURRENT_DIR
 
 
 # ── Prompt ────────────────────────────────────────────────────────────────────
@@ -530,7 +531,7 @@ def main() -> None:
 
     # Render and save markdown report
     report_md = render_report(review)
-    report_out = REPORTS_DIR / "judge_report.md"
+    report_out = JUDGE_REPORT
     report_out.write_text(report_md)
 
     print(f"\n[06] Judge report written → {report_out}")
