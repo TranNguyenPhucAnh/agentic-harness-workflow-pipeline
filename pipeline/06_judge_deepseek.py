@@ -518,7 +518,7 @@ def main() -> None:
     raw_response, reasoning_details = call_deepseek_judge(briefing)
 
     # Save raw response + reasoning chain
-    raw_out = RUN_DIR / "judge_raw.json"
+    raw_out = JUDGE_RAW
     raw_out.write_text(json.dumps({
         "model": MODEL,
         "timestamp": datetime.now(timezone.utc).isoformat(),
