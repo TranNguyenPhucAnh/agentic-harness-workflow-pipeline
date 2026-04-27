@@ -46,22 +46,20 @@ from pathlib import Path
 import time
 
 # === WRITE AUTHORITY: 07_fix_from_judge ===
-# OWNS  : (no artifact ownership — fixes src/ files only)
+# OWNS  : artifacts/knowledge/history/fix_log.json
 # READS : artifacts/run/judge_raw.json,
 #         artifacts/knowledge/current/findings.md,
 #         artifacts/knowledge/current/base.md,
 #         artifacts/cache/spec_compressed.md,
 #         artifacts/state/plan.json
-# NOTE  : FIX_REPORT_PATH writes to history/update_log.json
-#         which is owned by 07_update_knowledge.
-#         Treat as append-only / non-conflicting.
+# NOTE  : FIX_REPORT_PATH writes to history/fix_log.json (append-only per run)
 
 import sys as _sys
 _sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent))
 from artifacts.paths import (
     ROOT, SPEC_PATH, REPORTS_DIR,
     JUDGE_RAW as JUDGE_RAW_PATH,
-    UPDATE_LOG as FIX_REPORT_PATH,
+    FIX_LOG as FIX_REPORT_PATH,
     FINDINGS as FINDINGS_PATH,
     KNOWLEDGE_BASE,
     SPEC_COMPRESSED,
@@ -602,8 +600,15 @@ def main() -> None:
         "records":          [asdict(r) for r in fix_records],
     }
     FIX_REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    FIX_REPORT_PATH.write_text(json.dumps(report, indent=2))
-    print(f"\n[07] Fix report (merged) → {FIX_REPORT_PATH}")
+    existing_fixes: list = []
+    if FIX_REPORT_PATH.exists():
+        try:
+            existing_fixes = json.loads(FIX_REPORT_PATH.read_text())
+        except Exception:
+            existing_fixes = []
+    existing_fixes.append(report)
+    FIX_REPORT_PATH.write_text(json.dumps(existing_fixes, indent=2))
+    print(f"\n[07] Fix log appended → {FIX_REPORT_PATH}")
 
     print(f"\n{'='*50}")
     print(f"  STEP 7 SUMMARY")
