@@ -51,27 +51,22 @@ from pathlib import Path
 from typing import Callable
 import time
 
-ROOT        = Path(__file__).parent.parent
-SPEC_PATH   = ROOT / "spec.md"
+# === WRITE AUTHORITY: 04_test_and_iterate ===
+# OWNS  : artifacts/run/test_report.json
+#         artifacts/knowledge/current/findings.md
+# READS : spec.md, artifacts/state/plan.json, artifacts/knowledge/current/base.md
 
-# New artifact paths
-STATE_DIR      = ROOT / "artifacts" / "state"
-CACHE_DIR      = ROOT / "artifacts" / "cache"
-RUN_DIR        = ROOT / "artifacts" / "run"
-KNOWLEDGE_DIR  = ROOT / "artifacts" / "knowledge"
-CURRENT_DIR    = KNOWLEDGE_DIR / "current"
-
-STATE_DIR.mkdir(parents=True, exist_ok=True)
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
-RUN_DIR.mkdir(parents=True, exist_ok=True)
-KNOWLEDGE_DIR.mkdir(parents=True, exist_ok=True)
-CURRENT_DIR.mkdir(parents=True, exist_ok=True)
-
-GLM_PLAN    = STATE_DIR / "plan.json"
-TEST_REPORT = RUN_DIR   / "test_report.json"
-# Knowledge files
-FINDINGS_PATH  = CURRENT_DIR / "findings.md"
-KNOWLEDGE_BASE = CURRENT_DIR / "base.md"
+import sys as _sys
+_sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent))
+from artifacts.paths import (
+    ROOT, SPEC_PATH, CACHE_DIR,
+    PLAN_JSON as GLM_PLAN,
+    TEST_REPORT,
+    FINDINGS as FINDINGS_PATH,
+    KNOWLEDGE_BASE,
+    ensure_dirs,
+)
+ensure_dirs()
 
 SRC_DIR = "src"
 
