@@ -56,6 +56,7 @@ KNOWLEDGE_BASE  = CURRENT_DIR / "base.md"            # owner: 07_update_knowledg
 
 # ── knowledge/history/ ───────────────────────────────────────────────────────
 UPDATE_LOG      = HISTORY_DIR / "update_log.json"    # owner: 07_update_knowledge
+FIX_LOG         = HISTORY_DIR / "fix_log.json"       # owner: 07_fix_from_judge
 SPEC_CHANGELOG  = HISTORY_DIR / "spec.changelog"     # owner: spec_diff
 
 # ── reports/ ─────────────────────────────────────────────────────────────────
