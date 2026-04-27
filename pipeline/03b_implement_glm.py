@@ -37,18 +37,19 @@ OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions"
 MODEL              = "z-ai/glm-5.1"
 
-ROOT = Path(__file__).parent.parent
+# === WRITE AUTHORITY: 03b_implement_glm ===
+# OWNS  : artifacts/state/plan.json
+# READS : spec.md (or cache/spec_compressed.md), artifacts/state/scaffold.json
 
-# Artifact paths
-STATE_DIR = ROOT / "artifacts" / "state"
-CACHE_DIR = ROOT / "artifacts" / "cache"
-
-STATE_DIR.mkdir(parents=True, exist_ok=True)
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-SPEC_PATH     = ROOT / "spec.md"
-SCAFFOLD_JSON = STATE_DIR / "scaffold.json"
-PLAN_OUT      = STATE_DIR / "plan.json"
+import sys as _sys
+_sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent))
+from artifacts.paths import (
+    ROOT, SPEC_PATH,
+    CACHE_DIR, SCAFFOLD_JSON,
+    PLAN_JSON as PLAN_OUT,
+    ensure_dirs,
+)
+ensure_dirs()
 
 
 # ── Prompts ──────────────────────────────────────────────────────────────────
