@@ -484,23 +484,21 @@ def _dependencies_satisfied(f: dict, answered: dict[str, str]) -> bool:
 
 def _derive_impact(question: str, answer: str, category: str) -> str:
     """
-    Produce a one-line impact statement from a Q&A pair.
-    Uses a lightweight heuristic first; falls back to LLM for ambiguous cases.
+    Produce a one-line impact note from a Q&A pair — deterministic, no LLM call.
+    Impact is written to the log for audit purposes; synthesis LLM handles the
+    full clarified_requirement.md. No need for an extra blocking LLM call here.
     """
-    # Short answers that are simple acceptances don't need LLM
-    if answer.lower() in ("accepted", "yes", "no", "rejected", "(no answer provided)"):
+    if not answer or answer.lower() in ("accepted", "yes", "no", "rejected", "(no answer provided)"):
         return ""
-    # For substantive answers, derive impact via a fast LLM call
-    try:
-        system = (
-            "You are a technical analyst. Given a clarification Q&A pair, "
-            "output ONE concise sentence (max 20 words) describing the "
-            "implementation impact of this decision. No preamble."
-        )
-        user = f"Question: {question}\nAnswer: {answer}\nCategory: {category}"
-        return _call_llm(system, user).strip().splitlines()[0][:120]
-    except Exception:
-        return ""
+    # Truncate long answers to a readable note
+    short_answer = answer[:80] + ("..." if len(answer) > 80 else "")
+    category_label = {
+        "business":  "Business decision",
+        "technical": "Technical constraint",
+        "logic":     "Logic requirement",
+        "design":    "Design choice",
+    }.get(category, "Decision")
+    return f"{category_label}: {short_answer}"
 
 
 def _run_interactive_loop(
@@ -511,13 +509,15 @@ def _run_interactive_loop(
     Drive the Q&A loop. Returns (decisions, unresolved).
     decisions: list of {id, tier, question, answer, accepted, impact}
     """
-    decisions:   list[dict] = []
-    unresolved:  list[dict] = []
-    answered:    dict[str, str] = {}   # id → answer text
-    queue = _sort_findings([f for f in findings])
+    decisions:  list[dict] = []
+    unresolved: list[dict] = []
+    answered:   dict[str, str] = {}  # id → answer text
 
-    total = len(queue)
-    processed = 0
+    # Work from a stable sorted list; deferred items go into a separate pending set
+    queue:    list[dict] = _sort_findings(list(findings))
+    deferred: set[str]   = set()   # ids of items pushed-back at least once
+    total    = len(queue)
+    answered_count = 0
 
     _print_banner(f"Clarification session — {project_name}")
     print(f"  {total} findings to process.\n")
@@ -527,20 +527,30 @@ def _run_interactive_loop(
         f = queue[i]
         i += 1
 
-        # Skip if dependency not yet answered (push to back)
-        if not _dependencies_satisfied(f, answered):
-            queue.append(f)
-            # Safety: if we loop without progress, break
-            if len(queue) - i > total * 2:
-                unresolved.append(f)
-                break  # circular dependency — cannot resolve
+        # Already processed (can happen if item was appended multiple times)
+        if f["id"] in answered:
             continue
 
-        processed += 1
-        remaining = len([x for x in queue[i:] if _dependencies_satisfied(x, answered)]) + 1
-        _print_finding(f, processed, processed + remaining - 1)
+        # Dependency not yet satisfied — defer once
+        if not _dependencies_satisfied(f, answered):
+            if f["id"] not in deferred:
+                deferred.add(f["id"])
+                queue.append(f)
+            else:
+                # Second time we can't satisfy deps → circular/unresolvable
+                unresolved.append(f)
+            continue
 
-        tier = f.get("tier", 1)
+        answered_count += 1
+        # Remaining = items not yet answered and deps satisfied (approximate)
+        pending_ready = sum(
+            1 for x in queue[i:]
+            if x["id"] not in answered and _dependencies_satisfied(x, answered)
+        )
+        display_total = answered_count + pending_ready
+        _print_finding(f, answered_count, display_total)
+
+        tier     = f.get("tier", 1)
         accepted = True
 
         if tier == 1:
@@ -551,7 +561,6 @@ def _run_interactive_loop(
             answer, accepted = _ask_tier3(f)
 
         answered[f["id"]] = answer
-        # Derive a concise impact statement from the answer
         impact = _derive_impact(f["text"], answer, f.get("category", ""))
         decisions.append({
             "id":       f["id"],
@@ -563,12 +572,6 @@ def _run_interactive_loop(
             "accepted": accepted,
             "impact":   impact,
         })
-
-        # Check if this answer unlocks any previously-deferred findings
-        # (already handled by re-checking depends_on in next iteration)
-        # NOTE: v1 limitation — new questions generated from answers are not
-        # injected mid-session. Queue is fixed after Phase 1 analysis.
-        # Re-run clarificator with updated knowledge context for follow-ups.
 
     return decisions, unresolved
 
