@@ -32,7 +32,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import unittest.mock as mock
 
 # Load clarificator with all filesystem/network deps stubbed out
-_CLR_PATH = Path(__file__).parent / "00_clarificator_v2.py"
+_CLR_PATH = Path(__file__).parent / "00_clarificator.py"
 
 # Patch artifacts.paths before the import executes
 _mock_paths = mock.MagicMock(
