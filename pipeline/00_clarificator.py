@@ -484,21 +484,34 @@ def _dependencies_satisfied(f: dict, answered: dict[str, str]) -> bool:
 
 def _derive_impact(question: str, answer: str, category: str) -> str:
     """
-    Produce a one-line impact note from a Q&A pair — deterministic, no LLM call.
-    Impact is written to the log for audit purposes; synthesis LLM handles the
-    full clarified_requirement.md. No need for an extra blocking LLM call here.
+    Produce a one-line impact statement from a Q&A pair via LLM.
+    NOTE: Called in batch AFTER the interactive loop completes — never inside it.
     """
     if not answer or answer.lower() in ("accepted", "yes", "no", "rejected", "(no answer provided)"):
         return ""
-    # Truncate long answers to a readable note
-    short_answer = answer[:80] + ("..." if len(answer) > 80 else "")
-    category_label = {
-        "business":  "Business decision",
-        "technical": "Technical constraint",
-        "logic":     "Logic requirement",
-        "design":    "Design choice",
-    }.get(category, "Decision")
-    return f"{category_label}: {short_answer}"
+    try:
+        system = (
+            "You are a technical analyst. Given a clarification Q&A pair, "
+            "output ONE concise sentence (max 20 words) describing the "
+            "implementation impact of this decision. No preamble."
+        )
+        user = f"Question: {question}\nAnswer: {answer}\nCategory: {category}"
+        return _call_llm(system, user).strip().splitlines()[0][:120]
+    except Exception:
+        return ""
+
+
+def _batch_derive_impacts(decisions: list[dict]) -> None:
+    """
+    Enrich decisions[*]["impact"] in-place via LLM calls.
+    Called once after the interactive loop — all user Q&A is already done.
+    """
+    pending = [d for d in decisions if not d.get("impact")]
+    if not pending:
+        return
+    print(f"\n[00] Deriving impact statements ({len(pending)} decisions) ...")
+    for d in pending:
+        d["impact"] = _derive_impact(d["question"], d["answer"], d.get("category", ""))
 
 
 def _run_interactive_loop(
@@ -561,7 +574,6 @@ def _run_interactive_loop(
             answer, accepted = _ask_tier3(f)
 
         answered[f["id"]] = answer
-        impact = _derive_impact(f["text"], answer, f.get("category", ""))
         decisions.append({
             "id":       f["id"],
             "tier":     tier,
@@ -570,7 +582,7 @@ def _run_interactive_loop(
             "question": f["text"],
             "answer":   answer,
             "accepted": accepted,
-            "impact":   impact,
+            "impact":   "",  # filled by _batch_derive_impacts after loop
         })
 
     return decisions, unresolved
@@ -944,6 +956,9 @@ def main() -> None:
         )
         for u in unresolved:
             print(f"  - {u['id']}: {u['text'][:60]}...")
+
+    # ── Batch derive impact statements (LLM, post-loop) ──────────────────────
+    _batch_derive_impacts(decisions)
 
     # ── Write outputs ─────────────────────────────────────────────────────────
     _write_report(session_id, req_hash, project_name, decisions, unresolved, conflicts, findings)
