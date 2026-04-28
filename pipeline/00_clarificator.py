@@ -169,16 +169,7 @@ def _call_llm(system: str, user: str, model: str = _ANALYZE_MODEL) -> str:
     import os
 
     # Detect which provider to use based on model prefix
-    if model.startswith("deepseek"):
-        api_key  = os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
-        base_url = "https://api.deepseek.com/v1"
-        model_id = model.split("/")[-1]  # "deepseek-chat"
-    elif model.startswith("gemini"):
-        # Use OpenAI-compat endpoint for Gemini via Google AI SDK shim
-        api_key  = os.environ.get("GOOGLE_API_KEY", "")
-        base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
-        model_id = model.split("/")[-1]
-    elif "/" in model:  # OpenRouter format: "provider/model-name"
+    if "/" in model:  # OpenRouter format: "provider/model-name"
         api_key  = os.environ.get("OPENROUTER_API_KEY", "")
         base_url = "https://openrouter.ai/api/v1"
         model_id = model  # OpenRouter expects full "provider/model" string
