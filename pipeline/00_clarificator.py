@@ -405,7 +405,159 @@ Output only the JSON object."""
         if f.get("tier") in (1, 2) and not f.get("scenarios"):
             f["scenarios"] = ["Yes / proceed as implied", "No / needs different approach", "Other (specify below)"]
 
-    return result
+    result["findings"] = _enforce_tiers(result.get("findings", []))
+    return result(text: str) -> str:
+    """Stable 8-char hash of normalized finding text — cross-round identity."""
+    normalized = re.sub(r"\s+", " ", text.strip().lower())
+    return hashlib.sha256(normalized.encode()).hexdigest()[:8]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Rule engine: enforce tiers deterministically (Test 3)
+# LLM proposes → rule engine enforces. Tier is a rule, not a suggestion.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _enforce_tiers(findings: list[dict]) -> list[dict]:
+    """
+    Correct tier assignment using structural rules only.
+    No keywords, no LLM, 100% deterministic. Runs after _analyze().
+
+    Rules (first match wins per finding):
+      R1: suggestion + confidence ≥ 0.75 + citation       → Tier 3
+      R2: scenarios ≤ 5 + category in (technical/design/logic) → Tier 2
+      R3: category == business OR priority == blocking
+          OR no scenarios                                  → Tier 1
+      R4: Tier 3 missing citation OR confidence < 0.75    → demote to Tier 2
+
+    Post-assignment invariants:
+      - Tier 1/2: scenarios must be non-empty
+      - Tier 3: suggestion must be present
+    """
+    for f in findings:
+        suggestion = (f.get("suggestion") or "").strip()
+        confidence = f.get("confidence") or 0.0
+        citation   = (f.get("citation") or "").strip()
+        scenarios  = f.get("scenarios") or []
+        category   = f.get("category", "")
+        priority   = f.get("priority", "")
+
+        bounded      = bool(scenarios) and len(scenarios) <= 5
+        near_det_cat = category in ("technical", "design", "logic")
+
+        if suggestion and confidence >= _TIER3_MIN_CONF and citation:
+            f["tier"] = 3
+        elif bounded and near_det_cat:
+            f["tier"] = 2
+        elif category == "business" or priority == "blocking" or not scenarios:
+            f["tier"] = 1
+        # else: keep LLM assignment, still apply R4 below
+
+        # R4 safety
+        if f.get("tier") == 3 and (not citation or confidence < _TIER3_MIN_CONF):
+            f["tier"] = 2
+            f["confidence"] = None
+
+        # Invariants
+        if f.get("tier") in (1, 2) and not f.get("scenarios"):
+            f["scenarios"] = [
+                "Yes — proceed as implied",
+                "No — needs a different approach",
+                "Other (type custom answer)",
+            ]
+        if f.get("tier") == 3 and not f.get("suggestion"):
+            f["suggestion"] = "(see citation)"
+
+    return findings
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Delta analysis: focused follow-up after a Tier 1 blocking answer (Test 4)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_DELTA_SYSTEM = """
+You are a requirements analyst. A blocking clarification question was just answered.
+Your task is ONLY to determine:
+  1. What NEW questions does this answer reveal that are not already in the queue?
+  2. Which EXISTING queue questions are now irrelevant or resolved by this answer?
+
+Output ONLY a valid JSON object — no markdown, no preamble.
+Schema:
+{
+  "new_findings": [
+    {
+      "id": "NEW-001",
+      "text": "<question text>",
+      "tier": 1 | 2 | 3,
+      "category": "business" | "logic" | "technical" | "design",
+      "priority": "blocking" | "high" | "medium" | "low",
+      "depends_on": [],
+      "scenarios": ["<option A>", "<option B>"],
+      "suggestion": "",
+      "confidence": 0.0,
+      "citation": ""
+    }
+  ],
+  "invalidated_ids": ["CLR-XXX", "CLR-YYY"]
+}
+
+RULES:
+- new_findings[] should only contain questions that COULD NOT have been asked
+  before this answer was known. Do not regenerate existing questions.
+- invalidated_ids[] should list queue item IDs that this answer makes moot.
+- If nothing changes, return {"new_findings": [], "invalidated_ids": []}.
+- IDs for new findings use prefix NEW- to avoid collisions with existing CLR- IDs.
+- Apply same SCENARIOS RULE: Tier 1 and Tier 2 must have non-empty scenarios[].
+"""
+
+
+def _delta_analyze(
+    answered_finding: dict,
+    answer: str,
+    requirement_text: str,
+    current_queue_ids: list[str],
+) -> tuple[list[dict], list[str]]:
+    """
+    After a Tier 1 blocking answer, ask LLM:
+      - what new questions does this reveal?
+      - which pending questions are now invalidated?
+
+    Returns (new_findings, invalidated_ids).
+    Cheap: input is small, output is targeted delta only.
+    """
+    queue_summary = ", ".join(current_queue_ids) if current_queue_ids else "none"
+
+    user_msg = f"""REQUIREMENT CONTEXT (summary):
+{requirement_text[:800]}{'...' if len(requirement_text) > 800 else ''}
+
+ANSWERED QUESTION:
+  ID: {answered_finding['id']}
+  Text: {answered_finding['text']}
+  Category: {answered_finding.get('category', '')}
+  Priority: {answered_finding.get('priority', '')}
+
+USER ANSWER: {answer}
+
+CURRENT PENDING QUEUE (IDs still to be asked): {queue_summary}
+
+Given this answer, what new questions are revealed and which pending ones are now moot?
+Output only the JSON object."""
+
+    try:
+        raw = _call_llm(_DELTA_SYSTEM, user_msg)
+        clean = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.MULTILINE)
+        result = json.loads(clean)
+    except Exception as exc:
+        # Delta failure is non-fatal — log and continue with existing queue
+        print(f"  [00][delta] Delta analysis failed ({exc}), continuing without update.")
+        return [], []
+
+    new_findings    = result.get("new_findings", [])
+    invalidated_ids = result.get("invalidated_ids", [])
+
+    # Apply rule engine to new findings too
+    new_findings = _enforce_tiers(new_findings)
+
+    return new_findings, invalidated_ids
 
 
 # ─────────────────────────────────────────────────────────────────────────────
