@@ -10,23 +10,27 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-ROOT        = Path(__file__).parent.parent
-REPORTS_DIR = ROOT / "artifacts" / "reports"
-REPORTS_DIR.mkdir(exist_ok=True)
+# === WRITE AUTHORITY: 05_report ===
+# OWNS  : artifacts/reports/summary.md
+# READS : artifacts/state/plan.json, artifacts/run/test_report.json,
+#         artifacts/state/scaffold.json, artifacts/cache/spec_delta.json,
+#         artifacts/run/impl_record.json, artifacts/reports/judge_report.md
 
-# New artifact paths
-STATE_DIR  = ROOT / "artifacts" / "state"
-CACHE_DIR  = ROOT / "artifacts" / "cache"
-RUN_DIR    = ROOT / "artifacts" / "run"
-
-GLM_PLAN_PATH   = STATE_DIR / "plan.json"
-TEST_REPORT     = RUN_DIR   / "test_report.json"
-SCAFFOLD_JSON   = STATE_DIR / "scaffold.json"
-DELTA_JSON      = CACHE_DIR / "spec_delta.json"
-IMPL_RECORD     = RUN_DIR   / "impl_record.json"
-
-SUMMARY_PATH    = REPORTS_DIR / "summary.md"
-JUDGE_REPORT    = REPORTS_DIR / "judge_report.md"
+import sys as _sys
+_sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent))
+from artifacts.paths import (
+    ROOT, REPORTS_DIR,
+    PLAN_JSON as GLM_PLAN_PATH,
+    TEST_REPORT,
+    SCAFFOLD_JSON,
+    SPEC_DELTA as DELTA_JSON,
+    IMPL_RECORD,
+    SUMMARY,
+    JUDGE_REPORT,
+    ensure_dirs,
+)
+ensure_dirs()
+SUMMARY_PATH = SUMMARY
 
 def load_test_report() -> dict | None:
     """Load the merged test report (iterations + escalated)."""
@@ -241,7 +245,7 @@ def main():
             lines.append(f"- Files reused (delta, not re-implemented): {len(skipped_d)}")
 
     summary_md = "\n".join(lines) + "\n"
-    out = REPORTS_DIR / "summary.md"
+    out = SUMMARY
     out.write_text(summary_md)
     print(summary_md)
     print(f"[05] Report written → {out}")

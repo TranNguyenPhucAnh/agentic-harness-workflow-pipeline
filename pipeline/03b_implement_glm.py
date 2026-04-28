@@ -14,11 +14,8 @@ What this script does:
        an ordered list of implementation tasks / sub-tasks.
     3. Write artifacts/state/plan.json  ← consumed by 03a_implement_qwen.py
        when --use-glm-plan flag is passed.
-    4. Merge implementation_order into artifacts/state/scaffold.json.
-
 Writes:
     artifacts/state/plan.json
-    updates artifacts/state/scaffold.json (adds "implementation_order")
 
 Does NOT write any src/ files.  03a_implement_qwen.py is the sole executor.
 
@@ -37,18 +34,19 @@ OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions"
 MODEL              = "z-ai/glm-5.1"
 
-ROOT = Path(__file__).parent.parent
+# === WRITE AUTHORITY: 03b_implement_glm ===
+# OWNS  : artifacts/state/plan.json
+# READS : spec.md (or cache/spec_compressed.md), artifacts/state/scaffold.json
 
-# Artifact paths
-STATE_DIR = ROOT / "artifacts" / "state"
-CACHE_DIR = ROOT / "artifacts" / "cache"
-
-STATE_DIR.mkdir(parents=True, exist_ok=True)
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-SPEC_PATH     = ROOT / "spec.md"
-SCAFFOLD_JSON = STATE_DIR / "scaffold.json"
-PLAN_OUT      = STATE_DIR / "plan.json"
+import sys as _sys
+_sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent))
+from artifacts.paths import (
+    ROOT, SPEC_PATH,
+    CACHE_DIR, SCAFFOLD_JSON,
+    PLAN_JSON as PLAN_OUT,
+    ensure_dirs,
+)
+ensure_dirs()
 
 
 # ── Prompts ──────────────────────────────────────────────────────────────────
@@ -254,11 +252,8 @@ def main() -> None:
     print(f"[03b] Tasks in plan: {len(plan.get('tasks', []))}")
     print(f"[03b] Implementation order: {plan.get('implementation_order', [])}")
 
-    # Merge implementation_order into scaffold.json
-    scaffold["implementation_order"] = plan.get("implementation_order", [])
-    SCAFFOLD_JSON.write_text(json.dumps(scaffold, indent=2))
-    print(f"[03b] Updated {SCAFFOLD_JSON} with implementation_order")
-
+    # NOTE: implementation_order lives in plan.json — consumers read it from there.
+    # scaffold.json is immutable after 02_scaffold_gemini.
     print("[03b] Done. Pass --use-glm-plan to 03a_implement_qwen.py to use this plan.")
 
 

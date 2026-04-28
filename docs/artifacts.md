@@ -1,15 +1,21 @@
 # Artifact Taxonomy – LLM Pipeline
 
-This document describes the purpose, lifecycle, and relationships of all artifacts produced by the LLM pipeline.  
+This document describes the purpose, lifecycle, and ownership of all artifacts produced by the LLM pipeline.  
 All paths are relative to the project root.
 
+> **RULE: 1 artifact = 1 script owner duy nhất được quyền ghi.**  
+> Tất cả script khác chỉ được READ. Paths được define tập trung tại `artifacts/paths.py`.
+
+---
+
 ## Directory Overview
+
 ```
 artifacts/
 ├── state/
-│   ├── prev_src/
 │   ├── scaffold.json
 │   ├── plan.json
+│   ├── plan_notes.json          ← accumulated architect notes (07_update)
 │   └── spec_applied.json
 ├── cache/
 │   ├── spec_compressed.md
@@ -17,71 +23,174 @@ artifacts/
 ├── knowledge/
 │   ├── current/
 │   │   ├── base.md
-│   │   ├── findings.md
+│   │   ├── findings.md          ← judge snapshot per run (07_fix)
+│   │   ├── findings_notes.md    ← human regression notes, append-only (07_update)
 │   │   └── spec_addendum.md
 │   └── history/
 │       ├── spec.changelog
-│       ├── update_log.json
+│       ├── update_log.json      ← knowledge evolution log (07_update)
+│       ├── fix_log.json         ← fix action log (07_fix)
 │       ├── <version>.md
 │       └── <version>.changelog.md
 ├── run/
-│   ├── judge_raw.json
 │   ├── impl_record.json
+│   ├── judge_raw.json
 │   └── test_report.json
 └── reports/
     ├── summary.md
     └── judge_report.md
 ```
-> The `src/` and `tests/` directories are **build outputs**, not part of `artifacts/`. They are written by `02_scaffold_gemini.py` and `03a_implement_qwen.py`.
 
-## Lifecycle Table
+> `src/` and `tests/` are **build outputs**, not pipeline artifacts. Written by `02_scaffold_gemini.py` and `03a_implement_qwen.py`.  
+> `artifacts/state/prev_src/` is **scratch space** used by `harness.py` for delta runs — not a pipeline artifact, safe to delete.
 
-| Artifact | Overwritten? | Appended? | Consumed by |
-|----------|--------------|-----------|-------------|
-| `state/scaffold.json` | Yes | No | `03a`, `03b`, `06` |
-| `state/plan.json` | Yes | No | `03a`, `06` |
-| `state/spec_applied.json` | *Hybrid* | Yes (embedded history) | `spec_diff.py` |
-| `cache/spec_compressed.md` | Yes | No | `03a`, `03b`, `04`, `06`, `07` |
-| `cache/spec_delta.json` | Yes | No | `harness`, `06` |
-| `knowledge/current/base.md` | No | Yes | `04`, `07` |
-| `knowledge/current/spec_addendum.md` | No | Yes | `06` |
-| `knowledge/history/update_log.json` | No | Yes | (human review only) |
-| `knowledge/history/spec.changelog` | No | Yes | (human review only) |
-| `run/impl_record.json` | Yes | No | `harness` (retry) |
-| `run/test_report.json` | Yes | No | `05`, `06`, `07_update_knowledge` |
-| `run/judge_raw.json` | Yes | No | `07_fix_from_judge` |
-| `reports/*.md` | Yes | No | (human only) |
+---
+
+## Ownership & Lifecycle Table
+
+| Artifact | Owner (sole writer) | Write mode | Consumers (readers) |
+|---|---|---|---|
+| `state/scaffold.json` | `02_scaffold_gemini` | overwrite | `03a`, `03b`, `05`, `06`, `harness` |
+| `cache/spec_compressed.md` | `02_scaffold_gemini` | overwrite | `03a`, `03b`, `06`, `07_fix` |
+| `state/plan.json` | `03b_implement_glm` | overwrite | `03a`, `04`, `05`, `06`, `07_fix`, `07_update`, `harness` |
+| `cache/spec_delta.json` | `spec_diff` | overwrite | `05`, `06`, `harness` |
+| `state/spec_applied.json` | `spec_diff` | hybrid† | `spec_diff` (self-read) |
+| `knowledge/history/spec.changelog` | `spec_diff` | append | — (human review) |
+| `knowledge/history/<version>.md` | `spec_diff` | write-once | — (human review) |
+| `knowledge/history/<version>.changelog.md` | `spec_diff` | write-once | — (human review) |
+| `run/impl_record.json` | `03a_implement_qwen` | overwrite | `05`, `06` |
+| `run/test_report.json` | `04_test_and_iterate` | overwrite | `05`, `06`, `07_update` |
+| `knowledge/current/findings.md` | `07_fix_from_judge` | overwrite | `04`, `07_update` |
+| `knowledge/history/fix_log.json` | `07_fix_from_judge` | append | — (human review) |
+| `run/judge_raw.json` | `06_judge_deepseek` | overwrite | `07_update`, `07_fix`, `harness` |
+| `reports/judge_report.md` | `06_judge_deepseek` | overwrite | — (human only) |
+| `knowledge/current/spec_addendum.md` | `07_update_knowledge` | append | `06`, `07_update` |
+| `knowledge/current/base.md` | `07_update_knowledge` | append | `04`, `06`, `07_fix` |
+| `knowledge/current/findings_notes.md` | `07_update_knowledge` | append | `04`, `07_fix` |
+| `knowledge/history/update_log.json` | `07_update_knowledge` | append | — (human review) |
+| `state/plan_notes.json` | `07_update_knowledge` | append | `04`, `07_fix` |
+| `reports/summary.md` | `05_report` | overwrite | — (human only) |
+
+† See special note on `spec_applied.json` below.
+
+---
+
+## Data Flow
+
+```
+spec.md
+  │
+  ├─[spec_diff]──────► spec_delta.json, spec_applied.json, spec.changelog,
+  │                    <version>.md, <version>.changelog.md
+  │
+  └─[02_scaffold]────► scaffold.json, spec_compressed.md
+                              │
+               ┌─────────────┘
+               │
+        [03b_glm]──────────► plan.json
+               │
+        [03a_qwen]─────────► impl_record.json        (reads: scaffold, plan)
+               │
+        [04_test]──────────► test_report.json         (reads: plan, plan_notes,
+               │                                               findings, findings_notes, base)
+        [06_judge]─────────► judge_raw.json, judge_report.md
+               │              (reads: scaffold, plan, impl_record, test_report,
+               │               spec_delta, spec_compressed, spec_addendum, base)
+        [07_fix]───────────► findings.md, fix_log.json
+        [07_update]────────► base.md, findings_notes.md, update_log.json, plan_notes.json
+               │              (reads: judge_raw, plan, findings, spec_addendum, test_report)
+        [05_report]────────► summary.md
+```
+
+---
 
 ## Special Notes
 
+### `state/scaffold.json`
+Generated by Gemini 2.5 Flash from `spec.md`. Contains the full stub file tree: function signatures, interfaces, JSDoc, and complete test skeletons — no implementation bodies. Also carries `implementation_instructions.for_qwen` which `03a` reads as its executor briefing. Overwritten fully each run; all downstream steps treat it as read-only.
+
+### `cache/spec_compressed.md`
+A token-optimised version of `spec.md` with `§0` (pipeline meta for Gemini) and `§8` (Gemini output schema) stripped — saves ~35% tokens on every downstream API call. Regenerated by `02_scaffold_gemini` each run. All consumers fall back to full `spec.md` if absent, so it is a true cache: no data here that isn't derivable from source.
+
+### `state/plan.json`
+The output of GLM 5.1 acting as planner. Contains per-file implementation tasks, ordered sub-tasks, dependency order, gotchas, and Tailwind hints. **Immutable after `03b`** — no downstream script may mutate this file. Accumulated architect notes from later runs are stored separately in `plan_notes.json`.
+
+### `state/plan_notes.json`
+Append-only JSON array owned by `07_update_knowledge`. Each entry is `{"note": ..., "added": <iso timestamp>}`. Stores cross-cutting concerns and architecture notes discovered during judge/fix cycles — things the original planner could not know at plan time. `04_test_and_iterate` merges `plan.json["global_notes"]` (original GLM notes) with all entries here when building the Minimax system prompt.
+
 ### `state/spec_applied.json`
-This file stores the **current** applied version and metadata (overwritten each run), but also keeps a `run_history` array that grows over time. It is a deliberate **hybrid** – the `run_history` is effectively an append‑only log embedded inside an otherwise overwritten file.  
-*Rationale:* Keeps the history coupled with the state for simplicity; does not break the pipeline logic.
+Stores the currently applied spec version and run metadata — overwritten each run — but also contains a `run_history` array that grows across runs. A deliberate **hybrid**: top-level fields are mutable state, `run_history` is an append-only log embedded inside. Rationale: keeps history coupled with current state without adding another artifact. Used by `spec_diff` to determine whether the current run is a first-run or delta, and to load the previous snapshot for diffing.
 
 ### `cache/spec_delta.json`
-Used by `harness.py` to decide which steps to skip. This is a **control‑flow** decision derived from the spec. It is placed in `cache/` because it can be recomputed at any time from the current spec and the last applied version, but its consumption by harness makes it more than a pure cache. This is an **exception** documented here.
+Computed by `spec_diff` from the diff between the current spec and the last applied snapshot. Describes which sections changed, which files are affected, and which pipeline steps can be skipped. Used by `harness.py` for control-flow decisions (step skipping). Placed in `cache/` because it is fully derivable from `spec.md` + `spec_applied.json`, but its use by `harness` for control flow makes it more than a pure cache — documented exception.
+
+### `knowledge/history/spec.changelog`
+Aggregated human-readable changelog across all spec versions. Each run where the spec changes appends a new dated entry. Never overwritten. Consumed by humans only — no pipeline logic reads it.
+
+### `knowledge/history/<version>.md`
+Raw snapshot of `spec.md` at the moment a specific version was applied, saved by `spec_diff`. Write-once — never modified after creation. Used internally by `spec_diff` when computing future deltas (`_load_latest_snapshot`).
+
+### `knowledge/history/<version>.changelog.md`
+Per-version changelog entry — identical in content to the corresponding section appended to `spec.changelog`. Write-once. Exists for convenient per-version access without parsing the aggregated file. Consumed by humans only.
+
+### `run/impl_record.json`
+Written by `03a_implement_qwen` at the end of each implementation run. Records: model used, run mode (`full` / `delta`), list of files written this run, files skipped via delta reuse, and failed files. Consumed by `harness.py` for retry decisions and by `05_report` / `06_judge` for run context.
+
+### `run/test_report.json`
+Written by `04_test_and_iterate` after all repair iterations complete. Contains: final pass/fail status, per-iteration breakdown with test summaries, cluster-level repair details (layer used, owner, escalation status), and pipeline config. Consumed by `05_report` for the human summary, `06_judge` for verdict context, and `07_update_knowledge` to decide which knowledge entries to update.
+
+### `run/judge_raw.json`
+The raw DeepSeek V3.2 API response including the full reasoning chain. Written once per run by `06_judge_deepseek` immediately after the API call, before any parsing or post-processing. Preserves the unprocessed output so that `07_update_knowledge` and `07_fix_from_judge` can parse it independently, and so failures can be debugged without re-calling the API.
+
+### `knowledge/current/findings.md`
+A **per-run snapshot** of blocking and non-blocking findings extracted from the judge verdict by `07_fix_from_judge`. Overwritten each run — reflects the state of the *current* run only. Injected by `04_test_and_iterate` into Qwen/Minimax prompts as regression prevention context. Not a persistent record; for accumulated human-approved notes see `findings_notes.md`.
+
+### `knowledge/current/findings_notes.md`
+**Human-approved regression notes**, append-only across runs. Owned by `07_update_knowledge`'s interactive mode — the human decides which judge findings get promoted to long-term memory. Unlike `findings.md` (volatile, per-run), this file persists indefinitely. `04_test_and_iterate` reads both files and merges them when building prompts.
+
+### `knowledge/current/base.md`
+The core persistent knowledge base. Accumulates architecture decisions, recurring bug patterns, module relationships, and lessons learned across all runs. Append-only; the interactive flow in `07_update_knowledge` controls what gets added. Stored as markdown for human editability — one of the few artifacts where human manual editing is an intended use case. Also injected into `06_judge_deepseek` briefing for context continuity across runs.
+
+### `knowledge/current/spec_addendum.md`
+Edge cases, constraint clarifications, and spec gaps surfaced by the judge and approved by the human, accumulated across runs. Append-only, owned by `07_update_knowledge`. Injected into `06_judge_deepseek`'s briefing so the judge is aware of previously discovered edge cases when reviewing future runs. Also human-editable.
 
 ### `knowledge/history/update_log.json`
-Despite being under `knowledge/history/`, it is **appended by scripts** (`07_fix_from_judge.py`, `07_update_knowledge.py`) across runs. It belongs to `knowledge/` because it accumulates long‑term data; the `history/` subdirectory emphasises immutability.
+Append-only JSON array recording each knowledge update event produced by `07_update_knowledge`: action type, target artifact, content added, and ISO timestamp. Audit trail for the knowledge layer. Consumed by `harness.py` for status display and by humans reviewing what the pipeline has learned over time.
 
-### Scratch space: `scaffold/prev_src/`
-Used exclusively by `harness.py` to restore unaffected source files during delta runs. It is **not a pipeline artifact** – it can be deleted safely at any time.
+### `knowledge/history/fix_log.json`
+Append-only JSON array recording each automated fix run by `07_fix_from_judge`: which files were patched, what judge findings triggered the fix, and the outcome per file. Semantically distinct from `update_log.json` — fix actions modify `src/` directly rather than knowledge artifacts. Consumed by humans for audit only.
+
+### `reports/summary.md`
+Human-readable markdown aggregating the full pipeline run: GLM plan summary, test iteration breakdown, scaffold stats, spec delta summary, and implementation record. **No pipeline script parses this file.** On local runs, rendered on-demand. On GitHub Actions, piped once to `$GITHUB_STEP_SUMMARY` — does not need to be committed to the repo.
+
+### `reports/judge_report.md`
+Structured markdown rendering of the DeepSeek judge verdict: blocking issues with severity and suggested fixes, non-blocking notes, spec gaps, partial run notes, and sign-off. Generated by `06_judge_deepseek` from `judge_raw.json`. **No pipeline script parses this file.** Primary artifact for a human deciding whether the pipeline output is acceptable before merging.
+
+### Scratch space: `state/prev_src/`
+Used exclusively by `harness.py` to stash unaffected source files before a delta run and restore them after `03a` overwrites `src/`. Not a pipeline artifact — not tracked in `paths.py`, not versioned, safe to delete at any time.
+
+---
 
 ## Adding New Artifacts
 
 When extending the pipeline, follow these rules:
 
-1. **State** – for files that record progress to enable skipping steps. Overwrite each run.  
-2. **Cache** – for heavy intermediates that can be regenerated from spec. Overwrite each run.  
-3. **Knowledge** – for files that are appended across runs. They may be read by pipeline steps.  
-4. **Run** – for logs of a single run. Overwritten. May be consumed by later steps within the same run.  
-5. **Reports** – for human readability only. Never consumed by logic.  
-6. **Build outputs** (`src/`, `tests/`) – must only be written by designated scripts (`02_scaffold_gemini.py`, `03a_implement_qwen.py`).  
-7. **Scratch space** – not versioned as artifacts; use `scaffold/` for temporary data.
+1. **State** — records progress to enable step-skipping. Overwrite each run.
+2. **Cache** — heavy intermediates regenerable from spec. Overwrite each run.
+3. **Knowledge** — files appended across runs; may be read by pipeline steps.
+4. **Run** — logs of a single run. Overwritten. May be consumed by later steps within the same run.
+5. **Reports** — human readability only. Never consumed by pipeline logic.
+6. **Build outputs** (`src/`, `tests/`) — written only by `02_scaffold_gemini.py` and `03a_implement_qwen.py`.
+7. **Scratch space** — not versioned as artifacts; use `state/` subdirs for temporary data.
 
-If a file has **hybrid behaviour** (e.g., embedded appended arrays inside an overwritten file), document the exception in the lifecycle table and add a rationale.
+If a file has **hybrid behaviour** (e.g., embedded appended arrays inside an overwritten file), document the exception in the lifecycle table and add a rationale in Special Notes.
+
+Every new artifact must be registered in all three places:
+- `artifacts/paths.py` — with owner comment
+- `artifacts/OWNERSHIP.md` — in the ownership table
+- This document — directory overview, lifecycle table, and a special note
 
 ---
 
-*Last updated: 2026-04-26*  
-*Maintained with code in `pipeline/` and `harness.py`.*
+*Last updated: 2026-04-27*  
+*Maintained alongside `pipeline/` and `harness.py`.*

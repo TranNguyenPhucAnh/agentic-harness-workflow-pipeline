@@ -45,28 +45,30 @@ from datetime import datetime, timezone
 from pathlib import Path
 import time
 
-ROOT         = Path(__file__).parent.parent
-SPEC_PATH    = ROOT / "spec.md"
-REPORTS_DIR = ROOT / "artifacts" / "reports"
-REPORTS_DIR.mkdir(exist_ok=True)
+# === WRITE AUTHORITY: 07_fix_from_judge ===
+# OWNS  : artifacts/knowledge/history/fix_log.json
+#         artifacts/knowledge/current/findings.md
+# READS : artifacts/run/judge_raw.json,
+#         artifacts/knowledge/current/findings_notes.md,
+#         artifacts/knowledge/current/base.md,
+#         artifacts/cache/spec_compressed.md,
+#         artifacts/state/plan.json,
+#         artifacts/state/plan_notes.json
 
-# New artifact paths
-STATE_DIR     = ROOT / "artifacts" / "state"
-CACHE_DIR     = ROOT / "artifacts" / "cache"
-RUN_DIR       = ROOT / "artifacts" / "run"
-KNOWLEDGE_DIR = ROOT / "artifacts" / "knowledge"
-CURRENT_DIR   = KNOWLEDGE_DIR / "current"
-HISTORY_DIR   = KNOWLEDGE_DIR / "history"
-
-for d in (STATE_DIR, CACHE_DIR, RUN_DIR, KNOWLEDGE_DIR, CURRENT_DIR, HISTORY_DIR):
-    d.mkdir(parents=True, exist_ok=True)
-
-JUDGE_RAW_PATH   = RUN_DIR / "judge_raw.json"
-FIX_REPORT_PATH  = HISTORY_DIR / "update_log.json"
-FINDINGS_PATH    = CURRENT_DIR / "findings.md"
-KNOWLEDGE_BASE   = CURRENT_DIR / "base.md"
-SPEC_COMPRESSED  = CACHE_DIR / "spec_compressed.md"
-GLM_PLAN_PATH    = STATE_DIR / "plan.json"      # not used directly but kept for consistency
+import sys as _sys
+_sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent))
+from artifacts.paths import (
+    ROOT, SPEC_PATH, REPORTS_DIR,
+    JUDGE_RAW as JUDGE_RAW_PATH,
+    FIX_LOG as FIX_REPORT_PATH,
+    FINDINGS as FINDINGS_PATH,
+    KNOWLEDGE_BASE,
+    SPEC_COMPRESSED,
+    PLAN_JSON as GLM_PLAN_PATH,
+    PLAN_NOTES as PLAN_NOTES_PATH,
+    ensure_dirs,
+)
+ensure_dirs()
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -600,8 +602,15 @@ def main() -> None:
         "records":          [asdict(r) for r in fix_records],
     }
     FIX_REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    FIX_REPORT_PATH.write_text(json.dumps(report, indent=2))
-    print(f"\n[07] Fix report (merged) → {FIX_REPORT_PATH}")
+    existing_fixes: list = []
+    if FIX_REPORT_PATH.exists():
+        try:
+            existing_fixes = json.loads(FIX_REPORT_PATH.read_text())
+        except Exception:
+            existing_fixes = []
+    existing_fixes.append(report)
+    FIX_REPORT_PATH.write_text(json.dumps(existing_fixes, indent=2))
+    print(f"\n[07] Fix log appended → {FIX_REPORT_PATH}")
 
     print(f"\n{'='*50}")
     print(f"  STEP 7 SUMMARY")

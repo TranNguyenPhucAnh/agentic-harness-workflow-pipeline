@@ -26,22 +26,23 @@ import sys
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
-ROOT = Path(__file__).parent.parent
+# === WRITE AUTHORITY: spec_diff ===
+# OWNS  : artifacts/cache/spec_delta.json
+#         artifacts/state/spec_applied.json
+#         artifacts/knowledge/history/spec.changelog
+# READS : spec.md
 
-# New artifact paths
-SPEC_PATH = ROOT / "spec.md"
-STATE_DIR = ROOT / "artifacts" / "state"
-CACHE_DIR = ROOT / "artifacts" / "cache"
-KNOWLEDGE_HISTORY_DIR = ROOT / "artifacts" / "knowledge" / "history"
-CHANGELOG = KNOWLEDGE_HISTORY_DIR / "spec.changelog"
-
-DELTA_OUT = CACHE_DIR / "spec_delta.json"
-APPLIED_PATH = STATE_DIR / "spec_applied.json"
-
-# Ensure directories exist
-STATE_DIR.mkdir(parents=True, exist_ok=True)
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
-KNOWLEDGE_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+import sys as _sys
+_sys.path.insert(0, str(Path(__file__).parent.parent))
+from artifacts.paths import (
+    ROOT, SPEC_PATH,
+    HISTORY_DIR as KNOWLEDGE_HISTORY_DIR,
+    SPEC_CHANGELOG as CHANGELOG,
+    SPEC_DELTA as DELTA_OUT,
+    SPEC_APPLIED as APPLIED_PATH,
+    ensure_dirs,
+)
+ensure_dirs()
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -329,8 +330,7 @@ def _append_changelog(delta: "SpecDelta") -> None:
     lines.append("")
     entry = "\n".join(lines)
 
-    # Append to aggregated spec.changelog
-    CHANGELOG = KNOWLEDGE_HISTORY_DIR / "spec.changelog"
+    # Append to aggregated spec.changelog (CHANGELOG imported from artifacts/paths.py)
     existing = changelog_path.read_text() if changelog_path.exists() else ""
     changelog_path.write_text(existing + entry)
 
@@ -340,7 +340,6 @@ def _append_changelog(delta: "SpecDelta") -> None:
 
 
 def print_changelog(n: int = 0) -> None:
-    CHANGELOG = KNOWLEDGE_HISTORY_DIR / "spec.changelog"
     if not changelog_path.exists():
         print("[spec_diff] No changelog yet.")
         return

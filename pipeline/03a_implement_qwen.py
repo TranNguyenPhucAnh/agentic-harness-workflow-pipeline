@@ -35,21 +35,20 @@ OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions"
 MODEL              = "qwen/qwen3.6-plus"
 
-ROOT = Path(__file__).parent.parent
+# === WRITE AUTHORITY: 03a_implement_qwen ===
+# OWNS  : artifacts/run/impl_record.json
+# READS : spec.md, artifacts/state/scaffold.json, artifacts/state/plan.json
 
-# New artifact paths
-STATE_DIR = ROOT / "artifacts" / "state"
-CACHE_DIR = ROOT / "artifacts" / "cache"
-RUN_DIR   = ROOT / "artifacts" / "run"
-
-STATE_DIR.mkdir(parents=True, exist_ok=True)
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
-RUN_DIR.mkdir(parents=True, exist_ok=True)
-
-SPEC_PATH     = ROOT / "spec.md"
-SCAFFOLD_JSON = STATE_DIR / "scaffold.json"
-GLM_PLAN      = STATE_DIR / "plan.json"
-IMPL_RECORD   = RUN_DIR   / "impl_record.json"
+import sys as _sys
+_sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent))
+from artifacts.paths import (
+    ROOT, SPEC_PATH, CACHE_DIR,
+    SCAFFOLD_JSON,
+    PLAN_JSON as GLM_PLAN,
+    IMPL_RECORD,
+    ensure_dirs,
+)
+ensure_dirs()
 
 
 # ── System prompts ────────────────────────────────────────────────────────────
