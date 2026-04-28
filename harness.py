@@ -85,6 +85,13 @@ First run / spec changed:
     python harness.py
     # spec_diff detects changes automatically; full pipeline runs
  
+Clarify requirement before building (async client Q&A):
+    python harness.py --clarify-only --clarify-input requirement.md
+    python harness.py --clarify-only                    # interactive mode
+
+Build after clarification is done:
+    python harness.py --skip-clarify
+
 Spec changed, scaffold still valid (only component props changed):
     python harness.py --skip-scaffold
     # Reuses scaffold.json; re-plans + re-implements + tests + judges
@@ -140,6 +147,8 @@ ROOT = Path(__file__).parent
 # === WRITE AUTHORITY: harness ===
 # OWNS  : (no artifact ownership — orchestrator only)
 # READS : all artifacts (coordinates pipeline steps)
+# NOTE  : 00_clarificator.py owns clarification artifacts;
+#         harness only reads CLARIFICATION_REPORT + CLARIFIED_REQ
 
 import sys as _sys
 _sys.path.insert(0, str(ROOT))
@@ -150,6 +159,8 @@ from artifacts.paths import (
     IMPL_RECORD as IMPL_RECORD_PATH,
     UPDATE_LOG as UPDATE_LOG_PATH,
     JUDGE_RAW as JUDGE_RAW_PATH,
+    CLARIFICATION_REPORT,
+    CLARIFIED_REQ,
     ensure_dirs,
 )
 ensure_dirs()
@@ -475,6 +486,17 @@ def main() -> None:
         description="Local LLM pipeline runner",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    # Clarificator flags
+    parser.add_argument("--skip-clarify", action="store_true",
+                        help="Skip Step 0 (Clarificator). Use when requirement is "
+                             "already clear or clarified_requirement.md exists.")
+    parser.add_argument("--clarify-only", action="store_true",
+                        help="Run Step 0 (Clarificator) only, then stop. "
+                             "Useful for async client Q&A before committing to build.")
+    parser.add_argument("--clarify-input", type=str, default=None,
+                        metavar="FILE",
+                        help="Path to requirement file for Clarificator "
+                             "(PDF/MD/TXT). If omitted, Clarificator prompts interactively.")
     # Delta-aware flags
     parser.add_argument("--force", action="store_true",
                         help="Ignore spec_delta.json — re-run all steps unconditionally")
@@ -516,6 +538,13 @@ def main() -> None:
         args.skip_scaffold = True
         args.skip_plan     = True
 
+    # clarify-only: run Step 0 then stop immediately
+    if getattr(args, "clarify_only", False):
+        args.skip_scaffold = True
+        args.skip_plan     = True
+        args.test_only     = True
+        args.skip_judge    = True
+
     if args.retry_impl:
        args.skip_scaffold = True
        args.skip_plan     = True
@@ -529,6 +558,52 @@ def main() -> None:
         args.skip_judge    = True   # skip Step 6 (judge API call)
 
     results: dict[str, bool] = {}
+
+    # ── Step 0: Clarificator ─────────────────────────────────────────────────
+    # Optional upstream step — clarifies requirement ambiguities before any LLM
+    # generation. Skipped by default; opt-in with explicit requirement work.
+    skip_clarify = (
+        getattr(args, "skip_clarify", False)
+        or args.test_only
+        or getattr(args, "from_judge", False)
+        or getattr(args, "retry_impl", False)
+    )
+
+    if skip_clarify:
+        if CLARIFIED_REQ.exists():
+            skip_step("Step 0 — Clarificator",
+                      f"skipped — using existing {CLARIFIED_REQ.relative_to(ROOT)}")
+        else:
+            skip_step("Step 0 — Clarificator", "skipped (--skip-clarify or not applicable)")
+    else:
+        clarify_args: list[str] = []
+        if getattr(args, "clarify_input", None):
+            clarify_args += ["--input", args.clarify_input]
+        ok = run_step("Step 0 — Clarificator", "00_clarificator.py", clarify_args or None)
+        results["clarify"] = ok
+        if not ok:
+            print("\n[harness] Clarificator failed. Use --skip-clarify to bypass.")
+            sys.exit(1)
+
+    # ── --clarify-only: stop after Step 0 ───────────────────────────────────
+    if getattr(args, "clarify_only", False):
+        print("\n[harness] --clarify-only: stopping after Step 0.")
+        if CLARIFICATION_REPORT.exists():
+            try:
+                rep = json.loads(CLARIFICATION_REPORT.read_text())
+                t1  = rep.get("tier1_answered", 0)
+                t2  = rep.get("tier2_answered", 0)
+                t3a = rep.get("tier3_accepted", 0)
+                unr = len(rep.get("unresolved", []))
+                print(f"  Tier 1 answered : {t1}")
+                print(f"  Tier 2 answered : {t2}")
+                print(f"  Tier 3 accepted : {t3a}")
+                if unr:
+                    print(f"  Unresolved      : {unr} (check clarification_questions.md)")
+            except Exception:
+                pass
+        print("\n  Next: python harness.py --skip-clarify  (to proceed with build)")
+        return
 
     # ── Step 1: Spec diff ────────────────────────────────────────────────────
     # Always fast (no LLM). Skipped only with --test-only (no spec change expected).
@@ -561,6 +636,7 @@ def main() -> None:
         plan_str = ("skip (only-qwen)" if args.only_qwen
                     else "skip" if args.skip_plan else "run")
         steps = [
+            ("clarify",        "skip" if args.skip_clarify else "run"),
             ("scaffold",       "skip" if args.skip_scaffold else "run"),
             ("plan",           plan_str),
             ("implement",      "skip" if args.test_only else "run"),
@@ -748,6 +824,8 @@ def main() -> None:
     all_ok = all(results.values())
     print(f"\n  Overall: {'✅ PASS' if all_ok else '❌ FAIL'}")
     print(f"\n  Reports:")
+    if CLARIFICATION_REPORT.exists() and results.get("clarify"):
+        print(f"    Clarify   → {CLARIFICATION_REPORT.relative_to(ROOT)}")
     print(f"    Pipeline  → reports/summary.md")
     if not args.skip_judge and tests_passed:
         print(f"    Judge     → reports/judge_report.md")
