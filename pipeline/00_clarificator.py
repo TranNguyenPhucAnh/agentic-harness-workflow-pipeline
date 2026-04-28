@@ -9,15 +9,19 @@ tổ chức Q&A với user theo 3-tier system, và output clarified_requirement.
 cùng với structured report cho downstream steps.
 
 Usage:
-    python 00_clarificator.py --input requirement.pdf
-    python 00_clarificator.py --input spec_draft.md
-    python 00_clarificator.py --text "Build a dashboard that shows..."
-    python 00_clarificator.py                    # interactive multiline prompt
+    python 00_clarificator.py --project my-app --input requirement.pdf
+    python 00_clarificator.py --project my-app --input spec_draft.md
+    python 00_clarificator.py --project my-app --text "Build a dashboard..."
+    python 00_clarificator.py --project my-app   # interactive multiline prompt
+    python 00_clarificator.py                    # prompts for project name
+
+--project is required for dedup to work across sessions. Each project gets its
+own clarification_log_<slug>.md so decisions from project A never pollute B.
 
 Artifacts produced (owner: 00_clarificator):
     run/clarification_report.json
     run/clarification_questions.md
-    knowledge/current/clarification_log.md   ← append-only
+    knowledge/current/clarification_log_<project_slug>.md   ← append-only, per-project
     state/clarified_requirement.md
 """
 
@@ -32,7 +36,7 @@ import sys
 import textwrap
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any  # noqa: F401 — kept for future typed helpers
 
 import httpx
 
@@ -63,10 +67,38 @@ except ImportError:
             d.mkdir(parents=True, exist_ok=True)
 
 # ── New artifact paths (owned by this script) ─────────────────────────────────
+# NOTE: CLARIFICATION_LOG is NOT a module-level constant — it is per-project.
+#       Use _clarification_log_path(project_slug) to get the correct path.
 CLARIFICATION_REPORT    = RUN_DIR     / "clarification_report.json"
 CLARIFICATION_QUESTIONS = RUN_DIR     / "clarification_questions.md"
-CLARIFICATION_LOG       = CURRENT_DIR / "clarification_log.md"
 CLARIFIED_REQ           = STATE_DIR   / "clarified_requirement.md"
+# legacy single-file log kept for backward compat read-only migration
+_LEGACY_CLARIFICATION_LOG = CURRENT_DIR / "clarification_log.md"
+
+
+def _slugify(name: str) -> str:
+    """Convert a project name to a filesystem-safe slug."""
+    slug = name.lower().strip()
+    slug = re.sub(r"[^\w\s-]", "", slug)
+    slug = re.sub(r"[\s_-]+", "-", slug)
+    slug = slug.strip("-")
+    return slug or "unknown"
+
+
+def _clarification_log_path(project_slug: str) -> Path:
+    """Per-project append-only log: knowledge/current/clarification_log_<slug>.md"""
+    return CURRENT_DIR / f"clarification_log_{project_slug}.md"
+
+
+def _list_known_projects() -> list[str]:
+    """Return sorted list of project slugs that have existing logs."""
+    logs = sorted(CURRENT_DIR.glob("clarification_log_*.md"))
+    slugs = []
+    for p in logs:
+        m = re.match(r"clarification_log_(.+)\.md$", p.name)
+        if m:
+            slugs.append(m.group(1))
+    return slugs
 
 # ── Model config ──────────────────────────────────────────────────────────────
 _ANALYZE_MODEL   = "deepseek/deepseek-chat"          # Phase 1+2: reasoning heavy
@@ -138,21 +170,50 @@ def _read_input_file(path: Path) -> str:
         return path.read_text(encoding="latin-1")
 
 
-def _load_clarification_log() -> str:
-    return _load_text_file(CLARIFICATION_LOG)
+def _load_clarification_log(project_slug: str) -> str:
+    """Load per-project log. Falls back to legacy global log on first migration."""
+    project_log = _clarification_log_path(project_slug)
+    if project_log.exists():
+        return project_log.read_text(encoding="utf-8")
+    # One-time migration: if legacy global log exists, read it but don't trust it
+    # for dedup (different projects mixed in) — warn instead.
+    if _LEGACY_CLARIFICATION_LOG.exists():
+        print(
+            f"[00][warn] Found legacy clarification_log.md but no per-project log for "
+            f"'{project_slug}'. Legacy log ignored for dedup. "
+            f"Consider migrating: cp clarification_log.md clarification_log_{project_slug}.md"
+        )
+    return ""
 
 
-def _extract_answered_ids(log_text: str) -> set[str]:
-    """Pull all CLR-XXX ids that already appear in the log."""
-    return set(re.findall(r"CLR-\d{3}", log_text))
+def _extract_answered_qa_pairs(log_text: str) -> list[dict]:
+    """
+    Extract structured Q/A pairs from the log for semantic dedup.
+    Returns list of {id, question, answer} dicts.
+    """
+    pairs: list[dict] = []
+    # Pattern: ### CLR-NNN [...]\n**Q:** ...\n**A:** ...
+    blocks = re.split(r"\n(?=###\s+CLR-)", log_text)
+    for block in blocks:
+        id_match = re.search(r"###\s+(CLR-\d{3})", block)
+        q_match  = re.search(r"\*\*Q:\*\*\s*(.+?)(?=\n\*\*|\Z)", block, re.DOTALL)
+        a_match  = re.search(r"\*\*A:\*\*\s*(.+?)(?=\n\*\*|\Z)", block, re.DOTALL)
+        if id_match and q_match:
+            pairs.append({
+                "id":       id_match.group(1),
+                "question": q_match.group(1).strip()[:200],
+                "answer":   a_match.group(1).strip()[:200] if a_match else "",
+            })
+    return pairs
 
 
-def _load_knowledge_context() -> str:
+def _load_knowledge_context(project_slug: str) -> str:
     parts: list[str] = []
     if KNOWLEDGE_BASE.exists():
         parts.append(f"=== base.md ===\n{KNOWLEDGE_BASE.read_text(encoding='utf-8')}")
-    if CLARIFICATION_LOG.exists():
-        parts.append(f"=== clarification_log.md ===\n{CLARIFICATION_LOG.read_text(encoding='utf-8')}")
+    log_text = _load_clarification_log(project_slug)
+    if log_text:
+        parts.append(f"=== clarification_log_{project_slug}.md ===\n{log_text}")
     return "\n\n".join(parts)
 
 
@@ -221,9 +282,15 @@ assumption, conflict, and gap that would block or risk the implementation.
 
 You have access to the project's knowledge base and past clarification history.
 Use them to:
-1. AVOID asking questions that have already been answered (ids in clarification_log).
-2. DETECT conflicts between new requirements and past decisions.
-3. SURFACE assumptions the requirement makes about existing systems.
+1. SEMANTIC DEDUP — Do NOT generate a new finding if the ALREADY_ANSWERED_QA
+   section contains a question that is semantically equivalent or closely related
+   to the potential new finding. Equivalence means: same topic, same decision
+   space, same impact — even if worded differently.
+   If an existing answer already resolves the ambiguity, skip generating it.
+   Instead, if the existing answer is relevant, you may reference it in
+   "clarified_summary" but do NOT put it in findings[].
+2. CONFLICT DETECTION — requirement mới có contradict decision cũ không?
+3. ASSUMPTION SURFACING — requirement assume behavior chưa được implement.
 
 Output ONLY a valid JSON object — no markdown fences, no preamble.
 Schema:
@@ -240,7 +307,7 @@ Schema:
       "scenarios": ["<option A>", "<option B>"],
       "suggestion": "<recommended approach>",
       "confidence": 0.0,
-      "citation": "<source: base.md §X, pattern Y, etc.>"
+      "citation": "<source: base.md §X, past decision from log, pattern Y, etc.>"
     }
   ],
   "conflicts": [
@@ -251,7 +318,7 @@ Schema:
       "source_b": "<existing decision from knowledge base>"
     }
   ],
-  "clarified_summary": "<one paragraph: what the requirement IS asking for, stated confidently>"
+  "clarified_summary": "<one paragraph: what the requirement IS asking for, stating confidently what is already known from past decisions>"
 }
 
 TIER RULES (strict):
@@ -273,27 +340,39 @@ PRIORITY RULES:
 - "medium": affects one module or UX flow.
 - "low": nice-to-have clarification.
 
-ID FORMAT: CLR-001, CLR-002, ... (3-digit zero-padded, sequential)
+ID FORMAT: CLR-001, CLR-002, ... (3-digit zero-padded, sequential, start from 001 each session)
 """
 
 
-def _analyze(requirement_text: str, knowledge_context: str, answered_ids: set[str]) -> dict:
-    """Run Phase 1+2: call LLM, parse JSON, filter already-answered findings."""
-    already_answered_note = ""
-    if answered_ids:
-        already_answered_note = (
-            f"\n\nALREADY ANSWERED (skip these, do not re-generate):\n"
-            + "\n".join(sorted(answered_ids))
+def _analyze(
+    requirement_text: str,
+    knowledge_context: str,
+    answered_qa_pairs: list[dict],
+) -> dict:
+    """Run Phase 1+2: call LLM, parse JSON, enforce Tier 3 confidence threshold."""
+
+    # Build semantic dedup block — full Q/A text so LLM can detect meaning, not just IDs
+    if answered_qa_pairs:
+        qa_lines = []
+        for pair in answered_qa_pairs:
+            qa_lines.append(f"  [{pair['id']}] Q: {pair['question']}")
+            qa_lines.append(f"         A: {pair['answer']}")
+        already_answered_block = (
+            "\n\nALREADY_ANSWERED_QA (do NOT re-ask semantically equivalent questions):\n"
+            + "\n".join(qa_lines)
         )
+    else:
+        already_answered_block = ""
 
     user_msg = f"""KNOWLEDGE CONTEXT:
 {knowledge_context if knowledge_context else "(none — standalone mode)"}
-{already_answered_note}
+{already_answered_block}
 
 REQUIREMENT DOCUMENT:
 {requirement_text}
 
-Analyze thoroughly. Output only the JSON object."""
+Analyze thoroughly. Apply semantic dedup against ALREADY_ANSWERED_QA above.
+Output only the JSON object."""
 
     raw = _call_llm(_ANALYZE_SYSTEM, user_msg)
 
@@ -653,10 +732,13 @@ def _write_questions_md(
 def _append_to_log(
     session_id: str,
     project_name: str,
+    project_slug: str,
     decisions: list[dict],
     conflicts: list[dict],
 ) -> None:
-    """Append this session's decisions to the permanent clarification_log.md."""
+    """Append this session's decisions to the per-project clarification_log_<slug>.md."""
+    log_path = _clarification_log_path(project_slug)
+
     lines: list[str] = [
         f"\n## {session_id[:10]} | Project: {project_name} | Session: {session_id[11:19]}",
         "",
@@ -677,9 +759,9 @@ def _append_to_log(
             lines.append(f"- [{c['id']}] {c['description']}")
         lines.append("")
 
-    with CLARIFICATION_LOG.open("a", encoding="utf-8") as fh:
+    with log_path.open("a", encoding="utf-8") as fh:
         fh.write("\n".join(lines))
-    print(f"[00] ✓ Log appended → {CLARIFICATION_LOG}")
+    print(f"[00] ✓ Log appended → {log_path}")
 
 
 def _write_clarified_req(content: str) -> None:
@@ -722,43 +804,107 @@ def _gather_requirement(args: argparse.Namespace) -> str:
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _resolve_project(arg_project: str | None) -> tuple[str, str]:
+    """
+    Resolve (project_name, project_slug).
+    If --project not given, show existing workspaces and prompt user.
+    Returns (display_name, slug).
+    """
+    if arg_project:
+        name = arg_project.strip()
+        return name, _slugify(name)
+
+    ensure_dirs()
+    known = _list_known_projects()
+
+    print()
+    if known:
+        print("Known workspaces:")
+        for i, slug in enumerate(known, 1):
+            print(f"  {i}. {slug}")
+        print()
+        raw = input("Enter project name (or number to select existing): ").strip()
+        if raw.isdigit():
+            idx = int(raw) - 1
+            if 0 <= idx < len(known):
+                slug = known[idx]
+                return slug.replace("-", " ").title(), slug
+        name = raw or "unknown"
+    else:
+        print("[00] No existing workspaces found.")
+        name = input("Enter new project name: ").strip() or "unknown"
+
+    return name, _slugify(name)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="00_clarificator — requirement analysis & Q&A agent"
     )
-    parser.add_argument("--input",    metavar="FILE", help="Path to requirement file (.md, .txt, .pdf)")
-    parser.add_argument("--text",     metavar="TEXT", help="Requirement as inline text string")
+    parser.add_argument("--project",  metavar="NAME",
+                        help="Project workspace name (required for dedup). Prompted if omitted.")
+    parser.add_argument("--input",    metavar="FILE",
+                        help="Path to requirement file (.md, .txt, .pdf)")
+    parser.add_argument("--text",     metavar="TEXT",
+                        help="Requirement as inline text string")
     parser.add_argument("--no-synth", action="store_true",
                         help="Skip synthesis step (don't generate clarified_requirement.md)")
     parser.add_argument("--dry-run",  action="store_true",
                         help="Run analysis only, print findings, no Q&A and no file writes")
+    parser.add_argument("--list-projects", action="store_true",
+                        help="List all known project workspaces and exit")
     args = parser.parse_args()
 
     ensure_dirs()
+
+    if args.list_projects:
+        known = _list_known_projects()
+        if not known:
+            print("[00] No project workspaces found.")
+        else:
+            print("[00] Known workspaces:")
+            for slug in known:
+                log_path = _clarification_log_path(slug)
+                sessions = len(re.findall(r"^## \d{4}-", log_path.read_text(encoding="utf-8"), re.MULTILINE))
+                print(f"  • {slug}  ({sessions} session{'s' if sessions != 1 else ''})")
+        return
+
+    # ── Resolve project workspace ─────────────────────────────────────────────
+    project_name, project_slug = _resolve_project(args.project)
+    print(f"[00] Workspace: {project_name!r} (slug: {project_slug})")
 
     # ── Gather input ──────────────────────────────────────────────────────────
     requirement_text = _gather_requirement(args)
     req_hash         = _sha256(requirement_text)
     session_id       = _now_iso()
 
-    # ── Load knowledge context ────────────────────────────────────────────────
-    standalone = not (KNOWLEDGE_BASE.exists() or CLARIFICATION_LOG.exists())
+    # ── Load knowledge context (project-scoped) ───────────────────────────────
+    log_text      = _load_clarification_log(project_slug)
+    standalone    = not (KNOWLEDGE_BASE.exists() or bool(log_text))
     if standalone:
-        print("[00] Standalone mode — no knowledge context found.")
-        knowledge_context = ""
-        answered_ids: set[str] = set()
+        print("[00] Standalone mode — no knowledge context found for this workspace.")
+        knowledge_context  = ""
+        answered_qa_pairs: list[dict] = []
     else:
         print("[00] Loading knowledge context ...")
-        knowledge_context = _load_knowledge_context()
-        log_text          = _load_clarification_log()
-        answered_ids      = _extract_answered_ids(log_text)
-        if answered_ids:
-            print(f"[00] Skipping {len(answered_ids)} already-answered findings: {sorted(answered_ids)[:5]}{'...' if len(answered_ids) > 5 else ''}")
+        knowledge_context = _load_knowledge_context(project_slug)
+        answered_qa_pairs = _extract_answered_qa_pairs(log_text)
+        if answered_qa_pairs:
+            print(
+                f"[00] Loaded {len(answered_qa_pairs)} past Q/A pairs for semantic dedup "
+                f"(workspace: {project_slug})"
+            )
 
     # ── Phase 1+2: Analyze ────────────────────────────────────────────────────
     print("[00] Analyzing requirement ...")
-    analysis      = _analyze(requirement_text, knowledge_context, answered_ids)
-    project_name  = analysis.get("project_name", "Unknown")
+    analysis      = _analyze(requirement_text, knowledge_context, answered_qa_pairs)
+    # Use --project name as canonical; only fall back to LLM-inferred if project is "unknown"
+    inferred_name = analysis.get("project_name", "Unknown")
+    if project_name == "unknown" and inferred_name != "Unknown":
+        project_name = inferred_name
+        project_slug = _slugify(project_name)
+        print(f"[00] Project name inferred from requirement: {project_name!r}")
+
     findings      = analysis.get("findings", [])
     conflicts     = analysis.get("conflicts", [])
     clarified_sum = analysis.get("clarified_summary", "")
@@ -789,13 +935,16 @@ def main() -> None:
     decisions, unresolved = _run_interactive_loop(findings, project_name)
 
     if unresolved:
-        print(f"\n[00][warn] {len(unresolved)} findings could not be resolved due to circular/unmet dependencies:")
+        print(
+            f"\n[00][warn] {len(unresolved)} findings unresolved "
+            f"(circular or unmet dependencies):"
+        )
         for u in unresolved:
             print(f"  - {u['id']}: {u['text'][:60]}...")
 
     # ── Write outputs ─────────────────────────────────────────────────────────
     _write_report(session_id, req_hash, project_name, decisions, unresolved, conflicts, findings)
-    _append_to_log(session_id, project_name, decisions, conflicts)
+    _append_to_log(session_id, project_name, project_slug, decisions, conflicts)
 
     # ── Phase synthesis: clarified requirement ────────────────────────────────
     if not args.no_synth:
@@ -805,8 +954,9 @@ def main() -> None:
         )
         _write_clarified_req(clarified_md)
 
-    _print_banner(f"Done — {len(decisions)} decisions recorded")
-    print(f"  Next step: python 01_estimator.py --input {CLARIFIED_REQ}\n")
+    _print_banner(f"Done — {len(decisions)} decisions recorded  [{project_slug}]")
+    print(f"  Workspace log: {_clarification_log_path(project_slug)}")
+    print(f"  Next step:     python 01_estimator.py --input {CLARIFIED_REQ}\n")
 
 
 if __name__ == "__main__":
