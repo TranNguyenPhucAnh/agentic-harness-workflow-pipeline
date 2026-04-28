@@ -406,7 +406,10 @@ Output only the JSON object."""
             f["scenarios"] = ["Yes / proceed as implied", "No / needs different approach", "Other (specify below)"]
 
     result["findings"] = _enforce_tiers(result.get("findings", []))
-    return result(text: str) -> str:
+    return result
+
+
+def _finding_hash(text: str) -> str:
     """Stable 8-char hash of normalized finding text — cross-round identity."""
     normalized = re.sub(r"\s+", " ", text.strip().lower())
     return hashlib.sha256(normalized.encode()).hexdigest()[:8]
@@ -444,18 +447,28 @@ def _enforce_tiers(findings: list[dict]) -> list[dict]:
         bounded      = bool(scenarios) and len(scenarios) <= 5
         near_det_cat = category in ("technical", "design", "logic")
 
-        if suggestion and confidence >= _TIER3_MIN_CONF and citation:
-            f["tier"] = 3
-        elif bounded and near_det_cat:
-            f["tier"] = 2
-        elif category == "business" or priority == "blocking" or not scenarios:
-            f["tier"] = 1
-        # else: keep LLM assignment, still apply R4 below
-
-        # R4 safety
+        # R4: validate existing Tier 3 FIRST — before any reassignment
+        # If LLM said Tier 3 but evidence is weak, demote to Tier 2 immediately
+        # so R1/R2/R3 see the corrected tier (not the original Tier 3 claim)
         if f.get("tier") == 3 and (not citation or confidence < _TIER3_MIN_CONF):
             f["tier"] = 2
             f["confidence"] = None
+
+        # R1: structural promotion to Tier 3 (strongest positive signal)
+        if suggestion and confidence >= _TIER3_MIN_CONF and citation:
+            f["tier"] = 3
+        # R2: bounded enumerable → Tier 2
+        elif bounded and near_det_cat:
+            f["tier"] = 2
+        # R3: subjective / business / no scenarios → Tier 1
+        # Exception: if finding has a suggestion (was intended as Tier 3 but
+        # demoted by R4), keep it at Tier 2 — not Tier 1. "No scenarios" alone
+        # is not enough to force Tier 1 when there is a concrete suggestion.
+        elif category == "business" or priority == "blocking" or (
+            not scenarios and not suggestion
+        ):
+            f["tier"] = 1
+        # else: keep current tier (already validated by R4 above)
 
         # Invariants
         if f.get("tier") in (1, 2) and not f.get("scenarios"):
@@ -703,14 +716,21 @@ def _batch_derive_impacts(decisions: list[dict]) -> None:
 def _run_interactive_loop(
     findings: list[dict],
     project_name: str,
+    requirement_text: str = "",
 ) -> tuple[list[dict], list[dict]]:
     """
     Drive the Q&A loop. Returns (decisions, unresolved).
     decisions: list of {id, tier, question, answer, accepted, impact}
+
+    Delta loop (Test 4): after each Tier 1 blocking answer, calls _delta_analyze()
+    to inject new findings and remove invalidated ones from the queue.
+    Uses _finding_hash() for cross-round identity so NEW-* items are deduped
+    against already-answered content even if IDs differ.
     """
     decisions:  list[dict] = []
     unresolved: list[dict] = []
     answered:   dict[str, str] = {}  # id → answer text
+    answered_hashes: set[str]  = set()  # content hashes of answered questions
 
     # Work from a stable sorted list; deferred items go into a separate pending set
     queue:    list[dict] = _sort_findings(list(findings))
@@ -726,8 +746,11 @@ def _run_interactive_loop(
         f = queue[i]
         i += 1
 
-        # Already processed (can happen if item was appended multiple times)
+        # Already processed — check both ID and content hash
         if f["id"] in answered:
+            continue
+        if _finding_hash(f["text"]) in answered_hashes:
+            # Semantically duplicate from delta injection — skip silently
             continue
 
         # Dependency not yet satisfied — defer once
@@ -760,6 +783,7 @@ def _run_interactive_loop(
             answer, accepted = _ask_tier3(f)
 
         answered[f["id"]] = answer
+        answered_hashes.add(_finding_hash(f["text"]))
         decisions.append({
             "id":       f["id"],
             "tier":     tier,
@@ -770,6 +794,39 @@ def _run_interactive_loop(
             "accepted": accepted,
             "impact":   "",  # filled by _batch_derive_impacts after loop
         })
+
+        # ── Delta loop: inject new findings after Tier 1 blocking answer ─────
+        if tier == 1 and f.get("priority") == "blocking" and requirement_text:
+            current_queue_ids = [
+                x["id"] for x in queue[i:]
+                if x["id"] not in answered
+            ]
+            print(f"  [delta] Checking for follow-up questions after {f['id']}...")
+            new_findings, invalidated_ids = _delta_analyze(
+                f, answer, requirement_text, current_queue_ids
+            )
+
+            # Remove invalidated items (mark as answered with sentinel)
+            for inv_id in invalidated_ids:
+                if inv_id not in answered:
+                    answered[inv_id] = "[invalidated by delta]"
+                    print(f"  [delta] Invalidated: {inv_id}")
+
+            # Inject new findings — dedup by content hash
+            injected = 0
+            for nf in new_findings:
+                if _finding_hash(nf["text"]) in answered_hashes:
+                    continue  # semantically already answered
+                if nf["id"] in answered:
+                    continue  # ID collision
+                queue.append(nf)
+                injected += 1
+            if injected:
+                print(f"  [delta] Injected {injected} new finding(s) into queue.")
+            elif new_findings:
+                print(f"  [delta] {len(new_findings)} potential finding(s) already covered.")
+            else:
+                print(f"  [delta] No follow-up questions revealed.")
 
     return decisions, unresolved
 
@@ -1133,7 +1190,7 @@ def main() -> None:
     _write_questions_md(project_name, session_id, _sort_findings(findings), conflicts)
 
     # ── Phase 3: Interactive loop ─────────────────────────────────────────────
-    decisions, unresolved = _run_interactive_loop(findings, project_name)
+    decisions, unresolved = _run_interactive_loop(findings, project_name, requirement_text)
 
     if unresolved:
         print(
