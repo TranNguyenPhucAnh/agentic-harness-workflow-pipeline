@@ -304,7 +304,7 @@ Schema:
       "category": "business" | "logic" | "technical" | "design",
       "priority": "blocking" | "high" | "medium" | "low",
       "depends_on": ["CLR-XXX"],
-      "scenarios": ["<option A>", "<option B>"],
+      "scenarios": ["<option A>", "<option B>", "<option C>"],
       "suggestion": "<recommended approach>",
       "confidence": 0.0,
       "citation": "<source: base.md §X, past decision from log, pattern Y, etc.>"
@@ -322,13 +322,21 @@ Schema:
 }
 
 TIER RULES (strict):
-- Tier 1: answer space unbounded OR subjective (business goals, brand, user emotions, priorities).
-           → Must ask client. No suggestion.
-- Tier 2: answer space bounded and enumerable (≤5 concrete options).
-           → Present scenarios for client to choose. No suggestion needed.
+- Tier 1: answer space is subjective OR requires business/product decision from client.
+           → MUST include 2–4 concrete representative scenarios[] as starting options.
+             These are not exhaustive — user can always type a custom answer.
+             Good Tier 1 scenarios: realistic choices a product owner would consider.
+           → No suggestion field needed.
+- Tier 2: answer space is bounded and fully enumerable (≤5 concrete options cover all cases).
+           → MUST include all realistic scenarios[] (2–5 items).
+           → No suggestion field needed.
 - Tier 3: answer is near-deterministic from context (tech stack, patterns, stated constraints).
            → confidence ≥ 0.75 required. MUST include citation explaining why.
            → confidence < 0.75 → downgrade to Tier 2.
+           → scenarios[] can be empty for Tier 3.
+
+SCENARIOS RULE: scenarios[] MUST be non-empty for Tier 1 and Tier 2.
+Every Tier 1 and Tier 2 finding without scenarios is malformed — always provide them.
 
 DEPENDENCY RULES:
 - If finding B only makes sense after finding A is answered, put A's id in B's depends_on.
@@ -386,11 +394,16 @@ Output only the JSON object."""
         print("Raw output:\n", raw[:500])
         raise
 
-    # Enforce Tier 3 confidence threshold — downgrade if below
+    # Post-process: enforce invariants
     for f in result.get("findings", []):
+        # Enforce Tier 3 confidence threshold — downgrade if below
         if f.get("tier") == 3 and f.get("confidence", 0) < _TIER3_MIN_CONF:
             f["tier"] = 2
             f["confidence"] = None
+        # Enforce scenarios non-empty for Tier 1 and Tier 2
+        # If LLM forgot, add a generic fallback so UI always shows options
+        if f.get("tier") in (1, 2) and not f.get("scenarios"):
+            f["scenarios"] = ["Yes / proceed as implied", "No / needs different approach", "Other (specify below)"]
 
     return result
 
@@ -442,9 +455,30 @@ def _print_finding(f: dict, index: int, total: int) -> None:
 
 
 def _ask_tier1(f: dict) -> str:
-    print()
-    raw = input("  → Your answer: ").strip()
-    return raw or "(no answer provided)"
+    """
+    Tier 1: show representative options (not exhaustive) + always allow custom answer.
+    User can pick a number OR type anything freely.
+    """
+    scenarios = f.get("scenarios", [])
+    if scenarios:
+        print("\n  Options:")
+        for i, s in enumerate(scenarios, 1):
+            print(f"    {i}. {s}")
+        print()
+        while True:
+            choice = input(f"  → Choose 1–{len(scenarios)} or type custom answer: ").strip()
+            if choice.isdigit():
+                idx = int(choice) - 1
+                if 0 <= idx < len(scenarios):
+                    return scenarios[idx]
+            if choice:
+                return choice
+            print("  Please enter a choice.")
+    else:
+        # Fallback: pure free-text (should not happen after enforce above)
+        print()
+        raw = input("  → Your answer: ").strip()
+        return raw or "(no answer provided)"
 
 
 def _ask_tier2(f: dict) -> str:
