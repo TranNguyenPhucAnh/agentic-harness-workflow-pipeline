@@ -63,4 +63,10 @@ SPEC_CHANGELOG  = HISTORY_DIR / "spec.changelog"     # owner: spec_diff
 
 # ── reports/ ─────────────────────────────────────────────────────────────────
 SUMMARY         = REPORTS_DIR / "summary.md"         # owner: 05_report
-JUDGE_REPORT    = REPORTS_DIR / "judge_report.md"    # owner: 05_report (via 06)
+JUDGE_REPORT    = REPORTS_DIR / "judge_report.md"    # owner: 05_report
+
+# ── clarification (run/ + state/ + knowledge/) ───────────────────────────────
+CLARIFICATION_REPORT    = RUN_DIR     / "clarification_report.json"   # owner: 00_clarificator
+CLARIFICATION_QUESTIONS = RUN_DIR     / "clarification_questions.md"  # owner: 00_clarificator
+CLARIFICATION_LOG       = CURRENT_DIR / "clarification_log.md"        # owner: 00_clarificator
+CLARIFIED_REQ           = STATE_DIR   / "clarified_requirement.md"    # owner: 00_clarificator (via 06)
