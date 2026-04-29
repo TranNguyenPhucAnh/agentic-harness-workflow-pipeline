@@ -674,8 +674,16 @@ def _ask_tier3(f: dict) -> tuple[str, bool]:
     return modified or f.get("suggestion", ""), True
 
 
-def _dependencies_satisfied(f: dict, answered: dict[str, str]) -> bool:
+def _dependencies_satisfied(f: dict, answered: dict[str, str], known_ids: set[str] | None = None) -> bool:
+    """
+    Return True if all deps are answered.
+    If known_ids is provided, deps that don't exist in the queue at all
+    are treated as already-satisfied (dangling ref from LLM — skip silently).
+    """
     for dep in f.get("depends_on", []):
+        if known_ids is not None and dep not in known_ids:
+            # Dangling reference — dep was never in the queue, treat as resolved
+            continue
         if dep not in answered:
             return False
     return True
@@ -738,6 +746,9 @@ def _run_interactive_loop(
     total    = len(queue)
     answered_count = 0
 
+    # All IDs ever seen in the queue — used to detect dangling depends_on refs
+    known_ids: set[str] = {f["id"] for f in queue}
+
     _print_banner(f"Clarification session — {project_name}")
     print(f"  {total} findings to process.\n")
 
@@ -754,7 +765,7 @@ def _run_interactive_loop(
             continue
 
         # Dependency not yet satisfied — defer once
-        if not _dependencies_satisfied(f, answered):
+        if not _dependencies_satisfied(f, answered, known_ids):
             if f["id"] not in deferred:
                 deferred.add(f["id"])
                 queue.append(f)
@@ -820,6 +831,7 @@ def _run_interactive_loop(
                 if nf["id"] in answered:
                     continue  # ID collision
                 queue.append(nf)
+                known_ids.add(nf["id"])  # register so deps referencing it are not dangling
                 injected += 1
             if injected:
                 print(f"  [delta] Injected {injected} new finding(s) into queue.")
@@ -1193,12 +1205,19 @@ def main() -> None:
     decisions, unresolved = _run_interactive_loop(findings, project_name, requirement_text)
 
     if unresolved:
-        print(
-            f"\n[00][warn] {len(unresolved)} findings unresolved "
-            f"(circular or unmet dependencies):"
-        )
-        for u in unresolved:
-            print(f"  - {u['id']}: {u['text'][:60]}...")
+        # Split by severity: business/blocking = loud warn, rest = silent to report
+        loud = [u for u in unresolved
+                if u.get("category") == "business" or u.get("priority") == "blocking"]
+        silent = [u for u in unresolved if u not in loud]
+
+        if loud:
+            print(f"\n[00][warn] {len(loud)} blocking question(s) could not be resolved "
+                  f"(unmet or circular dependencies) — review before proceeding:")
+            for u in loud:
+                print(f"  ⚠️  {u['id']}: {u['text'][:70]}...")
+        if silent:
+            print(f"\n[00] {len(silent)} low-priority question(s) skipped due to "
+                  f"inconsistent dependencies (recorded in report).")
 
     # ── Batch derive impact statements (LLM, post-loop) ──────────────────────
     _batch_derive_impacts(decisions)
