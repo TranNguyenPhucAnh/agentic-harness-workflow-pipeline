@@ -378,11 +378,41 @@ DEPENDENCY RULES:
 - If finding B only makes sense after finding A is answered, put A's id in B's depends_on.
 - Findings with depends_on should have priority "low" or "medium" initially.
 
-PRIORITY RULES:
-- "blocking": estimate or implementation cannot proceed without this answer.
-- "high": significant scope/architecture impact.
-- "medium": affects one module or UX flow.
-- "low": nice-to-have clarification.
+PRIORITY RULES — TWO-TIER HEURISTIC:
+
+Assign priority by asking: "Does this answer change the architecture, approval
+semantics, or scope of the system?" If yes → blocking or high. If it only
+affects one edge case or one workflow step → medium or low.
+
+POLICY-SHAPING ambiguities (→ blocking / high):
+  These questions, if left unanswered, would cause architectural rework or
+  incorrect scope. Examples for complex enterprise systems:
+  - Risk scoring model: how is residual risk calculated? Who defines thresholds?
+  - Approval semantics: can final approval proceed with Approved-with-Conditions?
+  - Quorum / committee logic: does Risk Committee require 1 approver or a quorum?
+  - "Material change" definition for renewals: what triggers a full re-review?
+  - SLA basis: business hours vs calendar hours vs timezone-aware?
+  - Rule ownership: who can change routing rules, are rules versioned?
+  - Multi-region data residency: does data need to stay within each region?
+  - Audit retention scope: which event types are immutable vs admin-correctable?
+
+IMPLEMENTATION-DETAIL ambiguities (→ medium / low):
+  These questions affect one feature or edge case, not the overall system shape.
+  Examples:
+  - Draft save behavior with missing fields
+  - Clone field restrictions
+  - Reviewer reassignment edge cases
+  - Notification preference granularity
+
+CALIBRATION RULE: For a complex enterprise requirement (8+ epics, multiple roles,
+compliance obligations), expect 3–5 blocking/high findings before medium/low ones.
+If your entire finding set is medium priority, re-examine whether the most
+impactful policy ambiguities were surfaced. Surface them first.
+
+"blocking": this answer must be known before estimate or architecture can proceed.
+"high": significantly shapes scope, approval logic, or integration contracts.
+"medium": affects one module, one workflow step, or one edge case.
+"low": nice-to-have, can be decided during implementation.
 
 ID FORMAT: CLR-001, CLR-002, ... (3-digit zero-padded, sequential, start from 001 each session)
 """
@@ -562,6 +592,9 @@ RULES:
 - If nothing changes, return {"new_findings": [], "invalidated_ids": []}.
 - IDs for new findings use prefix NEW- to avoid collisions with existing CLR- IDs.
 - Apply same SCENARIOS RULE: Tier 1 and Tier 2 must have non-empty scenarios[].
+- Apply same PRIORITY HEURISTIC: new findings revealed by a blocking answer are
+  likely also blocking or high. Only mark medium/low if they are clearly
+  implementation-detail questions, not policy-shaping ones.
 """
 
 
@@ -745,11 +778,16 @@ def _derive_impact(question: str, answer: str, category: str) -> str:
     try:
         system = (
             "You are a technical analyst. Given a clarification Q&A pair, "
-            "output ONE concise sentence (max 20 words) describing the "
-            "implementation impact of this decision. No preamble."
+            "output ONE complete sentence (max 30 words) describing the "
+            "implementation impact of this decision. "
+            "The sentence must be grammatically complete — never cut off mid-word or mid-phrase. "
+            "No preamble, no trailing punctuation issues."
         )
         user = f"Question: {question}\nAnswer: {answer}\nCategory: {category}"
-        return _call_llm(system, user, max_tokens=128).strip().splitlines()[0][:120]
+        raw = _call_llm(system, user, max_tokens=256).strip()
+        # Take first sentence only; strip stray leading quotes
+        first_line = raw.splitlines()[0].strip().strip('"').strip("'")
+        return first_line
     except Exception:
         return ""
 
