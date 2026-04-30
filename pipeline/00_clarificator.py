@@ -404,10 +404,25 @@ IMPLEMENTATION-DETAIL ambiguities (→ medium / low):
   - Reviewer reassignment edge cases
   - Notification preference granularity
 
-CALIBRATION RULE: For a complex enterprise requirement (8+ epics, multiple roles,
-compliance obligations), expect 3–5 blocking/high findings before medium/low ones.
-If your entire finding set is medium priority, re-examine whether the most
-impactful policy ambiguities were surfaced. Surface them first.
+CALIBRATION RULE: The number of findings must match the actual complexity of the
+requirement — do not stop early. Scale findings to spec size:
+  - Simple spec (1–3 features, 1 role): 3–5 findings is normal.
+  - Medium spec (4–7 features, 2–4 roles): 6–10 findings is normal.
+  - Complex enterprise spec (8+ epics, multiple roles, compliance obligations,
+    multi-region, SLA semantics, routing rules): 10–20 findings is expected.
+
+For complex specs, you MUST surface at minimum:
+  - All policy-shaping ambiguities in the blocking/high category FIRST.
+  - Common enterprise gaps that are almost always ambiguous:
+      residual risk scoring model, conditional approval semantics,
+      SLA business hours vs calendar hours, quorum for committee approvals,
+      what constitutes "material change" for renewals,
+      routing rule ownership and versioning,
+      audit retention scope and immutability rules.
+  - Only AFTER exhausting blocking/high should you surface medium/low findings.
+
+If you only found 5 findings for a complex enterprise spec, you have under-generated.
+Re-examine the spec for the gaps listed above before returning.
 
 "blocking": this answer must be known before estimate or architecture can proceed.
 "high": significantly shapes scope, approval logic, or integration contracts.
@@ -933,15 +948,32 @@ def _run_interactive_loop(
 
 _SYNTHESIS_SYSTEM = """
 You are a technical writer. Given a raw requirement document and a set of
-clarification Q&A decisions, produce a clean, unambiguous
-"Clarified Requirement" document in markdown.
+clarification decisions, produce ONE clean, unified "Clarified Requirement"
+document in markdown.
 
-Rules:
-- Incorporate all decisions into the narrative naturally.
-- Preserve the original structure but resolve every ambiguity.
-- Add a "## Decisions Log" section at the end listing each CLR-XXX with
-  one-line summary of the answer.
-- Be concise. No preamble. Output only the markdown document.
+STRICT STRUCTURAL RULES — violations produce unusable output:
+1. OUTPUT THE DOCUMENT EXACTLY ONCE. Do not repeat any section, heading,
+   or block of content. Each section (Context, Workflow, Functional Requirements,
+   NFR, Integrations, Out of Scope, Acceptance Criteria) appears exactly one time.
+2. Use the ORIGINAL REQUIREMENT as the single structural template.
+   Walk through it section by section, top to bottom, in one pass.
+   Do not restructure, reorder, or merge sections differently.
+3. For each section: incorporate the relevant decisions inline by updating
+   the text naturally. Do not add a parallel or duplicate version of the section.
+4. Preserve all original bullet points and list items. Do not drop content
+   that was not affected by a decision.
+5. Every list item must start with "- " on its own line. Never run list items
+   into prose without a line break.
+6. Add a "## Decisions Log" section at the very end — one line per decision:
+   "- **CLR-XXX**: <one-line summary of the answer and its impact>"
+7. No preamble, no postamble. Output only the markdown document.
+
+ANTI-PATTERNS — never do these:
+- Do not output a short summary version followed by a long full version.
+- Do not output the Functional Requirements twice (once short, once detailed).
+- Do not copy the NFR or Out of Scope section more than once.
+- Do not leave "Automated security questionnaire..." mid-sentence merged into
+  an unrelated section.
 """
 
 
@@ -952,7 +984,7 @@ def _synthesize_requirement(
     summary: str,
 ) -> str:
     decisions_text = "\n".join(
-        f"- {d['id']}: {d['question'][:80]}... → {d['answer']}"
+        f"- {d['id']} [{d.get('priority','').upper()}]: {d['question']} → {d['answer']}"
         for d in decisions
     )
     conflicts_text = "\n".join(
