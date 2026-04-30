@@ -103,8 +103,29 @@ def _list_known_projects() -> list[str]:
 # ── Model config ──────────────────────────────────────────────────────────────
 _ANALYZE_MODEL   = "deepseek/deepseek-chat"          # Phase 1+2: reasoning heavy
 _SUGGEST_MODEL   = "deepseek/deepseek-chat"          # Phase 3 Tier3: lighter OK but same default
-_MAX_TOKENS      = 8192
 _TIER3_MIN_CONF  = 0.75                              # below this → promote to Tier 2
+
+# ── Token / context limits ────────────────────────────────────────────────────
+# Target use case: mini mode with long AC + detailed descriptions.
+# DeepSeek V3 context window: 64k tokens. Output cap set conservatively.
+#
+# _MAX_TOKENS: max output tokens per LLM call.
+#   - Analyze call: up to ~15 findings × ~200 tokens each = ~3000 output tokens.
+#     8192 is more than enough; kept as ceiling.
+#   - Delta call: small output (2–3 new findings max). 2048 is sufficient.
+#   - Synthesis call: full clarified_requirement.md, can be long. 4096 safer.
+_MAX_TOKENS_ANALYZE   = 8192   # Phase 1+2 analyze
+_MAX_TOKENS_DELTA     = 2048   # delta follow-up (small output by design)
+_MAX_TOKENS_SYNTHESIS = 4096   # clarified_requirement.md generation
+
+# _DELTA_REQ_CHARS: how many chars of the requirement to include in delta calls.
+#   Delta calls only need enough context to understand what was answered and why.
+#   Full requirement passed for correctness; truncated only if very long.
+#   4000 chars ≈ ~1000 tokens — enough for a detailed AC block.
+_DELTA_REQ_CHARS = 4000
+
+# No ceiling on number of findings per session — LLM generates as many as needed.
+# The rule engine and dedup filter down organically.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -190,6 +211,7 @@ def _extract_answered_qa_pairs(log_text: str) -> list[dict]:
     """
     Extract structured Q/A pairs from the log for semantic dedup.
     Returns list of {id, question, answer} dicts.
+    No truncation — full text needed so LLM can detect semantic equivalence.
     """
     pairs: list[dict] = []
     # Pattern: ### CLR-NNN [...]\n**Q:** ...\n**A:** ...
@@ -201,8 +223,8 @@ def _extract_answered_qa_pairs(log_text: str) -> list[dict]:
         if id_match and q_match:
             pairs.append({
                 "id":       id_match.group(1),
-                "question": q_match.group(1).strip()[:200],
-                "answer":   a_match.group(1).strip()[:200] if a_match else "",
+                "question": q_match.group(1).strip(),
+                "answer":   a_match.group(1).strip() if a_match else "",
             })
     return pairs
 
@@ -221,7 +243,7 @@ def _load_knowledge_context(project_slug: str) -> str:
 # LLM call (model-agnostic thin wrapper — swap backend as needed)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _call_llm(system: str, user: str, model: str = _ANALYZE_MODEL) -> str:
+def _call_llm(system: str, user: str, model: str = _ANALYZE_MODEL, max_tokens: int = _MAX_TOKENS_ANALYZE) -> str:
     """
     Call an LLM via OpenAI-compatible API.
     Reads OPENAI_API_KEY / DEEPSEEK_API_KEY / ANTHROPIC_API_KEY from env.
@@ -247,7 +269,7 @@ def _call_llm(system: str, user: str, model: str = _ANALYZE_MODEL) -> str:
     try:
         payload = {
             "model": model_id,
-            "max_tokens": _MAX_TOKENS,
+            "max_tokens": max_tokens,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user",   "content": user},
@@ -289,8 +311,8 @@ Use them to:
    If an existing answer already resolves the ambiguity, skip generating it.
    Instead, if the existing answer is relevant, you may reference it in
    "clarified_summary" but do NOT put it in findings[].
-2. CONFLICT DETECTION — requirement mới có contradict decision cũ không?
-3. ASSUMPTION SURFACING — requirement assume behavior chưa được implement.
+2. CONFLICT DETECTION — Does the new requirement contradict any past decision?
+3. ASSUMPTION SURFACING — Does the requirement assume behavior that may not exist yet?
 
 Output ONLY a valid JSON object — no markdown fences, no preamble.
 Schema:
@@ -299,7 +321,7 @@ Schema:
   "findings": [
     {
       "id": "CLR-001",
-      "text": "<clear description of the hole/conflict/assumption>",
+      "text": "<the clarification question — see TONE RULES below>",
       "tier": 1 | 2 | 3,
       "category": "business" | "logic" | "technical" | "design",
       "priority": "blocking" | "high" | "medium" | "low",
@@ -320,6 +342,20 @@ Schema:
   ],
   "clarified_summary": "<one paragraph: what the requirement IS asking for, stating confidently what is already known from past decisions>"
 }
+
+TONE RULES (strictly enforced for the "text" field):
+- Write as a natural, collaborative question — NOT a judgment or critique.
+- NEVER start with: "The requirement does not specify", "The requirement fails to",
+  "There is no mention of", "It is unclear", or any phrasing that implies the
+  requirement is deficient or that the author made a mistake.
+- INSTEAD, ask directly and warmly. Examples of good phrasing:
+  ✓ "Which customer segments should be available as filter options?"
+  ✓ "How should the mobile layout differ from the desktop view?"
+  ✓ "When an order ships, which notification channel should be used?"
+  ✓ "Should the dashboard support real-time updates or manual refresh?"
+  ✓ "What authentication method should protect this dashboard?"
+- The question should feel like a natural follow-up from a thoughtful colleague,
+  not an audit finding. Keep it concise (1–2 sentences max).
 
 TIER RULES (strict):
 - Tier 1: answer space is subjective OR requires business/product decision from client.
@@ -499,7 +535,7 @@ Schema:
   "new_findings": [
     {
       "id": "NEW-001",
-      "text": "<question text>",
+      "text": "<the clarification question — must follow TONE RULES>",
       "tier": 1 | 2 | 3,
       "category": "business" | "logic" | "technical" | "design",
       "priority": "blocking" | "high" | "medium" | "low",
@@ -512,6 +548,12 @@ Schema:
   ],
   "invalidated_ids": ["CLR-XXX", "CLR-YYY"]
 }
+
+TONE RULES (same as main analysis — enforced):
+- Write as a natural, collaborative question.
+- NEVER start with "The requirement does not specify", "It is unclear", or similar
+  phrasing that implies the author made a mistake.
+- Ask directly: "Which X should be used?", "How should Y behave when Z?", etc.
 
 RULES:
 - new_findings[] should only contain questions that COULD NOT have been asked
@@ -539,8 +581,12 @@ def _delta_analyze(
     """
     queue_summary = ", ".join(current_queue_ids) if current_queue_ids else "none"
 
-    user_msg = f"""REQUIREMENT CONTEXT (summary):
-{requirement_text[:800]}{'...' if len(requirement_text) > 800 else ''}
+    req_snippet = requirement_text
+    if len(req_snippet) > _DELTA_REQ_CHARS:
+        req_snippet = req_snippet[:_DELTA_REQ_CHARS] + f"\n... [truncated — {len(requirement_text)} chars total]"
+
+    user_msg = f"""REQUIREMENT CONTEXT:
+{req_snippet}
 
 ANSWERED QUESTION:
   ID: {answered_finding['id']}
@@ -556,7 +602,7 @@ Given this answer, what new questions are revealed and which pending ones are no
 Output only the JSON object."""
 
     try:
-        raw = _call_llm(_DELTA_SYSTEM, user_msg)
+        raw = _call_llm(_DELTA_SYSTEM, user_msg, max_tokens=_MAX_TOKENS_DELTA)
         clean = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.MULTILINE)
         result = json.loads(clean)
     except Exception as exc:
@@ -703,7 +749,7 @@ def _derive_impact(question: str, answer: str, category: str) -> str:
             "implementation impact of this decision. No preamble."
         )
         user = f"Question: {question}\nAnswer: {answer}\nCategory: {category}"
-        return _call_llm(system, user).strip().splitlines()[0][:120]
+        return _call_llm(system, user, max_tokens=128).strip().splitlines()[0][:120]
     except Exception:
         return ""
 
@@ -890,7 +936,7 @@ CONFLICTS DETECTED:
 
 Produce the clarified requirement document now."""
 
-    return _call_llm(_SYNTHESIS_SYSTEM, user_msg)
+    return _call_llm(_SYNTHESIS_SYSTEM, user_msg, max_tokens=_MAX_TOKENS_SYNTHESIS)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -991,8 +1037,10 @@ def _write_questions_md(
         lines += ["---", "## ⚠️ Conflicts Detected", ""]
         for c in conflicts:
             lines.append(f"- [{c['id']}] {c['description']}")
-            lines.append(f"  New: _{c.get('source_a', '')[:60]}_")
-            lines.append(f"  Existing: _{c.get('source_b', '')[:60]}_")
+            if c.get("source_a"):
+                lines.append(f"  New requirement: _{c['source_a']}_")
+            if c.get("source_b"):
+                lines.append(f"  Existing decision: _{c['source_b']}_")
             lines.append("")
 
     CLARIFICATION_QUESTIONS.write_text("\n".join(lines), encoding="utf-8")
@@ -1009,28 +1057,38 @@ def _append_to_log(
     """Append this session's decisions to the per-project clarification_log_<slug>.md."""
     log_path = _clarification_log_path(project_slug)
 
-    lines: list[str] = [
-        f"\n## {session_id[:10]} | Project: {project_name} | Session: {session_id[11:19]}",
-        "",
-    ]
+    blocks: list[str] = []
+    blocks.append(
+        f"## {session_id[:10]} | Project: {project_name} | Session: {session_id[11:19]}"
+    )
+
     for d in decisions:
         tier_label = {1: "Tier 1", 2: "Tier 2", 3: "Tier 3"}.get(d["tier"], "?")
-        accepted_label = "" if d["tier"] != 3 else (" / accepted" if d["accepted"] else " / rejected")
-        lines.append(f"### {d['id']} [{tier_label}{accepted_label}]")
-        lines.append(f"**Q:** {d['question']}")
-        lines.append(f"**A:** {d['answer']}")
+        accepted_label = (
+            "" if d["tier"] != 3
+            else (" / accepted" if d["accepted"] else " / rejected")
+        )
+        entry_lines = [
+            f"### {d['id']} [{tier_label}{accepted_label}]",
+            f"**Q:** {d['question']}",
+            f"**A:** {d['answer']}",
+        ]
         if d.get("impact"):
-            lines.append(f"**Impact:** {d['impact']}")
-        lines.append("")
+            entry_lines.append(f"**Impact:** {d['impact']}")
+        blocks.append("\n".join(entry_lines))
 
     if conflicts:
-        lines.append("### Conflicts resolved this session")
+        conflict_lines = ["### Conflicts resolved this session"]
         for c in conflicts:
-            lines.append(f"- [{c['id']}] {c['description']}")
-        lines.append("")
+            conflict_lines.append(f"- [{c['id']}] {c['description']}")
+        blocks.append("\n".join(conflict_lines))
+
+    # Each block separated by blank line; leading newline ensures separation
+    # from previous session already in file
+    content = "\n\n" + "\n\n".join(blocks) + "\n"
 
     with log_path.open("a", encoding="utf-8") as fh:
-        fh.write("\n".join(lines))
+        fh.write(content)
     print(f"[00] ✓ Log appended → {log_path}")
 
 
