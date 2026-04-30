@@ -610,6 +610,19 @@ RULES:
 - Apply same PRIORITY HEURISTIC: new findings revealed by a blocking answer are
   likely also blocking or high. Only mark medium/low if they are clearly
   implementation-detail questions, not policy-shaping ones.
+
+SCOPE CONSTRAINT — CRITICAL:
+  Only generate follow-up questions that are POLICY-SHAPING:
+  = questions whose answer would change system architecture, access control,
+    workflow design, or compliance posture.
+  DO NOT generate questions about:
+  - Exact numeric values, thresholds, or point scores (e.g. "how many points
+    for PHI?" — that is implementation config, not policy)
+  - Specific UI copy, labels, or field names
+  - Scheduling intervals, timeout durations, or retry counts
+  - Any detail that a developer can decide without client input
+  MAXIMUM 3 new findings per delta call. If you have more, pick the top 3
+  by policy impact. Quality over quantity.
 """
 
 
@@ -834,10 +847,12 @@ def _run_interactive_loop(
     Uses _finding_hash() for cross-round identity so NEW-* items are deduped
     against already-answered content even if IDs differ.
     """
-    decisions:  list[dict] = []
-    unresolved: list[dict] = []
-    answered:   dict[str, str] = {}  # id → answer text
-    answered_hashes: set[str]  = set()  # content hashes of answered questions
+    decisions:    list[dict] = []
+    unresolved:   list[dict] = []
+    answered:     dict[str, str] = {}  # id → answer text
+    answered_hashes: set[str] = set()  # content hashes of answered questions
+    delta_depth:  int = 0              # how many delta rounds have fired
+    _MAX_DELTA_DEPTH = 2               # cap: delta-of-delta is over-drill
 
     # Work from a stable sorted list; deferred items go into a separate pending set
     queue:    list[dict] = _sort_findings(list(findings))
@@ -906,7 +921,16 @@ def _run_interactive_loop(
         })
 
         # ── Delta loop: inject new findings after Tier 1 blocking answer ─────
-        if tier == 1 and f.get("priority") == "blocking" and requirement_text:
+        # depth cap prevents chain-reaction: delta-of-delta is over-drill
+        _is_delta_finding = f["id"].startswith("NEW-")
+        _can_delta = (
+            tier == 1
+            and f.get("priority") == "blocking"
+            and requirement_text
+            and delta_depth < _MAX_DELTA_DEPTH
+            and not _is_delta_finding  # never trigger delta from a delta finding
+        )
+        if _can_delta:
             current_queue_ids = [
                 x["id"] for x in queue[i:]
                 if x["id"] not in answered
@@ -938,6 +962,7 @@ def _run_interactive_loop(
                 print(f"  [delta] {len(new_findings)} potential finding(s) already covered.")
             else:
                 print(f"  [delta] No follow-up questions revealed.")
+            delta_depth += 1
 
     return decisions, unresolved
 
@@ -1036,11 +1061,15 @@ def _write_report(
         "requirement_hash": req_hash,
         "session_id":       session_id,
         "project_name":     project_name,
-        "total_findings":   len(findings),
-        "tier1_answered":   tier_counts.get(1, 0),
-        "tier2_answered":   tier_counts.get(2, 0),
-        "tier3_accepted":   tier3_accepted,
-        "tier3_rejected":   tier3_rejected,
+        "initial_findings":  len(findings),          # from Phase 1 analysis only
+        "delta_injected":    sum(                     # findings added by delta loop
+            1 for d in decisions if d["id"].startswith("NEW-")
+        ),
+        "total_decisions":   len(decisions),          # initial + delta combined
+        "tier1_answered":    tier_counts.get(1, 0),
+        "tier2_answered":    tier_counts.get(2, 0),
+        "tier3_accepted":    tier3_accepted,
+        "tier3_rejected":    tier3_rejected,
         "conflicts_detected": len(conflicts),
         "unresolved":       [u["id"] for u in unresolved],
         "decisions":        decisions,
