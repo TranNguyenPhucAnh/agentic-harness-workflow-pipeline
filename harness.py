@@ -14,6 +14,32 @@ Pipeline stages (run in order):
             └─ re-runs Step 5b + Step 6 after each fix, up to --max-judge-rounds
  
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MINI MODE — daily driver for small tasks
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  --mini "PROMPT"          Lightweight targeted patching. Bypasses the full
+                           pipeline (no spec_diff, scaffold, plan, judge, report).
+                           Loads knowledge context, calls Qwen, runs full tests,
+                           retries up to 2x on failure, logs to run/mini_log.json.
+
+  --files f1 f2 ...        Files to patch. If omitted, LLM suggests a list and
+                           you confirm interactively before any files are touched.
+
+Rule of thumb: if the task does NOT require a spec.md update → use --mini.
+               If spec.md must change → use the full pipeline.
+
+Examples:
+    python harness.py --mini "fix button color in Header.tsx to match design spec"
+    python harness.py --mini "add isLoading guard to useSensorData hook" --files src/hooks/useSensorData.ts
+    python harness.py --mini "extract theme tokens to constants file"
+
+Pipeline flow for --mini:
+    [prompt] → load knowledge context → LLM suggests files (if --files omitted)
+             → user confirms → Qwen patch → vitest (full suite)
+             → retry ×2 on fail → log mini_log.json
+             → append findings_notes.md on fail/retry > 1
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 PARAMETER REFERENCE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  
@@ -132,6 +158,7 @@ Requirements:
 """
 
 import argparse
+import datetime
 import json
 import os
 import re as _re
@@ -145,7 +172,7 @@ from pathlib import Path
 ROOT = Path(__file__).parent
 
 # === WRITE AUTHORITY: harness ===
-# OWNS  : (no artifact ownership — orchestrator only)
+# OWNS  : artifacts/run/mini_log.json  (mini mode, append-only)
 # READS : all artifacts (coordinates pipeline steps)
 # NOTE  : 00_clarificator.py owns clarification artifacts;
 #         harness only reads CLARIFICATION_REPORT + CLARIFIED_REQ
@@ -161,11 +188,431 @@ from artifacts.paths import (
     JUDGE_RAW as JUDGE_RAW_PATH,
     CLARIFICATION_REPORT,
     CLARIFIED_REQ,
+    KNOWLEDGE_BASE,
+    FINDINGS_NOTES,
+    SPEC_ADDENDUM,
+    RUN_DIR,
     ensure_dirs,
 )
 ensure_dirs()
 # NOTE: prev_src is a transient staging dir, not a pipeline artifact
 PREV_SRC_DIR = ROOT / "artifacts" / "state" / "prev_src"
+
+# mini_log.json — append-only, owned by harness (mini mode only)
+MINI_LOG = RUN_DIR / "mini_log.json"
+
+# ════════════════════════════════════════════════════════════════════════════
+# Mini mode
+# ════════════════════════════════════════════════════════════════════════════
+
+def _load_knowledge_context() -> str:
+    """
+    Concatenate available knowledge files into a single context string.
+    Returns empty string if none exist (standalone mode).
+    """
+    sections: list[str] = []
+    sources = [
+        (KNOWLEDGE_BASE,  "base.md"),
+        (FINDINGS_NOTES,  "findings_notes.md"),
+        (SPEC_ADDENDUM,   "spec_addendum.md"),
+    ]
+    for path, label in sources:
+        if path.exists():
+            text = path.read_text().strip()
+            if text:
+                sections.append(f"### {label}\n{text}")
+    if not sections:
+        return ""
+    return "\n\n".join(sections)
+
+
+def _call_qwen_mini(system: str, user_message: str) -> str:
+    """
+    Lightweight Qwen call for mini mode.
+    Mirrors _call_qwen from 03a but lives here to keep mini self-contained.
+    Uses same model + OpenRouter endpoint.
+    """
+    import httpx
+
+    api_key = os.environ.get("OPENROUTER_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("OPENROUTER_API_KEY not set")
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": "qwen/qwen3.6-plus",
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": user_message},
+        ],
+        "temperature": 0.15,
+        "max_tokens": 32768,
+    }
+
+    last_error: Exception | None = None
+    with httpx.Client(timeout=180) as client:
+        for attempt in range(2):
+            try:
+                r = client.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers=headers,
+                    json=payload,
+                )
+                r.raise_for_status()
+                data = r.json()
+                usage = data.get("usage", {})
+                print(f"[mini] Tokens: prompt={usage.get('prompt_tokens','?')}, "
+                      f"completion={usage.get('completion_tokens','?')}")
+                choice = data["choices"][0]
+                content = choice["message"].get("content", "").strip()
+                if not content:
+                    raise RuntimeError(
+                        f"Qwen returned empty content. "
+                        f"finish_reason={choice.get('finish_reason')}"
+                    )
+                return content
+            except Exception as e:
+                last_error = e
+                print(f"[mini] LLM error: {e}", file=sys.stderr)
+                if attempt == 0:
+                    print("[mini] Retrying in 3s …", file=sys.stderr)
+                    time.sleep(3)
+
+    raise RuntimeError(f"Qwen call failed after retries: {last_error}")
+
+
+def _parse_mini_json(raw: str) -> dict:
+    """Extract JSON from LLM response — strips markdown fences, falls back to regex."""
+    import re
+    raw = re.sub(r"^```[a-z]*\n?", "", raw.strip())
+    raw = re.sub(r"\n?```$", "", raw.strip())
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group())
+        except json.JSONDecodeError as e:
+            raise RuntimeError(
+                f"JSON parse failed: {e}\nRaw (first 500):\n{raw[:500]}"
+            )
+    raise RuntimeError(f"No JSON object found in LLM response.\nRaw (first 500):\n{raw[:500]}")
+
+
+def _suggest_files(prompt: str, context: str) -> list[str]:
+    """
+    Ask LLM to suggest which files to patch.
+    Returns a list of relative file paths (e.g. ['src/Header.tsx']).
+    """
+    system = """\
+You are a code assistant helping identify which files need to be changed.
+Given a task description and codebase context, return a JSON object:
+{
+  "files": ["src/path/to/file.tsx", "src/other/file.ts"]
+}
+Rules:
+- Only include files that actually need to change for this specific task.
+- Use paths relative to the project root.
+- Return raw JSON only. No markdown fences, no explanation.
+"""
+    user_msg = f"Task: {prompt}\n\nCodebase context:\n{context}" if context else f"Task: {prompt}"
+    try:
+        raw = _call_qwen_mini(system, user_msg)
+        result = _parse_mini_json(raw)
+        files = result.get("files", [])
+        if not isinstance(files, list):
+            return []
+        return [str(f) for f in files if isinstance(f, str) and f.strip()]
+    except Exception as e:
+        print(f"[mini] Could not get file suggestions: {e}", file=sys.stderr)
+        return []
+
+
+def _confirm_files(suggested: list[str]) -> list[str] | None:
+    """
+    Show suggested files to user and ask for confirmation.
+    Returns confirmed list, or None if user aborts.
+    """
+    if not suggested:
+        print("[mini] LLM could not suggest files. Please specify with --files.")
+        return None
+
+    print("\n[mini] Suggested files to patch:")
+    for i, f in enumerate(suggested, 1):
+        print(f"  {i}. {f}")
+
+    print("\n  Press Enter to confirm, type file paths to override, or 'q' to quit:")
+    try:
+        user_input = input("> ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return None
+
+    if user_input.lower() in ("q", "quit", "abort"):
+        return None
+    if user_input == "":
+        return suggested
+    # User provided override — split on whitespace/comma
+    import re
+    return [p.strip() for p in re.split(r"[\s,]+", user_input) if p.strip()]
+
+
+def _apply_patch(files_changed: list[dict]) -> list[str]:
+    """
+    Write patched file contents to disk.
+    Each entry: {"path": "...", "content": "..."}.
+    Creates parent dirs if needed.
+    Returns list of paths actually written.
+    """
+    written: list[str] = []
+    for entry in files_changed:
+        path_str = entry.get("path", "").strip()
+        content  = entry.get("content", "")
+        if not path_str:
+            print("[mini] WARNING: patch entry missing 'path' — skipped.", file=sys.stderr)
+            continue
+        dest = ROOT / path_str
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(content)
+            print(f"[mini] Patched: {path_str}")
+            written.append(path_str)
+        except OSError as e:
+            print(f"[mini] ERROR writing {path_str}: {e}", file=sys.stderr)
+    return written
+
+
+def _run_tests() -> tuple[bool, str]:
+    """
+    Run full vitest test suite.
+    Returns (passed: bool, output: str).
+    """
+    try:
+        result = subprocess.run(
+            ["npx", "vitest", "run", "--reporter=verbose"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        output = (result.stdout + result.stderr).strip()
+        passed = result.returncode == 0
+        return passed, output
+    except subprocess.TimeoutExpired:
+        return False, "Test run timed out after 120s"
+    except FileNotFoundError:
+        # vitest not available — try npm test as fallback
+        try:
+            result = subprocess.run(
+                ["npm", "test", "--", "--run"],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            output = (result.stdout + result.stderr).strip()
+            return result.returncode == 0, output
+        except Exception as e:
+            return False, f"Test runner not found: {e}"
+    except Exception as e:
+        return False, f"Test execution error: {e}"
+
+
+def _append_mini_log(
+    prompt: str,
+    files_changed: list[str],
+    test_result: str,
+    retry_count: int,
+) -> None:
+    """Append one entry to run/mini_log.json (creates file if absent)."""
+    entry = {
+        "timestamp":    datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "prompt":       prompt,
+        "files_changed": files_changed,
+        "test_result":  test_result,
+        "retry_count":  retry_count,
+    }
+    existing: list[dict] = []
+    if MINI_LOG.exists():
+        try:
+            existing = json.loads(MINI_LOG.read_text())
+            if not isinstance(existing, list):
+                existing = []
+        except Exception:
+            existing = []
+    existing.append(entry)
+    try:
+        MINI_LOG.parent.mkdir(parents=True, exist_ok=True)
+        MINI_LOG.write_text(json.dumps(existing, indent=2))
+    except OSError as e:
+        print(f"[mini] WARNING: could not write mini_log.json: {e}", file=sys.stderr)
+
+
+def _append_findings_note(prompt: str, error_output: str, retry_count: int) -> None:
+    """
+    Append a short failure note to findings_notes.md.
+    Only called when test failed or retry_count > 1.
+    """
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    note = (
+        f"\n---\n"
+        f"## Mini run failure — {ts}\n\n"
+        f"**Task:** {prompt}\n\n"
+        f"**Retries:** {retry_count}\n\n"
+        f"**Failure pattern:**\n"
+        f"```\n{error_output[-1500:].strip()}\n```\n"
+    )
+    try:
+        FINDINGS_NOTES.parent.mkdir(parents=True, exist_ok=True)
+        with FINDINGS_NOTES.open("a") as f:
+            f.write(note)
+        print(f"[mini] Failure pattern appended → {FINDINGS_NOTES.relative_to(ROOT)}")
+    except OSError as e:
+        print(f"[mini] WARNING: could not write findings_notes.md: {e}", file=sys.stderr)
+
+
+def run_mini(prompt: str, files: list[str] | None) -> None:
+    """
+    Mini mode execution path — lightweight targeted patching.
+    Bypasses full pipeline; uses knowledge context + Qwen + test suite.
+    """
+    print(f"\n{'='*60}")
+    print(f"  MINI MODE")
+    print(f"{'='*60}")
+    print(f"[mini] Task: {prompt}")
+
+    # ── 1. Load knowledge context ────────────────────────────────────────────
+    context = _load_knowledge_context()
+    if context:
+        print(f"[mini] Knowledge context loaded "
+              f"({len(context)} chars from base.md / findings_notes.md / spec_addendum.md)")
+    else:
+        print("[mini] No knowledge context found — running in standalone mode.")
+
+    # ── 2. File targeting ────────────────────────────────────────────────────
+    target_files: list[str] | None = files
+    if not target_files:
+        print("[mini] No --files specified — asking LLM to suggest …")
+        suggested = _suggest_files(prompt, context)
+        target_files = _confirm_files(suggested)
+        if target_files is None:
+            print("[mini] Aborted.")
+            sys.exit(0)
+
+    print(f"[mini] Target files: {target_files}")
+
+    # ── 3. Build patch prompt ────────────────────────────────────────────────
+    files_constraint = (
+        f"You MUST only modify these files: {json.dumps(target_files)}\n"
+        if target_files else
+        "Modify only the files necessary to complete the task.\n"
+    )
+
+    system = f"""\
+You are a senior developer performing a targeted code patch.
+
+{files_constraint}
+Rules:
+- DO NOT regenerate the full project.
+- DO NOT create unrelated files.
+- DO NOT modify spec.md or any artifact files.
+- Return ONLY a JSON object with this exact schema:
+  {{
+    "files_changed": [
+      {{
+        "path": "src/path/to/file.tsx",
+        "content": "<complete updated file content>"
+      }}
+    ]
+  }}
+- Each "content" field must be the COMPLETE file — not a diff, not a snippet.
+- Output raw JSON only. No markdown fences, no explanation.
+"""
+
+    context_block = f"\n\n### Knowledge context\n{context}" if context else ""
+    user_msg = (
+        f"Task: {prompt}"
+        f"{context_block}"
+        f"\n\nFiles to patch: {json.dumps(target_files)}"
+    )
+
+    # ── 4. LLM patch + test retry loop ──────────────────────────────────────
+    retry_count = 0
+    last_error_output = ""
+    files_actually_changed: list[str] = []
+    final_passed = False
+
+    for attempt in range(3):  # 1 initial + 2 retries
+        if attempt > 0:
+            retry_count += 1
+            print(f"\n[mini] Retry {retry_count}/2 — including previous error …")
+            user_msg = (
+                f"Task: {prompt}"
+                f"{context_block}"
+                f"\n\nFiles to patch: {json.dumps(target_files)}"
+                f"\n\n### Previous attempt failed\nTest errors:\n{last_error_output[-2000:]}"
+                f"\n\nFix the issues and return the corrected files."
+            )
+
+        # LLM call
+        try:
+            raw = _call_qwen_mini(system, user_msg)
+            patch = _parse_mini_json(raw)
+        except Exception as e:
+            print(f"[mini] LLM/parse error: {e}", file=sys.stderr)
+            last_error_output = str(e)
+            continue
+
+        files_changed_entries = patch.get("files_changed", [])
+        if not files_changed_entries:
+            print("[mini] WARNING: LLM returned no files_changed.", file=sys.stderr)
+            last_error_output = "LLM returned empty files_changed list."
+            continue
+
+        # Apply patch
+        files_actually_changed = _apply_patch(files_changed_entries)
+
+        # Run tests
+        print(f"\n[mini] Running test suite …")
+        passed, output = _run_tests()
+        last_error_output = output
+
+        status = "✓ PASS" if passed else "✗ FAIL"
+        print(f"[mini] Tests: {status}")
+        if not passed:
+            # Print last 30 lines of test output for visibility
+            tail = "\n".join(output.splitlines()[-30:])
+            print(f"\n[mini] Test output (tail):\n{tail}")
+
+        if passed:
+            final_passed = True
+            break
+
+    # ── 5. Log result ────────────────────────────────────────────────────────
+    test_result = "pass" if final_passed else "fail"
+    _append_mini_log(prompt, files_actually_changed, test_result, retry_count)
+    print(f"\n[mini] Logged → {MINI_LOG.relative_to(ROOT)}")
+
+    # ── 6. Knowledge contribution (failures / retries only) ──────────────────
+    if not final_passed or retry_count > 1:
+        _append_findings_note(prompt, last_error_output, retry_count)
+
+    # ── 7. Summary ───────────────────────────────────────────────────────────
+    print(f"\n{'='*60}")
+    if final_passed:
+        print(f"  MINI ✅  PASS  (retries: {retry_count})")
+        print(f"  Files patched: {files_actually_changed}")
+    else:
+        print(f"  MINI ❌  FAIL  (gave up after {retry_count} retries)")
+        print(f"  Check findings_notes.md for failure pattern.")
+    print(f"{'='*60}\n")
+
+    sys.exit(0 if final_passed else 1)
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # Core helpers
@@ -486,6 +933,16 @@ def main() -> None:
         description="Local LLM pipeline runner",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    # ── Mini mode ────────────────────────────────────────────────────────────
+    parser.add_argument("--mini", type=str, default=None,
+                        metavar="PROMPT",
+                        help="Run in mini mode: targeted patch for a small task. "
+                             "Bypasses full pipeline. Example: --mini 'fix button color'")
+    parser.add_argument("--files", nargs="+", default=None,
+                        metavar="FILE",
+                        help="Files to patch in mini mode. If omitted, LLM suggests "
+                             "and you confirm interactively. "
+                             "Example: --files src/Header.tsx src/theme.ts")
     # Clarificator flags
     parser.add_argument("--skip-clarify", action="store_true",
                         help="Skip Step 0 (Clarificator). Use when requirement is "
@@ -533,6 +990,14 @@ def main() -> None:
     parser.add_argument("--verbose", action="store_true",
                         help="Pass --verbose to 04_test_and_iterate.py")
     args = parser.parse_args()
+
+    # ── Mini mode: dispatch immediately, bypass full pipeline ────────────────
+    if args.mini:
+        load_dotenv()
+        if not check_env(["OPENROUTER_API_KEY"]):
+            sys.exit(1)
+        run_mini(prompt=args.mini, files=args.files)
+        return  # run_mini calls sys.exit internally; this is a safety return
 
     if args.test_only:
         args.skip_scaffold = True
