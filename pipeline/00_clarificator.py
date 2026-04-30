@@ -324,6 +324,7 @@ Schema:
       "text": "<the clarification question — see TONE RULES below>",
       "tier": 1 | 2 | 3,
       "category": "business" | "logic" | "technical" | "design",
+      "subcategory": "policy" | "scoring" | "approval" | "routing" | "output" | "config" | "access" | "integration" | "other",
       "priority": "blocking" | "high" | "medium" | "low",
       "depends_on": ["CLR-XXX"],
       "scenarios": ["<option A>", "<option B>", "<option C>"],
@@ -371,7 +372,29 @@ TIER RULES (strict):
            → confidence < 0.75 → downgrade to Tier 2.
            → scenarios[] can be empty for Tier 3.
 
-SCENARIOS RULE: scenarios[] MUST be non-empty for Tier 1 and Tier 2.
+SUBCATEGORY RULES — assign "subcategory" to help the rule engine classify correctly:
+  "policy"      — defines how the system MUST behave (approval semantics, risk rules,
+                  material change definition, retention obligations)
+  "scoring"     — risk rating model, thresholds, weighting
+  "approval"    — quorum, conditional approval logic, escalation paths
+  "routing"     — workflow routing rules, review triggers, skip conditions
+  "output"      — what data appears in reports, dashboards, exports, emails
+  "config"      — admin-configurable parameters (SLA values, notification prefs,
+                  calendar settings, reference lists)
+  "access"      — role-based permissions, document visibility, API restrictions
+  "integration" — which external systems, mandatory vs optional
+  "other"       — anything that doesn't fit above
+
+IMPORTANT: "output" and "config" subcategories are NEVER Tier 1, even if
+category is "business". Questions like "what fields appear in the compliance
+report", "what metrics show on the dashboard", or "which notifications can users
+configure" are Tier 2 — they have bounded, enumerable answer spaces.
+
+Tier 1 business questions are EXCLUSIVELY from subcategories: policy, scoring,
+approval, routing — because those answers fundamentally change what the system
+does, not just how it presents data.
+
+
 Every Tier 1 and Tier 2 finding without scenarios is malformed — always provide them.
 
 DEPENDENCY RULES:
@@ -527,6 +550,10 @@ def _enforce_tiers(findings: list[dict]) -> list[dict]:
 
         bounded      = bool(scenarios) and len(scenarios) <= 5
         near_det_cat = category in ("technical", "design", "logic")
+        subcategory  = f.get("subcategory", "other")
+        # "output" and "config" subcategories are presentation/configuration choices
+        # even if category is "business" — they do not shape policy or architecture
+        output_config = subcategory in ("output", "config")
 
         # R4: validate existing Tier 3 FIRST — before any reassignment
         # If LLM said Tier 3 but evidence is weak, demote to Tier 2 immediately
@@ -539,17 +566,18 @@ def _enforce_tiers(findings: list[dict]) -> list[dict]:
         if suggestion and confidence >= _TIER3_MIN_CONF and citation:
             f["tier"] = 3
         # R2: bounded enumerable → Tier 2
-        elif bounded and near_det_cat:
+        # Also: output/config subcategories are always bounded even if category=business
+        elif (bounded and near_det_cat) or (bounded and output_config):
             f["tier"] = 2
-        # R3: subjective / business / no scenarios → Tier 1
-        # Exception: if finding has a suggestion (was intended as Tier 3 but
-        # demoted by R4), keep it at Tier 2 — not Tier 1. "No scenarios" alone
-        # is not enough to force Tier 1 when there is a concrete suggestion.
-        elif category == "business" or priority == "blocking" or (
-            not scenarios and not suggestion
-        ):
+        # R3: policy-shaping business decisions → Tier 1
+        # Exception 1: output/config subcategories → Tier 2 (not policy-shaping)
+        # Exception 2: if finding has a suggestion (was intended as Tier 3 but
+        # demoted by R4), keep it at Tier 2 — not Tier 1.
+        elif (category == "business" or priority == "blocking") and not output_config and not suggestion:
             f["tier"] = 1
-        # else: keep current tier (already validated by R4 above)
+        elif not scenarios and not suggestion:
+            f["tier"] = 1
+        # else: keep current tier
 
         # Invariants
         if f.get("tier") in (1, 2) and not f.get("scenarios"):
@@ -1091,10 +1119,20 @@ def _write_questions_md(
         "",
     ]
 
-    blocking    = [f for f in findings if f.get("tier") in (1, 2) and f.get("priority") == "blocking"]
-    high        = [f for f in findings if f.get("tier") in (1, 2) and f.get("priority") == "high"]
-    medium_low  = [f for f in findings if f.get("tier") in (1, 2) and f.get("priority") not in ("blocking", "high")]
+    # Group by tier (not priority). Priority only controls ordering within a section.
+    tier1 = sorted(
+        [f for f in findings if f.get("tier") == 1],
+        key=lambda f: _PRIORITY_ORDER.get(f.get("priority", "low"), 9)
+    )
+    tier2 = sorted(
+        [f for f in findings if f.get("tier") == 2],
+        key=lambda f: _PRIORITY_ORDER.get(f.get("priority", "low"), 9)
+    )
     suggestions = [f for f in findings if f.get("tier") == 3]
+
+    # Sub-sections within Tier 1: blocking gets its own callout, rest grouped together
+    tier1_blocking = [f for f in tier1 if f.get("priority") == "blocking"]
+    tier1_other    = [f for f in tier1 if f.get("priority") != "blocking"]
 
     def _render_q(f: dict, numbered: int) -> list[str]:
         out = [f"{numbered}. [{f['id']}] {f['text']}"]
@@ -1103,26 +1141,31 @@ def _write_questions_md(
                 out.append(f"   - {s}")
         return out
 
-    if blocking:
-        lines += ["## 🔴 Blocking (cần trả lời trước khi estimate)", ""]
-        for n, f in enumerate(blocking, 1):
+    if tier1_blocking:
+        lines += ["## 🔴 Blocking — Tier 1 (cần trả lời trước khi estimate)", ""]
+        for n, f in enumerate(tier1_blocking, 1):
             lines += _render_q(f, n)
             lines.append("")
 
-    if high:
-        lines += ["## 🟡 Important", ""]
-        for n, f in enumerate(high, 1):
-            lines += _render_q(f, n)
+    if tier1_other:
+        label = "## 🔴 Tier 1 — Business & Policy Decisions"
+        lines += [label, ""]
+        for n, f in enumerate(tier1_other, 1):
+            priority_tag = f"[{f.get('priority', '').upper()}]" if f.get("priority") != "high" else ""
+            out = _render_q(f, n)
+            if priority_tag:
+                out[0] = f"{out[0]}  {priority_tag}"
+            lines += out
             lines.append("")
 
-    if medium_low:
-        lines += ["## ⚪ Other Questions", ""]
-        for n, f in enumerate(medium_low, 1):
+    if tier2:
+        lines += ["## 🟡 Tier 2 — Bounded Choices", ""]
+        for n, f in enumerate(tier2, 1):
             lines += _render_q(f, n)
             lines.append("")
 
     if suggestions:
-        lines += ["## 🟢 Suggestions (confirm nếu đồng ý)", ""]
+        lines += ["## 🟢 Tier 3 — Suggestions (confirm nếu đồng ý)", ""]
         for f in suggestions:
             conf = f.get("confidence", 0)
             conf_str = f"{int(conf * 100)}%" if conf else "?"
