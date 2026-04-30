@@ -9,15 +9,19 @@ tổ chức Q&A với user theo 3-tier system, và output clarified_requirement.
 cùng với structured report cho downstream steps.
 
 Usage:
-    python 00_clarificator.py --input requirement.pdf
-    python 00_clarificator.py --input spec_draft.md
-    python 00_clarificator.py --text "Build a dashboard that shows..."
-    python 00_clarificator.py                    # interactive multiline prompt
+    python 00_clarificator.py --project my-app --input requirement.pdf
+    python 00_clarificator.py --project my-app --input spec_draft.md
+    python 00_clarificator.py --project my-app --text "Build a dashboard..."
+    python 00_clarificator.py --project my-app   # interactive multiline prompt
+    python 00_clarificator.py                    # prompts for project name
+
+--project is required for dedup to work across sessions. Each project gets its
+own clarification_log_<slug>.md so decisions from project A never pollute B.
 
 Artifacts produced (owner: 00_clarificator):
     run/clarification_report.json
     run/clarification_questions.md
-    knowledge/current/clarification_log.md   ← append-only
+    knowledge/current/clarification_log_<project_slug>.md   ← append-only, per-project
     state/clarified_requirement.md
 """
 
@@ -32,7 +36,7 @@ import sys
 import textwrap
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any  # noqa: F401 — kept for future typed helpers
 
 import httpx
 
@@ -63,16 +67,65 @@ except ImportError:
             d.mkdir(parents=True, exist_ok=True)
 
 # ── New artifact paths (owned by this script) ─────────────────────────────────
+# NOTE: CLARIFICATION_LOG is NOT a module-level constant — it is per-project.
+#       Use _clarification_log_path(project_slug) to get the correct path.
 CLARIFICATION_REPORT    = RUN_DIR     / "clarification_report.json"
 CLARIFICATION_QUESTIONS = RUN_DIR     / "clarification_questions.md"
-CLARIFICATION_LOG       = CURRENT_DIR / "clarification_log.md"
 CLARIFIED_REQ           = STATE_DIR   / "clarified_requirement.md"
+# legacy single-file log kept for backward compat read-only migration
+_LEGACY_CLARIFICATION_LOG = CURRENT_DIR / "clarification_log.md"
+
+
+def _slugify(name: str) -> str:
+    """Convert a project name to a filesystem-safe slug."""
+    slug = name.lower().strip()
+    slug = re.sub(r"[^\w\s-]", "", slug)
+    slug = re.sub(r"[\s_-]+", "-", slug)
+    slug = slug.strip("-")
+    return slug or "unknown"
+
+
+def _clarification_log_path(project_slug: str) -> Path:
+    """Per-project append-only log: knowledge/current/clarification_log_<slug>.md"""
+    return CURRENT_DIR / f"clarification_log_{project_slug}.md"
+
+
+def _list_known_projects() -> list[str]:
+    """Return sorted list of project slugs that have existing logs."""
+    logs = sorted(CURRENT_DIR.glob("clarification_log_*.md"))
+    slugs = []
+    for p in logs:
+        m = re.match(r"clarification_log_(.+)\.md$", p.name)
+        if m:
+            slugs.append(m.group(1))
+    return slugs
 
 # ── Model config ──────────────────────────────────────────────────────────────
 _ANALYZE_MODEL   = "deepseek/deepseek-chat"          # Phase 1+2: reasoning heavy
 _SUGGEST_MODEL   = "deepseek/deepseek-chat"          # Phase 3 Tier3: lighter OK but same default
-_MAX_TOKENS      = 8192
 _TIER3_MIN_CONF  = 0.75                              # below this → promote to Tier 2
+
+# ── Token / context limits ────────────────────────────────────────────────────
+# Target use case: mini mode with long AC + detailed descriptions.
+# DeepSeek V3 context window: 64k tokens. Output cap set conservatively.
+#
+# _MAX_TOKENS: max output tokens per LLM call.
+#   - Analyze call: up to ~15 findings × ~200 tokens each = ~3000 output tokens.
+#     8192 is more than enough; kept as ceiling.
+#   - Delta call: small output (2–3 new findings max). 2048 is sufficient.
+#   - Synthesis call: full clarified_requirement.md, can be long. 4096 safer.
+_MAX_TOKENS_ANALYZE   = 8192   # Phase 1+2 analyze
+_MAX_TOKENS_DELTA     = 2048   # delta follow-up (small output by design)
+_MAX_TOKENS_SYNTHESIS = 4096   # clarified_requirement.md generation
+
+# _DELTA_REQ_CHARS: how many chars of the requirement to include in delta calls.
+#   Delta calls only need enough context to understand what was answered and why.
+#   Full requirement passed for correctness; truncated only if very long.
+#   4000 chars ≈ ~1000 tokens — enough for a detailed AC block.
+_DELTA_REQ_CHARS = 4000
+
+# No ceiling on number of findings per session — LLM generates as many as needed.
+# The rule engine and dedup filter down organically.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -138,21 +191,51 @@ def _read_input_file(path: Path) -> str:
         return path.read_text(encoding="latin-1")
 
 
-def _load_clarification_log() -> str:
-    return _load_text_file(CLARIFICATION_LOG)
+def _load_clarification_log(project_slug: str) -> str:
+    """Load per-project log. Falls back to legacy global log on first migration."""
+    project_log = _clarification_log_path(project_slug)
+    if project_log.exists():
+        return project_log.read_text(encoding="utf-8")
+    # One-time migration: if legacy global log exists, read it but don't trust it
+    # for dedup (different projects mixed in) — warn instead.
+    if _LEGACY_CLARIFICATION_LOG.exists():
+        print(
+            f"[00][warn] Found legacy clarification_log.md but no per-project log for "
+            f"'{project_slug}'. Legacy log ignored for dedup. "
+            f"Consider migrating: cp clarification_log.md clarification_log_{project_slug}.md"
+        )
+    return ""
 
 
-def _extract_answered_ids(log_text: str) -> set[str]:
-    """Pull all CLR-XXX ids that already appear in the log."""
-    return set(re.findall(r"CLR-\d{3}", log_text))
+def _extract_answered_qa_pairs(log_text: str) -> list[dict]:
+    """
+    Extract structured Q/A pairs from the log for semantic dedup.
+    Returns list of {id, question, answer} dicts.
+    No truncation — full text needed so LLM can detect semantic equivalence.
+    """
+    pairs: list[dict] = []
+    # Pattern: ### CLR-NNN [...]\n**Q:** ...\n**A:** ...
+    blocks = re.split(r"\n(?=###\s+CLR-)", log_text)
+    for block in blocks:
+        id_match = re.search(r"###\s+(CLR-\d{3})", block)
+        q_match  = re.search(r"\*\*Q:\*\*\s*(.+?)(?=\n\*\*|\Z)", block, re.DOTALL)
+        a_match  = re.search(r"\*\*A:\*\*\s*(.+?)(?=\n\*\*|\Z)", block, re.DOTALL)
+        if id_match and q_match:
+            pairs.append({
+                "id":       id_match.group(1),
+                "question": q_match.group(1).strip(),
+                "answer":   a_match.group(1).strip() if a_match else "",
+            })
+    return pairs
 
 
-def _load_knowledge_context() -> str:
+def _load_knowledge_context(project_slug: str) -> str:
     parts: list[str] = []
     if KNOWLEDGE_BASE.exists():
         parts.append(f"=== base.md ===\n{KNOWLEDGE_BASE.read_text(encoding='utf-8')}")
-    if CLARIFICATION_LOG.exists():
-        parts.append(f"=== clarification_log.md ===\n{CLARIFICATION_LOG.read_text(encoding='utf-8')}")
+    log_text = _load_clarification_log(project_slug)
+    if log_text:
+        parts.append(f"=== clarification_log_{project_slug}.md ===\n{log_text}")
     return "\n\n".join(parts)
 
 
@@ -160,7 +243,7 @@ def _load_knowledge_context() -> str:
 # LLM call (model-agnostic thin wrapper — swap backend as needed)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _call_llm(system: str, user: str, model: str = _ANALYZE_MODEL) -> str:
+def _call_llm(system: str, user: str, model: str = _ANALYZE_MODEL, max_tokens: int = _MAX_TOKENS_ANALYZE) -> str:
     """
     Call an LLM via OpenAI-compatible API.
     Reads OPENAI_API_KEY / DEEPSEEK_API_KEY / ANTHROPIC_API_KEY from env.
@@ -186,7 +269,7 @@ def _call_llm(system: str, user: str, model: str = _ANALYZE_MODEL) -> str:
     try:
         payload = {
             "model": model_id,
-            "max_tokens": _MAX_TOKENS,
+            "max_tokens": max_tokens,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user",   "content": user},
@@ -221,9 +304,15 @@ assumption, conflict, and gap that would block or risk the implementation.
 
 You have access to the project's knowledge base and past clarification history.
 Use them to:
-1. AVOID asking questions that have already been answered (ids in clarification_log).
-2. DETECT conflicts between new requirements and past decisions.
-3. SURFACE assumptions the requirement makes about existing systems.
+1. SEMANTIC DEDUP — Do NOT generate a new finding if the ALREADY_ANSWERED_QA
+   section contains a question that is semantically equivalent or closely related
+   to the potential new finding. Equivalence means: same topic, same decision
+   space, same impact — even if worded differently.
+   If an existing answer already resolves the ambiguity, skip generating it.
+   Instead, if the existing answer is relevant, you may reference it in
+   "clarified_summary" but do NOT put it in findings[].
+2. CONFLICT DETECTION — Does the new requirement contradict any past decision?
+3. ASSUMPTION SURFACING — Does the requirement assume behavior that may not exist yet?
 
 Output ONLY a valid JSON object — no markdown fences, no preamble.
 Schema:
@@ -232,15 +321,16 @@ Schema:
   "findings": [
     {
       "id": "CLR-001",
-      "text": "<clear description of the hole/conflict/assumption>",
+      "text": "<the clarification question — see TONE RULES below>",
       "tier": 1 | 2 | 3,
       "category": "business" | "logic" | "technical" | "design",
+      "subcategory": "policy" | "scoring" | "approval" | "routing" | "output" | "config" | "access" | "integration" | "other",
       "priority": "blocking" | "high" | "medium" | "low",
       "depends_on": ["CLR-XXX"],
-      "scenarios": ["<option A>", "<option B>"],
+      "scenarios": ["<option A>", "<option B>", "<option C>"],
       "suggestion": "<recommended approach>",
       "confidence": 0.0,
-      "citation": "<source: base.md §X, pattern Y, etc.>"
+      "citation": "<source: base.md §X, past decision from log, pattern Y, etc.>"
     }
   ],
   "conflicts": [
@@ -251,49 +341,150 @@ Schema:
       "source_b": "<existing decision from knowledge base>"
     }
   ],
-  "clarified_summary": "<one paragraph: what the requirement IS asking for, stated confidently>"
+  "clarified_summary": "<one paragraph: what the requirement IS asking for, stating confidently what is already known from past decisions>"
 }
 
+TONE RULES (strictly enforced for the "text" field):
+- Write as a natural, collaborative question — NOT a judgment or critique.
+- NEVER start with: "The requirement does not specify", "The requirement fails to",
+  "There is no mention of", "It is unclear", or any phrasing that implies the
+  requirement is deficient or that the author made a mistake.
+- INSTEAD, ask directly and warmly. Examples of good phrasing:
+  ✓ "Which customer segments should be available as filter options?"
+  ✓ "How should the mobile layout differ from the desktop view?"
+  ✓ "When an order ships, which notification channel should be used?"
+  ✓ "Should the dashboard support real-time updates or manual refresh?"
+  ✓ "What authentication method should protect this dashboard?"
+- The question should feel like a natural follow-up from a thoughtful colleague,
+  not an audit finding. Keep it concise (1–2 sentences max).
+
 TIER RULES (strict):
-- Tier 1: answer space unbounded OR subjective (business goals, brand, user emotions, priorities).
-           → Must ask client. No suggestion.
-- Tier 2: answer space bounded and enumerable (≤5 concrete options).
-           → Present scenarios for client to choose. No suggestion needed.
+- Tier 1: answer space is subjective OR requires business/product decision from client.
+           → MUST include 2–4 concrete representative scenarios[] as starting options.
+             These are not exhaustive — user can always type a custom answer.
+             Good Tier 1 scenarios: realistic choices a product owner would consider.
+           → No suggestion field needed.
+- Tier 2: answer space is bounded and fully enumerable (≤5 concrete options cover all cases).
+           → MUST include all realistic scenarios[] (2–5 items).
+           → No suggestion field needed.
 - Tier 3: answer is near-deterministic from context (tech stack, patterns, stated constraints).
            → confidence ≥ 0.75 required. MUST include citation explaining why.
            → confidence < 0.75 → downgrade to Tier 2.
+           → scenarios[] can be empty for Tier 3.
+
+SUBCATEGORY RULES — assign "subcategory" to help the rule engine classify correctly:
+  "policy"      — defines how the system MUST behave (approval semantics, risk rules,
+                  material change definition, retention obligations)
+  "scoring"     — risk rating model, thresholds, weighting
+  "approval"    — quorum, conditional approval logic, escalation paths
+  "routing"     — workflow routing rules, review triggers, skip conditions
+  "output"      — what data appears in reports, dashboards, exports, emails
+  "config"      — admin-configurable parameters (SLA values, notification prefs,
+                  calendar settings, reference lists)
+  "access"      — role-based permissions, document visibility, API restrictions
+  "integration" — which external systems, mandatory vs optional
+  "other"       — anything that doesn't fit above
+
+IMPORTANT: "output" and "config" subcategories are NEVER Tier 1, even if
+category is "business". Questions like "what fields appear in the compliance
+report", "what metrics show on the dashboard", or "which notifications can users
+configure" are Tier 2 — they have bounded, enumerable answer spaces.
+
+Tier 1 business questions are EXCLUSIVELY from subcategories: policy, scoring,
+approval, routing — because those answers fundamentally change what the system
+does, not just how it presents data.
+
+
+Every Tier 1 and Tier 2 finding without scenarios is malformed — always provide them.
 
 DEPENDENCY RULES:
 - If finding B only makes sense after finding A is answered, put A's id in B's depends_on.
 - Findings with depends_on should have priority "low" or "medium" initially.
 
-PRIORITY RULES:
-- "blocking": estimate or implementation cannot proceed without this answer.
-- "high": significant scope/architecture impact.
-- "medium": affects one module or UX flow.
-- "low": nice-to-have clarification.
+PRIORITY RULES — TWO-TIER HEURISTIC:
 
-ID FORMAT: CLR-001, CLR-002, ... (3-digit zero-padded, sequential)
+Assign priority by asking: "Does this answer change the architecture, approval
+semantics, or scope of the system?" If yes → blocking or high. If it only
+affects one edge case or one workflow step → medium or low.
+
+POLICY-SHAPING ambiguities (→ blocking / high):
+  These questions, if left unanswered, would cause architectural rework or
+  incorrect scope. Examples for complex enterprise systems:
+  - Risk scoring model: how is residual risk calculated? Who defines thresholds?
+  - Approval semantics: can final approval proceed with Approved-with-Conditions?
+  - Quorum / committee logic: does Risk Committee require 1 approver or a quorum?
+  - "Material change" definition for renewals: what triggers a full re-review?
+  - SLA basis: business hours vs calendar hours vs timezone-aware?
+  - Rule ownership: who can change routing rules, are rules versioned?
+  - Multi-region data residency: does data need to stay within each region?
+  - Audit retention scope: which event types are immutable vs admin-correctable?
+
+IMPLEMENTATION-DETAIL ambiguities (→ medium / low):
+  These questions affect one feature or edge case, not the overall system shape.
+  Examples:
+  - Draft save behavior with missing fields
+  - Clone field restrictions
+  - Reviewer reassignment edge cases
+  - Notification preference granularity
+
+CALIBRATION RULE: The number of findings must match the actual complexity of the
+requirement — do not stop early. Scale findings to spec size:
+  - Simple spec (1–3 features, 1 role): 3–5 findings is normal.
+  - Medium spec (4–7 features, 2–4 roles): 6–10 findings is normal.
+  - Complex enterprise spec (8+ epics, multiple roles, compliance obligations,
+    multi-region, SLA semantics, routing rules): 10–20 findings is expected.
+
+For complex specs, you MUST surface at minimum:
+  - All policy-shaping ambiguities in the blocking/high category FIRST.
+  - Common enterprise gaps that are almost always ambiguous:
+      residual risk scoring model, conditional approval semantics,
+      SLA business hours vs calendar hours, quorum for committee approvals,
+      what constitutes "material change" for renewals,
+      routing rule ownership and versioning,
+      audit retention scope and immutability rules.
+  - Only AFTER exhausting blocking/high should you surface medium/low findings.
+
+If you only found 5 findings for a complex enterprise spec, you have under-generated.
+Re-examine the spec for the gaps listed above before returning.
+
+"blocking": this answer must be known before estimate or architecture can proceed.
+"high": significantly shapes scope, approval logic, or integration contracts.
+"medium": affects one module, one workflow step, or one edge case.
+"low": nice-to-have, can be decided during implementation.
+
+ID FORMAT: CLR-001, CLR-002, ... (3-digit zero-padded, sequential, start from 001 each session)
 """
 
 
-def _analyze(requirement_text: str, knowledge_context: str, answered_ids: set[str]) -> dict:
-    """Run Phase 1+2: call LLM, parse JSON, filter already-answered findings."""
-    already_answered_note = ""
-    if answered_ids:
-        already_answered_note = (
-            f"\n\nALREADY ANSWERED (skip these, do not re-generate):\n"
-            + "\n".join(sorted(answered_ids))
+def _analyze(
+    requirement_text: str,
+    knowledge_context: str,
+    answered_qa_pairs: list[dict],
+) -> dict:
+    """Run Phase 1+2: call LLM, parse JSON, enforce Tier 3 confidence threshold."""
+
+    # Build semantic dedup block — full Q/A text so LLM can detect meaning, not just IDs
+    if answered_qa_pairs:
+        qa_lines = []
+        for pair in answered_qa_pairs:
+            qa_lines.append(f"  [{pair['id']}] Q: {pair['question']}")
+            qa_lines.append(f"         A: {pair['answer']}")
+        already_answered_block = (
+            "\n\nALREADY_ANSWERED_QA (do NOT re-ask semantically equivalent questions):\n"
+            + "\n".join(qa_lines)
         )
+    else:
+        already_answered_block = ""
 
     user_msg = f"""KNOWLEDGE CONTEXT:
 {knowledge_context if knowledge_context else "(none — standalone mode)"}
-{already_answered_note}
+{already_answered_block}
 
 REQUIREMENT DOCUMENT:
 {requirement_text}
 
-Analyze thoroughly. Output only the JSON object."""
+Analyze thoroughly. Apply semantic dedup against ALREADY_ANSWERED_QA above.
+Output only the JSON object."""
 
     raw = _call_llm(_ANALYZE_SYSTEM, user_msg)
 
@@ -307,13 +498,214 @@ Analyze thoroughly. Output only the JSON object."""
         print("Raw output:\n", raw[:500])
         raise
 
-    # Enforce Tier 3 confidence threshold — downgrade if below
+    # Post-process: enforce invariants
     for f in result.get("findings", []):
+        # Enforce Tier 3 confidence threshold — downgrade if below
         if f.get("tier") == 3 and f.get("confidence", 0) < _TIER3_MIN_CONF:
             f["tier"] = 2
             f["confidence"] = None
+        # Enforce scenarios non-empty for Tier 1 and Tier 2
+        # If LLM forgot, add a generic fallback so UI always shows options
+        if f.get("tier") in (1, 2) and not f.get("scenarios"):
+            f["scenarios"] = ["Yes / proceed as implied", "No / needs different approach", "Other (specify below)"]
 
+    result["findings"] = _enforce_tiers(result.get("findings", []))
     return result
+
+
+def _finding_hash(text: str) -> str:
+    """Stable 8-char hash of normalized finding text — cross-round identity."""
+    normalized = re.sub(r"\s+", " ", text.strip().lower())
+    return hashlib.sha256(normalized.encode()).hexdigest()[:8]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Rule engine: enforce tiers deterministically (Test 3)
+# LLM proposes → rule engine enforces. Tier is a rule, not a suggestion.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _enforce_tiers(findings: list[dict]) -> list[dict]:
+    """
+    Correct tier assignment using structural rules only.
+    No keywords, no LLM, 100% deterministic. Runs after _analyze().
+
+    Rules (first match wins per finding):
+      R1: suggestion + confidence ≥ 0.75 + citation       → Tier 3
+      R2: scenarios ≤ 5 + category in (technical/design/logic) → Tier 2
+      R3: category == business OR priority == blocking
+          OR no scenarios                                  → Tier 1
+      R4: Tier 3 missing citation OR confidence < 0.75    → demote to Tier 2
+
+    Post-assignment invariants:
+      - Tier 1/2: scenarios must be non-empty
+      - Tier 3: suggestion must be present
+    """
+    for f in findings:
+        suggestion = (f.get("suggestion") or "").strip()
+        confidence = f.get("confidence") or 0.0
+        citation   = (f.get("citation") or "").strip()
+        scenarios  = f.get("scenarios") or []
+        category   = f.get("category", "")
+        priority   = f.get("priority", "")
+
+        bounded      = bool(scenarios) and len(scenarios) <= 5
+        near_det_cat = category in ("technical", "design", "logic")
+        subcategory  = f.get("subcategory", "other")
+        # "output" and "config" subcategories are presentation/configuration choices
+        # even if category is "business" — they do not shape policy or architecture
+        output_config = subcategory in ("output", "config")
+
+        # R4: validate existing Tier 3 FIRST — before any reassignment
+        # If LLM said Tier 3 but evidence is weak, demote to Tier 2 immediately
+        # so R1/R2/R3 see the corrected tier (not the original Tier 3 claim)
+        if f.get("tier") == 3 and (not citation or confidence < _TIER3_MIN_CONF):
+            f["tier"] = 2
+            f["confidence"] = None
+
+        # R1: structural promotion to Tier 3 (strongest positive signal)
+        if suggestion and confidence >= _TIER3_MIN_CONF and citation:
+            f["tier"] = 3
+        # R2: bounded enumerable → Tier 2
+        # Also: output/config subcategories are always bounded even if category=business
+        elif (bounded and near_det_cat) or (bounded and output_config):
+            f["tier"] = 2
+        # R3: policy-shaping business decisions → Tier 1
+        # Exception 1: output/config subcategories → Tier 2 (not policy-shaping)
+        # Exception 2: if finding has a suggestion (was intended as Tier 3 but
+        # demoted by R4), keep it at Tier 2 — not Tier 1.
+        elif (category == "business" or priority == "blocking") and not output_config and not suggestion:
+            f["tier"] = 1
+        elif not scenarios and not suggestion:
+            f["tier"] = 1
+        # else: keep current tier
+
+        # Invariants
+        if f.get("tier") in (1, 2) and not f.get("scenarios"):
+            f["scenarios"] = [
+                "Yes — proceed as implied",
+                "No — needs a different approach",
+                "Other (type custom answer)",
+            ]
+        if f.get("tier") == 3 and not f.get("suggestion"):
+            f["suggestion"] = "(see citation)"
+
+    return findings
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Delta analysis: focused follow-up after a Tier 1 blocking answer (Test 4)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_DELTA_SYSTEM = """
+You are a requirements analyst. A blocking clarification question was just answered.
+Your task is ONLY to determine:
+  1. What NEW questions does this answer reveal that are not already in the queue?
+  2. Which EXISTING queue questions are now irrelevant or resolved by this answer?
+
+Output ONLY a valid JSON object — no markdown, no preamble.
+Schema:
+{
+  "new_findings": [
+    {
+      "id": "NEW-001",
+      "text": "<the clarification question — must follow TONE RULES>",
+      "tier": 1 | 2 | 3,
+      "category": "business" | "logic" | "technical" | "design",
+      "priority": "blocking" | "high" | "medium" | "low",
+      "depends_on": [],
+      "scenarios": ["<option A>", "<option B>"],
+      "suggestion": "",
+      "confidence": 0.0,
+      "citation": ""
+    }
+  ],
+  "invalidated_ids": ["CLR-XXX", "CLR-YYY"]
+}
+
+TONE RULES (same as main analysis — enforced):
+- Write as a natural, collaborative question.
+- NEVER start with "The requirement does not specify", "It is unclear", or similar
+  phrasing that implies the author made a mistake.
+- Ask directly: "Which X should be used?", "How should Y behave when Z?", etc.
+
+RULES:
+- new_findings[] should only contain questions that COULD NOT have been asked
+  before this answer was known. Do not regenerate existing questions.
+- invalidated_ids[] should list queue item IDs that this answer makes moot.
+- If nothing changes, return {"new_findings": [], "invalidated_ids": []}.
+- IDs for new findings use prefix NEW- to avoid collisions with existing CLR- IDs.
+- Apply same SCENARIOS RULE: Tier 1 and Tier 2 must have non-empty scenarios[].
+- Apply same PRIORITY HEURISTIC: new findings revealed by a blocking answer are
+  likely also blocking or high. Only mark medium/low if they are clearly
+  implementation-detail questions, not policy-shaping ones.
+
+SCOPE CONSTRAINT — CRITICAL:
+  Only generate follow-up questions that are POLICY-SHAPING:
+  = questions whose answer would change system architecture, access control,
+    workflow design, or compliance posture.
+  DO NOT generate questions about:
+  - Exact numeric values, thresholds, or point scores (e.g. "how many points
+    for PHI?" — that is implementation config, not policy)
+  - Specific UI copy, labels, or field names
+  - Scheduling intervals, timeout durations, or retry counts
+  - Any detail that a developer can decide without client input
+  MAXIMUM 3 new findings per delta call. If you have more, pick the top 3
+  by policy impact. Quality over quantity.
+"""
+
+
+def _delta_analyze(
+    answered_finding: dict,
+    answer: str,
+    requirement_text: str,
+    current_queue_ids: list[str],
+) -> tuple[list[dict], list[str]]:
+    """
+    After a Tier 1 blocking answer, ask LLM:
+      - what new questions does this reveal?
+      - which pending questions are now invalidated?
+
+    Returns (new_findings, invalidated_ids).
+    Cheap: input is small, output is targeted delta only.
+    """
+    queue_summary = ", ".join(current_queue_ids) if current_queue_ids else "none"
+
+    req_snippet = requirement_text
+    if len(req_snippet) > _DELTA_REQ_CHARS:
+        req_snippet = req_snippet[:_DELTA_REQ_CHARS] + f"\n... [truncated — {len(requirement_text)} chars total]"
+
+    user_msg = f"""REQUIREMENT CONTEXT:
+{req_snippet}
+
+ANSWERED QUESTION:
+  ID: {answered_finding['id']}
+  Text: {answered_finding['text']}
+  Category: {answered_finding.get('category', '')}
+  Priority: {answered_finding.get('priority', '')}
+
+USER ANSWER: {answer}
+
+CURRENT PENDING QUEUE (IDs still to be asked): {queue_summary}
+
+Given this answer, what new questions are revealed and which pending ones are now moot?
+Output only the JSON object."""
+
+    try:
+        raw = _call_llm(_DELTA_SYSTEM, user_msg, max_tokens=_MAX_TOKENS_DELTA)
+        clean = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.MULTILINE)
+        result = json.loads(clean)
+    except Exception as exc:
+        # Delta failure is non-fatal — log and continue with existing queue
+        print(f"  [00][delta] Delta analysis failed ({exc}), continuing without update.")
+        return [], []
+
+    new_findings    = result.get("new_findings", [])
+    invalidated_ids = result.get("invalidated_ids", [])
+
+    # Apply rule engine to new findings too
+    new_findings = _enforce_tiers(new_findings)
+
+    return new_findings, invalidated_ids
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -363,9 +755,30 @@ def _print_finding(f: dict, index: int, total: int) -> None:
 
 
 def _ask_tier1(f: dict) -> str:
-    print()
-    raw = input("  → Your answer: ").strip()
-    return raw or "(no answer provided)"
+    """
+    Tier 1: show representative options (not exhaustive) + always allow custom answer.
+    User can pick a number OR type anything freely.
+    """
+    scenarios = f.get("scenarios", [])
+    if scenarios:
+        print("\n  Options:")
+        for i, s in enumerate(scenarios, 1):
+            print(f"    {i}. {s}")
+        print()
+        while True:
+            choice = input(f"  → Choose 1–{len(scenarios)} or type custom answer: ").strip()
+            if choice.isdigit():
+                idx = int(choice) - 1
+                if 0 <= idx < len(scenarios):
+                    return scenarios[idx]
+            if choice:
+                return choice
+            print("  Please enter a choice.")
+    else:
+        # Fallback: pure free-text (should not happen after enforce above)
+        print()
+        raw = input("  → Your answer: ").strip()
+        return raw or "(no answer provided)"
 
 
 def _ask_tier2(f: dict) -> str:
@@ -396,8 +809,16 @@ def _ask_tier3(f: dict) -> tuple[str, bool]:
     return modified or f.get("suggestion", ""), True
 
 
-def _dependencies_satisfied(f: dict, answered: dict[str, str]) -> bool:
+def _dependencies_satisfied(f: dict, answered: dict[str, str], known_ids: set[str] | None = None) -> bool:
+    """
+    Return True if all deps are answered.
+    If known_ids is provided, deps that don't exist in the queue at all
+    are treated as already-satisfied (dangling ref from LLM — skip silently).
+    """
     for dep in f.get("depends_on", []):
+        if known_ids is not None and dep not in known_ids:
+            # Dangling reference — dep was never in the queue, treat as resolved
+            continue
         if dep not in answered:
             return False
     return True
@@ -405,40 +826,70 @@ def _dependencies_satisfied(f: dict, answered: dict[str, str]) -> bool:
 
 def _derive_impact(question: str, answer: str, category: str) -> str:
     """
-    Produce a one-line impact statement from a Q&A pair.
-    Uses a lightweight heuristic first; falls back to LLM for ambiguous cases.
+    Produce a one-line impact statement from a Q&A pair via LLM.
+    NOTE: Called in batch AFTER the interactive loop completes — never inside it.
     """
-    # Short answers that are simple acceptances don't need LLM
-    if answer.lower() in ("accepted", "yes", "no", "rejected", "(no answer provided)"):
+    if not answer or answer.lower() in ("accepted", "yes", "no", "rejected", "(no answer provided)"):
         return ""
-    # For substantive answers, derive impact via a fast LLM call
     try:
         system = (
             "You are a technical analyst. Given a clarification Q&A pair, "
-            "output ONE concise sentence (max 20 words) describing the "
-            "implementation impact of this decision. No preamble."
+            "output ONE complete sentence (max 30 words) describing the "
+            "implementation impact of this decision. "
+            "The sentence must be grammatically complete — never cut off mid-word or mid-phrase. "
+            "No preamble, no trailing punctuation issues."
         )
         user = f"Question: {question}\nAnswer: {answer}\nCategory: {category}"
-        return _call_llm(system, user).strip().splitlines()[0][:120]
+        raw = _call_llm(system, user, max_tokens=256).strip()
+        # Take first sentence only; strip stray leading quotes
+        first_line = raw.splitlines()[0].strip().strip('"').strip("'")
+        return first_line
     except Exception:
         return ""
+
+
+def _batch_derive_impacts(decisions: list[dict]) -> None:
+    """
+    Enrich decisions[*]["impact"] in-place via LLM calls.
+    Called once after the interactive loop — all user Q&A is already done.
+    """
+    pending = [d for d in decisions if not d.get("impact")]
+    if not pending:
+        return
+    print(f"\n[00] Deriving impact statements ({len(pending)} decisions) ...")
+    for d in pending:
+        d["impact"] = _derive_impact(d["question"], d["answer"], d.get("category", ""))
 
 
 def _run_interactive_loop(
     findings: list[dict],
     project_name: str,
+    requirement_text: str = "",
 ) -> tuple[list[dict], list[dict]]:
     """
     Drive the Q&A loop. Returns (decisions, unresolved).
     decisions: list of {id, tier, question, answer, accepted, impact}
-    """
-    decisions:   list[dict] = []
-    unresolved:  list[dict] = []
-    answered:    dict[str, str] = {}   # id → answer text
-    queue = _sort_findings([f for f in findings])
 
-    total = len(queue)
-    processed = 0
+    Delta loop (Test 4): after each Tier 1 blocking answer, calls _delta_analyze()
+    to inject new findings and remove invalidated ones from the queue.
+    Uses _finding_hash() for cross-round identity so NEW-* items are deduped
+    against already-answered content even if IDs differ.
+    """
+    decisions:    list[dict] = []
+    unresolved:   list[dict] = []
+    answered:     dict[str, str] = {}  # id → answer text
+    answered_hashes: set[str] = set()  # content hashes of answered questions
+    delta_depth:  int = 0              # how many delta rounds have fired
+    _MAX_DELTA_DEPTH = 2               # cap: delta-of-delta is over-drill
+
+    # Work from a stable sorted list; deferred items go into a separate pending set
+    queue:    list[dict] = _sort_findings(list(findings))
+    deferred: set[str]   = set()   # ids of items pushed-back at least once
+    total    = len(queue)
+    answered_count = 0
+
+    # All IDs ever seen in the queue — used to detect dangling depends_on refs
+    known_ids: set[str] = {f["id"] for f in queue}
 
     _print_banner(f"Clarification session — {project_name}")
     print(f"  {total} findings to process.\n")
@@ -448,20 +899,33 @@ def _run_interactive_loop(
         f = queue[i]
         i += 1
 
-        # Skip if dependency not yet answered (push to back)
-        if not _dependencies_satisfied(f, answered):
-            queue.append(f)
-            # Safety: if we loop without progress, break
-            if len(queue) - i > total * 2:
-                unresolved.append(f)
-                break  # circular dependency — cannot resolve
+        # Already processed — check both ID and content hash
+        if f["id"] in answered:
+            continue
+        if _finding_hash(f["text"]) in answered_hashes:
+            # Semantically duplicate from delta injection — skip silently
             continue
 
-        processed += 1
-        remaining = len([x for x in queue[i:] if _dependencies_satisfied(x, answered)]) + 1
-        _print_finding(f, processed, processed + remaining - 1)
+        # Dependency not yet satisfied — defer once
+        if not _dependencies_satisfied(f, answered, known_ids):
+            if f["id"] not in deferred:
+                deferred.add(f["id"])
+                queue.append(f)
+            else:
+                # Second time we can't satisfy deps → circular/unresolvable
+                unresolved.append(f)
+            continue
 
-        tier = f.get("tier", 1)
+        answered_count += 1
+        # Remaining = items not yet answered and deps satisfied (approximate)
+        pending_ready = sum(
+            1 for x in queue[i:]
+            if x["id"] not in answered and _dependencies_satisfied(x, answered)
+        )
+        display_total = answered_count + pending_ready
+        _print_finding(f, answered_count, display_total)
+
+        tier     = f.get("tier", 1)
         accepted = True
 
         if tier == 1:
@@ -472,8 +936,7 @@ def _run_interactive_loop(
             answer, accepted = _ask_tier3(f)
 
         answered[f["id"]] = answer
-        # Derive a concise impact statement from the answer
-        impact = _derive_impact(f["text"], answer, f.get("category", ""))
+        answered_hashes.add(_finding_hash(f["text"]))
         decisions.append({
             "id":       f["id"],
             "tier":     tier,
@@ -482,14 +945,52 @@ def _run_interactive_loop(
             "question": f["text"],
             "answer":   answer,
             "accepted": accepted,
-            "impact":   impact,
+            "impact":   "",  # filled by _batch_derive_impacts after loop
         })
 
-        # Check if this answer unlocks any previously-deferred findings
-        # (already handled by re-checking depends_on in next iteration)
-        # NOTE: v1 limitation — new questions generated from answers are not
-        # injected mid-session. Queue is fixed after Phase 1 analysis.
-        # Re-run clarificator with updated knowledge context for follow-ups.
+        # ── Delta loop: inject new findings after Tier 1 blocking answer ─────
+        # depth cap prevents chain-reaction: delta-of-delta is over-drill
+        _is_delta_finding = f["id"].startswith("NEW-")
+        _can_delta = (
+            tier == 1
+            and f.get("priority") == "blocking"
+            and requirement_text
+            and delta_depth < _MAX_DELTA_DEPTH
+            and not _is_delta_finding  # never trigger delta from a delta finding
+        )
+        if _can_delta:
+            current_queue_ids = [
+                x["id"] for x in queue[i:]
+                if x["id"] not in answered
+            ]
+            print(f"  [delta] Checking for follow-up questions after {f['id']}...")
+            new_findings, invalidated_ids = _delta_analyze(
+                f, answer, requirement_text, current_queue_ids
+            )
+
+            # Remove invalidated items (mark as answered with sentinel)
+            for inv_id in invalidated_ids:
+                if inv_id not in answered:
+                    answered[inv_id] = "[invalidated by delta]"
+                    print(f"  [delta] Invalidated: {inv_id}")
+
+            # Inject new findings — dedup by content hash
+            injected = 0
+            for nf in new_findings:
+                if _finding_hash(nf["text"]) in answered_hashes:
+                    continue  # semantically already answered
+                if nf["id"] in answered:
+                    continue  # ID collision
+                queue.append(nf)
+                known_ids.add(nf["id"])  # register so deps referencing it are not dangling
+                injected += 1
+            if injected:
+                print(f"  [delta] Injected {injected} new finding(s) into queue.")
+            elif new_findings:
+                print(f"  [delta] {len(new_findings)} potential finding(s) already covered.")
+            else:
+                print(f"  [delta] No follow-up questions revealed.")
+            delta_depth += 1
 
     return decisions, unresolved
 
@@ -500,15 +1001,32 @@ def _run_interactive_loop(
 
 _SYNTHESIS_SYSTEM = """
 You are a technical writer. Given a raw requirement document and a set of
-clarification Q&A decisions, produce a clean, unambiguous
-"Clarified Requirement" document in markdown.
+clarification decisions, produce ONE clean, unified "Clarified Requirement"
+document in markdown.
 
-Rules:
-- Incorporate all decisions into the narrative naturally.
-- Preserve the original structure but resolve every ambiguity.
-- Add a "## Decisions Log" section at the end listing each CLR-XXX with
-  one-line summary of the answer.
-- Be concise. No preamble. Output only the markdown document.
+STRICT STRUCTURAL RULES — violations produce unusable output:
+1. OUTPUT THE DOCUMENT EXACTLY ONCE. Do not repeat any section, heading,
+   or block of content. Each section (Context, Workflow, Functional Requirements,
+   NFR, Integrations, Out of Scope, Acceptance Criteria) appears exactly one time.
+2. Use the ORIGINAL REQUIREMENT as the single structural template.
+   Walk through it section by section, top to bottom, in one pass.
+   Do not restructure, reorder, or merge sections differently.
+3. For each section: incorporate the relevant decisions inline by updating
+   the text naturally. Do not add a parallel or duplicate version of the section.
+4. Preserve all original bullet points and list items. Do not drop content
+   that was not affected by a decision.
+5. Every list item must start with "- " on its own line. Never run list items
+   into prose without a line break.
+6. Add a "## Decisions Log" section at the very end — one line per decision:
+   "- **CLR-XXX**: <one-line summary of the answer and its impact>"
+7. No preamble, no postamble. Output only the markdown document.
+
+ANTI-PATTERNS — never do these:
+- Do not output a short summary version followed by a long full version.
+- Do not output the Functional Requirements twice (once short, once detailed).
+- Do not copy the NFR or Out of Scope section more than once.
+- Do not leave "Automated security questionnaire..." mid-sentence merged into
+  an unrelated section.
 """
 
 
@@ -519,7 +1037,7 @@ def _synthesize_requirement(
     summary: str,
 ) -> str:
     decisions_text = "\n".join(
-        f"- {d['id']}: {d['question'][:80]}... → {d['answer']}"
+        f"- {d['id']} [{d.get('priority','').upper()}]: {d['question']} → {d['answer']}"
         for d in decisions
     )
     conflicts_text = "\n".join(
@@ -541,7 +1059,7 @@ CONFLICTS DETECTED:
 
 Produce the clarified requirement document now."""
 
-    return _call_llm(_SYNTHESIS_SYSTEM, user_msg)
+    return _call_llm(_SYNTHESIS_SYSTEM, user_msg, max_tokens=_MAX_TOKENS_SYNTHESIS)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -571,11 +1089,15 @@ def _write_report(
         "requirement_hash": req_hash,
         "session_id":       session_id,
         "project_name":     project_name,
-        "total_findings":   len(findings),
-        "tier1_answered":   tier_counts.get(1, 0),
-        "tier2_answered":   tier_counts.get(2, 0),
-        "tier3_accepted":   tier3_accepted,
-        "tier3_rejected":   tier3_rejected,
+        "initial_findings":  len(findings),          # from Phase 1 analysis only
+        "delta_injected":    sum(                     # findings added by delta loop
+            1 for d in decisions if d["id"].startswith("NEW-")
+        ),
+        "total_decisions":   len(decisions),          # initial + delta combined
+        "tier1_answered":    tier_counts.get(1, 0),
+        "tier2_answered":    tier_counts.get(2, 0),
+        "tier3_accepted":    tier3_accepted,
+        "tier3_rejected":    tier3_rejected,
         "conflicts_detected": len(conflicts),
         "unresolved":       [u["id"] for u in unresolved],
         "decisions":        decisions,
@@ -597,10 +1119,20 @@ def _write_questions_md(
         "",
     ]
 
-    blocking    = [f for f in findings if f.get("tier") in (1, 2) and f.get("priority") == "blocking"]
-    high        = [f for f in findings if f.get("tier") in (1, 2) and f.get("priority") == "high"]
-    medium_low  = [f for f in findings if f.get("tier") in (1, 2) and f.get("priority") not in ("blocking", "high")]
+    # Group by tier (not priority). Priority only controls ordering within a section.
+    tier1 = sorted(
+        [f for f in findings if f.get("tier") == 1],
+        key=lambda f: _PRIORITY_ORDER.get(f.get("priority", "low"), 9)
+    )
+    tier2 = sorted(
+        [f for f in findings if f.get("tier") == 2],
+        key=lambda f: _PRIORITY_ORDER.get(f.get("priority", "low"), 9)
+    )
     suggestions = [f for f in findings if f.get("tier") == 3]
+
+    # Sub-sections within Tier 1: blocking gets its own callout, rest grouped together
+    tier1_blocking = [f for f in tier1 if f.get("priority") == "blocking"]
+    tier1_other    = [f for f in tier1 if f.get("priority") != "blocking"]
 
     def _render_q(f: dict, numbered: int) -> list[str]:
         out = [f"{numbered}. [{f['id']}] {f['text']}"]
@@ -609,26 +1141,31 @@ def _write_questions_md(
                 out.append(f"   - {s}")
         return out
 
-    if blocking:
-        lines += ["## 🔴 Blocking (cần trả lời trước khi estimate)", ""]
-        for n, f in enumerate(blocking, 1):
+    if tier1_blocking:
+        lines += ["## 🔴 Blocking — Tier 1 (cần trả lời trước khi estimate)", ""]
+        for n, f in enumerate(tier1_blocking, 1):
             lines += _render_q(f, n)
             lines.append("")
 
-    if high:
-        lines += ["## 🟡 Important", ""]
-        for n, f in enumerate(high, 1):
-            lines += _render_q(f, n)
+    if tier1_other:
+        label = "## 🔴 Tier 1 — Business & Policy Decisions"
+        lines += [label, ""]
+        for n, f in enumerate(tier1_other, 1):
+            priority_tag = f"[{f.get('priority', '').upper()}]" if f.get("priority") != "high" else ""
+            out = _render_q(f, n)
+            if priority_tag:
+                out[0] = f"{out[0]}  {priority_tag}"
+            lines += out
             lines.append("")
 
-    if medium_low:
-        lines += ["## ⚪ Other Questions", ""]
-        for n, f in enumerate(medium_low, 1):
+    if tier2:
+        lines += ["## 🟡 Tier 2 — Bounded Choices", ""]
+        for n, f in enumerate(tier2, 1):
             lines += _render_q(f, n)
             lines.append("")
 
     if suggestions:
-        lines += ["## 🟢 Suggestions (confirm nếu đồng ý)", ""]
+        lines += ["## 🟢 Tier 3 — Suggestions (confirm nếu đồng ý)", ""]
         for f in suggestions:
             conf = f.get("confidence", 0)
             conf_str = f"{int(conf * 100)}%" if conf else "?"
@@ -642,8 +1179,10 @@ def _write_questions_md(
         lines += ["---", "## ⚠️ Conflicts Detected", ""]
         for c in conflicts:
             lines.append(f"- [{c['id']}] {c['description']}")
-            lines.append(f"  New: _{c.get('source_a', '')[:60]}_")
-            lines.append(f"  Existing: _{c.get('source_b', '')[:60]}_")
+            if c.get("source_a"):
+                lines.append(f"  New requirement: _{c['source_a']}_")
+            if c.get("source_b"):
+                lines.append(f"  Existing decision: _{c['source_b']}_")
             lines.append("")
 
     CLARIFICATION_QUESTIONS.write_text("\n".join(lines), encoding="utf-8")
@@ -653,33 +1192,46 @@ def _write_questions_md(
 def _append_to_log(
     session_id: str,
     project_name: str,
+    project_slug: str,
     decisions: list[dict],
     conflicts: list[dict],
 ) -> None:
-    """Append this session's decisions to the permanent clarification_log.md."""
-    lines: list[str] = [
-        f"\n## {session_id[:10]} | Project: {project_name} | Session: {session_id[11:19]}",
-        "",
-    ]
+    """Append this session's decisions to the per-project clarification_log_<slug>.md."""
+    log_path = _clarification_log_path(project_slug)
+
+    blocks: list[str] = []
+    blocks.append(
+        f"## {session_id[:10]} | Project: {project_name} | Session: {session_id[11:19]}"
+    )
+
     for d in decisions:
         tier_label = {1: "Tier 1", 2: "Tier 2", 3: "Tier 3"}.get(d["tier"], "?")
-        accepted_label = "" if d["tier"] != 3 else (" / accepted" if d["accepted"] else " / rejected")
-        lines.append(f"### {d['id']} [{tier_label}{accepted_label}]")
-        lines.append(f"**Q:** {d['question']}")
-        lines.append(f"**A:** {d['answer']}")
+        accepted_label = (
+            "" if d["tier"] != 3
+            else (" / accepted" if d["accepted"] else " / rejected")
+        )
+        entry_lines = [
+            f"### {d['id']} [{tier_label}{accepted_label}]",
+            f"**Q:** {d['question']}",
+            f"**A:** {d['answer']}",
+        ]
         if d.get("impact"):
-            lines.append(f"**Impact:** {d['impact']}")
-        lines.append("")
+            entry_lines.append(f"**Impact:** {d['impact']}")
+        blocks.append("\n".join(entry_lines))
 
     if conflicts:
-        lines.append("### Conflicts resolved this session")
+        conflict_lines = ["### Conflicts resolved this session"]
         for c in conflicts:
-            lines.append(f"- [{c['id']}] {c['description']}")
-        lines.append("")
+            conflict_lines.append(f"- [{c['id']}] {c['description']}")
+        blocks.append("\n".join(conflict_lines))
 
-    with CLARIFICATION_LOG.open("a", encoding="utf-8") as fh:
-        fh.write("\n".join(lines))
-    print(f"[00] ✓ Log appended → {CLARIFICATION_LOG}")
+    # Each block separated by blank line; leading newline ensures separation
+    # from previous session already in file
+    content = "\n\n" + "\n\n".join(blocks) + "\n"
+
+    with log_path.open("a", encoding="utf-8") as fh:
+        fh.write(content)
+    print(f"[00] ✓ Log appended → {log_path}")
 
 
 def _write_clarified_req(content: str) -> None:
@@ -722,43 +1274,107 @@ def _gather_requirement(args: argparse.Namespace) -> str:
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _resolve_project(arg_project: str | None) -> tuple[str, str]:
+    """
+    Resolve (project_name, project_slug).
+    If --project not given, show existing workspaces and prompt user.
+    Returns (display_name, slug).
+    """
+    if arg_project:
+        name = arg_project.strip()
+        return name, _slugify(name)
+
+    ensure_dirs()
+    known = _list_known_projects()
+
+    print()
+    if known:
+        print("Known workspaces:")
+        for i, slug in enumerate(known, 1):
+            print(f"  {i}. {slug}")
+        print()
+        raw = input("Enter project name (or number to select existing): ").strip()
+        if raw.isdigit():
+            idx = int(raw) - 1
+            if 0 <= idx < len(known):
+                slug = known[idx]
+                return slug.replace("-", " ").title(), slug
+        name = raw or "unknown"
+    else:
+        print("[00] No existing workspaces found.")
+        name = input("Enter new project name: ").strip() or "unknown"
+
+    return name, _slugify(name)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="00_clarificator — requirement analysis & Q&A agent"
     )
-    parser.add_argument("--input",    metavar="FILE", help="Path to requirement file (.md, .txt, .pdf)")
-    parser.add_argument("--text",     metavar="TEXT", help="Requirement as inline text string")
+    parser.add_argument("--project",  metavar="NAME",
+                        help="Project workspace name (required for dedup). Prompted if omitted.")
+    parser.add_argument("--input",    metavar="FILE",
+                        help="Path to requirement file (.md, .txt, .pdf)")
+    parser.add_argument("--text",     metavar="TEXT",
+                        help="Requirement as inline text string")
     parser.add_argument("--no-synth", action="store_true",
                         help="Skip synthesis step (don't generate clarified_requirement.md)")
     parser.add_argument("--dry-run",  action="store_true",
                         help="Run analysis only, print findings, no Q&A and no file writes")
+    parser.add_argument("--list-projects", action="store_true",
+                        help="List all known project workspaces and exit")
     args = parser.parse_args()
 
     ensure_dirs()
+
+    if args.list_projects:
+        known = _list_known_projects()
+        if not known:
+            print("[00] No project workspaces found.")
+        else:
+            print("[00] Known workspaces:")
+            for slug in known:
+                log_path = _clarification_log_path(slug)
+                sessions = len(re.findall(r"^## \d{4}-", log_path.read_text(encoding="utf-8"), re.MULTILINE))
+                print(f"  • {slug}  ({sessions} session{'s' if sessions != 1 else ''})")
+        return
+
+    # ── Resolve project workspace ─────────────────────────────────────────────
+    project_name, project_slug = _resolve_project(args.project)
+    print(f"[00] Workspace: {project_name!r} (slug: {project_slug})")
 
     # ── Gather input ──────────────────────────────────────────────────────────
     requirement_text = _gather_requirement(args)
     req_hash         = _sha256(requirement_text)
     session_id       = _now_iso()
 
-    # ── Load knowledge context ────────────────────────────────────────────────
-    standalone = not (KNOWLEDGE_BASE.exists() or CLARIFICATION_LOG.exists())
+    # ── Load knowledge context (project-scoped) ───────────────────────────────
+    log_text      = _load_clarification_log(project_slug)
+    standalone    = not (KNOWLEDGE_BASE.exists() or bool(log_text))
     if standalone:
-        print("[00] Standalone mode — no knowledge context found.")
-        knowledge_context = ""
-        answered_ids: set[str] = set()
+        print("[00] Standalone mode — no knowledge context found for this workspace.")
+        knowledge_context  = ""
+        answered_qa_pairs: list[dict] = []
     else:
         print("[00] Loading knowledge context ...")
-        knowledge_context = _load_knowledge_context()
-        log_text          = _load_clarification_log()
-        answered_ids      = _extract_answered_ids(log_text)
-        if answered_ids:
-            print(f"[00] Skipping {len(answered_ids)} already-answered findings: {sorted(answered_ids)[:5]}{'...' if len(answered_ids) > 5 else ''}")
+        knowledge_context = _load_knowledge_context(project_slug)
+        answered_qa_pairs = _extract_answered_qa_pairs(log_text)
+        if answered_qa_pairs:
+            print(
+                f"[00] Loaded {len(answered_qa_pairs)} past Q/A pairs for semantic dedup "
+                f"(workspace: {project_slug})"
+            )
 
     # ── Phase 1+2: Analyze ────────────────────────────────────────────────────
     print("[00] Analyzing requirement ...")
-    analysis      = _analyze(requirement_text, knowledge_context, answered_ids)
-    project_name  = analysis.get("project_name", "Unknown")
+    analysis      = _analyze(requirement_text, knowledge_context, answered_qa_pairs)
+    # Use --project name as canonical; only fall back to LLM-inferred if project is "unknown"
+    inferred_name = analysis.get("project_name", "Unknown")
+    if project_name == "unknown" and inferred_name != "Unknown":
+        project_name = inferred_name
+        project_slug = _slugify(project_name)
+        print(f"[00] Project name inferred from requirement: {project_name!r}")
+
     findings      = analysis.get("findings", [])
     conflicts     = analysis.get("conflicts", [])
     clarified_sum = analysis.get("clarified_summary", "")
@@ -786,16 +1402,29 @@ def main() -> None:
     _write_questions_md(project_name, session_id, _sort_findings(findings), conflicts)
 
     # ── Phase 3: Interactive loop ─────────────────────────────────────────────
-    decisions, unresolved = _run_interactive_loop(findings, project_name)
+    decisions, unresolved = _run_interactive_loop(findings, project_name, requirement_text)
 
     if unresolved:
-        print(f"\n[00][warn] {len(unresolved)} findings could not be resolved due to circular/unmet dependencies:")
-        for u in unresolved:
-            print(f"  - {u['id']}: {u['text'][:60]}...")
+        # Split by severity: business/blocking = loud warn, rest = silent to report
+        loud = [u for u in unresolved
+                if u.get("category") == "business" or u.get("priority") == "blocking"]
+        silent = [u for u in unresolved if u not in loud]
+
+        if loud:
+            print(f"\n[00][warn] {len(loud)} blocking question(s) could not be resolved "
+                  f"(unmet or circular dependencies) — review before proceeding:")
+            for u in loud:
+                print(f"  ⚠️  {u['id']}: {u['text'][:70]}...")
+        if silent:
+            print(f"\n[00] {len(silent)} low-priority question(s) skipped due to "
+                  f"inconsistent dependencies (recorded in report).")
+
+    # ── Batch derive impact statements (LLM, post-loop) ──────────────────────
+    _batch_derive_impacts(decisions)
 
     # ── Write outputs ─────────────────────────────────────────────────────────
     _write_report(session_id, req_hash, project_name, decisions, unresolved, conflicts, findings)
-    _append_to_log(session_id, project_name, decisions, conflicts)
+    _append_to_log(session_id, project_name, project_slug, decisions, conflicts)
 
     # ── Phase synthesis: clarified requirement ────────────────────────────────
     if not args.no_synth:
@@ -805,8 +1434,9 @@ def main() -> None:
         )
         _write_clarified_req(clarified_md)
 
-    _print_banner(f"Done — {len(decisions)} decisions recorded")
-    print(f"  Next step: python 01_estimator.py --input {CLARIFIED_REQ}\n")
+    _print_banner(f"Done — {len(decisions)} decisions recorded  [{project_slug}]")
+    print(f"  Workspace log: {_clarification_log_path(project_slug)}")
+    print(f"  Next step:     python 01_estimator.py --input {CLARIFIED_REQ}\n")
 
 
 if __name__ == "__main__":
