@@ -49,6 +49,7 @@ PLAN_NOTES      = STATE_DIR / "plan_notes.json"      # owner: 07_update_knowledg
 IMPL_RECORD     = RUN_DIR / "impl_record.json"       # owner: 03a_implement_qwen
 TEST_REPORT     = RUN_DIR / "test_report.json"       # owner: 04_test_and_iterate
 JUDGE_RAW       = RUN_DIR / "judge_raw.json"         # owner: 06_judge_deepseek
+MINI_LOG        = RUN_DIR / "mini_log.json"          # owner: mini_mode
 
 # ── knowledge/current/ ────────────────────────────────────────────────────────
 FINDINGS        = CURRENT_DIR / "findings.md"        # owner: 07_fix_from_judge

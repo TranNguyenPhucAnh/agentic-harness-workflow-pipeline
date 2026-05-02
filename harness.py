@@ -14,6 +14,43 @@ Pipeline stages (run in order):
             └─ re-runs Step 5b + Step 6 after each fix, up to --max-judge-rounds
  
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MINI MODE — daily driver for small / targeted tasks
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Bypasses the full pipeline. Implemented in pipeline/mini_mode.py.
+  Rule of thumb: no spec.md change needed → --mini.
+
+  --mini "PROMPT"          Patch local files or rewrite a context file.
+                           Loads knowledge context, calls Qwen, verifies,
+                           retries ×2, logs to run/mini_log.json.
+
+  --files f1 f2 ...        (code mode) Files to patch. If omitted, LLM
+                           suggests and you confirm interactively.
+
+  --context-file FILE      (DE/MLOps mode) Read FILE as task input.
+                           LLM rewrites its content. Task type is
+                           auto-detected from extension (.sql → sql,
+                           .py → python, .yaml → config, etc.).
+
+  --output-file FILE       Where to write the result. Defaults to
+                           overwriting --context-file in place.
+
+  --task-type TYPE         Override auto-detection.
+                           Values: code | sql | python | config | text | auto
+                           Verifiers: vitest | sqlfluff | py_compile+ruff |
+                                      yaml/json parse | LLM self-review
+
+  --dry-run                Print plan without writing anything.
+
+  Examples:
+    python harness.py --mini "fix button color" --files src/Header.tsx
+    python harness.py --mini "optimize for partition pruning" \\
+        --context-file queries/daily_agg.sql
+    python harness.py --mini "split DAG into two tasks" \\
+        --context-file dags/ingest_orders.py --output-file dags/ingest_orders.py
+    python harness.py --mini "..." --context-file queries/q.sql --dry-run
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 PARAMETER REFERENCE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  
@@ -132,6 +169,7 @@ Requirements:
 """
 
 import argparse
+import datetime
 import json
 import os
 import re as _re
@@ -145,10 +183,9 @@ from pathlib import Path
 ROOT = Path(__file__).parent
 
 # === WRITE AUTHORITY: harness ===
-# OWNS  : (no artifact ownership — orchestrator only)
+# OWNS  : (none — orchestrator only; mini_mode.py owns run/mini_log.json)
 # READS : all artifacts (coordinates pipeline steps)
-# NOTE  : 00_clarificator.py owns clarification artifacts;
-#         harness only reads CLARIFICATION_REPORT + CLARIFIED_REQ
+# NOTE  : mini mode is delegated entirely to pipeline/mini_mode.py
 
 import sys as _sys
 _sys.path.insert(0, str(ROOT))
@@ -532,7 +569,55 @@ def main() -> None:
                         help="Max LLM repair attempts per cluster before give-up (default: 2)")
     parser.add_argument("--verbose", action="store_true",
                         help="Pass --verbose to 04_test_and_iterate.py")
+
+    # ── Mini mode args ───────────────────────────────────────────────────────
+    parser.add_argument("--mini", type=str, default=None,
+                        metavar="PROMPT",
+                        help="Run in mini mode (bypasses full pipeline). "
+                             "Example: --mini 'fix button color'")
+    parser.add_argument("--files", nargs="+", default=None,
+                        metavar="FILE",
+                        help="(mini/code) Files to patch. LLM suggests + you confirm "
+                             "if omitted. Example: --files src/Header.tsx src/theme.ts")
+    parser.add_argument("--context-file", type=str, default=None,
+                        metavar="FILE",
+                        help="(mini/DE) File whose content is the task input. "
+                             "LLM rewrites it. Type auto-detected from extension. "
+                             "Example: --context-file queries/daily_agg.sql")
+    parser.add_argument("--output-file", type=str, default=None,
+                        metavar="FILE",
+                        help="(mini/DE) Where to write result. "
+                             "Defaults to overwriting --context-file in place.")
+    parser.add_argument("--task-type", type=str, default=None,
+                        metavar="TYPE",
+                        choices=["auto", "code", "sql", "python", "config", "text"],
+                        help="(mini) Override task type auto-detection. "
+                             "Values: auto | code | sql | python | config | text")
+
     args = parser.parse_args()
+
+    # ── Mini mode: dispatch immediately, bypass full pipeline ────────────────
+    if args.mini is not None:
+        load_dotenv()
+        if not check_env(["OPENROUTER_API_KEY"]):
+            sys.exit(1)
+        # Import mini_mode from pipeline/ subdirectory
+        import importlib.util
+        _spec = importlib.util.spec_from_file_location(
+            "mini_mode", ROOT / "pipeline" / "mini_mode.py"
+        )
+        _mod = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+
+        _mod.run_mini(
+            prompt           = args.mini,
+            files            = args.files,
+            context_file     = Path(args.context_file) if args.context_file else None,
+            output_file      = Path(args.output_file)  if args.output_file  else None,
+            task_type_override = args.task_type,
+            dry_run          = args.dry_run,
+        )
+        return  # run_mini calls sys.exit internally; safety return
 
     if args.test_only:
         args.skip_scaffold = True
