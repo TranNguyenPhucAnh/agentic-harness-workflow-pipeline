@@ -26,6 +26,7 @@
 | `knowledge/current/findings_notes.md` | `07_update_knowledge` | `04`, `07_fix` |
 | `state/plan_notes.json` | `07_update_knowledge` | `04`, `07_fix` |
 | `artifacts/reports/summary.md` | `05_report` | — |
+| `run/mini_log.json` | `mini_mode` | — (human review) |
 
 ## Data Flow
 
