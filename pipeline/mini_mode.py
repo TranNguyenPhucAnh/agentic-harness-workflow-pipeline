@@ -771,6 +771,7 @@ def apply_patch(files_changed: list[dict]) -> list[str]:
 # from crowding out the others. Adjust if your model supports longer context.
 _FILE_CONTENT_TOTAL_CAP = 40_000   # chars across all files combined
 _FILE_CONTENT_PER_FILE  = 12_000   # chars per individual file
+_DEP_CONTEXT_CAP        =  8_000   # chars for Layer B dep signatures combined
 
 
 def load_file_context(target_files: list[str]) -> str:
@@ -831,6 +832,178 @@ def load_file_context(target_files: list[str]) -> str:
 
     header = f"### Current file contents ({len(sections)} file(s) loaded)"
     return header + "\n\n" + "\n\n".join(sections)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Layer B — Dependency context (depth-1 local imports → signatures only)
+# ════════════════════════════════════════════════════════════════════════════
+
+def scan_local_imports(file_path: Path) -> list[str]:
+    """
+    Parse import statements in a single file and return relative paths
+    of local (non-node_modules) dependencies.
+
+    Covers:
+      TS/JS  — import ... from './x' | '../x' | await import('./x')
+      Python — from .mod import X  |  from ..mod import X
+               from src.mod import X  |  import src.mod
+      SQL / YAML / TOML / JSON — no import concept → returns []
+
+    Depth-1 only: does NOT recurse into the dependencies found.
+    """
+    try:
+        text = file_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return []
+
+    ext     = file_path.suffix.lower()
+    results: list[str] = []
+
+    # ── TypeScript / JavaScript ───────────────────────────────────────────
+    if ext in (".ts", ".tsx", ".js", ".jsx"):
+        pattern = re.compile(
+            r"""(?:import\s+.*?\s+from\s+|import\s*\(\s*)['"](\./[^'"]+|\.\.\/[^'"]+)['"]""",
+            re.DOTALL,
+        )
+        base = file_path.parent
+        for m in pattern.finditer(text):
+            raw = m.group(1)
+            # Resolve the specifier relative to the importing file
+            resolved = (base / raw).resolve()
+            # Try with common extensions if no extension given
+            candidate: Path | None = None
+            if resolved.exists():
+                candidate = resolved
+            else:
+                for try_ext in (".ts", ".tsx", ".js", ".jsx", "/index.ts", "/index.tsx"):
+                    attempt = Path(str(resolved) + try_ext) if not try_ext.startswith("/") \
+                              else resolved / f"index{try_ext.split('/')[-1]}"
+                    if attempt.exists():
+                        candidate = attempt
+                        break
+            if candidate:
+                try:
+                    results.append(str(candidate.relative_to(ROOT)))
+                except ValueError:
+                    pass  # outside ROOT — skip
+
+    # ── Python ───────────────────────────────────────────────────────────
+    elif ext == ".py":
+        base = file_path.parent
+
+        # Relative imports: from .mod import X  /  from ..mod import X
+        rel_pattern = re.compile(r"^\s*from\s+(\.+)([\w.]*)\s+import", re.MULTILINE)
+        for m in rel_pattern.finditer(text):
+            dots  = m.group(1)      # e.g. "." or ".."
+            mod   = m.group(2)      # e.g. "utils" or "utils.helpers"
+            level = len(dots)       # 1 = same package, 2 = parent, …
+            anchor = base
+            for _ in range(level - 1):
+                anchor = anchor.parent
+            if mod:
+                candidate = anchor / Path(mod.replace(".", "/"))
+                for try_ext in (".py", "/__init__.py"):
+                    attempt = Path(str(candidate) + try_ext) if not try_ext.startswith("/") \
+                              else candidate / "__init__.py"
+                    if attempt.exists():
+                        try:
+                            results.append(str(attempt.relative_to(ROOT)))
+                        except ValueError:
+                            pass
+                        break
+
+        # Absolute-local imports with src/ prefix:
+        # from src.utils import X  /  import src.utils
+        abs_pattern = re.compile(
+            r"^\s*(?:from\s+(src(?:[\w.]+)?)\s+import|import\s+(src(?:[\w.]+)?))",
+            re.MULTILINE,
+        )
+        for m in abs_pattern.finditer(text):
+            mod_str = (m.group(1) or m.group(2)).replace(".", "/")
+            candidate = ROOT / mod_str
+            for try_ext in (".py", "/__init__.py"):
+                attempt = Path(str(candidate) + try_ext) if not try_ext.startswith("/") \
+                          else candidate / "__init__.py"
+                if attempt.exists():
+                    try:
+                        results.append(str(attempt.relative_to(ROOT)))
+                    except ValueError:
+                        pass
+                    break
+
+    # Deduplicate preserving order
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for r in results:
+        if r not in seen:
+            seen.add(r)
+            deduped.append(r)
+    return deduped
+
+
+def resolve_deps(target_files: list[str]) -> list[str]:
+    """
+    Scan all target_files for local imports (depth 1).
+    Returns sorted list of dependency paths that are NOT already in target_files,
+    exist on disk, and are not skipped by _should_skip.
+    """
+    target_set = set(target_files)
+    dep_set: set[str] = set()
+
+    for rel in target_files:
+        abs_path = ROOT / rel
+        if not abs_path.exists():
+            continue
+        for dep in scan_local_imports(abs_path):
+            if dep not in target_set:
+                dep_path = ROOT / dep
+                if dep_path.exists() and not _should_skip(dep_path):
+                    dep_set.add(dep)
+
+    return sorted(dep_set)
+
+
+def build_dep_context(dep_files: list[str]) -> str:
+    """
+    Layer B — Build a compact dependency context string from dep_files.
+
+    Uses _extract_signatures() (already exists) to get API surface only.
+    Files are sorted by import-count (most-referenced first) for truncation priority.
+    Total output is capped at _DEP_CONTEXT_CAP chars.
+
+    Format injected into prompt:
+        ### Dependency context (read-only — do not modify these files)
+        src/types/sensor.ts: SensorPoint, AnomalyCluster, DecisionScore
+        src/utils/anomaly.ts: buildAnomalyCluster, detectAnomaly
+    """
+    if not dep_files:
+        return ""
+
+    lines: list[str] = []
+    total = 0
+
+    for rel in dep_files:
+        abs_path = ROOT / rel
+        sigs = _extract_signatures(abs_path)
+        if sigs:
+            line = f"  {rel}: {', '.join(sigs)}"
+        else:
+            line = f"  {rel}"
+
+        if total + len(line) > _DEP_CONTEXT_CAP:
+            remaining = len(dep_files) - len(lines)
+            if remaining:
+                lines.append(f"  ... ({remaining} more dep file(s) omitted — cap reached)")
+            break
+
+        lines.append(line)
+        total += len(line)
+
+    if not lines:
+        return ""
+
+    header = "### Dependency context (read-only — do not modify these files)"
+    return header + "\n" + "\n".join(lines)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -959,13 +1132,15 @@ def _build_code_patch_prompt(
     prompt: str,
     target_files: list[str],
     file_context: str,
+    dep_context: str,
     knowledge_context: str,
     prev_error: str,
 ) -> tuple[str, str]:
     """
     Build (system, user) prompt for code-patch mode.
     LLM returns JSON {files_changed: [...]}.
-    file_context contains actual current file contents (Layer A).
+    file_context  — Layer A: full content of target files.
+    dep_context   — Layer B: signatures of local imports (read-only context).
     """
     files_constraint = (
         f"You MUST only modify these files: {json.dumps(target_files)}\n"
@@ -984,8 +1159,9 @@ def _build_code_patch_prompt(
         f"- Each 'content' must be the COMPLETE updated file — not a diff, not a snippet.\n"
         f"- Raw JSON only. No markdown fences."
     )
-    file_block  = f"\n\n{file_context}"        if file_context        else ""
-    know_block  = f"\n\n### Knowledge context\n{knowledge_context}" if knowledge_context else ""
+    file_block  = f"\n\n{file_context}"                                if file_context        else ""
+    dep_block   = f"\n\n{dep_context}"                                 if dep_context         else ""
+    know_block  = f"\n\n### Knowledge context\n{knowledge_context}"   if knowledge_context   else ""
     error_block = (
         f"\n\n### Previous attempt failed\nErrors:\n{prev_error[-2000:]}"
         f"\n\nFix those issues."
@@ -994,6 +1170,7 @@ def _build_code_patch_prompt(
     user_msg = (
         f"Task: {prompt}"
         f"{file_block}"
+        f"{dep_block}"
         f"{know_block}"
         f"\n\nFiles to patch: {json.dumps(target_files)}"
         f"{error_block}"
@@ -1090,6 +1267,18 @@ def run_mini(
         else:
             print("[mini] File context: no existing files found (all new).")
 
+    # ── Layer B: dependency context ───────────────────────────────────────────
+    # Depth-1 local imports of target files → signatures only (read-only).
+    # Skipped entirely in context-file mode (no target_files to scan).
+    dep_files: list[str] = []
+    dep_context = ""
+    if context_file is None and target_files:
+        dep_files = resolve_deps(target_files)
+        if dep_files:
+            dep_context = build_dep_context(dep_files)
+            print(f"[mini] Dep context: {len(dep_files)} file(s)  "
+                  f"({len(dep_context)} chars injected into prompt)")
+
     # ── Dry run ──────────────────────────────────────────────────────────────
     if dry_run:
         print(f"\n[mini] DRY RUN — nothing will be written.")
@@ -1099,6 +1288,12 @@ def run_mini(
         print(f"  target_files : {target_files or '(none — context-file mode)'}")
         print(f"  file_context : {len(file_context)} chars" if file_context else
               f"  file_context : (none)")
+        if dep_files:
+            print(f"  dep_context  : {len(dep_files)} file(s)  ({len(dep_context)} chars)")
+            for d in dep_files:
+                print(f"    └─ {d}")
+        else:
+            print(f"  dep_context  : (none)")
         print(f"  verifier     : "
               f"{'vitest' if task_type == 'code' else task_type + ' linter/parser'}")
         return
@@ -1127,6 +1322,7 @@ def run_mini(
             system, user_msg = _build_code_patch_prompt(
                 prompt, target_files,
                 file_context,
+                dep_context,
                 knowledge_context, last_error if attempt > 0 else "",
             )
 
