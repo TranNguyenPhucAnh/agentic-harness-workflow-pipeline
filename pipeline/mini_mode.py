@@ -514,19 +514,200 @@ def write_output_file(path: Path, content: str) -> None:
 # File targeting (code mode only)
 # ════════════════════════════════════════════════════════════════════════════
 
+# ── Skip lists (borrowed + extended from vfs) ─────────────────────────────────
+_SKIP_DIRS: frozenset[str] = frozenset({
+    ".git", "node_modules", "__pycache__", "artifacts",
+    ".venv", "venv", "dist", "build", ".next",
+    "target", ".terraform", "testdata", ".tox",
+    "coverage", ".pytest_cache", ".mypy_cache",
+})
+
+_SKIP_SUFFIXES: frozenset[str] = frozenset({
+    ".min.js", ".min.css", ".d.ts", ".pyc", ".pyo",
+    ".lock",   # package-lock.json, poetry.lock, etc.
+    ".map",    # source maps
+})
+
+_SKIP_PATTERNS: frozenset[str] = frozenset({
+    ".spec.", ".test.", "_test.", "test_",
+})
+
+# Extensions that carry meaningful signatures
+_SIG_EXTS: frozenset[str] = frozenset({
+    ".ts", ".tsx", ".js", ".jsx",
+    ".py", ".go", ".rs", ".java",
+    ".sql", ".yaml", ".yml", ".toml", ".json",
+    ".tf", ".hcl",
+})
+
+
+def _should_skip(path: Path) -> bool:
+    """Return True if this path should be excluded from file scanning."""
+    # Skip any file inside a blocked directory (at any depth)
+    if any(part in _SKIP_DIRS for part in path.parts):
+        return True
+    name = path.name
+    # Skip files matching blocked suffix combinations
+    name_lower = name.lower()
+    if any(name_lower.endswith(s) for s in _SKIP_SUFFIXES):
+        return True
+    # Skip test/spec files
+    if any(pat in name_lower for pat in _SKIP_PATTERNS):
+        return True
+    return False
+
+
+def _extract_signatures(path: Path) -> list[str]:
+    """
+    Lightweight signature extraction — no AST, regex-based.
+    Returns a list of short signature strings for the file.
+    Covers: TS/JS exports, Python defs/classes, SQL DDL, Go funcs.
+
+    Intentionally simple: the goal is navigation context for the LLM,
+    not a complete API surface. Full content is injected separately
+    by load_file_context() when the file is confirmed as a patch target.
+    """
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return []
+
+    ext  = path.suffix.lower()
+    sigs: list[str] = []
+
+    if ext in (".ts", ".tsx", ".js", ".jsx"):
+        # Exported functions, consts, classes, interfaces, types, enums
+        pattern = re.compile(
+            r"^export\s+(?:default\s+)?"
+            r"(?:async\s+)?"
+            r"(function\s+\w+|const\s+\w+|class\s+\w+|interface\s+\w+"
+            r"|type\s+\w+|enum\s+\w+)",
+            re.MULTILINE,
+        )
+        sigs = [m.group(0).replace("export default ", "export ")
+                           .replace("export ", "").strip()
+                for m in pattern.finditer(text)]
+
+    elif ext == ".py":
+        # Top-level def, async def, class (non-private)
+        pattern = re.compile(
+            r"^(?:async\s+)?def\s+([A-Za-z][A-Za-z0-9_]*)\s*\(|"
+            r"^class\s+([A-Za-z][A-Za-z0-9_]*)",
+            re.MULTILINE,
+        )
+        for m in pattern.finditer(text):
+            name = m.group(1) or m.group(2)
+            if not name.startswith("_"):
+                sigs.append(m.group(0).strip().rstrip("(").strip())
+
+    elif ext == ".go":
+        pattern = re.compile(r"^func\s+(?:\(\w+\s+\*?\w+\)\s+)?([A-Z]\w*)\s*\(", re.MULTILINE)
+        sigs = [m.group(0).strip().rstrip("(").strip() for m in pattern.finditer(text)]
+
+    elif ext == ".sql":
+        pattern = re.compile(
+            r"^(?:CREATE|ALTER|DROP)\s+(?:TABLE|VIEW|FUNCTION|PROCEDURE|INDEX)\s+\S+",
+            re.MULTILINE | re.IGNORECASE,
+        )
+        sigs = [m.group(0).strip() for m in pattern.finditer(text)]
+
+    elif ext in (".yaml", ".yml"):
+        # Top-level keys only (e.g. DAG id, job name, pipeline stage)
+        pattern = re.compile(r"^([A-Za-z_][\w-]*):", re.MULTILINE)
+        sigs = [m.group(1) for m in pattern.finditer(text)][:10]  # cap at 10
+
+    # Deduplicate, cap at 15 signatures per file
+    seen: set[str] = set()
+    result: list[str] = []
+    for s in sigs:
+        s = s.strip()
+        if s and s not in seen:
+            seen.add(s)
+            result.append(s)
+        if len(result) >= 15:
+            break
+    return result
+
+
+def _build_file_tree_with_sigs(cap_chars: int = 10_000) -> str:
+    """
+    Walk the project, build a file tree where source files include
+    their exported signatures inline. Non-source files get paths only.
+
+    Format:
+        src/hooks/useSensorData.ts: useSensorData, SensorConfig
+        src/types/sensor.ts: SensorPoint, AnomalyCluster, DecisionScore
+        package.json
+        tsconfig.json
+
+    This gives the LLM navigation-quality context at a fraction of the
+    token cost of injecting full file contents.
+    """
+    lines: list[str] = []
+    total = 0
+
+    for p in sorted(ROOT.rglob("*")):
+        if not p.is_file() or _should_skip(p):
+            continue
+        if total >= cap_chars:
+            lines.append("  ... (truncated)")
+            break
+
+        rel = str(p.relative_to(ROOT))
+        ext = p.suffix.lower()
+
+        if ext in _SIG_EXTS:
+            sigs = _extract_signatures(p)
+            if sigs:
+                line = f"  {rel}: {', '.join(sigs)}"
+            else:
+                line = f"  {rel}"
+        else:
+            line = f"  {rel}"
+
+        lines.append(line)
+        total += len(line)
+
+    return "\n".join(lines)
+
+
 def suggest_files(prompt: str, knowledge_context: str) -> list[str]:
-    """Ask LLM to suggest which files need patching."""
+    """
+    Ask LLM to suggest which files need patching.
+
+    Injects a signature-aware file tree (paths + exported names, bodies
+    stripped) instead of either raw file contents or paths-only.
+    Saves ~60-80% tokens vs full content while giving the LLM enough
+    signal to make an informed file selection.
+    """
+    print("[mini/suggest] Building signature index …", end=" ", flush=True)
+    sig_tree = _build_file_tree_with_sigs()
+    print(f"{len(sig_tree)} chars")
+
     system = """\
-You are a code assistant. Given a task, return the files that need to change.
+You are a code assistant. Given a task and a project signature index \
+(file paths with their exported names), identify which files need to \
+change to complete the task.
+
+The signature index format is:
+  path/to/file.ts: ExportedName1, ExportedName2, ...
+
 Return ONLY:
 {
-  "files": ["src/path/to/file.tsx", ...]
+  "files": ["path/to/file.tsx", "path/to/other.ts"]
 }
-Raw JSON only. No markdown fences."""
-    user_msg = (
-        f"Task: {prompt}\n\nKnowledge context:\n{knowledge_context}"
-        if knowledge_context else f"Task: {prompt}"
+Raw JSON only. No markdown fences. No explanation."""
+
+    tree_block = (
+        f"\n\n### Project signature index\n```\n{sig_tree}\n```"
+        if sig_tree else ""
     )
+    know_block = (
+        f"\n\n### Knowledge context\n{knowledge_context}"
+        if knowledge_context else ""
+    )
+    user_msg = f"Task: {prompt}{tree_block}{know_block}"
+
     try:
         raw    = _call_llm(system, user_msg, label="mini/suggest")
         result = _parse_json(raw)
@@ -583,6 +764,73 @@ def apply_patch(files_changed: list[dict]) -> list[str]:
         except OSError as e:
             print(f"[mini] ERROR writing {path_str}: {e}", file=sys.stderr)
     return written
+
+
+# ── Character budget for file content injection ───────────────────────────────
+# Keeps total prompt size reasonable. Per-file cap prevents one large file
+# from crowding out the others. Adjust if your model supports longer context.
+_FILE_CONTENT_TOTAL_CAP = 40_000   # chars across all files combined
+_FILE_CONTENT_PER_FILE  = 12_000   # chars per individual file
+
+
+def load_file_context(target_files: list[str]) -> str:
+    """
+    Layer A — Read current content of target files from disk and format
+    them as a fenced code block section for injection into the LLM prompt.
+
+    Only reads files that exist. Truncates files exceeding _FILE_CONTENT_PER_FILE
+    chars with a clear marker. Stops adding files once _FILE_CONTENT_TOTAL_CAP
+    is reached (preserves most-important-first ordering).
+
+    Returns '' if no files could be read (e.g. all new files).
+    """
+    sections: list[str] = []
+    total_chars = 0
+
+    for rel_path in target_files:
+        if total_chars >= _FILE_CONTENT_TOTAL_CAP:
+            remaining = len(target_files) - len(sections)
+            if remaining:
+                sections.append(
+                    f"<!-- {remaining} more file(s) omitted — total context cap reached -->"
+                )
+            break
+
+        abs_path = ROOT / rel_path
+        if not abs_path.exists():
+            sections.append(f"### {rel_path}\n*(new file — does not exist yet)*")
+            continue
+
+        try:
+            raw = abs_path.read_text(encoding="utf-8")
+        except Exception as e:
+            sections.append(f"### {rel_path}\n*(could not read: {e})*")
+            continue
+
+        truncated = False
+        if len(raw) > _FILE_CONTENT_PER_FILE:
+            raw = raw[:_FILE_CONTENT_PER_FILE]
+            truncated = True
+
+        # Infer language for fenced block syntax highlighting
+        ext = abs_path.suffix.lstrip(".")
+        lang = {"ts": "typescript", "tsx": "typescript", "js": "javascript",
+                "jsx": "javascript", "py": "python", "sql": "sql",
+                "yaml": "yaml", "yml": "yaml", "json": "json",
+                "toml": "toml", "md": "markdown"}.get(ext, ext)
+
+        block = f"### {rel_path}\n```{lang}\n{raw}\n```"
+        if truncated:
+            block += f"\n*... (truncated at {_FILE_CONTENT_PER_FILE} chars)*"
+
+        sections.append(block)
+        total_chars += len(raw)
+
+    if not sections:
+        return ""
+
+    header = f"### Current file contents ({len(sections)} file(s) loaded)"
+    return header + "\n\n" + "\n\n".join(sections)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -710,12 +958,14 @@ def _build_context_file_prompt(
 def _build_code_patch_prompt(
     prompt: str,
     target_files: list[str],
+    file_context: str,
     knowledge_context: str,
     prev_error: str,
 ) -> tuple[str, str]:
     """
-    Build (system, user) prompt for code-patch mode (original behaviour).
+    Build (system, user) prompt for code-patch mode.
     LLM returns JSON {files_changed: [...]}.
+    file_context contains actual current file contents (Layer A).
     """
     files_constraint = (
         f"You MUST only modify these files: {json.dumps(target_files)}\n"
@@ -731,12 +981,11 @@ def _build_code_patch_prompt(
         f"- DO NOT modify spec.md or any artifact files.\n"
         f"- Return ONLY a JSON object:\n"
         f"  {{\"files_changed\": [{{\"path\": \"src/...\", \"content\": \"<full file>\"}}]}}\n"
-        f"- Each 'content' must be the COMPLETE file — not a diff, not a snippet.\n"
+        f"- Each 'content' must be the COMPLETE updated file — not a diff, not a snippet.\n"
         f"- Raw JSON only. No markdown fences."
     )
-    context_block = (
-        f"\n\n### Knowledge context\n{knowledge_context}" if knowledge_context else ""
-    )
+    file_block  = f"\n\n{file_context}"        if file_context        else ""
+    know_block  = f"\n\n### Knowledge context\n{knowledge_context}" if knowledge_context else ""
     error_block = (
         f"\n\n### Previous attempt failed\nErrors:\n{prev_error[-2000:]}"
         f"\n\nFix those issues."
@@ -744,7 +993,8 @@ def _build_code_patch_prompt(
     )
     user_msg = (
         f"Task: {prompt}"
-        f"{context_block}"
+        f"{file_block}"
+        f"{know_block}"
         f"\n\nFiles to patch: {json.dumps(target_files)}"
         f"{error_block}"
     )
@@ -828,6 +1078,18 @@ def run_mini(
             target_files = confirmed
         print(f"[mini] Target files: {target_files}")
 
+    # ── Layer A: load current file contents ──────────────────────────────────
+    # Only in code-patch mode (context-file mode already has explicit content).
+    file_context = ""
+    if context_file is None and target_files:
+        file_context = load_file_context(target_files)
+        if file_context:
+            loaded = [f for f in target_files if (ROOT / f).exists()]
+            print(f"[mini] File context loaded: {len(loaded)} file(s)  "
+                  f"({len(file_context)} chars injected into prompt)")
+        else:
+            print("[mini] File context: no existing files found (all new).")
+
     # ── Dry run ──────────────────────────────────────────────────────────────
     if dry_run:
         print(f"\n[mini] DRY RUN — nothing will be written.")
@@ -835,6 +1097,8 @@ def run_mini(
         print(f"  context_file : {context_file or '(none)'}")
         print(f"  output_file  : {effective_output or '(none)'}")
         print(f"  target_files : {target_files or '(none — context-file mode)'}")
+        print(f"  file_context : {len(file_context)} chars" if file_context else
+              f"  file_context : (none)")
         print(f"  verifier     : "
               f"{'vitest' if task_type == 'code' else task_type + ' linter/parser'}")
         return
@@ -862,6 +1126,7 @@ def run_mini(
             # Original: code-patch mode
             system, user_msg = _build_code_patch_prompt(
                 prompt, target_files,
+                file_context,
                 knowledge_context, last_error if attempt > 0 else "",
             )
 
