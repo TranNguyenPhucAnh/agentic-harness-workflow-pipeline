@@ -35,6 +35,7 @@ artifacts/
 ├── run/
 │   ├── impl_record.json
 │   ├── judge_raw.json
+│   ├── mini_log.json
 │   └── test_report.json
 └── reports/
     ├── summary.md
@@ -70,6 +71,7 @@ artifacts/
 | `knowledge/history/update_log.json` | `07_update_knowledge` | append | — (human review) |
 | `state/plan_notes.json` | `07_update_knowledge` | append | `04`, `07_fix` |
 | `reports/summary.md` | `05_report` | overwrite | — (human only) |
+| `run/mini_log.json` | `mini_mode` | — (human review) |
 
 † See special note on `spec_applied.json` below.
 
