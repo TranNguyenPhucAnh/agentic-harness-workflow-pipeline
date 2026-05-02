@@ -601,12 +601,17 @@ def main() -> None:
         load_dotenv()
         if not check_env(["OPENROUTER_API_KEY"]):
             sys.exit(1)
-        # Import mini_mode from pipeline/ subdirectory
-        import importlib.util
-        _spec = importlib.util.spec_from_file_location(
-            "mini_mode", ROOT / "pipeline" / "mini_mode.py"
-        )
-        _mod = importlib.util.module_from_spec(_spec)
+        # Import mini_mode — lives in pipeline/ alongside other pipeline scripts
+        import importlib.util as _ilu
+        _mini_path = ROOT / "pipeline" / "mini_mode.py"
+        if not _mini_path.exists():
+            _mini_path = ROOT / "mini_mode.py"   # fallback: root-level
+        if not _mini_path.exists():
+            print("[harness] ERROR: pipeline/mini_mode.py not found.")
+            print("          Place mini_mode.py in the pipeline/ directory.")
+            sys.exit(1)
+        _spec = _ilu.spec_from_file_location("mini_mode", _mini_path)
+        _mod = _ilu.module_from_spec(_spec)
         _spec.loader.exec_module(_mod)
 
         _mod.run_mini(
