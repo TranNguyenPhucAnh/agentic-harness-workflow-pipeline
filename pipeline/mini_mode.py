@@ -1403,10 +1403,13 @@ def run_mini(
 
     # ── Summary ───────────────────────────────────────────────────────────────
     print(f"\n{'='*60}")
+  
     if final_passed:
         print(f"  MINI ✅  PASS  (task_type={task_type}, retries={retry_count})")
         if files_written:
             print(f"  Files written: {files_written}")
+        if retry_count > 1:
+            print(f"  Retry pattern logged → findings_notes.md")
     else:
         print(f"  MINI ❌  FAIL  (gave up after {retry_count} retries)")
         print(f"\n  Failure pattern logged → knowledge/current/findings_notes.md")
