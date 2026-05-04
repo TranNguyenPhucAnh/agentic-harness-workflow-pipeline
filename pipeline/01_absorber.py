@@ -728,7 +728,7 @@ def _resolve_model(model: str) -> tuple[str, str, str]:
     if model.startswith("gemini/") or model.startswith("gemini-"):
         model_id = model.split("/")[-1]
         return (
-            os.environ.get("GOOGLE_API_KEY", ""),
+            os.environ.get("GEMINI_API_KEY", ""),
             "https://generativelanguage.googleapis.com/v1beta/openai",
             model_id,
         )
