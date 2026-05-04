@@ -235,6 +235,7 @@ class TestAAbsorberIgnoreRules(unittest.TestCase):
             mode="w", suffix=".ignored", delete=False
         ) as f:
             f.write(content)
+            f.flush()   # ensure bytes reach disk before _parse() reads the file
             return AbsorberIgnoreRules(Path(f.name))
 
     def test_empty_file_gives_full_mode(self):
@@ -242,7 +243,9 @@ class TestAAbsorberIgnoreRules(unittest.TestCase):
         self.assertEqual(rules.mode_for("src/app.ts"), "full")
 
     def test_skip_pattern_exact(self):
-        rules = self._make_rules("*.lock\ndist/\n")
+        # *.lock matches files that literally end in ".lock" (yarn.lock, Gemfile.lock)
+        # package-lock.json ends in ".json" — to skip it, use "package-lock.json" exactly
+        rules = self._make_rules("*.lock\npackage-lock.json\ndist/\n")
         self.assertEqual(rules.mode_for("package-lock.json"), "skip")
         self.assertEqual(rules.mode_for("yarn.lock"), "skip")
 
@@ -704,6 +707,7 @@ class TestDConfigInventory(unittest.TestCase):
                 "redis_url": "redis://...",
                 "kafka_brokers": ["broker1:9092"],
                 "aws_region": "us-east-1",
+                "s3_bucket": "my-uploads",      # triggers 'storage' pattern
                 "auth_provider": "keycloak",
                 "smtp_host": "mail.server.com",
             })
@@ -711,7 +715,8 @@ class TestDConfigInventory(unittest.TestCase):
         result = build_config_map(inv, cache)
         detected = result["services_detected"]
         self.assertIn("messaging", detected)
-        self.assertIn("storage", detected)   # aws
+        self.assertIn("storage", detected)   # s3_bucket → storage
+        self.assertIn("cloud", detected)     # aws_region → cloud
         self.assertIn("auth", detected)
         self.assertIn("email", detected)
 
@@ -791,8 +796,9 @@ class TestEGitCrawl(unittest.TestCase):
     def test_parse_git_log_insertions_deletions(self):
         commits = _parse_git_log(self._SAMPLE_GIT_LOG)
         first = commits[0]
-        self.assertEqual(first["insertions"], 12)
-        self.assertEqual(first["deletions"], 3)
+        # First commit touches 2 files: 12+5=17 insertions, 3+2=5 deletions
+        self.assertEqual(first["insertions"], 17)
+        self.assertEqual(first["deletions"], 5)
 
     def test_parse_git_log_empty_input(self):
         self.assertEqual(_parse_git_log(""), [])
