@@ -171,17 +171,53 @@ class AbsorberIgnoreRules:
                 else:
                     self.sig_only_patterns.append(line)
 
+    @staticmethod
+    def _matches(rel_path: str, pattern: str) -> bool:
+        """
+        Match rel_path against a gitignore-style glob pattern.
+
+        Supports:
+          **   — match zero or more path segments (cross-directory)
+          *    — match any sequence of characters within one path segment
+          ?    — match any single character within one path segment
+
+        Simple patterns (no '/') are matched against both the full relative
+        path and just the filename, so "*.lock" catches "yarn.lock" and
+        "sub/yarn.lock".  Patterns containing '/' are path-anchored.
+        """
+        # Build a regex from the glob pattern (gitignore semantics)
+        pat = pattern.rstrip("/")
+        parts = re.split(r"(\*\*|\*|\?)", pat)
+        rx = ""
+        for part in parts:
+            if part == "**":
+                rx += ".*"         # matches across directory boundaries
+            elif part == "*":
+                rx += "[^/]*"      # matches within a single path segment
+            elif part == "?":
+                rx += "[^/]"
+            else:
+                rx += re.escape(part)
+
+        # Simple patterns (no '/' in original, no '**') apply to the filename
+        # segment anywhere in the tree, so prefix with an optional dir component.
+        if "/" not in pat and "**" not in pat:
+            rx = r"(?:.+/)?" + rx
+
+        compiled = re.compile(r"^" + rx + r"$")
+        return bool(compiled.match(rel_path))
+
     def mode_for(self, rel_path: str) -> str:
         """Return 'skip', 'key-only', 'signature-only', or 'full'."""
         # Check signature-only first (more restrictive)
         for pat in self.sig_only_patterns:
-            if fnmatch.fnmatch(rel_path, pat):
+            if self._matches(rel_path, pat):
                 return "signature-only"
         for pat in self.key_only_patterns:
-            if fnmatch.fnmatch(rel_path, pat):
+            if self._matches(rel_path, pat):
                 return "key-only"
         for pat in self.skip_patterns:
-            if fnmatch.fnmatch(rel_path, pat):
+            if self._matches(rel_path, pat):
                 return "skip"
         return "full"
 
@@ -408,6 +444,8 @@ def _redact_json(raw: str) -> str:
     def _walk(obj: Any, depth: int = 0) -> Any:
         indent = "  " * depth
         if isinstance(obj, dict):
+            if not obj:
+                return "{}"
             lines = ["{"]
             for k, v in obj.items():
                 child = _walk(v, depth + 1)
@@ -542,8 +580,9 @@ def _extract_python_signatures(path: Path) -> str:
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             # Only top-level and class methods
+            prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
             args  = [a.arg for a in node.args.args]
-            sig   = f"def {node.name}({', '.join(args)})"
+            sig   = f"{prefix} {node.name}({', '.join(args)})"
             if node.returns:
                 sig += f" -> {ast.unparse(node.returns)}"
             lines.append(sig)
@@ -749,12 +788,23 @@ def build_config_map(
         if not content:
             continue
 
-        # Extract env var references: ${VAR}, $VAR, process.env.VAR
+        # Extract env var references two ways:
+        # 1. ${VAR} / $VAR / process.env.VAR references in config templates
         env_refs = set(re.findall(
             r'\$\{?([A-Z_][A-Z0-9_]{2,})\}?|process\.env\.([A-Z_][A-Z0-9_]{2,})',
             content,
         ))
         file_env_vars = {g for pair in env_refs for g in pair if g}
+
+        # 2. KEY=<redacted> lines from already-redacted .env files
+        #    (after _redact_env runs, values are gone but keys remain)
+        env_key_matches = re.findall(
+            r'^([A-Z_][A-Z0-9_]{2,})=',
+            content,
+            re.MULTILINE,
+        )
+        file_env_vars.update(env_key_matches)
+
         all_env_vars.update(file_env_vars)
 
         # Detect referenced services
@@ -899,15 +949,19 @@ def _parse_git_log(raw: str) -> list[dict]:
     current: dict | None = None
 
     for line in raw.splitlines():
-        if "|||" in line:
+        # Strip leading/trailing whitespace to handle indented test fixtures
+        # and trailing spaces, but preserve the tab structure of numstat lines.
+        stripped = line.strip()
+
+        if "|||" in stripped:
             # New commit header
             if current is not None:
                 commits.append(current)
-            parts = line.split("|||", 3)
+            parts = stripped.split("|||", 3)
             if len(parts) < 4:
                 continue
             current = {
-                "hash":          parts[0][:8],
+                "hash":          parts[0][:7],   # 7-char short hash (git convention)
                 "date":          parts[1][:10],
                 "author":        parts[2],
                 "message":       parts[3][:200],
@@ -915,9 +969,10 @@ def _parse_git_log(raw: str) -> list[dict]:
                 "insertions":    0,
                 "deletions":     0,
             }
-        elif current is not None and line.strip():
+        elif current is not None and stripped:
             # numstat line: insertions \t deletions \t filename
-            parts = line.split("\t", 2)
+            # Use the stripped version for splitting (tabs preserved after strip)
+            parts = stripped.split("\t", 2)
             if len(parts) == 3:
                 ins_str, del_str, fname = parts
                 try:
