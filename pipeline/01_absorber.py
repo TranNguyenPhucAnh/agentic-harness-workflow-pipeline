@@ -84,7 +84,7 @@ GIT_HISTORY    = HISTORY_DIR / "git_history.json"        # owner: 01_absorber
 ABSORBER_CACHE = CACHE_DIR   / "absorber_cache.json"     # owner: 01_absorber
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-_MAX_TOKENS_MAP   = 8192
+_MAX_TOKENS_MAP   = 16384
 _MAX_FILE_BYTES   = 256 * 1024   # 256 KB — skip very large files
 _IGNORED_FILE     = "absorber.ignored"
 
@@ -263,6 +263,87 @@ def _should_skip_file(name: str) -> bool:
     return False
 
 
+def _looks_like_config_file(rel_path: str, fname: str, ext: str) -> bool:
+    """
+    Heuristic to auto-promote likely config/manifest/infra files to key-only mode.
+    Covers generic naming keywords, well-known filenames, and infra path patterns.
+    """
+    if ext not in _KEY_ONLY_EXTENSIONS:
+        return False
+
+    rel_lower  = rel_path.lower()
+    name_lower = fname.lower()
+
+    # .env files (any variant) are always secrets
+    if ext == ".env" or name_lower.startswith(".env"):
+        return True
+
+    # Generic config-ish keywords in filename
+    if any(kw in name_lower for kw in (
+        "config", "settings", "secret", "appsetting",
+        "credential", "password", "token",
+        "manifest", "values", "override",
+    )):
+        return True
+
+    # Well-known filenames that are always config/metadata
+    if name_lower in {
+        "package.json",
+        "package-lock.json",
+        "composer.json",
+        "pom.xml",
+        "launchsettings.json",
+        "tsconfig.json",
+        "tsconfig.app.json",
+        "tsconfig.spec.json",
+        "tsconfig.base.json",
+        "angular.json",
+        "dynamic-env.json",
+        "ecs-task-def.json",
+        "db-migrator-task-def.json",
+    }:
+        return True
+
+    # Infra / deployment descriptor paths
+    if any(token in rel_lower for token in (
+        "task-def",
+        "cloudformation",
+        "helm",
+        "k8s",
+        "kubernetes",
+        "deploy",
+        "deployment",
+        "docker-compose",
+    )):
+        return True
+
+    return False
+
+
+def _should_include_in_config_inventory(rel_path: str) -> bool:
+    """
+    Filter out pure build/tooling files from the config inventory.
+    These have no runtime config relevance (tsconfig, lock files, e2e scaffolding).
+    """
+    rel_lower = rel_path.lower()
+    name      = Path(rel_path).name.lower()
+
+    if name in {
+        "package-lock.json",
+        "tsconfig.json",
+        "tsconfig.app.json",
+        "tsconfig.spec.json",
+        "tsconfig.base.json",
+    }:
+        return False
+
+    # e2e directories contain test fixtures, not runtime config
+    if "/e2e/" in rel_lower:
+        return False
+
+    return True
+
+
 def scan_files(
     target: Path,
     rules: AbsorberIgnoreRules,
@@ -295,14 +376,9 @@ def scan_files(
             if mode == "skip":
                 continue
 
-            # Auto-promote to key-only for config extensions if not explicitly set
-            if mode == "full" and ext in _KEY_ONLY_EXTENSIONS:
-                # Only auto-promote if filename looks like a config
-                if any(kw in fname.lower() for kw in (
-                    "config", "settings", "secret", ".env",
-                    "credential", "password", "token",
-                )):
-                    mode = "key-only"
+            # Auto-promote to key-only for likely config/manifest files
+            if mode == "full" and _looks_like_config_file(rel_path, fname, ext):
+                mode = "key-only"
 
             try:
                 size = abs_path.stat().st_size
@@ -698,6 +774,20 @@ def call_llm_for_map(
     tokens_est = len(context) // 4
     print(f"[01] LLM call: {model_id} | ~{tokens_est:,} input tokens")
 
+    # Validate API key early — httpx raises a cryptic error if the key is empty
+    if not api_key or not api_key.strip():
+        env_var = (
+            "GEMINI_API_KEY"     if model.startswith(("gemini/", "gemini-")) else
+            "DEEPSEEK_API_KEY"   if model.startswith("deepseek")             else
+            "OPENROUTER_API_KEY" if "/" in model                             else
+            "OPENAI_API_KEY"
+        )
+        raise ValueError(
+            f"API key not set. Export {env_var} and retry.\n"
+            f"  e.g.  export {env_var}=<your-key>\n"
+            f"  or pass --skip-llm to skip LLM synthesis."
+        )
+
     try:
         with httpx.Client(timeout=300) as client:
             resp = client.post(
@@ -717,7 +807,19 @@ def call_llm_for_map(
                 },
             )
             resp.raise_for_status()
-            return resp.json()["choices"][0]["message"]["content"]
+            data         = resp.json()
+            choice       = data["choices"][0]
+            content      = choice["message"]["content"]
+            finish_reason = choice.get("finish_reason", "unknown")
+            if finish_reason == "length":
+                print(
+                    f"[01][warn] LLM output was truncated (finish_reason=length). "
+                    f"Consider increasing _MAX_TOKENS_MAP (currently {_MAX_TOKENS_MAP}) "
+                    f"or reducing codebase context."
+                )
+            else:
+                print(f"[01] LLM finish_reason: {finish_reason}")
+            return content
     except Exception as e:
         print(f"[01][error] LLM call failed: {e}", file=sys.stderr)
         raise
@@ -757,76 +859,134 @@ def _resolve_model(model: str) -> tuple[str, str, str]:
 # Phase 4 — Config inventory → config_map.json
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Module-level so both build_config_map and tests can import directly
+_SERVICE_PATTERNS: dict[str, re.Pattern] = {
+    "database":   re.compile(r'(?:postgres|mysql|mongodb|redis|sqlite|db_|database|connectionstring)', re.I),
+    "messaging":  re.compile(r'(?:kafka|rabbitmq|sqs|sns|pubsub|amqp)', re.I),
+    "auth":       re.compile(r'(?:auth|oauth|jwt|saml|sso|oidc|keycloak|openiddict)', re.I),
+    "storage":    re.compile(r'(?:s3|gcs|azure_blob|minio|storage|bucket)', re.I),
+    "monitoring": re.compile(r'(?:datadog|newrelic|prometheus|grafana|sentry|cloudwatch)', re.I),
+    "email":      re.compile(r'(?:smtp|sendgrid|ses|mailgun|email)', re.I),
+    "cloud":      re.compile(r'(?:aws|gcp|azure|heroku|fly\.io|ecs|fargate|cloudformation)', re.I),
+}
+
+
+def _extract_env_vars_from_raw(path: Path, ext: str) -> set[str]:
+    """
+    Extract env var names from raw (un-redacted) config/template content.
+
+    Covers:
+      - ${VAR} and $VAR shell-style interpolation
+      - process.env.VAR (Node.js)
+      - KEY=value lines (.env files)
+      - SECTION__KEY double-underscore notation (.NET / container env overrides)
+    """
+    try:
+        raw = path.read_text(errors="replace")
+    except Exception:
+        return set()
+    return _parse_env_vars_from_text(raw)
+
+
+def _parse_env_vars_from_text(raw: str) -> set[str]:
+    """Core env var extraction logic — operates on a raw string."""
+    env_vars: set[str] = set()
+
+    # ${VAR} and $VAR
+    for match in re.findall(r'\$\{([A-Z_][A-Z0-9_]*)\}|\$([A-Z_][A-Z0-9_]*)', raw):
+        env_vars.update(g for g in match if g)
+
+    # process.env.VAR (case-insensitive key name)
+    env_vars.update(re.findall(
+        r'process\.env\.([A-Z_][A-Z0-9_]*)',
+        raw,
+        re.IGNORECASE,
+    ))
+
+    # KEY=value lines — .env style
+    env_vars.update(re.findall(
+        r'^\s*([A-Z_][A-Z0-9_]*)\s*=',
+        raw,
+        re.MULTILINE,
+    ))
+
+    # SECTION__KEY double-underscore (.NET environment variable overrides)
+    env_vars.update(re.findall(
+        r'([A-Z_][A-Z0-9_]*(?:__[A-Z0-9_]+)+)',
+        raw,
+    ))
+
+    return env_vars
+
+
 def build_config_map(
     inventory: list[dict[str, Any]],
     cache: dict[str, Any],
 ) -> dict[str, Any]:
     """
-    Aggregate all key-only extractions into a structured config inventory.
-    Detects services, env var references, and feature flags.
+    Aggregate key-only config files into a structured config inventory.
+
+    Env var detection reads from the RAW source file (before redaction) so that
+    ${VAR}, process.env.VAR, and .env KEY= references are never lost to the
+    redaction pass.  Service detection scans both raw and redacted content.
     """
-    config_files: list[dict] = []
+    config_files: list[dict[str, Any]] = []
     all_env_vars: set[str] = set()
     all_services: set[str] = set()
-
-    _SERVICE_PATTERNS = {
-        "database":    re.compile(r'(?:postgres|mysql|mongodb|redis|sqlite|db_|database)', re.I),
-        "messaging":   re.compile(r'(?:kafka|rabbitmq|sqs|sns|pubsub|amqp)', re.I),
-        "auth":        re.compile(r'(?:auth|oauth|jwt|saml|sso|oidc|keycloak)', re.I),
-        "storage":     re.compile(r'(?:s3|gcs|azure_blob|minio|storage)', re.I),
-        "monitoring":  re.compile(r'(?:datadog|newrelic|prometheus|grafana|sentry)', re.I),
-        "email":       re.compile(r'(?:smtp|sendgrid|ses|mailgun|email)', re.I),
-        "cloud":       re.compile(r'(?:aws|gcp|azure|heroku|fly\.io)', re.I),
-    }
 
     for entry in inventory:
         if entry["mode"] != "key-only":
             continue
 
         rel_path = entry["rel_path"]
-        content  = cache.get(rel_path, {}).get("content", "")
-        if not content:
+
+        # Skip pure build/tooling files — they add noise, not signal
+        if not _should_include_in_config_inventory(rel_path):
             continue
 
-        # Extract env var references two ways:
-        # 1. ${VAR} / $VAR / process.env.VAR references in config templates
-        env_refs = set(re.findall(
-            r'\$\{?([A-Z_][A-Z0-9_]{2,})\}?|process\.env\.([A-Z_][A-Z0-9_]{2,})',
-            content,
-        ))
-        file_env_vars = {g for pair in env_refs for g in pair if g}
+        abs_path = Path(entry.get("abs_path", ""))
+        ext      = entry["ext"]
 
-        # 2. KEY=<redacted> lines from already-redacted .env files
-        #    (after _redact_env runs, values are gone but keys remain)
-        env_key_matches = re.findall(
-            r'^([A-Z_][A-Z0-9_]{2,})=',
-            content,
-            re.MULTILINE,
-        )
-        file_env_vars.update(env_key_matches)
+        # Read raw content for accurate env var + service detection.
+        # Fall back to cached content when abs_path is unavailable (e.g. tests).
+        raw = ""
+        if abs_path.exists():
+            try:
+                raw = abs_path.read_text(errors="replace")
+            except Exception:
+                pass
+        if not raw:
+            raw = cache.get(rel_path, {}).get("content", "")
 
+        # Redacted content (from cache) as fallback for service scan
+        redacted = cache.get(rel_path, {}).get("content", "")
+
+        # Env vars — always from raw to avoid losing context after redaction
+        file_env_vars = _parse_env_vars_from_text(raw)
         all_env_vars.update(file_env_vars)
 
-        # Detect referenced services
+        # Services — prefer raw; fall back to redacted if raw unavailable
+        service_scan_text = raw or redacted
         file_services: list[str] = []
         for svc_name, pattern in _SERVICE_PATTERNS.items():
-            if pattern.search(content):
+            if pattern.search(service_scan_text):
                 file_services.append(svc_name)
                 all_services.add(svc_name)
 
         config_files.append({
-            "path":      rel_path,
-            "env_vars":  sorted(file_env_vars),
-            "services":  file_services,
+            "path":     rel_path,
+            "env_vars": sorted(file_env_vars),
+            "services": sorted(file_services),
         })
 
     return {
-        "generated":    datetime.now(timezone.utc).isoformat(),
-        "total_configs": len(config_files),
+        "generated":         datetime.now(timezone.utc).isoformat(),
+        "total_configs":     len(config_files),
         "services_detected": sorted(all_services),
         "env_vars_detected": sorted(all_env_vars),
-        "files": config_files,
+        "files":             config_files,
     }
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
