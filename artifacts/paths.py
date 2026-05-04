@@ -49,7 +49,6 @@ PLAN_NOTES      = STATE_DIR / "plan_notes.json"      # owner: 07_update_knowledg
 IMPL_RECORD     = RUN_DIR / "impl_record.json"       # owner: 03a_implement_qwen
 TEST_REPORT     = RUN_DIR / "test_report.json"       # owner: 04_test_and_iterate
 JUDGE_RAW       = RUN_DIR / "judge_raw.json"         # owner: 06_judge_deepseek
-MINI_LOG        = RUN_DIR / "mini_log.json"          # owner: mini_mode
 
 # ── knowledge/current/ ────────────────────────────────────────────────────────
 FINDINGS        = CURRENT_DIR / "findings.md"        # owner: 07_fix_from_judge
@@ -65,6 +64,13 @@ SPEC_CHANGELOG  = HISTORY_DIR / "spec.changelog"     # owner: spec_diff
 # ── reports/ ─────────────────────────────────────────────────────────────────
 SUMMARY         = REPORTS_DIR / "summary.md"         # owner: 05_report
 JUDGE_REPORT    = REPORTS_DIR / "judge_report.md"    # owner: 05_report
+
+# ── absorber (knowledge/current/ + knowledge/history/ + cache/) ─────────────
+CODEBASE_MAP   = CURRENT_DIR / "codebase_map.md"        # owner: 01_absorber
+CONFIG_MAP     = CURRENT_DIR / "config_map.json"         # owner: 01_absorber
+BLAME_MAP      = CURRENT_DIR / "blame_map.md"            # owner: 01_absorber
+GIT_HISTORY    = HISTORY_DIR / "git_history.json"        # owner: 01_absorber
+ABSORBER_CACHE = CACHE_DIR   / "absorber_cache.json"     # owner: 01_absorber
 
 # ── clarification (run/ + state/ + knowledge/) ───────────────────────────────
 CLARIFICATION_REPORT    = RUN_DIR     / "clarification_report.json"   # owner: 00_clarificator
