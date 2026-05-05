@@ -323,13 +323,17 @@ def _looks_like_config_file(rel_path: str, fname: str, ext: str) -> bool:
 def _should_include_in_config_inventory(rel_path: str) -> bool:
     """
     Filter out pure build/tooling files from the config inventory.
-    These have no runtime config relevance (tsconfig, lock files, e2e scaffolding).
+    These have no runtime config relevance (tsconfig, lock files, e2e scaffolding,
+    package manifests whose service keyword hits are false positives).
     """
     rel_lower = rel_path.lower()
     name      = Path(rel_path).name.lower()
 
+    # Pure build/tooling filenames — no runtime config value
     if name in {
         "package-lock.json",
+        "package.json",         # npm deps contain keywords that false-positive service detect
+        "angular.json",         # Angular CLI config, not runtime
         "tsconfig.json",
         "tsconfig.app.json",
         "tsconfig.spec.json",
@@ -338,7 +342,8 @@ def _should_include_in_config_inventory(rel_path: str) -> bool:
         return False
 
     # e2e directories contain test fixtures, not runtime config
-    if "/e2e/" in rel_lower:
+    # Check without requiring a leading "/" so it matches "angular/e2e/..." too
+    if "e2e/" in rel_lower or rel_lower.startswith("e2e/"):
         return False
 
     return True
@@ -889,32 +894,55 @@ def _extract_env_vars_from_raw(path: Path, ext: str) -> set[str]:
 
 
 def _parse_env_vars_from_text(raw: str) -> set[str]:
-    """Core env var extraction logic — operates on a raw string."""
+    """Core env var extraction logic — operates on a raw string.
+
+    Covers four sources:
+      1. ${VAR} / $VAR — shell-style interpolation (docker-compose, CloudFormation Fn::Sub)
+      2. process.env.VAR — Node.js env references
+      3. KEY=value lines — .env file style
+      4. SECTION__KEY — .NET double-underscore env override notation
+      5. JSON top-level keys — appsettings.json PascalCase keys converted to SCREAMING_SNAKE
+         (e.g. "ConnectionStrings" → CONNECTION_STRINGS, "App" → APP)
+         This covers ABP/.NET configs that don't use ${VAR} syntax.
+    """
     env_vars: set[str] = set()
 
-    # ${VAR} and $VAR
+    # 1. ${VAR} and $VAR
     for match in re.findall(r'\$\{([A-Z_][A-Z0-9_]*)\}|\$([A-Z_][A-Z0-9_]*)', raw):
         env_vars.update(g for g in match if g)
 
-    # process.env.VAR (case-insensitive key name)
+    # 2. process.env.VAR (case-insensitive key name)
     env_vars.update(re.findall(
         r'process\.env\.([A-Z_][A-Z0-9_]*)',
         raw,
         re.IGNORECASE,
     ))
 
-    # KEY=value lines — .env style
+    # 3. KEY=value lines — .env style
     env_vars.update(re.findall(
         r'^\s*([A-Z_][A-Z0-9_]*)\s*=',
         raw,
         re.MULTILINE,
     ))
 
-    # SECTION__KEY double-underscore (.NET environment variable overrides)
+    # 4. SECTION__KEY double-underscore (.NET environment variable overrides)
     env_vars.update(re.findall(
         r'([A-Z_][A-Z0-9_]*(?:__[A-Z0-9_]+)+)',
         raw,
     ))
+
+    # 5. JSON top-level keys → SCREAMING_SNAKE
+    # Covers appsettings.json / appsettings.*.json patterns where .NET apps
+    # expose config keys as env vars using double-underscore notation.
+    # Only lift keys that look like config sections (PascalCase or ALLCAPS, ≥3 chars).
+    json_keys = re.findall(r'"([A-Za-z][A-Za-z0-9]{2,})"\s*:', raw)
+    for key in json_keys:
+        # Convert PascalCase/camelCase → SCREAMING_SNAKE
+        # e.g. ConnectionStrings → CONNECTION_STRINGS, App → APP, authServer → AUTH_SERVER
+        screaming = re.sub(r'(?<=[a-z0-9])(?=[A-Z])', '_', key).upper()
+        # Only include keys that are plausibly env-var-shaped (all caps, underscores, ≥3 chars)
+        if re.match(r'^[A-Z][A-Z0-9_]{2,}$', screaming):
+            env_vars.add(screaming)
 
     return env_vars
 
