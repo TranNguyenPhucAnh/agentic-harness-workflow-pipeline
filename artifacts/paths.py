@@ -192,11 +192,12 @@ KNOWLEDGE_DIR = _LazyPath("knowledge")
 CURRENT_DIR   = _LazyPath("knowledge/current")
 HISTORY_DIR   = _LazyPath("knowledge/history")
 REPORTS_DIR   = _LazyPath("reports")
-
+SRC_DIR       = _LazyPath("src")
+TESTS_DIR     = _LazyPath("tests")
 
 # ── Misc ──────────────────────────────────────────────────────────────────────
 
-SPEC_PATH = ROOT / "spec.md"   # source — not project-scoped (lives at repo root)
+SPEC_PATH = _LazyPath("spec.md")   # per-project, không phải repo root
 
 
 # ── state/ ────────────────────────────────────────────────────────────────────
@@ -264,11 +265,13 @@ def ensure_dirs() -> None:
     """
     root = _artifact_root()
     for rel in (
-        "state",
-        "cache",
-        "run",
-        "knowledge/current",
-        "knowledge/history",
-        "reports",
+    "src",
+    "tests",
+    "state",
+    "cache",
+    "run",
+    "knowledge/current",
+    "knowledge/history",
+    "reports",
     ):
         (root / rel).mkdir(parents=True, exist_ok=True)
