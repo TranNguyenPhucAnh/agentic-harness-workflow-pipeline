@@ -209,6 +209,84 @@ def _prev_src_dir() -> Path:
     return artifact_root() / "state" / "prev_src"
 
 # ════════════════════════════════════════════════════════════════════════════
+# Project selection
+# ════════════════════════════════════════════════════════════════════════════
+
+def _interactive_project_select(root: Path) -> str:
+    """
+    Called when --project is omitted.
+
+    1. Scans root/ for existing artifacts_<slug>/ directories.
+    2. If none found  → prompts user to enter a new project name.
+    3. If some found  → numbered list + option to type a new name.
+    4. Returns the chosen project name (raw, not slug) ready to be injected
+       into PIPELINE_PROJECT.
+
+    Raises SystemExit if the user sends EOF / Ctrl-C or enters an empty name.
+    """
+    existing: list[tuple[str, str]] = []   # [(slug, display_name), ...]
+
+    for p in sorted(root.iterdir()):
+        if p.is_dir() and p.name.startswith("artifacts_"):
+            slug = p.name[len("artifacts_"):]
+            if slug:                        # skip bare "artifacts_"
+                existing.append((slug, p.name))
+
+    print()
+    print("┌─ No --project specified ───────────────────────────────────┐")
+
+    if not existing:
+        print("│  No existing projects found.                               │")
+        print("└────────────────────────────────────────────────────────────┘")
+        try:
+            name = input("  Enter new project name: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n[harness] Aborted.")
+            sys.exit(1)
+        if not name:
+            print("[harness] Project name cannot be empty.")
+            sys.exit(1)
+        return name
+
+    # Existing projects found — show numbered list
+    print("│  Existing projects:                                        │")
+    for i, (slug, dirname) in enumerate(existing, 1):
+        line = f"│    [{i}] {dirname}"
+        print(line)
+    print("│    [N] Enter a new project name                            │")
+    print("└────────────────────────────────────────────────────────────┘")
+
+    try:
+        choice = input("  Select [1-{}/N]: ".format(len(existing))).strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\n[harness] Aborted.")
+        sys.exit(1)
+
+    if choice.upper() == "N" or choice == "":
+        try:
+            name = input("  New project name: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n[harness] Aborted.")
+            sys.exit(1)
+        if not name:
+            print("[harness] Project name cannot be empty.")
+            sys.exit(1)
+        return name
+
+    try:
+        idx = int(choice) - 1
+        if 0 <= idx < len(existing):
+            slug = existing[idx][0]
+            # Slug is the canonical name for existing projects
+            print(f"[harness] Selected project: {slug!r}")
+            return slug
+    except ValueError:
+        pass
+
+    print(f"[harness] Invalid selection: {choice!r}")
+    sys.exit(1)
+
+# ════════════════════════════════════════════════════════════════════════════
 # Core helpers
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -258,7 +336,8 @@ def check_file_exists(path: Path, flag: str) -> bool:
 
 
 def check_src_exists() -> bool:
-    src_dir = ROOT / "src"
+    from artifacts.paths import artifact_root
+    src_dir = artifact_root() / "src"
     if not src_dir.exists() or not any(src_dir.rglob("*.ts")):
         print("[harness] src/ is empty or missing.")
         print("          Run without --test-only first to generate implementation.")
@@ -314,7 +393,8 @@ def print_delta_summary(delta: dict) -> None:
 
 def snapshot_src() -> None:
     """Save current src/ as prev_src/ for future delta partial restores."""
-    src = ROOT / "src"
+    from artifacts.paths import artifact_root
+    src = artifact_root() / "src"
     if not src.exists():
         return
     prev_src = _prev_src_dir()
@@ -329,14 +409,16 @@ def restore_unaffected_files(delta: dict) -> int:
     Copy unaffected src/ files from prev_src/ so Qwen only implements
     the files that changed. Returns number of files restored.
     """
+    from artifacts.paths import artifact_root
     unaffected = [f for f in delta.get("unaffected_files", []) if f.startswith("src/")]
     prev_src = _prev_src_dir()
     if not unaffected or not prev_src.exists():
         return 0
+    art_root = artifact_root()
     restored = 0
     for rel in unaffected:
         prev = prev_src / rel[len("src/"):]
-        dest = ROOT / rel
+        dest = art_root / rel          # e.g. artifacts_my-app/src/foo.ts
         if prev.exists():
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(prev, dest)
@@ -344,7 +426,6 @@ def restore_unaffected_files(delta: dict) -> int:
     if restored:
         print(f"[harness] Restored {restored} unaffected file(s) from prev_src/")
     return restored
-
 
 # ════════════════════════════════════════════════════════════════════════════
 # Judge helpers
@@ -457,9 +538,9 @@ def _run_fix_from_existing_judge(args, results: dict) -> None:
              c. If fix fails → stop, report for human review
         5. NEEDS_REVISION + --skip-fix → print verdict, done
     """
-    raw_path = ROOT / "reports" / "judge_raw.json"
+    raw_path = JUDGE_RAW_PATH          # LazyPath — resolves to artifacts_<slug>/run/judge_raw.json
     if not raw_path.exists():
-        print("[harness] --from-judge: reports/judge_raw.json not found.")
+        print(f"[harness] --from-judge: {raw_path} not found.")
         print("          Run the full pipeline first to generate a judge report.")
         results["judge_from_existing"] = False
         return
@@ -530,11 +611,12 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     # Project isolation (required)
-    parser.add_argument("--project", type=str, required=True,
+    parser.add_argument("--project", type=str, default=None,
                         metavar="NAME",
                         help="Project name. Artifacts are isolated to "
                              "artifacts_<slug>/ (e.g. --project my-app → "
-                             "artifacts_my-app/). Required.")
+                             "artifacts_my-app/). If omitted, an interactive "
+                             "prompt lists existing projects to choose from.")
     # Clarificator flags
     parser.add_argument("--skip-clarify", action="store_true",
                         help="Skip Step 0 (Clarificator). Use when requirement is "
@@ -607,7 +689,11 @@ def main() -> None:
                              "Values: auto | code | sql | python | config | text")
 
     args = parser.parse_args()
-
+ 
+    # ── Project resolution (interactive fallback if --project omitted) ───────
+    if not args.project:
+        args.project = _interactive_project_select(ROOT)
+     
     # ── Inject project into env so all child processes inherit it ────────────
     os.environ["PIPELINE_PROJECT"] = args.project
 
@@ -973,7 +1059,9 @@ def main() -> None:
             steps=applied_steps,
             status="PASS",
         )
-        print(f"\n  Apply record → artifacts/state/spec_applied.json  "
+     
+        from artifacts.paths import SPEC_APPLIED
+        print(f"\n  Apply record → {SPEC_APPLIED}  "
               f"(v{delta.get('to_version', '?')} marked as applied)")
 
     sys.exit(0 if all_ok else 1)
