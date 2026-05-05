@@ -265,13 +265,13 @@ def ensure_dirs() -> None:
     """
     root = _artifact_root()
     for rel in (
-    "src",
-    "tests",
-    "state",
-    "cache",
-    "run",
-    "knowledge/current",
-    "knowledge/history",
-    "reports",
+        "src",
+        "tests",
+        "state",
+        "cache",
+        "run",
+        "knowledge/current",
+        "knowledge/history",
+        "reports",
     ):
         (root / rel).mkdir(parents=True, exist_ok=True)
