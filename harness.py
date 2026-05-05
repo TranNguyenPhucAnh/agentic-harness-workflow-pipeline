@@ -189,6 +189,9 @@ ROOT = Path(__file__).parent
 
 import sys as _sys
 _sys.path.insert(0, str(ROOT))
+# LazyPath constants — resolve to the correct project artifact root at use time.
+# ensure_dirs() is called inside main() after --project is parsed and
+# PIPELINE_PROJECT env var is set.  Do NOT call ensure_dirs() here.
 from artifacts.paths import (
     SPEC_DELTA as DELTA_PATH,
     SCAFFOLD_JSON,
@@ -198,11 +201,12 @@ from artifacts.paths import (
     JUDGE_RAW as JUDGE_RAW_PATH,
     CLARIFICATION_REPORT,
     CLARIFIED_REQ,
-    ensure_dirs,
 )
-ensure_dirs()
-# NOTE: prev_src is a transient staging dir, not a pipeline artifact
-PREV_SRC_DIR = ROOT / "artifacts" / "state" / "prev_src"
+# NOTE: prev_src is a transient staging dir, not a pipeline artifact.
+# Resolved lazily so it uses the correct project artifact root.
+def _prev_src_dir() -> Path:
+    from artifacts.paths import artifact_root
+    return artifact_root() / "state" / "prev_src"
 
 # ════════════════════════════════════════════════════════════════════════════
 # Core helpers
@@ -313,10 +317,11 @@ def snapshot_src() -> None:
     src = ROOT / "src"
     if not src.exists():
         return
-    if PREV_SRC_DIR.exists():
-        shutil.rmtree(PREV_SRC_DIR)
-    shutil.copytree(src, PREV_SRC_DIR)
-    print(f"[harness] src/ snapshot → {PREV_SRC_DIR.relative_to(ROOT)}")
+    prev_src = _prev_src_dir()
+    if prev_src.exists():
+        shutil.rmtree(prev_src)
+    shutil.copytree(src, prev_src)
+    print(f"[harness] src/ snapshot → {prev_src.relative_to(ROOT)}")
 
 
 def restore_unaffected_files(delta: dict) -> int:
@@ -325,11 +330,12 @@ def restore_unaffected_files(delta: dict) -> int:
     the files that changed. Returns number of files restored.
     """
     unaffected = [f for f in delta.get("unaffected_files", []) if f.startswith("src/")]
-    if not unaffected or not PREV_SRC_DIR.exists():
+    prev_src = _prev_src_dir()
+    if not unaffected or not prev_src.exists():
         return 0
     restored = 0
     for rel in unaffected:
-        prev = PREV_SRC_DIR / rel[len("src/"):]
+        prev = prev_src / rel[len("src/"):]
         dest = ROOT / rel
         if prev.exists():
             dest.parent.mkdir(parents=True, exist_ok=True)
@@ -523,6 +529,12 @@ def main() -> None:
         description="Local LLM pipeline runner",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    # Project isolation (required)
+    parser.add_argument("--project", type=str, required=True,
+                        metavar="NAME",
+                        help="Project name. Artifacts are isolated to "
+                             "artifacts_<slug>/ (e.g. --project my-app → "
+                             "artifacts_my-app/). Required.")
     # Clarificator flags
     parser.add_argument("--skip-clarify", action="store_true",
                         help="Skip Step 0 (Clarificator). Use when requirement is "
@@ -595,6 +607,19 @@ def main() -> None:
                              "Values: auto | code | sql | python | config | text")
 
     args = parser.parse_args()
+
+    # ── Inject project into env so all child processes inherit it ────────────
+    os.environ["PIPELINE_PROJECT"] = args.project
+
+    # Re-import paths now that the env var is set.
+    # LazyPath objects in paths.py resolve at *use time* so existing imports
+    # are fine, but we call ensure_dirs() here to create project dirs early
+    # and print a clear header showing which workspace is active.
+    from artifacts.paths import ensure_dirs as _ensure_dirs, project_info as _project_info
+    _info = _project_info()
+    print(f"[harness] Project  : {_info['name']!r}  (slug: {_info['slug']})")
+    print(f"[harness] Artifacts: {_info['artifact_root']}")
+    _ensure_dirs()
 
     # ── Mini mode: dispatch immediately, bypass full pipeline ────────────────
     if args.mini is not None:
