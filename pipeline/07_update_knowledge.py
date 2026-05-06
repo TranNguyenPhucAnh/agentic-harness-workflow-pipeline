@@ -11,7 +11,7 @@ Two modes:
   B) HUMAN-FIX CAPTURE (new):
      Run after you manually fix code that AI couldn't fix.
      Uses `git diff` to capture what you changed, links it to escalated clusters,
-     and distills a Pattern entry into artifacts/knowledge/base.md.
+     and distills a Pattern entry into artifacts_<slug>/knowledge/base.md.
      On next run, base.md is injected into Minimax L2 system prompt.
 
 Usage
@@ -30,17 +30,17 @@ Usage
 
 Writes (judge mode)
 ───────────────────
-  artifacts/knowledge/findings.md
-  artifacts/knowledge/current/spec_addendum.md
-  artifacts/state/plan.json                    (global_notes patched)
-  artifacts/knowledge/current/base.md          (pattern entries from judge blocking issues)
-  artifacts/run/update_log.json                (merged log)
+  artifacts_<slug>/knowledge/findings.md
+  artifacts_<slug>/knowledge/current/spec_addendum.md
+  artifacts_<slug>/state/plan.json                    (global_notes patched)
+  artifacts_<slug>/knowledge/current/base.md          (pattern entries from judge blocking issues)
+  artifacts_<slug>/run/update_log.json                (merged log)
 
 Writes (human-fix capture mode)
 ────────────────────────────────
-  artifacts/run/update_log.json                ← diff + cluster context + root cause
-  artifacts/knowledge/current/base.md          ← new Pattern entry appended
-  artifacts/knowledge/findings.md              ← human fix note appended (regression prevention)
+  artifacts_<slug>/run/update_log.json                ← diff + cluster context + root cause
+  artifacts_<slug>/knowledge/current/base.md          ← new Pattern entry appended
+  artifacts_<slug>/knowledge/findings.md              ← human fix note appended (regression prevention)
 
 For taxonomy details see docs/artifacts.md
 """
@@ -58,19 +58,20 @@ from pathlib import Path
 from textwrap import indent
 
 # === WRITE AUTHORITY: 07_update_knowledge ===
-# OWNS  : artifacts/knowledge/current/base.md
-#         artifacts/knowledge/current/findings_notes.md
-#         artifacts/knowledge/history/update_log.json
-#         artifacts/state/plan_notes.json
-# READS : artifacts/run/judge_raw.json, artifacts/state/plan.json,
-#         artifacts/knowledge/current/findings.md,
-#         artifacts/knowledge/current/spec_addendum.md,
-#         artifacts/run/test_report.json
+# OWNS  : artifacts_<slug>/knowledge/current/base.md
+#         artifacts_<slug>/knowledge/current/findings_notes.md
+#         artifacts_<slug>/knowledge/history/update_log.json
+#         artifacts_<slug>/state/plan_notes.json
+# READS : artifacts_<slug>/run/judge_raw.json, artifacts_<slug>/state/plan.json,
+#         artifacts_<slug>/knowledge/current/findings.md,
+#         artifacts_<slug>/knowledge/current/spec_addendum.md,
+#         artifacts_<slug>/run/test_report.json
 
 import sys as _sys
 _sys.path.insert(0, str(Path(__file__).parent.parent))
 from artifacts.paths import (
-    ROOT,
+    SPEC_PATH,
+    artifact_root,
     JUDGE_RAW as JUDGE_RAW_PATH,
     PLAN_JSON as GLM_PLAN_PATH,
     PLAN_NOTES as PLAN_NOTES_PATH,
@@ -114,13 +115,14 @@ ACTION_SKIP          = "skip"
 def _git_diff_src() -> str:
     """Get unstaged + staged diff for src/ files."""
     try:
+        root = artifact_root()
         staged   = subprocess.run(
             ["git", "diff", "--cached", "--", "src/"],
-            cwd=ROOT, capture_output=True, text=True,
+            cwd=root, capture_output=True, text=True,
         ).stdout
         unstaged = subprocess.run(
             ["git", "diff", "--", "src/"],
-            cwd=ROOT, capture_output=True, text=True,
+            cwd=root, capture_output=True, text=True,
         ).stdout
         return (staged + unstaged).strip()
     except Exception as e:
@@ -247,7 +249,7 @@ def capture_human_fix(dry_run: bool) -> None:
         root_cause = ""
 
     spec_version = "unknown"
-    spec_path = ROOT / "spec.md"
+    spec_path = SPEC_PATH
     if spec_path.exists():
         m = re.search(r"^#\s*Version:\s*(\S+)", spec_path.read_text(), re.MULTILINE)
         if m:
@@ -368,14 +370,14 @@ def _suggest_action(finding: str, severity: str, section_notes: str) -> tuple[st
 
     if any(kw in text for kw in _SPEC_EDGE_KEYWORDS):
         content = f"## Edge case: {finding[:80]}\n\nBehaviour: define exact behaviour for: {finding}\n"
-        return ACTION_ADDENDUM, "artifacts/knowledge/current/spec_addendum.md", content
+        return ACTION_ADDENDUM, "artifacts_<slug>/knowledge/current/spec_addendum.md", content
 
     if any(kw in text for kw in _GLM_NOTE_KEYWORDS) or severity == "blocking":
         content = finding
-        return ACTION_GLM_NOTE, "artifacts/state/plan.json (global_notes)", content
+        return ACTION_GLM_NOTE, "artifacts_<slug>/state/plan.json (global_notes)", content
 
     content = f"- {finding}"
-    return ACTION_FINDINGS_ADD, "artifacts/knowledge/findings.md", content
+    return ACTION_FINDINGS_ADD, "artifacts_<slug>/knowledge/findings.md", content
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -573,7 +575,7 @@ def main() -> None:
     print(f"\n[07b] Processing {len(all_findings)} finding(s) …\n")
 
     spec_version = "unknown"
-    spec_path = ROOT / "spec.md"
+    spec_path = SPEC_PATH
     if spec_path.exists():
         m = re.search(r"^#\s*Version:\s*(\S+)", spec_path.read_text(), re.MULTILINE)
         if m:
