@@ -51,7 +51,7 @@ USAGE
 
 ARTIFACT OWNERSHIP
 ──────────────────
-  OWNS  : artifacts/run/mini_log.json        (append-only)
+  OWNS  : artifacts_<slug>/run/mini_log.json        (append-only)
   WRITES: --output-file path (if provided)   (overwrite on success only)
   READS : knowledge/current/base.md
           knowledge/current/findings_notes.md
@@ -72,19 +72,25 @@ import time
 from pathlib import Path
 
 # ── Path bootstrap ────────────────────────────────────────────────────────────
-# mini_mode.py lives in pipeline/ — ROOT is one level up.
+# mini_mode.py lives in pipeline/ — repo root is one level up.
 _HERE = Path(__file__).parent
-ROOT  = _HERE.parent
+_REPO_ROOT = _HERE.parent   # used only for sys.path bootstrap below
 
-sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(_REPO_ROOT))
 from artifacts.paths import (
     KNOWLEDGE_BASE,
     FINDINGS_NOTES,
     SPEC_ADDENDUM,
     RUN_DIR,
+    artifact_root,
     ensure_dirs,
 )
 ensure_dirs()
+
+# Convenience alias — resolves lazily so PIPELINE_PROJECT is always current.
+# Use this everywhere file I/O or subprocess cwd is needed.
+def _art_root() -> Path:
+    return artifact_root()
 
 MINI_LOG = RUN_DIR / "mini_log.json"
 
@@ -245,7 +251,7 @@ def _verify_code(files_written: list[str]) -> tuple[bool, str]:
     try:
         result = subprocess.run(
             ["npx", "vitest", "run", "--reporter=verbose"],
-            cwd=ROOT,
+            cwd=_art_root(),
             capture_output=True,
             text=True,
             timeout=120,
@@ -258,7 +264,7 @@ def _verify_code(files_written: list[str]) -> tuple[bool, str]:
         try:
             result = subprocess.run(
                 ["npm", "test", "--", "--run"],
-                cwd=ROOT,
+                cwd=_art_root(),
                 capture_output=True,
                 text=True,
                 timeout=120,
@@ -447,19 +453,19 @@ def run_verifier(
     Returns (passed: bool, output: str).
     """
     if task_type == "sql":
-        target = output_path or (ROOT / files_written[0] if files_written else None)
+        target = output_path or (_art_root() / files_written[0] if files_written else None)
         if target is None:
             return False, "No output file to verify."
         return _verify_sql(target)
 
     if task_type == "python":
-        target = output_path or (ROOT / files_written[0] if files_written else None)
+        target = output_path or (_art_root() / files_written[0] if files_written else None)
         if target is None:
             return False, "No output file to verify."
         return _verify_python(target)
 
     if task_type == "config":
-        target = output_path or (ROOT / files_written[0] if files_written else None)
+        target = output_path or (_art_root() / files_written[0] if files_written else None)
         if target is None:
             return False, "No output file to verify."
         return _verify_config(target)
@@ -646,14 +652,14 @@ def _build_file_tree_with_sigs(cap_chars: int = 10_000) -> str:
     lines: list[str] = []
     total = 0
 
-    for p in sorted(ROOT.rglob("*")):
+    for p in sorted(_art_root().rglob("*")):
         if not p.is_file() or _should_skip(p):
             continue
         if total >= cap_chars:
             lines.append("  ... (truncated)")
             break
 
-        rel = str(p.relative_to(ROOT))
+        rel = str(p.relative_to(_art_root()))
         ext = p.suffix.lower()
 
         if ext in _SIG_EXTS:
@@ -755,7 +761,7 @@ def apply_patch(files_changed: list[dict]) -> list[str]:
         if not path_str:
             print("[mini] WARNING: patch entry missing 'path' — skipped.", file=sys.stderr)
             continue
-        dest = ROOT / path_str
+        dest = _art_root() / path_str
         try:
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text(content, encoding="utf-8")
@@ -797,7 +803,7 @@ def load_file_context(target_files: list[str]) -> str:
                 )
             break
 
-        abs_path = ROOT / rel_path
+        abs_path = _art_root() / rel_path
         if not abs_path.exists():
             sections.append(f"### {rel_path}\n*(new file — does not exist yet)*")
             continue
@@ -883,9 +889,9 @@ def scan_local_imports(file_path: Path) -> list[str]:
                         break
             if candidate:
                 try:
-                    results.append(str(candidate.relative_to(ROOT)))
+                    results.append(str(candidate.relative_to(_art_root())))
                 except ValueError:
-                    pass  # outside ROOT — skip
+                    pass  # outside artifact root — skip
 
     # ── Python ───────────────────────────────────────────────────────────
     elif ext == ".py":
@@ -907,7 +913,7 @@ def scan_local_imports(file_path: Path) -> list[str]:
                               else candidate / "__init__.py"
                     if attempt.exists():
                         try:
-                            results.append(str(attempt.relative_to(ROOT)))
+                            results.append(str(attempt.relative_to(_art_root())))
                         except ValueError:
                             pass
                         break
@@ -920,13 +926,13 @@ def scan_local_imports(file_path: Path) -> list[str]:
         )
         for m in abs_pattern.finditer(text):
             mod_str = (m.group(1) or m.group(2)).replace(".", "/")
-            candidate = ROOT / mod_str
+            candidate = _art_root() / mod_str
             for try_ext in (".py", "/__init__.py"):
                 attempt = Path(str(candidate) + try_ext) if not try_ext.startswith("/") \
                           else candidate / "__init__.py"
                 if attempt.exists():
                     try:
-                        results.append(str(attempt.relative_to(ROOT)))
+                        results.append(str(attempt.relative_to(_art_root())))
                     except ValueError:
                         pass
                     break
@@ -951,12 +957,12 @@ def resolve_deps(target_files: list[str]) -> list[str]:
     dep_set: set[str] = set()
 
     for rel in target_files:
-        abs_path = ROOT / rel
+        abs_path = _art_root() / rel
         if not abs_path.exists():
             continue
         for dep in scan_local_imports(abs_path):
             if dep not in target_set:
-                dep_path = ROOT / dep
+                dep_path = _art_root() / dep
                 if dep_path.exists() and not _should_skip(dep_path):
                     dep_set.add(dep)
 
@@ -983,7 +989,7 @@ def build_dep_context(dep_files: list[str]) -> str:
     total = 0
 
     for rel in dep_files:
-        abs_path = ROOT / rel
+        abs_path = _art_root() / rel
         sigs = _extract_signatures(abs_path)
         if sigs:
             line = f"  {rel}: {', '.join(sigs)}"
@@ -1067,7 +1073,7 @@ def append_findings_note(
         FINDINGS_NOTES.parent.mkdir(parents=True, exist_ok=True)
         with FINDINGS_NOTES.open("a") as f:
             f.write(note)
-        print(f"[mini] Failure pattern → {FINDINGS_NOTES.relative_to(ROOT)}")
+        print(f"[mini] Failure pattern → {FINDINGS_NOTES.relative_to(_art_root())}")
     except OSError as e:
         print(f"[mini] WARNING: could not write findings_notes.md: {e}", file=sys.stderr)
 
@@ -1261,7 +1267,7 @@ def run_mini(
     if context_file is None and target_files:
         file_context = load_file_context(target_files)
         if file_context:
-            loaded = [f for f in target_files if (ROOT / f).exists()]
+            loaded = [f for f in target_files if (_art_root() / f).exists()]
             print(f"[mini] File context loaded: {len(loaded)} file(s)  "
                   f"({len(file_context)} chars injected into prompt)")
         else:
@@ -1395,7 +1401,7 @@ def run_mini(
         verify_result= "pass" if final_passed else "fail",
         retry_count  = retry_count,
     )
-    print(f"[mini] Logged → {MINI_LOG.relative_to(ROOT)}")
+    print(f"[mini] Logged → {MINI_LOG.relative_to(_art_root())}")
 
     # ── Knowledge contribution ────────────────────────────────────────────────
     if not final_passed or retry_count > 1:
