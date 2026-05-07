@@ -7,32 +7,35 @@ Runs once when taking over a legacy project, and on-demand when the codebase
 changes significantly enough to warrant a refresh.
 
 Phases:
-  1. File tree scan     — apply absorber.ignored rules, build file inventory
-  2. Content extraction — full / key-only / signature-only per file
-  3. Semantic compression — single LLM call → codebase_map.md
-  4. Config inventory   — aggregate key-only extractions → config_map.json
-  5. Git crawl          — git log → git_history.json + blame_map.md
+  1. File tree scan        — apply absorber.ignored rules, build file inventory
+  2. Content extraction    — full / key-only / signature-only per file
+  3. Semantic compression  — single LLM call → codebase_map.md
+  4. Config inventory      — aggregate key-only extractions → config_map.json
+  5. Git crawl             — git log → git_history.json + blame_map.md
 
-External integrations (optional, graceful fallback):
-  - vfs CLI            — signature extraction (98% token reduction)
-  - Serena MCP         — symbol-level call graph (future: via subprocess)
+External integrations optional, graceful fallback:
+  - vfs CLI     — signature extraction
+  - Serena MCP  — symbol-level call graph, future via subprocess
 
-Change detection (CocoIndex-inspired):
+Change detection:
   - absorber_cache.json tracks file hashes
   - Only re-extracts files that changed since last run
   - --force flag bypasses cache
 
 Usage:
-  python 01_absorber.py                         # interactive git scope prompt
-  python 01_absorber.py --git-scope 6m          # last 6 months
-  python 01_absorber.py --git-scope 500         # last 500 commits
-  python 01_absorber.py --git-scope all         # full history
-  python 01_absorber.py --force                 # ignore cache, re-extract all
-  python 01_absorber.py --skip-git              # skip git crawl
-  python 01_absorber.py --dry-run               # scan only, no writes
-  python 01_absorber.py --target /path/to/repo  # explicit target (default: artifact_root())
+  python 01_absorber.py
+  python 01_absorber.py --project my-app
+  PIPELINE_PROJECT=my-app python 01_absorber.py
 
-Writes (owner: 01_absorber):
+  python 01_absorber.py --git-scope 6m
+  python 01_absorber.py --git-scope 500
+  python 01_absorber.py --git-scope all
+  python 01_absorber.py --force
+  python 01_absorber.py --skip-git
+  python 01_absorber.py --dry-run
+  python 01_absorber.py --target /path/to/repo
+
+Writes, owner: 01_absorber:
   artifacts_<slug>/knowledge/current/codebase_map.md
   artifacts_<slug>/knowledge/current/config_map.json
   artifacts_<slug>/knowledge/current/blame_map.md
@@ -61,7 +64,7 @@ from typing import Any
 
 import httpx
 
-# === WRITE AUTHORITY: 01_absorber ===
+# === WRITE AUTHORITY: 01_absorBER ===
 # OWNS  : artifacts_<slug>/knowledge/current/codebase_map.md
 #         artifacts_<slug>/knowledge/current/config_map.json
 #         artifacts_<slug>/knowledge/current/blame_map.md
@@ -70,50 +73,86 @@ import httpx
 # READS : project source files (target codebase)
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from artifacts.paths import (
-    CACHE_DIR, CURRENT_DIR, HISTORY_DIR,
-    CODEBASE_MAP, CONFIG_MAP, BLAME_MAP, GIT_HISTORY, ABSORBER_CACHE,
+from artifacts.paths import (  # noqa: E402
+    ABSORBER_CACHE,
+    BLAME_MAP,
+    CODEBASE_MAP,
+    CONFIG_MAP,
+    GIT_HISTORY,
     artifact_root,
     ensure_dirs,
 )
-ensure_dirs()
+
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-_MAX_TOKENS_MAP   = 16384
-_MAX_FILE_BYTES   = 256 * 1024   # 256 KB — skip very large files
-_IGNORED_FILE     = "absorber.ignored"
 
-# Model config — use long-context model for codebase synthesis
+_MAX_TOKENS_MAP = 16384
+_MAX_FILE_BYTES = 256 * 1024
+_IGNORED_FILE = "absorber.ignored"
+
 _MODEL = os.environ.get("ABSORBER_MODEL", "gemini/gemini-2.5-flash")
 
-# Built-in skip dirs (align with VFS + common sense)
 _BUILTIN_SKIP_DIRS: frozenset[str] = frozenset({
-    "node_modules", "vendor", ".git", "testdata",
-    "dist", "build", ".next", "__pycache__", ".venv",
-    "venv", ".tox", ".terraform", "target", "coverage",
-    ".nyc_output", "storybook-static", ".parcel-cache",
-    ".turbo", ".cache", "tmp", "temp",
+    "node_modules",
+    "vendor",
+    ".git",
+    "testdata",
+    "dist",
+    "build",
+    ".next",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".tox",
+    ".terraform",
+    "target",
+    "coverage",
+    ".nyc_output",
+    "storybook-static",
+    ".parcel-cache",
+    ".turbo",
+    ".cache",
+    "tmp",
+    "temp",
 })
 
-# Built-in test file patterns (skipped by default — same as VFS)
+# Pipeline-owned artifact subdirectories.
+#
+# When target defaults to artifact_root(), scanning these directories makes the
+# knowledge layer self-referential, e.g. codebase_map.md ingesting previous
+# codebase_map.md, test_report.json, cache files, etc.
+_ARTIFACT_CONTROL_DIRS: frozenset[str] = frozenset({
+    "state",
+    "cache",
+    "run",
+    "knowledge",
+    "reports",
+})
+
 _BUILTIN_SKIP_PATTERNS: tuple[str, ...] = (
-    "*_test.go", "*.test.ts", "*.test.tsx", "*.test.js",
-    "*.spec.ts", "*.spec.tsx", "*.spec.js",
-    "test_*.py", "*_test.py", "*Test.java", "*Tests.java",
+    "*_test.go",
+    "*.test.ts",
+    "*.test.tsx",
+    "*.test.js",
+    "*.spec.ts",
+    "*.spec.tsx",
+    "*.spec.js",
+    "test_*.py",
+    "*_test.py",
+    "*Test.java",
+    "*Tests.java",
 )
 
-# Extensions that support key-only extraction
 _KEY_ONLY_EXTENSIONS: frozenset[str] = frozenset({
-    ".json", ".yaml", ".yml", ".toml", ".ini",
-    ".env", ".properties", ".cfg", ".conf",
-})
-
-# Source code extensions for signature extraction
-_SOURCE_EXTENSIONS: frozenset[str] = frozenset({
-    ".ts", ".tsx", ".js", ".jsx",
-    ".py", ".go", ".java", ".rs",
-    ".cs", ".cpp", ".c", ".h",
-    ".rb", ".php", ".kt", ".swift",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".ini",
+    ".env",
+    ".properties",
+    ".cfg",
+    ".conf",
 })
 
 
@@ -125,7 +164,7 @@ class AbsorberIgnoreRules:
     """
     Parses absorber.ignored, which extends .gitignore syntax with directives:
 
-      # Standard — skip entirely (same as .gitignore)
+      # Standard — skip entirely
       node_modules/
       *.lock
 
@@ -141,30 +180,31 @@ class AbsorberIgnoreRules:
     """
 
     def __init__(self, rules_path: Path) -> None:
-        self.skip_patterns:      list[str] = []
-        self.key_only_patterns:  list[str] = []
-        self.sig_only_patterns:  list[str] = []
+        self.skip_patterns: list[str] = []
+        self.key_only_patterns: list[str] = []
+        self.sig_only_patterns: list[str] = []
         self._parse(rules_path)
 
     def _parse(self, path: Path) -> None:
         if not path.exists():
             return
+
         mode = "skip"
-        for raw in path.read_text().splitlines():
+        for raw in path.read_text(errors="replace").splitlines():
             line = raw.strip()
             if not line or line.startswith("#"):
                 continue
+
             if line == "[key-only]":
                 mode = "key-only"
             elif line == "[signature-only]":
                 mode = "signature-only"
+            elif mode == "skip":
+                self.skip_patterns.append(line)
+            elif mode == "key-only":
+                self.key_only_patterns.append(line)
             else:
-                if mode == "skip":
-                    self.skip_patterns.append(line)
-                elif mode == "key-only":
-                    self.key_only_patterns.append(line)
-                else:
-                    self.sig_only_patterns.append(line)
+                self.sig_only_patterns.append(line)
 
     @staticmethod
     def _matches(rel_path: str, pattern: str) -> bool:
@@ -172,53 +212,48 @@ class AbsorberIgnoreRules:
         Match rel_path against a gitignore-style glob pattern.
 
         Supports:
-          **   — match zero or more path segments (cross-directory)
-          *    — match any sequence of characters within one path segment
+          **   — match zero or more path segments
+          *    — match any sequence within one path segment
           ?    — match any single character within one path segment
-
-        Simple patterns (no '/') are matched against both the full relative
-        path and just the filename, so "*.lock" catches "yarn.lock" and
-        "sub/yarn.lock".  Patterns containing '/' are path-anchored.
         """
-        # Build a regex from the glob pattern (gitignore semantics)
         pat = pattern.rstrip("/")
         parts = re.split(r"(\*\*|\*|\?)", pat)
+
         rx = ""
         for part in parts:
             if part == "**":
-                rx += ".*"         # matches across directory boundaries
+                rx += ".*"
             elif part == "*":
-                rx += "[^/]*"      # matches within a single path segment
+                rx += "[^/]*"
             elif part == "?":
                 rx += "[^/]"
             else:
                 rx += re.escape(part)
 
-        # Simple patterns (no '/' in original, no '**') apply to the filename
-        # segment anywhere in the tree, so prefix with an optional dir component.
         if "/" not in pat and "**" not in pat:
             rx = r"(?:.+/)?" + rx
 
-        compiled = re.compile(r"^" + rx + r"$")
-        return bool(compiled.match(rel_path))
+        return bool(re.compile(r"^" + rx + r"$").match(rel_path))
 
     def mode_for(self, rel_path: str) -> str:
-        """Return 'skip', 'key-only', 'signature-only', or 'full'."""
-        # Check signature-only first (more restrictive)
+        """Return skip, key-only, signature-only, or full."""
         for pat in self.sig_only_patterns:
             if self._matches(rel_path, pat):
                 return "signature-only"
+
         for pat in self.key_only_patterns:
             if self._matches(rel_path, pat):
                 return "key-only"
+
         for pat in self.skip_patterns:
             if self._matches(rel_path, pat):
                 return "skip"
+
         return "full"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Change detection cache (CocoIndex-inspired)
+# Change detection cache
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _load_cache() -> dict[str, Any]:
@@ -236,7 +271,6 @@ def _save_cache(cache: dict[str, Any]) -> None:
 
 
 def _file_hash(path: Path) -> str:
-    """SHA-256 of file content, truncated to 16 hex chars."""
     try:
         return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
     except Exception:
@@ -247,41 +281,50 @@ def _file_hash(path: Path) -> str:
 # Phase 1 — File tree scan
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _should_skip_dir(name: str) -> bool:
-    return name in _BUILTIN_SKIP_DIRS or name.startswith(".")
+def _should_skip_dir(name: str, *, skip_artifact_control_dirs: bool = False) -> bool:
+    if name.startswith("."):
+        return True
+
+    if name in _BUILTIN_SKIP_DIRS:
+        return True
+
+    if skip_artifact_control_dirs and name in _ARTIFACT_CONTROL_DIRS:
+        return True
+
+    return False
 
 
 def _should_skip_file(name: str) -> bool:
-    for pat in _BUILTIN_SKIP_PATTERNS:
-        if fnmatch.fnmatch(name, pat):
-            return True
-    return False
+    return any(fnmatch.fnmatch(name, pat) for pat in _BUILTIN_SKIP_PATTERNS)
 
 
 def _looks_like_config_file(rel_path: str, fname: str, ext: str) -> bool:
     """
     Heuristic to auto-promote likely config/manifest/infra files to key-only mode.
-    Covers generic naming keywords, well-known filenames, and infra path patterns.
     """
     if ext not in _KEY_ONLY_EXTENSIONS:
         return False
 
-    rel_lower  = rel_path.lower()
+    rel_lower = rel_path.lower()
     name_lower = fname.lower()
 
-    # .env files (any variant) are always secrets
     if ext == ".env" or name_lower.startswith(".env"):
         return True
 
-    # Generic config-ish keywords in filename
     if any(kw in name_lower for kw in (
-        "config", "settings", "secret", "appsetting",
-        "credential", "password", "token",
-        "manifest", "values", "override",
+        "config",
+        "settings",
+        "secret",
+        "appsetting",
+        "credential",
+        "password",
+        "token",
+        "manifest",
+        "values",
+        "override",
     )):
         return True
 
-    # Well-known filenames that are always config/metadata
     if name_lower in {
         "package.json",
         "package-lock.json",
@@ -299,7 +342,6 @@ def _looks_like_config_file(rel_path: str, fname: str, ext: str) -> bool:
     }:
         return True
 
-    # Infra / deployment descriptor paths
     if any(token in rel_lower for token in (
         "task-def",
         "cloudformation",
@@ -317,18 +359,15 @@ def _looks_like_config_file(rel_path: str, fname: str, ext: str) -> bool:
 
 def _should_include_in_config_inventory(rel_path: str) -> bool:
     """
-    Filter out pure build/tooling files from the config inventory.
-    These have no runtime config relevance (tsconfig, lock files, e2e scaffolding,
-    package manifests whose service keyword hits are false positives).
+    Filter out pure build/tooling files from config_map.json.
     """
     rel_lower = rel_path.lower()
-    name      = Path(rel_path).name.lower()
+    name = Path(rel_path).name.lower()
 
-    # Pure build/tooling filenames — no runtime config value
     if name in {
         "package-lock.json",
-        "package.json",         # npm deps contain keywords that false-positive service detect
-        "angular.json",         # Angular CLI config, not runtime
+        "package.json",
+        "angular.json",
         "tsconfig.json",
         "tsconfig.app.json",
         "tsconfig.spec.json",
@@ -336,8 +375,6 @@ def _should_include_in_config_inventory(rel_path: str) -> bool:
     }:
         return False
 
-    # e2e directories contain test fixtures, not runtime config
-    # Check without requiring a leading "/" so it matches "angular/e2e/..." too
     if "e2e/" in rel_lower or rel_lower.startswith("e2e/"):
         return False
 
@@ -347,20 +384,36 @@ def _should_include_in_config_inventory(rel_path: str) -> bool:
 def scan_files(
     target: Path,
     rules: AbsorberIgnoreRules,
+    *,
+    skip_artifact_control_dirs: bool = False,
 ) -> list[dict[str, Any]]:
     """
     Walk target directory and build file inventory.
-    Returns list of {rel_path, abs_path, ext, size_bytes, mode, lang}.
+
+    Returns:
+      [
+        {
+          "rel_path": str,
+          "abs_path": str,
+          "ext": str,
+          "size": int,
+          "mode": "full" | "key-only" | "signature-only",
+          "lang": str | None,
+        },
+        ...
+      ]
     """
     inventory: list[dict[str, Any]] = []
 
     for root_dir, dirs, files in os.walk(target):
         root_path = Path(root_dir)
 
-        # Prune skipped dirs in-place (affects os.walk)
         dirs[:] = [
             d for d in dirs
-            if not _should_skip_dir(d)
+            if not _should_skip_dir(
+                d,
+                skip_artifact_control_dirs=skip_artifact_control_dirs,
+            )
         ]
 
         for fname in files:
@@ -368,15 +421,18 @@ def scan_files(
                 continue
 
             abs_path = root_path / fname
-            rel_path = str(abs_path.relative_to(target))
-            ext      = abs_path.suffix.lower()
 
-            # Check absorber.ignored rules
+            try:
+                rel_path = str(abs_path.relative_to(target))
+            except ValueError:
+                continue
+
+            ext = abs_path.suffix.lower()
+
             mode = rules.mode_for(rel_path)
             if mode == "skip":
                 continue
 
-            # Auto-promote to key-only for likely config/manifest files
             if mode == "full" and _looks_like_config_file(rel_path, fname, ext):
                 mode = "key-only"
 
@@ -385,57 +441,68 @@ def scan_files(
             except OSError:
                 continue
 
-            if size > _MAX_FILE_BYTES:
-                continue  # skip very large files
-            if size == 0:
+            if size <= 0 or size > _MAX_FILE_BYTES:
                 continue
 
-            lang = _detect_language(ext)
+            lang = _detect_language(abs_path)
             if lang is None and mode == "full":
-                continue  # skip binary/unknown unless explicitly mapped
+                continue
 
             inventory.append({
                 "rel_path": rel_path,
                 "abs_path": str(abs_path),
-                "ext":      ext,
-                "size":     size,
-                "mode":     mode,
-                "lang":     lang,
+                "ext": ext,
+                "size": size,
+                "mode": mode,
+                "lang": lang,
             })
 
     inventory.sort(key=lambda x: x["rel_path"])
     return inventory
 
 
-def _detect_language(ext: str) -> str | None:
+def _detect_language(path: Path) -> str | None:
+    ext = path.suffix.lower()
+    name = path.name.lower()
+
+    if name == "dockerfile" or name.endswith(".dockerfile"):
+        return "Dockerfile"
+
     mapping = {
-        ".ts": "TypeScript", ".tsx": "TypeScript",
-        ".js": "JavaScript", ".jsx": "JavaScript",
+        ".ts": "TypeScript",
+        ".tsx": "TypeScript",
+        ".js": "JavaScript",
+        ".jsx": "JavaScript",
         ".py": "Python",
         ".go": "Go",
         ".java": "Java",
         ".rs": "Rust",
         ".cs": "C#",
-        ".cpp": "C++", ".c": "C", ".h": "C/C++",
+        ".cpp": "C++",
+        ".c": "C",
+        ".h": "C/C++",
         ".rb": "Ruby",
         ".php": "PHP",
         ".kt": "Kotlin",
         ".swift": "Swift",
         ".sql": "SQL",
         ".json": "JSON",
-        ".yaml": "YAML", ".yml": "YAML",
+        ".yaml": "YAML",
+        ".yml": "YAML",
         ".toml": "TOML",
-        ".tf": "Terraform", ".hcl": "HCL",
+        ".tf": "Terraform",
+        ".hcl": "HCL",
         ".proto": "Protobuf",
         ".md": "Markdown",
-        ".sh": "Shell", ".bash": "Shell",
-        ".dockerfile": "Dockerfile",
+        ".sh": "Shell",
+        ".bash": "Shell",
         ".xml": "XML",
         ".env": "ENV",
-        ".ini": "INI", ".cfg": "Config",
+        ".ini": "INI",
+        ".cfg": "Config",
+        ".conf": "Config",
         ".properties": "Properties",
     }
-    # Special case for files named "Dockerfile"
     return mapping.get(ext)
 
 
@@ -449,18 +516,18 @@ def extract_content(
     force: bool,
 ) -> tuple[str, bool]:
     """
-    Extract content from a file according to its mode.
-    Returns (content, from_cache).
-    Uses change-detection cache to skip unchanged files.
+    Extract content according to file mode.
+
+    Returns:
+      (content, from_cache)
     """
     abs_path = Path(entry["abs_path"])
     rel_path = entry["rel_path"]
-    mode     = entry["mode"]
+    mode = entry["mode"]
 
     current_hash = _file_hash(abs_path)
     cached = cache.get(rel_path, {})
 
-    # Cache hit — return cached extraction
     if (
         not force
         and cached.get("hash") == current_hash
@@ -469,21 +536,19 @@ def extract_content(
     ):
         return cached["content"], True
 
-    # Extract fresh
     if mode == "full":
         content = _extract_full(abs_path)
     elif mode == "key-only":
         content = _extract_key_only(abs_path, entry["ext"])
-    else:  # signature-only
+    else:
         content = _extract_signature(abs_path, entry["ext"], entry["lang"])
 
-    # Update cache
     cache[rel_path] = {
-        "hash":    current_hash,
-        "mode":    mode,
+        "hash": current_hash,
+        "mode": mode,
         "content": content,
-        "lang":    entry["lang"],
-        "size":    entry["size"],
+        "lang": entry["lang"],
+        "size": entry["size"],
     }
     return content, False
 
@@ -496,29 +561,27 @@ def _extract_full(path: Path) -> str:
 
 
 def _extract_key_only(path: Path, ext: str) -> str:
-    """
-    Parse structured config files and return key structure only.
-    Values are replaced with <redacted> to prevent secret leakage.
-    """
     raw = _extract_full(path)
 
-    if ext in (".json",):
+    if ext == ".json":
         return _redact_json(raw)
-    elif ext in (".yaml", ".yml"):
+
+    if ext in (".yaml", ".yml"):
         return _redact_yaml(raw)
-    elif ext in (".toml",):
+
+    if ext == ".toml":
         return _redact_toml(raw)
-    elif ext in (".env",) or path.name.startswith(".env"):
+
+    if ext == ".env" or path.name.startswith(".env"):
         return _redact_env(raw)
-    else:
-        # Generic: mask values on lines with = or :
-        return _redact_generic(raw)
+
+    return _redact_generic(raw)
 
 
 def _redact_json(raw: str) -> str:
-    """Recursively redact JSON values, keep keys."""
     def _walk(obj: Any, depth: int = 0) -> Any:
         indent = "  " * depth
+
         if isinstance(obj, dict):
             if not obj:
                 return "{}"
@@ -528,111 +591,121 @@ def _redact_json(raw: str) -> str:
                 lines.append(f'{indent}  "{k}": {child}')
             lines.append(indent + "}")
             return "\n".join(lines)
-        elif isinstance(obj, list):
+
+        if isinstance(obj, list):
             if not obj:
                 return "[]"
             return f"[... {len(obj)} item(s)]"
-        elif isinstance(obj, (int, float, bool)):
-            return str(obj)   # keep primitive types (not secrets)
-        else:
-            return '"<redacted>"'
+
+        if isinstance(obj, (int, float, bool)):
+            return str(obj)
+
+        return '"<redacted>"'
 
     try:
-        parsed = json.loads(raw)
-        return _walk(parsed)
+        return _walk(json.loads(raw))
     except Exception:
         return _redact_generic(raw)
 
 
 def _redact_yaml(raw: str) -> str:
     lines_out: list[str] = []
+
     for line in raw.splitlines():
         stripped = line.strip()
         if stripped.startswith("#") or not stripped:
             lines_out.append(line)
             continue
-        # Match "key: value" — redact value part
-        match = re.match(r'^(\s*[\w\-\.]+\s*:)\s*(.+)$', line)
+
+        match = re.match(r"^(\s*[\w\-\.]+\s*:)\s*(.+)$", line)
         if match:
             lines_out.append(match.group(1) + " <redacted>")
         else:
             lines_out.append(line)
+
     return "\n".join(lines_out)
 
 
 def _redact_toml(raw: str) -> str:
     lines_out: list[str] = []
+
     for line in raw.splitlines():
         stripped = line.strip()
         if stripped.startswith("#") or stripped.startswith("[") or not stripped:
             lines_out.append(line)
             continue
-        match = re.match(r'^(\s*[\w\-\.]+\s*=)\s*(.+)$', line)
+
+        match = re.match(r"^(\s*[\w\-\.]+\s*=)\s*(.+)$", line)
         if match:
             lines_out.append(match.group(1) + " <redacted>")
         else:
             lines_out.append(line)
+
     return "\n".join(lines_out)
 
 
 def _redact_env(raw: str) -> str:
     lines_out: list[str] = []
+
     for line in raw.splitlines():
         stripped = line.strip()
         if stripped.startswith("#") or not stripped:
             lines_out.append(line)
             continue
-        match = re.match(r'^([A-Z_][A-Z0-9_]*)\s*=\s*(.*)$', line, re.IGNORECASE)
+
+        match = re.match(r"^([A-Z_][A-Z0-9_]*)\s*=\s*(.*)$", line, re.IGNORECASE)
         if match:
             lines_out.append(f"{match.group(1)}=<redacted>")
         else:
             lines_out.append(line)
+
     return "\n".join(lines_out)
 
 
 def _redact_generic(raw: str) -> str:
     lines_out: list[str] = []
+
     for line in raw.splitlines():
         stripped = line.strip()
         if stripped.startswith("#") or stripped.startswith("//") or not stripped:
             lines_out.append(line)
             continue
+
         for sep in ("=", ":"):
-            match = re.match(rf'^(\s*[^{sep}\n]+{sep})\s*(.+)$', line)
+            match = re.match(rf"^(\s*[^{sep}\n]+{sep})\s*(.+)$", line)
             if match:
                 lines_out.append(match.group(1) + " <redacted>")
                 break
         else:
             lines_out.append(line)
+
     return "\n".join(lines_out)
 
 
 def _extract_signature(path: Path, ext: str, lang: str | None) -> str:
     """
     Extract signatures via vfs CLI if available, else Python AST for .py,
-    else regex-based fallback for other languages.
+    else regex fallback for TS/JS, else preview.
     """
-    # Try vfs first (best token reduction, multi-language)
     if shutil.which("vfs"):
         try:
             result = subprocess.run(
                 ["vfs", str(path)],
-                capture_output=True, text=True, timeout=15,
+                capture_output=True,
+                text=True,
+                timeout=15,
             )
             if result.returncode == 0 and result.stdout.strip():
                 return result.stdout
         except Exception:
             pass
 
-    # Python AST parser (no external deps)
     if ext == ".py":
         return _extract_python_signatures(path)
 
-    # TypeScript/JavaScript — regex-based
     if ext in (".ts", ".tsx", ".js", ".jsx"):
         return _extract_ts_signatures(path)
 
-    # Fallback — return first N lines as preview
     try:
         lines = path.read_text(errors="replace").splitlines()
         preview = "\n".join(lines[:50])
@@ -644,68 +717,80 @@ def _extract_signature(path: Path, ext: str, lang: str | None) -> str:
 
 
 def _extract_python_signatures(path: Path) -> str:
-    """Use Python AST to extract class/function signatures and docstrings."""
     try:
         source = path.read_text(errors="replace")
-        tree   = ast.parse(source)
+        tree = ast.parse(source)
     except SyntaxError:
-        return _extract_ts_signatures(path)  # fallback to regex
+        return _extract_ts_signatures(path)
+    except Exception:
+        return "[signature extraction failed]"
 
     lines: list[str] = []
 
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            # Only top-level and class methods
             prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
-            args  = [a.arg for a in node.args.args]
-            sig   = f"{prefix} {node.name}({', '.join(args)})"
+            args = [a.arg for a in node.args.args]
+            sig = f"{prefix} {node.name}({', '.join(args)})"
+
             if node.returns:
-                sig += f" -> {ast.unparse(node.returns)}"
+                try:
+                    sig += f" -> {ast.unparse(node.returns)}"
+                except Exception:
+                    pass
+
             lines.append(sig)
-            if (docstring := ast.get_docstring(node)):
+
+            docstring = ast.get_docstring(node)
+            if docstring:
                 lines.append(f'    """{docstring[:120]}"""')
 
         elif isinstance(node, ast.ClassDef):
-            bases = [ast.unparse(b) for b in node.bases]
-            sig   = f"class {node.name}"
+            try:
+                bases = [ast.unparse(b) for b in node.bases]
+            except Exception:
+                bases = []
+
+            sig = f"class {node.name}"
             if bases:
                 sig += f"({', '.join(bases)})"
             lines.append(sig + ":")
-            if (docstring := ast.get_docstring(node)):
+
+            docstring = ast.get_docstring(node)
+            if docstring:
                 lines.append(f'    """{docstring[:120]}"""')
 
-    return "\n".join(lines) if lines else path.read_text(errors="replace")[:500]
+    if lines:
+        return "\n".join(lines)
+
+    try:
+        return path.read_text(errors="replace")[:500]
+    except Exception:
+        return "[signature extraction failed]"
 
 
 def _extract_ts_signatures(path: Path) -> str:
-    """Regex-based TypeScript/JS/other signature extraction."""
     try:
         source = path.read_text(errors="replace")
     except Exception:
         return "[read error]"
 
-    lines: list[str] = []
     patterns = [
-        # export function / export async function
-        r'export\s+(?:async\s+)?function\s+\w+[^{]*',
-        # export const fn = (...) =>
-        r'export\s+const\s+\w+\s*=\s*(?:async\s*)?\([^)]*\)\s*(?::\s*[^=>{]+)?(?:=>)?',
-        # export class / abstract class
-        r'(?:export\s+)?(?:abstract\s+)?class\s+\w+[^{]*',
-        # export interface
-        r'export\s+interface\s+\w+[^{]*',
-        # export type
-        r'export\s+type\s+\w+\s*=\s*[^;]+',
-        # export enum
-        r'export\s+enum\s+\w+',
-        # @Component / @Injectable decorators
-        r'@\w+\([^)]*\)',
+        r"export\s+(?:async\s+)?function\s+\w+[^{]*",
+        r"export\s+const\s+\w+\s*=\s*(?:async\s*)?\([^)]*\)\s*(?::\s*[^=>{]+)?(?:=>)?",
+        r"(?:export\s+)?(?:abstract\s+)?class\s+\w+[^{]*",
+        r"export\s+interface\s+\w+[^{]*",
+        r"export\s+type\s+\w+\s*=\s*[^;]+",
+        r"export\s+enum\s+\w+",
+        r"@\w+\([^)]*\)",
     ]
+
     combined = re.compile("|".join(f"(?:{p})" for p in patterns))
+    lines: list[str] = []
 
     for match in combined.finditer(source):
         sig = match.group().strip()
-        sig = re.sub(r'\s+', ' ', sig)[:200]
+        sig = re.sub(r"\s+", " ", sig)[:200]
         lines.append(sig)
 
     return "\n".join(lines) if lines else source[:500]
@@ -717,26 +802,25 @@ def _extract_ts_signatures(path: Path) -> str:
 
 _MAP_SYSTEM = textwrap.dedent("""
     You are a senior software architect performing a codebase intake.
-    You will receive the extracted signatures and structure of a codebase.
+    You will receive extracted signatures and structure of a codebase.
     Your job is to produce a structured codebase_map.md document.
 
-    Output a SINGLE markdown document with these sections (no extra commentary):
+    Output a SINGLE markdown document with these sections, no extra commentary:
 
     # Codebase Map
     _Generated: {date} | Absorber v1_
 
     ## Project Overview
     [3-4 paragraph summary: what the system does, primary tech stack,
-     architectural style (monolith/micro/serverless), key patterns observed]
+     architectural style, and key patterns observed]
 
     ## Module Inventory
-    [For each logical module/directory, a subsection:
+    [For each logical module/directory:
      ### <module-name>
      - **Purpose**: one sentence
      - **Key files**: comma-separated
      - **Primary exports**: function/class names
-     - **Depends on**: other modules
-    ]
+     - **Depends on**: other modules]
 
     ## Entry Points & Call Flows
     [Top 3-5 most important call chains, traced from entry to outcome]
@@ -752,7 +836,7 @@ _MAP_SYSTEM = textwrap.dedent("""
      deprecated patterns — be specific with file names]
 
     ## Absorber Notes
-    [Any ambiguities, files that could not be parsed, recommended follow-ups]
+    [Ambiguities, files that could not be parsed, recommended follow-ups]
 """).strip()
 
 
@@ -761,30 +845,25 @@ def call_llm_for_map(
     target_name: str,
     model: str = _MODEL,
 ) -> str:
-    """Single LLM call to synthesize codebase_map.md from extracted content."""
     api_key, base_url, model_id = _resolve_model(model)
 
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    system   = _MAP_SYSTEM.replace("{date}", date_str)
-    user     = (
-        f"Codebase: {target_name}\n\n"
-        f"Extracted content:\n\n{context}"
-    )
+    system = _MAP_SYSTEM.replace("{date}", date_str)
+    user = f"Codebase: {target_name}\n\nExtracted content:\n\n{context}"
 
     tokens_est = len(context) // 4
     print(f"[01] LLM call: {model_id} | ~{tokens_est:,} input tokens")
 
-    # Validate API key early — httpx raises a cryptic error if the key is empty
     if not api_key or not api_key.strip():
         env_var = (
-            "GEMINI_API_KEY"     if model.startswith(("gemini/", "gemini-")) else
-            "DEEPSEEK_API_KEY"   if model.startswith("deepseek")             else
-            "OPENROUTER_API_KEY" if "/" in model                             else
+            "GEMINI_API_KEY" if model.startswith(("gemini/", "gemini-")) else
+            "DEEPSEEK_API_KEY" if model.startswith("deepseek") else
+            "OPENROUTER_API_KEY" if "/" in model else
             "OPENAI_API_KEY"
         )
         raise ValueError(
             f"API key not set. Export {env_var} and retry.\n"
-            f"  e.g.  export {env_var}=<your-key>\n"
+            f"  e.g. export {env_var}=<your-key>\n"
             f"  or pass --skip-llm to skip LLM synthesis."
         )
 
@@ -801,32 +880,34 @@ def call_llm_for_map(
                     "max_tokens": _MAX_TOKENS_MAP,
                     "messages": [
                         {"role": "system", "content": system},
-                        {"role": "user",   "content": user},
+                        {"role": "user", "content": user},
                     ],
                     "temperature": 0.2,
                 },
             )
             resp.raise_for_status()
-            data         = resp.json()
-            choice       = data["choices"][0]
-            content      = choice["message"]["content"]
+            data = resp.json()
+            choice = data["choices"][0]
+            content = choice["message"]["content"]
             finish_reason = choice.get("finish_reason", "unknown")
+
             if finish_reason == "length":
                 print(
-                    f"[01][warn] LLM output was truncated (finish_reason=length). "
-                    f"Consider increasing _MAX_TOKENS_MAP (currently {_MAX_TOKENS_MAP}) "
+                    f"[01][warn] LLM output was truncated. "
+                    f"Consider increasing _MAX_TOKENS_MAP={_MAX_TOKENS_MAP} "
                     f"or reducing codebase context."
                 )
             else:
                 print(f"[01] LLM finish_reason: {finish_reason}")
+
             return content
+
     except Exception as e:
         print(f"[01][error] LLM call failed: {e}", file=sys.stderr)
         raise
 
 
 def _resolve_model(model: str) -> tuple[str, str, str]:
-    """Return (api_key, base_url, model_id) for the given model string."""
     if model.startswith("gemini/") or model.startswith("gemini-"):
         model_id = model.split("/")[-1]
         return (
@@ -834,53 +915,71 @@ def _resolve_model(model: str) -> tuple[str, str, str]:
             "https://generativelanguage.googleapis.com/v1beta/openai",
             model_id,
         )
-    elif model.startswith("deepseek"):
+
+    if model.startswith("deepseek"):
         return (
             os.environ.get("DEEPSEEK_API_KEY", os.environ.get("OPENAI_API_KEY", "")),
             "https://api.deepseek.com/v1",
             model.split("/")[-1],
         )
-    elif "/" in model:
-        # OpenRouter format: provider/model
+
+    if "/" in model:
         return (
             os.environ.get("OPENROUTER_API_KEY", ""),
             "https://openrouter.ai/api/v1",
             model,
         )
-    else:
-        return (
-            os.environ.get("OPENAI_API_KEY", ""),
-            "https://api.openai.com/v1",
-            model,
-        )
+
+    return (
+        os.environ.get("OPENAI_API_KEY", ""),
+        "https://api.openai.com/v1",
+        model,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Phase 4 — Config inventory → config_map.json
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Module-level so both build_config_map and tests can import directly
-_SERVICE_PATTERNS: dict[str, re.Pattern] = {
-    "database":   re.compile(r'(?:postgres|mysql|mongodb|redis|sqlite|db_|database|connectionstring)', re.I),
-    "messaging":  re.compile(r'(?:kafka|rabbitmq|sqs|sns|pubsub|amqp)', re.I),
-    "auth":       re.compile(r'(?:auth|oauth|jwt|saml|sso|oidc|keycloak|openiddict)', re.I),
-    "storage":    re.compile(r'(?:s3|gcs|azure_blob|minio|storage|bucket)', re.I),
-    "monitoring": re.compile(r'(?:datadog|newrelic|prometheus|grafana|sentry|cloudwatch)', re.I),
-    "email":      re.compile(r'(?:smtp|sendgrid|ses|mailgun|email)', re.I),
-    "cloud":      re.compile(r'(?:aws|gcp|azure|heroku|fly\.io|ecs|fargate|cloudformation)', re.I),
+_SERVICE_PATTERNS: dict[str, re.Pattern[str]] = {
+    "database": re.compile(
+        r"(?:postgres|mysql|mongodb|redis|sqlite|db_|database|connectionstring)",
+        re.I,
+    ),
+    "messaging": re.compile(
+        r"(?:kafka|rabbitmq|sqs|sns|pubsub|amqp)",
+        re.I,
+    ),
+    "auth": re.compile(
+        r"(?:auth|oauth|jwt|saml|sso|oidc|keycloak|openiddict)",
+        re.I,
+    ),
+    "storage": re.compile(
+        r"(?:s3|gcs|azure_blob|minio|storage|bucket)",
+        re.I,
+    ),
+    "monitoring": re.compile(
+        r"(?:datadog|newrelic|prometheus|grafana|sentry|cloudwatch)",
+        re.I,
+    ),
+    "email": re.compile(
+        r"(?:smtp|sendgrid|ses|mailgun|email)",
+        re.I,
+    ),
+    "cloud": re.compile(
+        r"(?:aws|gcp|azure|heroku|fly\.io|ecs|fargate|cloudformation)",
+        re.I,
+    ),
 }
 
 
 def _extract_env_vars_from_raw(path: Path, ext: str) -> set[str]:
     """
-    Extract env var names from raw (un-redacted) config/template content.
+    Extract env var names from raw config/template content.
 
-    Covers:
-      - ${VAR} and $VAR shell-style interpolation
-      - process.env.VAR (Node.js)
-      - KEY=value lines (.env files)
-      - SECTION__KEY double-underscore notation (.NET / container env overrides)
+    ext is kept for compatibility with tests/importers.
     """
+    _ = ext
     try:
         raw = path.read_text(errors="replace")
     except Exception:
@@ -889,54 +988,42 @@ def _extract_env_vars_from_raw(path: Path, ext: str) -> set[str]:
 
 
 def _parse_env_vars_from_text(raw: str) -> set[str]:
-    """Core env var extraction logic — operates on a raw string.
+    """
+    Extract env var-like names from raw text.
 
-    Covers four sources:
-      1. ${VAR} / $VAR — shell-style interpolation (docker-compose, CloudFormation Fn::Sub)
-      2. process.env.VAR — Node.js env references
-      3. KEY=value lines — .env file style
-      4. SECTION__KEY — .NET double-underscore env override notation
-      5. JSON top-level keys — appsettings.json PascalCase keys converted to SCREAMING_SNAKE
-         (e.g. "ConnectionStrings" → CONNECTION_STRINGS, "App" → APP)
-         This covers ABP/.NET configs that don't use ${VAR} syntax.
+    Covers:
+      1. ${VAR} and $VAR
+      2. process.env.VAR
+      3. KEY=value lines
+      4. SECTION__KEY .NET/container overrides
+      5. JSON top-level keys converted to SCREAMING_SNAKE
     """
     env_vars: set[str] = set()
 
-    # 1. ${VAR} and $VAR
-    for match in re.findall(r'\$\{([A-Z_][A-Z0-9_]*)\}|\$([A-Z_][A-Z0-9_]*)', raw):
+    for match in re.findall(r"\$\{([A-Z_][A-Z0-9_]*)\}|\$([A-Z_][A-Z0-9_]*)", raw):
         env_vars.update(g for g in match if g)
 
-    # 2. process.env.VAR (case-insensitive key name)
     env_vars.update(re.findall(
-        r'process\.env\.([A-Z_][A-Z0-9_]*)',
+        r"process\.env\.([A-Z_][A-Z0-9_]*)",
         raw,
         re.IGNORECASE,
     ))
 
-    # 3. KEY=value lines — .env style
     env_vars.update(re.findall(
-        r'^\s*([A-Z_][A-Z0-9_]*)\s*=',
+        r"^\s*([A-Z_][A-Z0-9_]*)\s*=",
         raw,
         re.MULTILINE,
     ))
 
-    # 4. SECTION__KEY double-underscore (.NET environment variable overrides)
     env_vars.update(re.findall(
-        r'([A-Z_][A-Z0-9_]*(?:__[A-Z0-9_]+)+)',
+        r"([A-Z_][A-Z0-9_]*(?:__[A-Z0-9_]+)+)",
         raw,
     ))
 
-    # 5. JSON top-level keys → SCREAMING_SNAKE
-    # Covers appsettings.json / appsettings.*.json patterns where .NET apps
-    # expose config keys as env vars using double-underscore notation.
-    # Only lift keys that look like config sections (PascalCase or ALLCAPS, ≥3 chars).
     json_keys = re.findall(r'"([A-Za-z][A-Za-z0-9]{2,})"\s*:', raw)
     for key in json_keys:
-        # Convert PascalCase/camelCase → SCREAMING_SNAKE
-        # e.g. ConnectionStrings → CONNECTION_STRINGS, App → APP, authServer → AUTH_SERVER
-        screaming = re.sub(r'(?<=[a-z0-9])(?=[A-Z])', '_', key).upper()
-        # Only include keys that are plausibly env-var-shaped (all caps, underscores, ≥3 chars)
-        if re.match(r'^[A-Z][A-Z0-9_]{2,}$', screaming):
+        screaming = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", key).upper()
+        if re.match(r"^[A-Z][A-Z0-9_]{2,}$", screaming):
             env_vars.add(screaming)
 
     return env_vars
@@ -947,11 +1034,10 @@ def build_config_map(
     cache: dict[str, Any],
 ) -> dict[str, Any]:
     """
-    Aggregate key-only config files into a structured config inventory.
+    Aggregate key-only config files into config_map.json.
 
-    Env var detection reads from the RAW source file (before redaction) so that
-    ${VAR}, process.env.VAR, and .env KEY= references are never lost to the
-    redaction pass.  Service detection scans both raw and redacted content.
+    Env var detection reads raw source file where possible, not redacted content,
+    to avoid losing ${VAR}, process.env.VAR, and KEY=value references.
     """
     config_files: list[dict[str, Any]] = []
     all_env_vars: set[str] = set()
@@ -963,53 +1049,47 @@ def build_config_map(
 
         rel_path = entry["rel_path"]
 
-        # Skip pure build/tooling files — they add noise, not signal
         if not _should_include_in_config_inventory(rel_path):
             continue
 
         abs_path = Path(entry.get("abs_path", ""))
-        ext      = entry["ext"]
 
-        # Read raw content for accurate env var + service detection.
-        # Fall back to cached content when abs_path is unavailable (e.g. tests).
         raw = ""
         if abs_path.exists():
             try:
                 raw = abs_path.read_text(errors="replace")
             except Exception:
-                pass
+                raw = ""
+
         if not raw:
             raw = cache.get(rel_path, {}).get("content", "")
 
-        # Redacted content (from cache) as fallback for service scan
         redacted = cache.get(rel_path, {}).get("content", "")
 
-        # Env vars — always from raw to avoid losing context after redaction
         file_env_vars = _parse_env_vars_from_text(raw)
         all_env_vars.update(file_env_vars)
 
-        # Services — prefer raw; fall back to redacted if raw unavailable
         service_scan_text = raw or redacted
         file_services: list[str] = []
+
         for svc_name, pattern in _SERVICE_PATTERNS.items():
             if pattern.search(service_scan_text):
                 file_services.append(svc_name)
                 all_services.add(svc_name)
 
         config_files.append({
-            "path":     rel_path,
+            "path": rel_path,
             "env_vars": sorted(file_env_vars),
             "services": sorted(file_services),
         })
 
     return {
-        "generated":         datetime.now(timezone.utc).isoformat(),
-        "total_configs":     len(config_files),
+        "generated": datetime.now(timezone.utc).isoformat(),
+        "total_configs": len(config_files),
         "services_detected": sorted(all_services),
         "env_vars_detected": sorted(all_env_vars),
-        "files":             config_files,
+        "files": config_files,
     }
-
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1017,66 +1097,67 @@ def build_config_map(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _ask_git_scope() -> str:
-    """Interactive prompt to choose git history scope."""
     print("\n[01] Git history scope:")
     print("  1. Last 3 months")
     print("  2. Last 6 months")
     print("  3. Last 1 year")
     print("  4. All history")
-    print("  5. Custom (number of commits or date range e.g. '500' or '2024-01-01')")
-    choice = input("→ Choose [1-5]: ").strip()
+    print("  5. Custom: number of commits or date, e.g. 500 or 2024-01-01")
 
+    choice = input("→ Choose [1-5]: ").strip()
     mapping = {"1": "3m", "2": "6m", "3": "1y", "4": "all"}
+
     if choice in mapping:
         return mapping[choice]
-    elif choice == "5":
-        custom = input("  Enter commits count or start date (YYYY-MM-DD): ").strip()
-        return custom
-    else:
-        print("[01] Invalid choice, defaulting to 6 months.")
-        return "6m"
+
+    if choice == "5":
+        custom = input("  Enter commits count or start date YYYY-MM-DD: ").strip()
+        return custom or "6m"
+
+    print("[01] Invalid choice, defaulting to 6 months.")
+    return "6m"
 
 
 def _scope_to_git_args(scope: str) -> list[str]:
-    """Convert scope string to git log arguments."""
     if scope == "all":
         return []
-    elif scope.endswith("m"):
-        months = int(scope[:-1])
-        return [f"--since={months} months ago"]
-    elif scope.endswith("y"):
-        years = int(scope[:-1])
-        return [f"--since={years} years ago"]
-    elif scope.isdigit():
-        return [f"-n", scope]
-    elif re.match(r'\d{4}-\d{2}-\d{2}', scope):
+
+    if scope.endswith("m") and scope[:-1].isdigit():
+        return [f"--since={int(scope[:-1])} months ago"]
+
+    if scope.endswith("y") and scope[:-1].isdigit():
+        return [f"--since={int(scope[:-1])} years ago"]
+
+    if scope.isdigit():
+        return ["-n", scope]
+
+    if re.match(r"\d{4}-\d{2}-\d{2}", scope):
         return [f"--since={scope}"]
-    else:
-        return [f"--since=6 months ago"]
+
+    return ["--since=6 months ago"]
 
 
 def crawl_git(target: Path, scope: str) -> dict[str, Any] | None:
-    """
-    Crawl git history for the target repo.
-    Returns structured git_history dict or None if not a git repo.
-    """
     git_dir = target / ".git"
     if not git_dir.exists():
         print("[01] No .git directory found — skipping git crawl.")
         return None
 
-    scope_args = _scope_to_git_args(scope)
-
-    # Get commit log
     git_cmd = [
-        "git", "-C", str(target), "log",
+        "git",
+        "-C",
+        str(target),
+        "log",
         "--format=%H|||%ai|||%ae|||%s",
         "--numstat",
-    ] + scope_args
+    ] + _scope_to_git_args(scope)
 
     try:
         result = subprocess.run(
-            git_cmd, capture_output=True, text=True, timeout=60,
+            git_cmd,
+            capture_output=True,
+            text=True,
+            timeout=60,
         )
     except subprocess.TimeoutExpired:
         print("[01][warn] git log timed out — skipping git crawl.")
@@ -1091,80 +1172,79 @@ def crawl_git(target: Path, scope: str) -> dict[str, Any] | None:
         print("[01] No commits found for scope.")
         return None
 
-    # Build file churn stats
-    churn: dict[str, dict] = {}
+    churn: dict[str, dict[str, Any]] = {}
     for commit in commits:
-        for f in commit.get("files_changed", []):
-            if f not in churn:
-                churn[f] = {"count": 0, "authors": set()}
-            churn[f]["count"] += 1
-            churn[f]["authors"].add(commit["author"])
+        for fpath in commit.get("files_changed", []):
+            if fpath not in churn:
+                churn[fpath] = {"count": 0, "authors": set()}
+            churn[fpath]["count"] += 1
+            churn[fpath]["authors"].add(commit["author"])
 
     hotspots = sorted(
         [
             {
-                "file":         fp,
+                "file": fp,
                 "change_count": data["count"],
-                "authors":      sorted(data["authors"]),
+                "authors": sorted(data["authors"]),
             }
             for fp, data in churn.items()
         ],
         key=lambda x: x["change_count"],
         reverse=True,
-    )[:50]  # Top 50 hotspots
+    )[:50]
 
-    # Collect unique authors
     authors = sorted({c["author"] for c in commits})
 
     return {
-        "scope":         scope,
-        "generated":     datetime.now(timezone.utc).isoformat(),
+        "scope": scope,
+        "generated": datetime.now(timezone.utc).isoformat(),
         "total_commits": len(commits),
-        "authors":       authors,
-        "hotspots":      hotspots,
-        "commits":       commits,
+        "authors": authors,
+        "hotspots": hotspots,
+        "commits": commits,
     }
 
 
-def _parse_git_log(raw: str) -> list[dict]:
-    """Parse git log --format=%H|||%ai|||%ae|||%s --numstat output."""
-    commits: list[dict] = []
-    current: dict | None = None
+def _parse_git_log(raw: str) -> list[dict[str, Any]]:
+    commits: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
 
     for line in raw.splitlines():
-        # Strip leading/trailing whitespace to handle indented test fixtures
-        # and trailing spaces, but preserve the tab structure of numstat lines.
         stripped = line.strip()
 
         if "|||" in stripped:
-            # New commit header
             if current is not None:
                 commits.append(current)
+
             parts = stripped.split("|||", 3)
             if len(parts) < 4:
+                current = None
                 continue
+
             current = {
-                "hash":          parts[0][:7],   # 7-char short hash (git convention)
-                "date":          parts[1][:10],
-                "author":        parts[2],
-                "message":       parts[3][:200],
+                "hash": parts[0][:7],
+                "date": parts[1][:10],
+                "author": parts[2],
+                "message": parts[3][:200],
                 "files_changed": [],
-                "insertions":    0,
-                "deletions":     0,
+                "insertions": 0,
+                "deletions": 0,
             }
+
         elif current is not None and stripped:
-            # numstat line: insertions \t deletions \t filename
-            # Use the stripped version for splitting (tabs preserved after strip)
             parts = stripped.split("\t", 2)
-            if len(parts) == 3:
-                ins_str, del_str, fname = parts
-                try:
-                    current["insertions"] += int(ins_str) if ins_str != "-" else 0
-                    current["deletions"]  += int(del_str) if del_str != "-" else 0
-                except ValueError:
-                    pass
-                if fname:
-                    current["files_changed"].append(fname)
+            if len(parts) != 3:
+                continue
+
+            ins_str, del_str, fname = parts
+            try:
+                current["insertions"] += int(ins_str) if ins_str != "-" else 0
+                current["deletions"] += int(del_str) if del_str != "-" else 0
+            except ValueError:
+                pass
+
+            if fname:
+                current["files_changed"].append(fname)
 
     if current is not None:
         commits.append(current)
@@ -1173,10 +1253,9 @@ def _parse_git_log(raw: str) -> list[dict]:
 
 
 def build_blame_map(git_data: dict[str, Any]) -> str:
-    """Generate human-readable blame_map.md from git history data."""
-    now    = git_data["generated"][:10]
-    scope  = git_data["scope"]
-    total  = git_data["total_commits"]
+    now = git_data["generated"][:10]
+    scope = git_data["scope"]
+    total = git_data["total_commits"]
     authors = git_data["authors"]
 
     lines: list[str] = [
@@ -1185,13 +1264,13 @@ def build_blame_map(git_data: dict[str, Any]) -> str:
         "",
         "## Team",
         f"Active contributors: {', '.join(authors[:10])}"
-        + (f" (+{len(authors)-10} more)" if len(authors) > 10 else ""),
+        + (f" (+{len(authors) - 10} more)" if len(authors) > 10 else ""),
         "",
     ]
 
     hotspots = git_data.get("hotspots", [])
-    high     = [h for h in hotspots if h["change_count"] >= 10]
-    medium   = [h for h in hotspots if 5 <= h["change_count"] < 10]
+    high = [h for h in hotspots if h["change_count"] >= 10]
+    medium = [h for h in hotspots if 5 <= h["change_count"] < 10]
 
     if high:
         lines += [
@@ -1203,7 +1282,7 @@ def build_blame_map(git_data: dict[str, Any]) -> str:
         for h in high[:20]:
             auth_str = ", ".join(h["authors"][:3])
             if len(h["authors"]) > 3:
-                auth_str += f" (+{len(h['authors'])-3})"
+                auth_str += f" (+{len(h['authors']) - 3})"
             lines.append(f"| `{h['file']}` | {h['change_count']} | {auth_str} |")
         lines.append("")
 
@@ -1218,12 +1297,11 @@ def build_blame_map(git_data: dict[str, Any]) -> str:
             lines.append(f"| `{h['file']}` | {h['change_count']} |")
         lines.append("")
 
-    # Module-level activity summary
     module_activity: dict[str, int] = {}
     for h in hotspots:
         parts = h["file"].split("/")
         if len(parts) >= 2:
-            module = parts[0] if parts[0] not in ("src",) else parts[1]
+            module = parts[0] if parts[0] != "src" else parts[1]
             module_activity[module] = module_activity.get(module, 0) + h["change_count"]
 
     if module_activity:
@@ -1238,112 +1316,183 @@ def build_blame_map(git_data: dict[str, Any]) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main orchestrator
+# Main orchestrator helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_extraction_context(
     inventory: list[dict[str, Any]],
     cache: dict[str, Any],
 ) -> str:
-    """
-    Assemble the full extraction context string for the LLM call.
-    Groups files by directory and truncates very long individual extractions.
-    """
-    _MAX_PER_FILE = 2000  # chars
-    _MAX_TOTAL    = 800_000  # chars (~200k tokens for Gemini)
+    _MAX_PER_FILE = 2000
+    _MAX_TOTAL = 800_000
 
     sections: list[str] = []
     total_chars = 0
 
-    # Group by top-level directory
-    groups: dict[str, list[dict]] = {}
+    groups: dict[str, list[dict[str, Any]]] = {}
     for entry in inventory:
         parts = entry["rel_path"].split("/")
-        top   = parts[0] if len(parts) > 1 else "(root)"
+        top = parts[0] if len(parts) > 1 else "(root)"
         groups.setdefault(top, []).append(entry)
 
     for group_name, entries in sorted(groups.items()):
         group_lines = [f"\n## {group_name}/\n"]
+
         for entry in entries:
-            rel  = entry["rel_path"]
+            rel = entry["rel_path"]
             lang = entry["lang"] or ""
             content = cache.get(rel, {}).get("content", "")
+
             if not content:
                 continue
+
             if len(content) > _MAX_PER_FILE:
-                content = content[:_MAX_PER_FILE] + f"\n... [truncated, {len(content)} chars total]"
-            group_lines.append(f"### {rel} ({lang}, {entry['mode']})\n```\n{content}\n```\n")
+                content = (
+                    content[:_MAX_PER_FILE]
+                    + f"\n... [truncated, {len(content)} chars total]"
+                )
+
+            group_lines.append(
+                f"### {rel} ({lang}, {entry['mode']})\n"
+                f"```\n{content}\n```\n"
+            )
 
         chunk = "\n".join(group_lines)
         if total_chars + len(chunk) > _MAX_TOTAL:
-            sections.append(f"\n[...{len(inventory) - len(sections)} more files truncated due to context limit]")
+            sections.append(
+                f"\n[...context truncated due to {_MAX_TOTAL:,} char limit]"
+            )
             break
+
         sections.append(chunk)
         total_chars += len(chunk)
 
     return "\n".join(sections)
 
 
-def main() -> None:
+def _configure_project(
+    project: str | None,
+    parser: argparse.ArgumentParser,
+) -> None:
+    """
+    Configure project context for direct execution.
+
+    Harness normally sets PIPELINE_PROJECT before invoking this script.
+    Direct usage can pass --project.
+    """
+    if project:
+        os.environ["PIPELINE_PROJECT"] = project
+        return
+
+    if os.environ.get("PIPELINE_PROJECT"):
+        return
+
+    parser.error(
+        "PIPELINE_PROJECT is not set. Use --project <name> or export "
+        "PIPELINE_PROJECT=<name> before running 01_absorber.py directly."
+    )
+
+
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Absorb a codebase into the pipeline knowledge layer.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""
             Examples:
-              python 01_absorber.py                         # interactive
-              python 01_absorber.py --git-scope 6m          # last 6 months
-              python 01_absorber.py --git-scope 500         # last 500 commits
-              python 01_absorber.py --git-scope all         # full history
-              python 01_absorber.py --skip-git              # skip git crawl
-              python 01_absorber.py --force                 # ignore cache
-              python 01_absorber.py --target /path/to/repo  # explicit target
-              python 01_absorber.py --dry-run               # scan only
+              python 01_absorber.py --project my-app
+              PIPELINE_PROJECT=my-app python 01_absorber.py
+
+              python 01_absorber.py --project my-app --git-scope 6m
+              python 01_absorber.py --project my-app --git-scope 500
+              python 01_absorber.py --project my-app --git-scope all
+              python 01_absorber.py --project my-app --skip-git
+              python 01_absorber.py --project my-app --force
+              python 01_absorber.py --project my-app --target /path/to/repo
+              python 01_absorber.py --project my-app --dry-run
         """),
     )
+
     parser.add_argument(
-        "--target", type=Path, default=None,
-        help="Path to codebase root (default: artifacts_<slug>/ for current project)",
+        "--project",
+        default=None,
+        help=(
+            "Project name for direct execution. Sets PIPELINE_PROJECT before "
+            "resolving artifact paths."
+        ),
     )
     parser.add_argument(
-        "--git-scope", metavar="SCOPE", default=None,
-        help="Git history scope: 3m, 6m, 1y, all, N (commits), YYYY-MM-DD",
+        "--target",
+        type=Path,
+        default=None,
+        help="Path to codebase root. Default: artifacts_<slug>/ for current project.",
     )
     parser.add_argument(
-        "--skip-git", action="store_true",
-        help="Skip git crawl entirely",
+        "--git-scope",
+        metavar="SCOPE",
+        default=None,
+        help="Git history scope: 3m, 6m, 1y, all, N commits, or YYYY-MM-DD.",
     )
     parser.add_argument(
-        "--force", action="store_true",
-        help="Ignore absorber_cache.json — re-extract all files",
+        "--skip-git",
+        action="store_true",
+        help="Skip git crawl entirely.",
     )
     parser.add_argument(
-        "--dry-run", action="store_true",
-        help="Scan and report only — no LLM call, no file writes",
+        "--force",
+        action="store_true",
+        help="Ignore absorber_cache.json and re-extract all files.",
     )
     parser.add_argument(
-        "--skip-llm", action="store_true",
-        help="Skip LLM synthesis — write raw extraction only",
+        "--dry-run",
+        action="store_true",
+        help="Scan and report only. No LLM call and no file writes.",
     )
+    parser.add_argument(
+        "--skip-llm",
+        action="store_true",
+        help="Skip LLM synthesis and write raw extraction as codebase_map.md.",
+    )
+
+    return parser
+
+
+def main() -> None:
+    parser = _build_parser()
     args = parser.parse_args()
 
+    _configure_project(args.project, parser)
+
+    # Important: do not call ensure_dirs() at import-time.
+    # PIPELINE_PROJECT must be available before artifact paths are resolved.
+    ensure_dirs()
+
+    using_default_target = args.target is None
     target: Path = (args.target or artifact_root()).resolve()
+
     if not target.exists():
         print(f"[01][error] Target path does not exist: {target}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"\n{'─'*50}")
+    print(f"\n{'─' * 50}")
     print(f"  Absorber — {target.name}")
-    print(f"{'─'*50}\n")
+    print(f"{'─' * 50}\n")
 
     # ── Phase 1: File tree scan ───────────────────────────────────────────────
+
     print("[01] Phase 1 — Scanning file tree ...")
     rules_path = target / _IGNORED_FILE
-    rules      = AbsorberIgnoreRules(rules_path)
-    inventory  = scan_files(target, rules)
+    rules = AbsorberIgnoreRules(rules_path)
+
+    inventory = scan_files(
+        target,
+        rules,
+        skip_artifact_control_dirs=using_default_target,
+    )
 
     lang_counts: dict[str, int] = {}
     for entry in inventory:
-        lang_counts[entry["lang"] or "other"] = lang_counts.get(entry["lang"] or "other", 0) + 1
+        lang = entry["lang"] or "other"
+        lang_counts[lang] = lang_counts.get(lang, 0) + 1
 
     print(f"[01] Found {len(inventory)} files to process")
     for lang, count in sorted(lang_counts.items(), key=lambda x: -x[1])[:8]:
@@ -1352,75 +1501,101 @@ def main() -> None:
     mode_counts = {"full": 0, "key-only": 0, "signature-only": 0}
     for entry in inventory:
         mode_counts[entry["mode"]] = mode_counts.get(entry["mode"], 0) + 1
+
     print(f"[01] Extraction modes: {mode_counts}")
+
+    if using_default_target:
+        skipped = ", ".join(sorted(_ARTIFACT_CONTROL_DIRS))
+        print(f"[01] Default target detected; skipping artifact-control dirs: {skipped}")
 
     if args.dry_run:
         print("\n[01] --dry-run: stopping here. No files written.")
         return
 
     # ── Phase 2: Content extraction ───────────────────────────────────────────
+
     print("\n[01] Phase 2 — Extracting content ...")
     cache = _load_cache()
     cache_hits = 0
 
     for i, entry in enumerate(inventory, 1):
-        content, from_cache = extract_content(entry, cache, args.force)
+        _, from_cache = extract_content(entry, cache, args.force)
+
         if from_cache:
             cache_hits += 1
+
         if i % 50 == 0:
             print(f"     {i}/{len(inventory)} files processed ...")
 
-    total_chars = sum(len(cache.get(e["rel_path"], {}).get("content", "")) for e in inventory)
-    est_tokens  = total_chars // 4
+    total_chars = sum(
+        len(cache.get(e["rel_path"], {}).get("content", ""))
+        for e in inventory
+    )
+    est_tokens = total_chars // 4
+
     print(f"[01] Extracted {len(inventory)} files | cache hits: {cache_hits}")
     print(f"[01] Total content: {total_chars:,} chars (~{est_tokens:,} tokens)")
 
-    # Save cache after extraction
     _save_cache(cache)
     print(f"[01] ✓ Cache saved → {ABSORBER_CACHE}")
 
     # ── Phase 3: Semantic compression → codebase_map.md ──────────────────────
+
     if not args.skip_llm:
         print("\n[01] Phase 3 — Semantic compression (LLM) ...")
         context = _build_extraction_context(inventory, cache)
+
         try:
             codebase_map = call_llm_for_map(context, target.name)
+            CODEBASE_MAP.parent.mkdir(parents=True, exist_ok=True)
             CODEBASE_MAP.write_text(codebase_map)
             print(f"[01] ✓ Codebase map → {CODEBASE_MAP}")
         except Exception as e:
             print(f"[01][warn] LLM synthesis failed: {e} — skipping codebase_map.md")
     else:
-        # Write raw extraction as codebase_map for human review
         raw_context = _build_extraction_context(inventory, cache)
+        CODEBASE_MAP.parent.mkdir(parents=True, exist_ok=True)
         CODEBASE_MAP.write_text(
-            f"# Codebase Map (raw extraction — no LLM synthesis)\n\n{raw_context}"
+            "# Codebase Map (raw extraction — no LLM synthesis)\n\n"
+            + raw_context
         )
         print(f"[01] ✓ Raw extraction → {CODEBASE_MAP} (--skip-llm)")
 
     # ── Phase 4: Config inventory ─────────────────────────────────────────────
+
     print("\n[01] Phase 4 — Config inventory ...")
     config_map = build_config_map(inventory, cache)
+
+    CONFIG_MAP.parent.mkdir(parents=True, exist_ok=True)
     CONFIG_MAP.write_text(json.dumps(config_map, indent=2))
+
     print(f"[01] ✓ Config map → {CONFIG_MAP}")
     print(f"     Services detected: {', '.join(config_map['services_detected']) or 'none'}")
     print(f"     Env vars detected: {len(config_map['env_vars_detected'])}")
 
     # ── Phase 5: Git crawl ────────────────────────────────────────────────────
+
     if not args.skip_git:
         print("\n[01] Phase 5 — Git crawl ...")
-        scope = args.git_scope
-        if scope is None:
-            scope = _ask_git_scope()
 
+        scope = args.git_scope or _ask_git_scope()
         git_data = crawl_git(target, scope)
+
         if git_data:
+            GIT_HISTORY.parent.mkdir(parents=True, exist_ok=True)
             GIT_HISTORY.write_text(json.dumps(git_data, indent=2))
+
             print(f"[01] ✓ Git history → {GIT_HISTORY}")
-            print(f"     Commits: {git_data['total_commits']} | Authors: {len(git_data['authors'])}")
+            print(
+                f"     Commits: {git_data['total_commits']} | "
+                f"Authors: {len(git_data['authors'])}"
+            )
             print(f"     Hotspots: {len(git_data['hotspots'])} files")
 
             blame_md = build_blame_map(git_data)
+            BLAME_MAP.parent.mkdir(parents=True, exist_ok=True)
             BLAME_MAP.write_text(blame_md)
+
             print(f"[01] ✓ Blame map → {BLAME_MAP}")
         else:
             print("[01] Git crawl skipped or failed.")
@@ -1428,11 +1603,13 @@ def main() -> None:
         print("\n[01] Phase 5 — Git crawl skipped (--skip-git).")
 
     # ── Summary ───────────────────────────────────────────────────────────────
-    print(f"\n{'─'*50}")
+
+    print(f"\n{'─' * 50}")
     print(f"  Done — {target.name} absorbed")
-    print(f"{'─'*50}")
+    print(f"{'─' * 50}")
     print(f"  codebase_map.md  → {CODEBASE_MAP}")
     print(f"  config_map.json  → {CONFIG_MAP}")
+
     if not args.skip_git:
         print(f"  git_history.json → {GIT_HISTORY}")
         print(f"  blame_map.md     → {BLAME_MAP}")
