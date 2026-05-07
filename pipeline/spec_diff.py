@@ -4,14 +4,14 @@ Spec diff engine — detect what changed between spec versions and map to affect
 
 Reads:
     spec.md                              ← current spec (single source of truth)
-    artifacts/state/spec_applied.json    ← last successfully applied version
-    artifacts/knowledge/history/         ← raw spec snapshots per version
+    artifacts_<slug>/state/spec_applied.json    ← last successfully applied version
+    artifacts_<slug>/knowledge/history/         ← raw spec snapshots per version
 
 Writes:
-    artifacts/cache/spec_delta.json      ← delta for this run
-    artifacts/knowledge/history/<ver>.md ← raw snapshot of current spec
-    artifacts/knowledge/history/<ver>.changelog.md ← changelog entry
-    artifacts/knowledge/history/spec.changelog    ← aggregated changelog
+    artifacts_<slug>/cache/spec_delta.json      ← delta for this run
+    artifacts_<slug>/knowledge/history/<ver>.md ← raw snapshot of current spec
+    artifacts_<slug>/knowledge/history/<ver>.changelog.md ← changelog entry
+    artifacts_<slug>/knowledge/history/spec.changelog    ← aggregated changelog
 
 For taxonomy details see docs/artifacts.md
 """
@@ -27,15 +27,15 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
 # === WRITE AUTHORITY: spec_diff ===
-# OWNS  : artifacts/cache/spec_delta.json
-#         artifacts/state/spec_applied.json
-#         artifacts/knowledge/history/spec.changelog
+# OWNS  : artifacts_<slug>/cache/spec_delta.json
+#         artifacts_<slug>/state/spec_applied.json
+#         artifacts_<slug>/knowledge/history/spec.changelog
 # READS : spec.md
 
 import sys as _sys
 _sys.path.insert(0, str(Path(__file__).parent.parent))
 from artifacts.paths import (
-    ROOT, SPEC_PATH,
+    SPEC_PATH,
     HISTORY_DIR as KNOWLEDGE_HISTORY_DIR,
     SPEC_CHANGELOG as CHANGELOG,
     SPEC_DELTA as DELTA_OUT,
@@ -330,7 +330,7 @@ def _append_changelog(delta: "SpecDelta") -> None:
     lines.append("")
     entry = "\n".join(lines)
 
-    # Append to aggregated spec.changelog (CHANGELOG imported from artifacts/paths.py)
+    # Append to aggregated spec.changelog (CHANGELOG imported from artifacts_<slug>/paths.py)
     existing = changelog_path.read_text() if changelog_path.exists() else ""
     changelog_path.write_text(existing + entry)
 

@@ -4,18 +4,18 @@ Step 3a — Qwen 3.6 Plus as EXECUTOR (per-file generation).
 
 Modes:
     Default (--only-qwen, no plan):
-        One API call per stub file → src/<file>
+        One API call per stub file → artifacts_<slug>/src/<file>
         Falls back to original single-call behaviour if only 1 file.
 
     With GLM plan (--use-glm-plan):
-        Reads artifacts/state/plan.json produced by 03b_implement_glm.py.
+        Reads artifacts_<slug>/state/plan.json produced by 03b_implement_glm.py.
         For each file, injects the matching GLM task (sub_tasks, gotchas,
         tailwind_hints, depends_on) into the prompt before generating.
         Files are generated in implementation_order from the plan.
 
 Writes:
-    src/**                                    (non-test files only)
-    artifacts/run/impl_record.json
+    artifacts_<slug>/src/**                           (non-test files only)
+    artifacts_<slug>/run/impl_record.json
 
 For taxonomy details see docs/artifacts.md
 """
@@ -36,16 +36,19 @@ OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions"
 MODEL              = "qwen/qwen3.6-plus"
 
 # === WRITE AUTHORITY: 03a_implement_qwen ===
-# OWNS  : artifacts/run/impl_record.json
-# READS : spec.md, artifacts/state/scaffold.json, artifacts/state/plan.json
+# OWNS  : artifacts_<slug>/run/impl_record.json
+#         artifacts_<slug>/src/**
+# READS : artifacts_<slug>/spec.md, artifacts_<slug>/state/scaffold.json,
+#         artifacts_<slug>/state/plan.json
 
 import sys as _sys
 _sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent))
 from artifacts.paths import (
-    ROOT, SPEC_PATH, CACHE_DIR,
+    SPEC_PATH, CACHE_DIR,
     SCAFFOLD_JSON,
     PLAN_JSON as GLM_PLAN,
     IMPL_RECORD,
+    SRC_DIR,
     ensure_dirs,
 )
 ensure_dirs()
@@ -343,12 +346,12 @@ def _load_restored_files(only_set: set[str]) -> dict[str, str]:
     Loads only files NOT in only_set (i.e. the unaffected/restored ones).
     """
     restored: dict[str, str] = {}
-    src_dir = ROOT / "src"
+    src_dir = SRC_DIR
     if not src_dir.exists():
         return restored
     all_src = sorted(src_dir.rglob("*.ts")) + sorted(src_dir.rglob("*.tsx"))
     for p in all_src:
-        rel = str(p.relative_to(ROOT))
+        rel = "src/" + str(p.relative_to(src_dir))
         if rel not in only_set:
             try:
                 restored[rel] = p.read_text()
@@ -433,8 +436,8 @@ def main() -> None:
                 failed_files.append(fp)
                 continue
 
-            out_path = ROOT / fp
-            if not str(out_path).startswith(str(ROOT / "src")):
+            out_path = SRC_DIR / fp[len("src/"):]  if fp.startswith("src/") else SRC_DIR / fp
+            if not str(out_path).startswith(str(SRC_DIR)):
                 print(f"[03a] SKIP (outside src/): {fp}")
                 continue
 
@@ -442,7 +445,7 @@ def main() -> None:
             out_path.write_text(entry["code"])
             already_written[fp] = entry["code"]
             written.append(fp)
-            print(f"[03a] WROTE {fp}")
+            print(f"[03a] WROTE {out_path}")
 
     else:
         # Single-call: only send affected stubs, Qwen doesn't need the rest
@@ -456,14 +459,14 @@ def main() -> None:
 
         for entry in entries:
             fp = entry["file_path"]
-            out_path = ROOT / fp
-            if not str(out_path).startswith(str(ROOT / "src")):
+            out_path = SRC_DIR / fp[len("src/"):] if fp.startswith("src/") else SRC_DIR / fp
+            if not str(out_path).startswith(str(SRC_DIR)):
                 print(f"[03a] SKIP (outside src/): {fp}")
                 continue
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text(entry["code"])
             written.append(fp)
-            print(f"[03a] WROTE {fp}")
+            print(f"[03a] WROTE {out_path}")
 
     mode = "per-file-with-glm-plan" if plan else "single-call"
     if only_set:

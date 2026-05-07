@@ -11,15 +11,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 # === WRITE AUTHORITY: 05_report ===
-# OWNS  : artifacts/reports/summary.md
-# READS : artifacts/state/plan.json, artifacts/run/test_report.json,
-#         artifacts/state/scaffold.json, artifacts/cache/spec_delta.json,
-#         artifacts/run/impl_record.json, artifacts/reports/judge_report.md
+# OWNS  : artifacts_<slug>/reports/summary.md
+# READS : artifacts_<slug>/state/plan.json, artifacts_<slug>/run/test_report.json,
+#         artifacts_<slug>/state/scaffold.json, artifacts_<slug>/cache/spec_delta.json,
+#         artifacts_<slug>/run/impl_record.json, artifacts_<slug>/reports/judge_report.md
 
 import sys as _sys
 _sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent))
 from artifacts.paths import (
-    ROOT, REPORTS_DIR,
     PLAN_JSON as GLM_PLAN_PATH,
     TEST_REPORT,
     SCAFFOLD_JSON,

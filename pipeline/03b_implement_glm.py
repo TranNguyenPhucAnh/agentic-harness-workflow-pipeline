@@ -9,13 +9,13 @@ Role change rationale:
     *plan*, not code.  Qwen (03a) is the executor that turns the plan into src/.
 
 What this script does:
-    1. Read spec.md + artifacts/state/scaffold.json (stub files from Gemini).
+    1. Read artifacts_<slug>/spec.md + artifacts_<slug>/state/scaffold.json (stub files from Gemini).
     2. Call GLM 5.1 with reasoning ON — task: decompose each stub file into
        an ordered list of implementation tasks / sub-tasks.
-    3. Write artifacts/state/plan.json  ← consumed by 03a_implement_qwen.py
+    3. Write artifacts_<slug>/state/plan.json  ← consumed by 03a_implement_qwen.py
        when --use-glm-plan flag is passed.
 Writes:
-    artifacts/state/plan.json
+    artifacts_<slug>/state/plan.json
 
 Does NOT write any src/ files.  03a_implement_qwen.py is the sole executor.
 
@@ -35,13 +35,14 @@ OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions"
 MODEL              = "z-ai/glm-5.1"
 
 # === WRITE AUTHORITY: 03b_implement_glm ===
-# OWNS  : artifacts/state/plan.json
-# READS : spec.md (or cache/spec_compressed.md), artifacts/state/scaffold.json
+# OWNS  : artifacts_<slug>/state/plan.json
+# READS : artifacts_<slug>/spec.md (or cache/spec_compressed.md),
+#         artifacts_<slug>/state/scaffold.json
 
 import sys as _sys
 _sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent))
 from artifacts.paths import (
-    ROOT, SPEC_PATH,
+    SPEC_PATH,
     CACHE_DIR, SCAFFOLD_JSON,
     PLAN_JSON as PLAN_OUT,
     ensure_dirs,
@@ -112,7 +113,7 @@ Rules:
 # ── API call ──────────────────────────────────────────────────────────────────
 
 def _load_spec() -> str:
-    """Use compressed spec if available (artifacts/cache/), fallback to full spec."""
+    """Use compressed spec if available (artifacts_<slug>/cache/), fallback to full spec."""
     compressed = CACHE_DIR / "spec_compressed.md"
     if compressed.exists():
         return compressed.read_text()

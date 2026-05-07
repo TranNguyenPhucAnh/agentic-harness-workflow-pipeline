@@ -7,19 +7,18 @@ exits 0).  Aggregates all pipeline artefacts into a single briefing, sends to
 DeepSeek V3.2 for deep review, writes reports/judge_report.md.
 
 Reads:
-    spec.md
-    artifacts/state/scaffold.json
-    artifacts/state/plan.json (optional — present if GLM planner ran)
-    artifacts/run/impl_record.json
-    artifacts/run/test_report.json
-    src/**/*.ts  src/**/*.tsx        (final implemented source)
-    tests/**/*.ts  tests/**/*.tsx    (test files for reference)
-    artifacts/cache/spec_delta.json (if partial run)
-    artifacts/knowledge/current/spec_addendum.md (if exists)
+    artifacts_<slug>/spec.md
+    artifacts_<slug>/state/scaffold.json
+    artifacts_<slug>/state/plan.json (optional — present if GLM planner ran)
+    artifacts_<slug>/run/impl_record.json
+    artifacts_<slug>/run/test_report.json
+    artifacts_<slug>/src/**  artifacts_<slug>/tests/**
+    artifacts_<slug>/cache/spec_delta.json (if partial run)
+    artifacts_<slug>/knowledge/current/spec_addendum.md (if exists)
 
 Writes:
-    reports/judge_report.md         ← human-readable final report
-    reports/judge_raw.json          ← full model response + metadata
+    artifacts_<slug>/reports/judge_report.md   ← human-readable final report
+    artifacts_<slug>/run/judge_raw.json        ← full model response + metadata
 
 For taxonomy details see docs/artifacts.md
 """
@@ -40,17 +39,18 @@ OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions"
 MODEL              = "deepseek/deepseek-v3.2"
 
 # === WRITE AUTHORITY: 06_judge_deepseek ===
-# OWNS  : artifacts/run/judge_raw.json
-#         artifacts/knowledge/current/spec_addendum.md
-#         artifacts/reports/judge_report.md
-# READS : artifacts/state/scaffold.json, artifacts/state/plan.json,
-#         artifacts/run/impl_record.json, artifacts/run/test_report.json,
-#         artifacts/cache/spec_delta.json, artifacts/cache/spec_compressed.md
+# OWNS  : artifacts_<slug>/run/judge_raw.json
+#         artifacts_<slug>/knowledge/current/spec_addendum.md
+#         artifacts_<slug>/reports/judge_report.md
+# READS : artifacts_<slug>/state/scaffold.json, artifacts_<slug>/state/plan.json,
+#         artifacts_<slug>/run/impl_record.json, artifacts_<slug>/run/test_report.json,
+#         artifacts_<slug>/cache/spec_delta.json, artifacts_<slug>/cache/spec_compressed.md
 
 import sys as _sys
 _sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent))
 from artifacts.paths import (
-    ROOT, REPORTS_DIR,
+    SPEC_PATH,
+    SRC_DIR, TESTS_DIR,
     SCAFFOLD_JSON,
     PLAN_JSON as GLM_PLAN_PATH,
     IMPL_RECORD,
@@ -119,7 +119,7 @@ NEEDS_REVISION  → one or more blocking issues found
 def _load_spec() -> str:
     if SPEC_COMPRESSED.exists():
         return SPEC_COMPRESSED.read_text()
-    return (ROOT / "spec.md").read_text()
+    return SPEC_PATH.read_text()
 
 
 def _load_delta() -> dict | None:
@@ -145,9 +145,11 @@ def _read_safe(path: Path, label: str) -> str:
 
 def _collect_src_files(src_dir: Path) -> dict[str, str]:
     files: dict[str, str] = {}
+    # Determine prefix from the dir name (src or tests)
+    prefix = src_dir.name + "/"
     for ext in ("*.ts", "*.tsx"):
         for p in sorted(src_dir.rglob(ext)):
-            rel = str(p.relative_to(ROOT))
+            rel = prefix + str(p.relative_to(src_dir))
             files[rel] = p.read_text()
     return files
 
@@ -155,7 +157,7 @@ def _collect_src_files(src_dir: Path) -> dict[str, str]:
 def _collect_changed_files(src_dir: Path) -> dict[str, str]:
     """
     Collect source files whose content differs from the original stub.
-    Reads stub_map from artifacts/state/scaffold.json to detect changes.
+    Reads stub_map from artifacts_<slug>/state/scaffold.json to detect changes.
     """
     stub_map: dict[str, str] = {}
     if SCAFFOLD_JSON.exists():
@@ -168,7 +170,7 @@ def _collect_changed_files(src_dir: Path) -> dict[str, str]:
     changed: dict[str, str] = {}
     for ext in ("*.ts", "*.tsx"):
         for p in sorted(src_dir.rglob(ext)):
-            rel = str(p.relative_to(ROOT))
+            rel = "src/" + str(p.relative_to(src_dir))
             if not rel.startswith("src/"):
                 continue
             current = p.read_text()
@@ -291,11 +293,11 @@ def build_briefing() -> str:
         parts.append("\n".join(lines))
 
     # 5. Source files — scope to affected only on partial runs
-    src_dir = ROOT / "src"
+    src_dir = SRC_DIR
     if is_partial and affected_set:
         primary: dict[str, str] = {}
         for fp in sorted(affected_set):
-            p = ROOT / fp
+            p = SRC_DIR / fp.replace("src/", "", 1) if fp.startswith("src/") else SRC_DIR / fp
             if p.exists():
                 primary[fp] = p.read_text()
         src_block = "\n\n".join(
@@ -317,7 +319,7 @@ def build_briefing() -> str:
         if skipped_paths:
             secondary_lines = ["## 5b. Reused Files — signatures only (not re-implemented)\n"]
             for fp in skipped_paths:
-                p = ROOT / fp
+                p = SRC_DIR / fp.replace("src/", "", 1) if fp.startswith("src/") else SRC_DIR / fp
                 if p.exists():
                     sig_lines = [
                         l for l in p.read_text().splitlines()
@@ -342,7 +344,7 @@ def build_briefing() -> str:
         )
 
     # 6. Test files — always full
-    test_files = _collect_src_files(ROOT / "tests")
+    test_files = _collect_src_files(TESTS_DIR)
     test_block = "\n\n".join(
         f"### {fp}\n```typescript\n{code}\n```"
         for fp, code in test_files.items()

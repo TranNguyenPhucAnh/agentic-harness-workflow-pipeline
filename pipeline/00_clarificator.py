@@ -16,13 +16,13 @@ Usage:
     python 00_clarificator.py                    # prompts for project name
 
 --project is required for dedup to work across sessions. Each project gets its
-own clarification_log_<slug>.md so decisions from project A never pollute B.
+own artifacts_<slug>/ folder so decisions from project A never pollute B.
 
 Artifacts produced (owner: 00_clarificator):
-    run/clarification_report.json
-    run/clarification_questions.md
-    knowledge/current/clarification_log_<project_slug>.md   ← append-only, per-project
-    state/clarified_requirement.md
+    artifacts_<slug>/run/clarification_report.json
+    artifacts_<slug>/run/clarification_questions.md
+    artifacts_<slug>/knowledge/current/clarification_log.md   ← append-only, per-project
+    artifacts_<slug>/state/clarified_requirement.md
 """
 
 from __future__ import annotations
@@ -40,65 +40,20 @@ from typing import Any  # noqa: F401 — kept for future typed helpers
 
 import httpx
 
-# ── Attempt to import from sibling paths.py ───────────────────────────────────
-try:
-    # 00_clarificator.py lives in pipeline/ — project root is one level up
-    sys.path.insert(0, str(Path(__file__).parent.parent))
-    from artifacts.paths import (  # type: ignore
-        CURRENT_DIR,
-        KNOWLEDGE_BASE,
-        RUN_DIR,
-        STATE_DIR,
-        ensure_dirs,
-    )
-    # Note: CLARIFICATION_* paths are defined at module level below,
-    # using the imported RUN_DIR/STATE_DIR/CURRENT_DIR from paths.py
-except ImportError:
-    # Standalone mode: derive paths relative to this script
-    _SCRIPT_DIR = Path(__file__).parent
-    _ART = _SCRIPT_DIR / "artifacts"
-    CURRENT_DIR   = _ART / "knowledge" / "current"
-    KNOWLEDGE_BASE = CURRENT_DIR / "base.md"
-    RUN_DIR        = _ART / "run"
-    STATE_DIR      = _ART / "state"
+# ── Import from artifacts.paths (source of truth cho tất cả paths) ────────────
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from artifacts.paths import (  # type: ignore
+    CURRENT_DIR,
+    KNOWLEDGE_BASE,
+    RUN_DIR,
+    STATE_DIR,
+    CLARIFICATION_REPORT,
+    CLARIFICATION_QUESTIONS,
+    CLARIFICATION_LOG,
+    CLARIFIED_REQ,
+    ensure_dirs,
+)
 
-    def ensure_dirs() -> None:  # type: ignore[misc]
-        for d in (CURRENT_DIR, RUN_DIR, STATE_DIR):
-            d.mkdir(parents=True, exist_ok=True)
-
-# ── New artifact paths (owned by this script) ─────────────────────────────────
-# NOTE: CLARIFICATION_LOG is NOT a module-level constant — it is per-project.
-#       Use _clarification_log_path(project_slug) to get the correct path.
-CLARIFICATION_REPORT    = RUN_DIR     / "clarification_report.json"
-CLARIFICATION_QUESTIONS = RUN_DIR     / "clarification_questions.md"
-CLARIFIED_REQ           = STATE_DIR   / "clarified_requirement.md"
-# legacy single-file log kept for backward compat read-only migration
-_LEGACY_CLARIFICATION_LOG = CURRENT_DIR / "clarification_log.md"
-
-
-def _slugify(name: str) -> str:
-    """Convert a project name to a filesystem-safe slug."""
-    slug = name.lower().strip()
-    slug = re.sub(r"[^\w\s-]", "", slug)
-    slug = re.sub(r"[\s_-]+", "-", slug)
-    slug = slug.strip("-")
-    return slug or "unknown"
-
-
-def _clarification_log_path(project_slug: str) -> Path:
-    """Per-project append-only log: knowledge/current/clarification_log_<slug>.md"""
-    return CURRENT_DIR / f"clarification_log_{project_slug}.md"
-
-
-def _list_known_projects() -> list[str]:
-    """Return sorted list of project slugs that have existing logs."""
-    logs = sorted(CURRENT_DIR.glob("clarification_log_*.md"))
-    slugs = []
-    for p in logs:
-        m = re.match(r"clarification_log_(.+)\.md$", p.name)
-        if m:
-            slugs.append(m.group(1))
-    return slugs
 
 # ── Model config ──────────────────────────────────────────────────────────────
 _ANALYZE_MODEL   = "deepseek/deepseek-chat"          # Phase 1+2: reasoning heavy
@@ -191,19 +146,10 @@ def _read_input_file(path: Path) -> str:
         return path.read_text(encoding="latin-1")
 
 
-def _load_clarification_log(project_slug: str) -> str:
-    """Load per-project log. Falls back to legacy global log on first migration."""
-    project_log = _clarification_log_path(project_slug)
-    if project_log.exists():
-        return project_log.read_text(encoding="utf-8")
-    # One-time migration: if legacy global log exists, read it but don't trust it
-    # for dedup (different projects mixed in) — warn instead.
-    if _LEGACY_CLARIFICATION_LOG.exists():
-        print(
-            f"[00][warn] Found legacy clarification_log.md but no per-project log for "
-            f"'{project_slug}'. Legacy log ignored for dedup. "
-            f"Consider migrating: cp clarification_log.md clarification_log_{project_slug}.md"
-        )
+def _load_clarification_log() -> str:
+    """Load project clarification log (project-scoped via PIPELINE_PROJECT)."""
+    if CLARIFICATION_LOG.exists():
+        return CLARIFICATION_LOG.read_text(encoding="utf-8")
     return ""
 
 
@@ -229,13 +175,13 @@ def _extract_answered_qa_pairs(log_text: str) -> list[dict]:
     return pairs
 
 
-def _load_knowledge_context(project_slug: str) -> str:
+def _load_knowledge_context() -> str:
     parts: list[str] = []
     if KNOWLEDGE_BASE.exists():
         parts.append(f"=== base.md ===\n{KNOWLEDGE_BASE.read_text(encoding='utf-8')}")
-    log_text = _load_clarification_log(project_slug)
+    log_text = _load_clarification_log()
     if log_text:
-        parts.append(f"=== clarification_log_{project_slug}.md ===\n{log_text}")
+        parts.append(f"=== clarification_log.md ===\n{log_text}")
     return "\n\n".join(parts)
 
 
@@ -1192,12 +1138,11 @@ def _write_questions_md(
 def _append_to_log(
     session_id: str,
     project_name: str,
-    project_slug: str,
     decisions: list[dict],
     conflicts: list[dict],
 ) -> None:
-    """Append this session's decisions to the per-project clarification_log_<slug>.md."""
-    log_path = _clarification_log_path(project_slug)
+    """Append this session's decisions to clarification_log.md (project-scoped)."""
+    log_path = CLARIFICATION_LOG
 
     blocks: list[str] = []
     blocks.append(
@@ -1274,37 +1219,27 @@ def _gather_requirement(args: argparse.Namespace) -> str:
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _resolve_project(arg_project: str | None) -> tuple[str, str]:
+def _resolve_project(arg_project: str | None) -> str:
     """
-    Resolve (project_name, project_slug).
-    If --project not given, show existing workspaces and prompt user.
-    Returns (display_name, slug).
+    Resolve project name.
+    Priority: --project arg → PIPELINE_PROJECT env var → interactive prompt.
+    Returns display name (raw). Slug is handled by paths.py / harness.py.
     """
+    from artifacts.paths import get_project_name  # type: ignore
     if arg_project:
-        name = arg_project.strip()
-        return name, _slugify(name)
-
-    ensure_dirs()
-    known = _list_known_projects()
-
+        return arg_project.strip()
+    try:
+        return get_project_name()
+    except RuntimeError:
+        pass
+    # Interactive fallback — only if running directly without harness
     print()
-    if known:
-        print("Known workspaces:")
-        for i, slug in enumerate(known, 1):
-            print(f"  {i}. {slug}")
-        print()
-        raw = input("Enter project name (or number to select existing): ").strip()
-        if raw.isdigit():
-            idx = int(raw) - 1
-            if 0 <= idx < len(known):
-                slug = known[idx]
-                return slug.replace("-", " ").title(), slug
-        name = raw or "unknown"
-    else:
-        print("[00] No existing workspaces found.")
-        name = input("Enter new project name: ").strip() or "unknown"
-
-    return name, _slugify(name)
+    print("[00] No --project specified and PIPELINE_PROJECT not set.")
+    name = input("  Enter project name: ").strip()
+    if not name:
+        print("[00] Project name cannot be empty.")
+        sys.exit(1)
+    return name
 
 
 def main() -> None:
@@ -1328,20 +1263,19 @@ def main() -> None:
     ensure_dirs()
 
     if args.list_projects:
-        known = _list_known_projects()
-        if not known:
-            print("[00] No project workspaces found.")
+        # List is handled by harness.py which knows all artifacts_* folders.
+        # Here we just show whether this project's log exists.
+        if CLARIFICATION_LOG.exists():
+            log_text = CLARIFICATION_LOG.read_text(encoding="utf-8")
+            sessions = len(re.findall(r"^## \d{4}-", log_text, re.MULTILINE))
+            print(f"[00] clarification_log.md — {sessions} session{'s' if sessions != 1 else ''}")
         else:
-            print("[00] Known workspaces:")
-            for slug in known:
-                log_path = _clarification_log_path(slug)
-                sessions = len(re.findall(r"^## \d{4}-", log_path.read_text(encoding="utf-8"), re.MULTILINE))
-                print(f"  • {slug}  ({sessions} session{'s' if sessions != 1 else ''})")
+            print("[00] No clarification log found for this project workspace.")
         return
 
     # ── Resolve project workspace ─────────────────────────────────────────────
-    project_name, project_slug = _resolve_project(args.project)
-    print(f"[00] Workspace: {project_name!r} (slug: {project_slug})")
+    project_name = _resolve_project(args.project)
+    print(f"[00] Workspace: {project_name!r}")
 
     # ── Gather input ──────────────────────────────────────────────────────────
     requirement_text = _gather_requirement(args)
@@ -1349,7 +1283,7 @@ def main() -> None:
     session_id       = _now_iso()
 
     # ── Load knowledge context (project-scoped) ───────────────────────────────
-    log_text      = _load_clarification_log(project_slug)
+    log_text      = _load_clarification_log()
     standalone    = not (KNOWLEDGE_BASE.exists() or bool(log_text))
     if standalone:
         print("[00] Standalone mode — no knowledge context found for this workspace.")
@@ -1357,12 +1291,11 @@ def main() -> None:
         answered_qa_pairs: list[dict] = []
     else:
         print("[00] Loading knowledge context ...")
-        knowledge_context = _load_knowledge_context(project_slug)
+        knowledge_context = _load_knowledge_context()
         answered_qa_pairs = _extract_answered_qa_pairs(log_text)
         if answered_qa_pairs:
             print(
-                f"[00] Loaded {len(answered_qa_pairs)} past Q/A pairs for semantic dedup "
-                f"(workspace: {project_slug})"
+                f"[00] Loaded {len(answered_qa_pairs)} past Q/A pairs for semantic dedup"
             )
 
     # ── Phase 1+2: Analyze ────────────────────────────────────────────────────
@@ -1372,7 +1305,6 @@ def main() -> None:
     inferred_name = analysis.get("project_name", "Unknown")
     if project_name == "unknown" and inferred_name != "Unknown":
         project_name = inferred_name
-        project_slug = _slugify(project_name)
         print(f"[00] Project name inferred from requirement: {project_name!r}")
 
     findings      = analysis.get("findings", [])
@@ -1424,7 +1356,7 @@ def main() -> None:
 
     # ── Write outputs ─────────────────────────────────────────────────────────
     _write_report(session_id, req_hash, project_name, decisions, unresolved, conflicts, findings)
-    _append_to_log(session_id, project_name, project_slug, decisions, conflicts)
+    _append_to_log(session_id, project_name, decisions, conflicts)
 
     # ── Phase synthesis: clarified requirement ────────────────────────────────
     if not args.no_synth:
@@ -1434,8 +1366,8 @@ def main() -> None:
         )
         _write_clarified_req(clarified_md)
 
-    _print_banner(f"Done — {len(decisions)} decisions recorded  [{project_slug}]")
-    print(f"  Workspace log: {_clarification_log_path(project_slug)}")
+    _print_banner(f"Done — {len(decisions)} decisions recorded  [{project_name}]")
+    print(f"  Workspace log: {CLARIFICATION_LOG}")
     print(f"  Next step:     python 01_estimator.py --input {CLARIFIED_REQ}\n")
 
 

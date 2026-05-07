@@ -32,7 +32,7 @@ Phase flow:
     Phase D : rerun vitest → repeat
 
 Writes:
-    artifacts/run/test_report.json   (merged report with iteration details + escalated clusters)
+    artifacts_<slug>/run/test_report.json   (merged report with iteration details + escalated clusters)
 
 For taxonomy details see docs/artifacts.md
 """
@@ -52,25 +52,28 @@ from typing import Callable
 import time
 
 # === WRITE AUTHORITY: 04_test_and_iterate ===
-# OWNS  : artifacts/run/test_report.json
-# READS : spec.md, artifacts/state/plan.json, artifacts/state/plan_notes.json,
-#         artifacts/knowledge/current/findings.md (from 07_fix),
-#         artifacts/knowledge/current/findings_notes.md (from 07_update),
-#         artifacts/knowledge/current/base.md
+# OWNS  : artifacts_<slug>/run/test_report.json
+# READS : artifacts_<slug>/spec.md, artifacts_<slug>/state/plan.json,
+#         artifacts_<slug>/state/plan_notes.json,
+#         artifacts_<slug>/knowledge/current/findings.md (from 07_fix),
+#         artifacts_<slug>/knowledge/current/findings_notes.md (from 07_update),
+#         artifacts_<slug>/knowledge/current/base.md
 
 import sys as _sys
 _sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent))
 from artifacts.paths import (
-    ROOT, SPEC_PATH, CACHE_DIR,
+    SPEC_PATH, CACHE_DIR,
     PLAN_JSON as GLM_PLAN,
     TEST_REPORT,
     FINDINGS as FINDINGS_PATH,
     KNOWLEDGE_BASE,
+    SRC_DIR, TESTS_DIR,
+    artifact_root,
     ensure_dirs,
 )
 ensure_dirs()
 
-SRC_DIR = "src"
+_SRC_PREFIX = "src"
 
 # Files Minimax is allowed to write — hooks and pure logic only
 MINIMAX_SCOPE_PATTERNS: list[re.Pattern] = [
@@ -240,7 +243,7 @@ def _load_judge_findings() -> str:
 def run_vitest() -> tuple[bool, str]:
     result = subprocess.run(
         ["npx", "vitest", "run", "--reporter=verbose"],
-        cwd=ROOT, capture_output=True, text=True,
+        cwd=artifact_root(), capture_output=True, text=True,
     )
     return result.returncode == 0, result.stdout + "\n" + result.stderr
 
@@ -261,7 +264,7 @@ def _infer_src_file(test_file: str) -> str:
     rel = test_file.replace("tests/", "", 1)
     rel = re.sub(r"\.test\.(tsx?)$", r".\1", rel)
     rel = re.sub(r"\.test\.(ts)$",   r".\1", rel)
-    return f"{SRC_DIR}/{rel}"
+    return f"{_SRC_PREFIX}/{rel}"
 
 
 def parse_failures(output: str) -> list[FailureCluster]:
@@ -352,11 +355,11 @@ def layer0_static_prepass(cluster: FailureCluster, verbose: bool) -> tuple[bool,
     if verbose:
         print(f"    [L0] Static pre-pass for {cluster.test_file} …")
     if cluster.is_transform_error:
-        fixed, desc = _static_fix_transform(ROOT / cluster.test_file)
+        fixed, desc = _static_fix_transform(TESTS_DIR / cluster.test_file.replace("tests/", "", 1))
         if fixed:
             print(f"    [L0] ✓ {desc}")
             return True, desc
-    fixed, desc = _static_fix_src(ROOT / cluster.src_file)
+    fixed, desc = _static_fix_src(SRC_DIR / cluster.src_file.replace("src/", "", 1))
     if fixed:
         print(f"    [L0] ✓ {desc}")
         return True, desc
@@ -433,7 +436,7 @@ def _build_qwen_system_with_findings(findings: str) -> str:
     )
 
 def _load_knowledge_base() -> str:
-    """Load artifacts/knowledge/base.md if it exists — accumulated human fix patterns."""
+    """Load artifacts_<slug>/knowledge/base.md if it exists — accumulated human fix patterns."""
     if not KNOWLEDGE_BASE.exists():
         return ""
     content = KNOWLEDGE_BASE.read_text().strip()
@@ -529,6 +532,19 @@ def _read_file_safe(path: Path) -> str:
     return path.read_text() if path.exists() else f"// FILE NOT FOUND: {path}\n"
 
 
+def _resolve_artifact_path(rel: str) -> Path:
+    """
+    Resolve a scaffold-relative path (e.g. 'src/App.tsx', 'tests/App.test.tsx')
+    to its absolute disk path inside the current project's artifact folder.
+    """
+    if rel.startswith("src/"):
+        return SRC_DIR / rel[len("src/"):]
+    if rel.startswith("tests/"):
+        return TESTS_DIR / rel[len("tests/"):]
+    # fallback: treat as relative to artifact_root
+    return artifact_root() / rel
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # Phase 0 — Consistency checker
 # ════════════════════════════════════════════════════════════════════════════
@@ -606,8 +622,8 @@ def check_consistency(
     Phase 0: cross-check test vs code vs spec. Does NOT modify any files.
     Returns verdict dict. Falls back to CODE_BUG on any error.
     """
-    src_code  = _read_file_safe(ROOT / cluster.src_file)
-    test_code = _read_file_safe(ROOT / cluster.test_file)
+    src_code  = _read_file_safe(_resolve_artifact_path(cluster.src_file))
+    test_code = _read_file_safe(_resolve_artifact_path(cluster.test_file))
     error_log = cluster.error_block()
 
     user_content = (
@@ -658,8 +674,8 @@ def repair_test_file(
     Returns True if patch was applied and file written.
     """
     spec      = _load_spec()
-    test_code = _read_file_safe(ROOT / cluster.test_file)
-    src_code  = _read_file_safe(ROOT / cluster.src_file)
+    test_code = _read_file_safe(_resolve_artifact_path(cluster.test_file))
+    src_code  = _read_file_safe(_resolve_artifact_path(cluster.src_file))
     error_log = cluster.error_block()
 
     rationale_block = (
@@ -694,10 +710,10 @@ def repair_test_file(
         print(f"    [P0-fix] Parse error: {e}", file=sys.stderr)
         return False
 
-    out_path = ROOT / patch.get("file_path", cluster.test_file)
+    out_path = _resolve_artifact_path(patch.get("file_path", cluster.test_file))
 
     # Safety: only allow writes to tests/
-    if not str(out_path).startswith(str(ROOT / "tests")):
+    if not str(out_path).startswith(str(TESTS_DIR)):
         print(f"    [P0-fix] ⚠ Scope violation: tried to write {out_path}. Rejected.",
               file=sys.stderr)
         return False
@@ -731,8 +747,8 @@ def _call_repair(
     Special: if layer_name=="L1" and explanation contains "LOGIC_BUG", returns (False, "LOGIC_BUG").
     """
     spec      = _load_spec()
-    src_code  = _read_file_safe(ROOT / cluster.src_file)
-    test_code = _read_file_safe(ROOT / cluster.test_file)
+    src_code  = _read_file_safe(_resolve_artifact_path(cluster.src_file))
+    test_code = _read_file_safe(_resolve_artifact_path(cluster.test_file))
     error_log = cluster.error_block()
 
     user_content = (
@@ -780,7 +796,7 @@ def _call_repair(
               f"Allowed: hooks/, data/, types/, utils/. Patch rejected.")
         return False, f"scope violation: {out_rel}"
 
-    out_path = ROOT / out_rel
+    out_path = _resolve_artifact_path(out_rel)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(patch["code"])
 
@@ -961,7 +977,7 @@ def repair_cluster(
 
     # ── L2: Minimax logic debugger ────────────────────────────────────────────
     cluster.owner  = "minimax"
-    test_code      = _read_file_safe(ROOT / cluster.test_file)
+    test_code      = _read_file_safe(_resolve_artifact_path(cluster.test_file))
     timeline       = _build_state_timeline(test_code)
     minimax_system = _build_minimax_system(global_notes, judge_findings)
 
@@ -1114,7 +1130,7 @@ def main() -> None:
             log_snippet=output[-1200:],
         ))
 
-    # ── Single merged report: artifacts/run/test_report.json ─────────────────────
+    # ── Single merged report: artifacts_<slug>/run/test_report.json ──────────────────
     final_passed = bool(iteration_records and iteration_records[-1].passed)
     report = {
         "impl":                 "qwen+minimax",

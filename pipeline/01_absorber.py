@@ -30,14 +30,14 @@ Usage:
   python 01_absorber.py --force                 # ignore cache, re-extract all
   python 01_absorber.py --skip-git              # skip git crawl
   python 01_absorber.py --dry-run               # scan only, no writes
-  python 01_absorber.py --target /path/to/repo  # explicit target (default: ROOT)
+  python 01_absorber.py --target /path/to/repo  # explicit target (default: artifact_root())
 
 Writes (owner: 01_absorber):
-  artifacts/knowledge/current/codebase_map.md
-  artifacts/knowledge/current/config_map.json
-  artifacts/knowledge/current/blame_map.md
-  artifacts/knowledge/history/git_history.json
-  artifacts/cache/absorber_cache.json
+  artifacts_<slug>/knowledge/current/codebase_map.md
+  artifacts_<slug>/knowledge/current/config_map.json
+  artifacts_<slug>/knowledge/current/blame_map.md
+  artifacts_<slug>/knowledge/history/git_history.json
+  artifacts_<slug>/cache/absorber_cache.json
 
 For taxonomy details see docs/artifacts.md
 """
@@ -62,26 +62,21 @@ from typing import Any
 import httpx
 
 # === WRITE AUTHORITY: 01_absorber ===
-# OWNS  : artifacts/knowledge/current/codebase_map.md
-#         artifacts/knowledge/current/config_map.json
-#         artifacts/knowledge/current/blame_map.md
-#         artifacts/knowledge/history/git_history.json
-#         artifacts/cache/absorber_cache.json
+# OWNS  : artifacts_<slug>/knowledge/current/codebase_map.md
+#         artifacts_<slug>/knowledge/current/config_map.json
+#         artifacts_<slug>/knowledge/current/blame_map.md
+#         artifacts_<slug>/knowledge/history/git_history.json
+#         artifacts_<slug>/cache/absorber_cache.json
 # READS : project source files (target codebase)
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from artifacts.paths import (
-    ROOT, CACHE_DIR, CURRENT_DIR, HISTORY_DIR,
+    CACHE_DIR, CURRENT_DIR, HISTORY_DIR,
+    CODEBASE_MAP, CONFIG_MAP, BLAME_MAP, GIT_HISTORY, ABSORBER_CACHE,
+    artifact_root,
     ensure_dirs,
 )
 ensure_dirs()
-
-# ── Output paths ─────────────────────────────────────────────────────────────
-CODEBASE_MAP   = CURRENT_DIR / "codebase_map.md"        # owner: 01_absorber
-CONFIG_MAP     = CURRENT_DIR / "config_map.json"         # owner: 01_absorber
-BLAME_MAP      = CURRENT_DIR / "blame_map.md"            # owner: 01_absorber
-GIT_HISTORY    = HISTORY_DIR / "git_history.json"        # owner: 01_absorber
-ABSORBER_CACHE = CACHE_DIR   / "absorber_cache.json"     # owner: 01_absorber
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 _MAX_TOKENS_MAP   = 16384
@@ -1306,8 +1301,8 @@ def main() -> None:
         """),
     )
     parser.add_argument(
-        "--target", type=Path, default=ROOT,
-        help="Path to codebase root (default: project root)",
+        "--target", type=Path, default=None,
+        help="Path to codebase root (default: artifacts_<slug>/ for current project)",
     )
     parser.add_argument(
         "--git-scope", metavar="SCOPE", default=None,
@@ -1331,7 +1326,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    target: Path = args.target.resolve()
+    target: Path = (args.target or artifact_root()).resolve()
     if not target.exists():
         print(f"[01][error] Target path does not exist: {target}", file=sys.stderr)
         sys.exit(1)

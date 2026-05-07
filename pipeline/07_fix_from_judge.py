@@ -14,13 +14,13 @@ What this script does
      spec + affected src files + judge's exact description
 4. Apply patches (scope-locked to src/ only — never tests/)
 5. Run vitest to confirm fixes (exit 1 if still failing)
-6. Write artifacts/knowledge/current/findings.md — injected into Minimax/Qwen prompts on
+6. Write artifacts_<slug>/knowledge/current/findings.md — injected into Minimax/Qwen prompts on
    future runs so the same mistakes are not repeated
 
 Writes
 ──────
-    artifacts/knowledge/current/findings.md     ← persistent cross-run memory
-    artifacts/run/update_log.json               ← this run's fix log (merged)
+    artifacts_<slug>/knowledge/current/findings.md     ← persistent cross-run memory
+    artifacts_<slug>/run/update_log.json               ← this run's fix log (merged)
     src/**                                      ← patched files
 
 Does NOT
@@ -46,19 +46,21 @@ from pathlib import Path
 import time
 
 # === WRITE AUTHORITY: 07_fix_from_judge ===
-# OWNS  : artifacts/knowledge/history/fix_log.json
-#         artifacts/knowledge/current/findings.md
-# READS : artifacts/run/judge_raw.json,
-#         artifacts/knowledge/current/findings_notes.md,
-#         artifacts/knowledge/current/base.md,
-#         artifacts/cache/spec_compressed.md,
-#         artifacts/state/plan.json,
-#         artifacts/state/plan_notes.json
+# OWNS  : artifacts_<slug>/knowledge/history/fix_log.json
+#         artifacts_<slug>/knowledge/current/findings.md
+# READS : artifacts_<slug>/run/judge_raw.json,
+#         artifacts_<slug>/knowledge/current/findings_notes.md,
+#         artifacts_<slug>/knowledge/current/base.md,
+#         artifacts_<slug>/cache/spec_compressed.md,
+#         artifacts_<slug>/state/plan.json,
+#         artifacts_<slug>/state/plan_notes.json
 
 import sys as _sys
 _sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent))
 from artifacts.paths import (
-    ROOT, SPEC_PATH, REPORTS_DIR,
+    SPEC_PATH,
+    SRC_DIR,
+    artifact_root,
     JUDGE_RAW as JUDGE_RAW_PATH,
     FIX_LOG as FIX_REPORT_PATH,
     FINDINGS as FINDINGS_PATH,
@@ -187,18 +189,19 @@ def _infer_files(text: str) -> list[str]:
     for kw, files in _KEYWORD_FILES.items():
         if kw.lower() in text_lower:
             for f in files:
-                if f not in found and (ROOT / f).exists():
+                rel_path = SRC_DIR / f.replace("src/", "", 1) if f.startswith("src/") else SRC_DIR / f
+                if f not in found and rel_path.exists():
                     found.append(f)
 
     if any(kw in text_lower for kw in _COMPONENT_SCAN_KEYWORDS):
-        comp_dir = ROOT / "src" / "components"
+        comp_dir = SRC_DIR / "components"
         if comp_dir.exists():
             for p in sorted(comp_dir.rglob("*.tsx")):
-                rel = str(p.relative_to(ROOT))
+                rel = "src/" + str(p.relative_to(SRC_DIR))
                 if rel not in found:
                     found.append(rel)
 
-    return [f for f in found if (ROOT / f).exists()]
+    return [f for f in found if (SRC_DIR / f.replace("src/", "", 1)).exists()]
 
 
 def extract_findings(verdict: dict) -> tuple[list[JudgeFinding], list[JudgeFinding]]:
@@ -349,7 +352,8 @@ def fix_finding(
 
     files_block = ""
     for fp in finding.files:
-        code = _read_safe(ROOT / fp)
+        disk = SRC_DIR / fp.replace("src/", "", 1) if fp.startswith("src/") else SRC_DIR / fp
+        code = _read_safe(disk)
         files_block += f"\n### {fp}\n```typescript\n{code}\n```\n"
 
     sections_block = ""
@@ -397,7 +401,7 @@ def fix_finding(
     written: list[str] = []
     for entry in patch.get("files", []):
         out_rel  = entry.get("file_path", "")
-        out_path = ROOT / out_rel
+        out_path = SRC_DIR / out_rel.replace("src/", "", 1) if out_rel.startswith("src/") else None
 
         if not out_rel.startswith("src/"):
             print(f"  [07] ⚠ Scope violation: {out_rel} not under src/ — rejected",
@@ -435,7 +439,7 @@ def run_vitest_confirm() -> tuple[bool, str]:
     print("\n[07] Running vitest to confirm fixes …")
     result = subprocess.run(
         ["npx", "vitest", "run", "--reporter=verbose"],
-        cwd=ROOT, capture_output=True, text=True,
+        cwd=artifact_root(), capture_output=True, text=True,
     )
     output = result.stdout + "\n" + result.stderr
     passed = result.returncode == 0

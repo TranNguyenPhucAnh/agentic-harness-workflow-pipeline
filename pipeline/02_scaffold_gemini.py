@@ -3,10 +3,10 @@ pipeline/02_scaffold_gemini.py
 Step 2 — Call Gemini 2.5 Flash to generate scaffold JSON from spec.md
 
 Writes:
-    artifacts/state/scaffold.json          ← full scaffold with stubs + test files
-    src/**                                 ← individual stub source files
-    tests/**                               ← individual test files
-    artifacts/cache/spec_compressed.md     ← compressed spec for downstream use
+    artifacts_<slug>/state/scaffold.json       ← full scaffold with stubs + test files
+    artifacts_<slug>/src/**                    ← individual stub source files
+    artifacts_<slug>/tests/**                  ← individual test files
+    artifacts_<slug>/cache/spec_compressed.md  ← compressed spec for downstream use
 
 For taxonomy details see docs/artifacts.md
 """
@@ -29,15 +29,18 @@ GEMINI_URL     = (
 )
 
 # === WRITE AUTHORITY: 02_scaffold_gemini ===
-# OWNS  : artifacts/state/scaffold.json
-#         artifacts/cache/spec_compressed.md
-# READS : spec.md
+# OWNS  : artifacts_<slug>/state/scaffold.json
+#         artifacts_<slug>/cache/spec_compressed.md
+#         artifacts_<slug>/src/**
+#         artifacts_<slug>/tests/**
+# READS : artifacts_<slug>/spec.md
 
 import sys
 sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent.parent))
 from artifacts.paths import (
-    ROOT, SPEC_PATH,
+    SPEC_PATH,
     SCAFFOLD_JSON, SPEC_COMPRESSED,
+    SRC_DIR, TESTS_DIR,
     ensure_dirs,
 )
 ensure_dirs()
@@ -185,13 +188,24 @@ def write_files(scaffold: dict, spec: str) -> None:
     SCAFFOLD_JSON.write_text(json.dumps(scaffold, indent=2))
     print(f"[02] Scaffold JSON → {SCAFFOLD_JSON}")
 
-    # Write individual source and test stubs
+    # Write individual source and test stubs into artifacts_<slug>/src/ and tests/
     for entry in scaffold["files"]:
-        path = ROOT / entry["file_path"]
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(entry["code"])
-        tag = "TEST" if entry.get("is_test") else "SRC "
-        print(f"[02] [{tag}] {entry['file_path']}")
+        file_path = entry["file_path"]           # e.g. "src/App.tsx" or "tests/App.test.tsx"
+        is_test   = entry.get("is_test", False)
+
+        if is_test:
+            # strip leading "tests/" prefix if present, resolve under TESTS_DIR
+            rel = file_path[len("tests/"):] if file_path.startswith("tests/") else file_path
+            dest = TESTS_DIR / rel
+        else:
+            # strip leading "src/" prefix if present, resolve under SRC_DIR
+            rel = file_path[len("src/"):] if file_path.startswith("src/") else file_path
+            dest = SRC_DIR / rel
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(entry["code"])
+        tag = "TEST" if is_test else "SRC "
+        print(f"[02] [{tag}] {dest}")
 
     # Write compressed spec to cache/
     compressed = _compress_spec(spec)
