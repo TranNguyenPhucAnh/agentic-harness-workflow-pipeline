@@ -1419,11 +1419,7 @@ def run_mini(
     else:
         print(f"  MINI ❌  FAIL  (gave up after {retry_count} retries)")
         print(f"\n  Failure pattern logged → knowledge/current/findings_notes.md")
-        print(f"\n  Next steps:")
-        print(f"    1. Fix manually:  edit {files_written or 'the relevant files'}")
-        print(f"    2. Capture fix:   python pipeline/07_update_knowledge.py --capture-human-fix")
-        print(f"       └─ git diff src/ → distills pattern into knowledge/current/base.md")
-        print(f"       └─ next mini run will have this context injected automatically")
+        print(f"  Fix manually: edit {files_written or 'the relevant files'}")
     print(f"{'='*60}\n")
 
     sys.exit(0 if final_passed else 1)
