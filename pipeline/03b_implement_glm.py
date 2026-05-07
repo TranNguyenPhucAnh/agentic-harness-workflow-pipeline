@@ -53,22 +53,86 @@ ensure_dirs()
 # ── Prompts ──────────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """\
-You are a senior TypeScript/React architect acting as a PLANNER.
+You are a senior software architect acting as a PLANNER.
 You will receive a spec and a scaffold JSON (stub files with signatures only).
 
 Your job is NOT to write code.
 Your job is to reason carefully and produce an implementation plan.
 
+## Step 0 — Identify the stack FIRST
+
+Before planning any file, read the spec and scaffold and extract the project stack.
+
+Record this as a top-level "stack" object in your JSON output.
+
+The stack should include:
+- Primary language and version if known, e.g. TypeScript 5.x, Python 3.12, Go 1.22
+- Runtime / bundler / platform, e.g. Vite 5, Node 20, Bun, uWSGI, Docker
+- Main framework(s), e.g. React 18, FastAPI, Vue 3, Django, Express
+- CSS / styling system if any, e.g. Tailwind CSS v3, CSS Modules, Styled Components
+- Test runner if any, e.g. Vitest, pytest, Jest, Go test
+- Key libraries that affect implementation patterns, e.g. Zustand, React Query, Pydantic, SQLAlchemy
+
+If the project is a monorepo or mixed stack, represent that explicitly, for example:
+{
+  "frontend": {
+    "language": "TypeScript 5.x",
+    "runtime": "Vite 5",
+    "framework": "React 18",
+    "styling": "Tailwind CSS v3",
+    "test_runner": "Vitest",
+    "key_libs": ["Zustand", "React Query"]
+  },
+  "backend": {
+    "language": "Python 3.12",
+    "runtime": "Uvicorn",
+    "framework": "FastAPI",
+    "styling": null,
+    "test_runner": "pytest",
+    "key_libs": ["Pydantic", "SQLAlchemy"]
+  }
+}
+
+## Step 1 — Plan each non-test stub file
+
 For each non-test stub file, output a task object describing:
 - What the file does and its role in the system
-- Ordered list of implementation sub-tasks (what to implement, in what order)
-- Key types / interfaces this file depends on (with their source file)
+- Ordered list of implementation sub-tasks, in dependency-aware order
+- Key types / interfaces / schemas / models this file depends on, with source file
 - Gotchas or edge cases the implementer must handle
-- Tailwind class hints for visual components (colours, layout, states)
+- Styling hints for visual/UI components if applicable
+
+## Step 2 — Stack-specific gotchas
+
+For EACH file, "gotchas" must include framework/language/runtime quirks relevant to the detected stack and to THIS file.
+
+Do not give generic advice.
+Ask yourself:
+
+"What would a developer who knows the detected stack warn their colleague about before implementing this specific file?"
+
+Examples of good stack-derived gotchas:
+- React 18+: useEffect can run twice in StrictMode, so effects need cleanup/idempotence
+- Vite: use import.meta.env instead of process.env for client env vars
+- Python/FastAPI: use async def only when awaiting async I/O; do not block the event loop
+- Pydantic v2: use model_config / field validators instead of v1 Config/validator patterns
+- Vue 3 Composition API: destructuring reactive() can lose reactivity
+- Go: propagate context cancellation to avoid goroutine leaks
+- SQLAlchemy async: do not mix sync Session with async engine/session
+
+The point is to derive these from the spec's stack, not from hardcoded React/Vite assumptions.
 
 Return a single JSON object — NO markdown fences, raw JSON only:
 {
   "plan_version": "1.0.0",
+  "stack": {
+    "language": "TypeScript 5.x",
+    "runtime": "Vite 5",
+    "framework": "React 18",
+    "styling": "Tailwind CSS v3",
+    "test_runner": "Vitest",
+    "key_libs": ["Zustand", "React Query"]
+  },
   "tasks": [
     {
       "file_path": "src/hooks/useSensorData.ts",
@@ -81,7 +145,7 @@ Return a single JSON object — NO markdown fences, raw JSON only:
       ],
       "gotchas": [
         "decisionScore must be negative for anomaly points (-0.05 to -0.45)",
-        "..."
+        "React state updates derived from timers must be cleaned up in useEffect cleanup"
       ],
       "tailwind_hints": null
     }
@@ -103,12 +167,13 @@ Return a single JSON object — NO markdown fences, raw JSON only:
 
 Rules:
 - Reason as deeply as needed — this is your reasoning budget well spent.
-- Be specific: reference exact constant names, prop names, type names from the spec.
-- implementation_order must respect dependency order (types before hooks before components).
-- tailwind_hints: include for visual components, null for hooks/types/data files.
+- Be specific: reference exact constant names, prop names, type names, schema names, and file paths from the spec/scaffold.
+- implementation_order must respect dependency order.
+- tailwind_hints: include for visual components if the detected stack uses Tailwind; otherwise provide relevant styling hints or null.
+- Do not assume TypeScript, React, Vite, Tailwind, or Vitest unless the spec/scaffold actually indicates them.
+- Do not use implementation patterns from a different stack than the one detected.
 - Output raw JSON only. Absolutely no markdown fences or preamble text.
 """
-
 
 # ── API call ──────────────────────────────────────────────────────────────────
 
@@ -222,7 +287,7 @@ def _parse_json(raw: str, label: str) -> dict:
 # ── Validation ────────────────────────────────────────────────────────────────
 
 def validate_plan(plan: dict, stub_files: list) -> None:
-    """Warn if any stub file is missing from the plan."""
+    """Warn if any stub file is missing from the plan and report detected stack."""
     planned = {t["file_path"] for t in plan.get("tasks", [])}
     for f in stub_files:
         fp = f["file_path"]
@@ -233,6 +298,11 @@ def validate_plan(plan: dict, stub_files: list) -> None:
     missing = required_keys - set(plan.keys())
     if missing:
         print(f"[03b] WARNING: plan missing keys: {missing}")
+
+    if "stack" not in plan:
+        print("[03b] WARNING: plan missing 'stack' — framework quirks may be generic")
+    else:
+        print(f"[03b] Stack detected: {json.dumps(plan['stack'], indent=2)}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
