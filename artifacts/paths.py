@@ -41,6 +41,7 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
+from typing import Any
 
 
 # ── Project resolution ────────────────────────────────────────────────────────
@@ -106,12 +107,12 @@ def artifact_root() -> Path:
     return _artifact_root()
 
 
-def project_info() -> dict:
+def project_info() -> dict[str, str]:
     """Return project name, slug, and artifact root as a dict."""
     name = get_project_name()
     return {
-        "name":          name,
-        "slug":          _slugify(name),
+        "name": name,
+        "slug": _slugify(name),
         "artifact_root": str(_artifact_root()),
     }
 
@@ -132,55 +133,107 @@ class _LazyPath:
     __slots__ = ("_rel",)
 
     def __init__(self, rel: str) -> None:
-        self._rel = rel   # relative path inside the artifact root
+        self._rel = rel  # relative path inside the artifact root
 
     def _resolve(self) -> Path:
         return _artifact_root() / self._rel
 
     # ── os.fspath / str / repr ────────────────────────────────────────────────
-    def __fspath__(self)  -> str:  return str(self._resolve())
-    def __str__(self)     -> str:  return str(self._resolve())
-    def __repr__(self)    -> str:  return f"LazyPath({self._rel!r} → {self._resolve()})"
-    def __eq__(self, o)   -> bool: return self._resolve() == Path(o) if o is not None else False
-    def __hash__(self)    -> int:  return hash(self._resolve())
+    def __fspath__(self) -> str:
+        return str(self._resolve())
+
+    def __str__(self) -> str:
+        return str(self._resolve())
+
+    def __repr__(self) -> str:
+        return f"LazyPath({self._rel!r} → {self._resolve()})"
+
+    def __eq__(self, other: object) -> bool:
+        return self._resolve() == Path(other) if other is not None else False
+
+    def __hash__(self) -> int:
+        return hash(self._resolve())
 
     # ── Path arithmetic ───────────────────────────────────────────────────────
-    def __truediv__(self, other):  return self._resolve() / other
-    def __rtruediv__(self, other): return Path(other) / self._resolve()
+    def __truediv__(self, other: str | os.PathLike[str]) -> Path:
+        return self._resolve() / other
+
+    def __rtruediv__(self, other: str | os.PathLike[str]) -> Path:
+        return Path(other) / self._resolve()
 
     # ── Properties ───────────────────────────────────────────────────────────
     @property
-    def parent(self) -> Path:      return self._resolve().parent
+    def parent(self) -> Path:
+        return self._resolve().parent
+
     @property
-    def name(self)   -> str:       return self._resolve().name
+    def name(self) -> str:
+        return self._resolve().name
+
     @property
-    def stem(self)   -> str:       return self._resolve().stem
+    def stem(self) -> str:
+        return self._resolve().stem
+
     @property
-    def suffix(self) -> str:       return self._resolve().suffix
+    def suffix(self) -> str:
+        return self._resolve().suffix
 
     # ── File I/O ─────────────────────────────────────────────────────────────
-    def read_text(self, **kw):          return self._resolve().read_text(**kw)
-    def write_text(self, data, **kw):   return self._resolve().write_text(data, **kw)
-    def read_bytes(self):               return self._resolve().read_bytes()
-    def write_bytes(self, data):        return self._resolve().write_bytes(data)
-    def open(self, *a, **kw):           return self._resolve().open(*a, **kw)
+    def read_text(self, **kwargs: Any) -> str:
+        return self._resolve().read_text(**kwargs)
+
+    def write_text(self, data: str, **kwargs: Any) -> int:
+        return self._resolve().write_text(data, **kwargs)
+
+    def read_bytes(self) -> bytes:
+        return self._resolve().read_bytes()
+
+    def write_bytes(self, data: bytes) -> int:
+        return self._resolve().write_bytes(data)
+
+    def open(self, *args: Any, **kwargs: Any):
+        return self._resolve().open(*args, **kwargs)
 
     # ── Filesystem ops ────────────────────────────────────────────────────────
-    def exists(self)         -> bool:   return self._resolve().exists()
-    def is_file(self)        -> bool:   return self._resolve().is_file()
-    def is_dir(self)         -> bool:   return self._resolve().is_dir()
-    def mkdir(self, **kw):              return self._resolve().mkdir(**kw)
-    def stat(self):                     return self._resolve().stat()
-    def unlink(self, **kw):             return self._resolve().unlink(**kw)
-    def rename(self, target):           return self._resolve().rename(target)
+    def exists(self) -> bool:
+        return self._resolve().exists()
+
+    def is_file(self) -> bool:
+        return self._resolve().is_file()
+
+    def is_dir(self) -> bool:
+        return self._resolve().is_dir()
+
+    def mkdir(self, **kwargs: Any) -> None:
+        return self._resolve().mkdir(**kwargs)
+
+    def stat(self):
+        return self._resolve().stat()
+
+    def unlink(self, **kwargs: Any) -> None:
+        return self._resolve().unlink(**kwargs)
+
+    def rename(self, target: str | os.PathLike[str]) -> Path:
+        return self._resolve().rename(target)
 
     # ── Path helpers ──────────────────────────────────────────────────────────
-    def relative_to(self, *a):     return self._resolve().relative_to(*a)
-    def with_name(self, name):     return self._resolve().with_name(name)
-    def with_suffix(self, suf):    return self._resolve().with_suffix(suf)
-    def glob(self, pattern):       return self._resolve().glob(pattern)
-    def rglob(self, pattern):      return self._resolve().rglob(pattern)
-    def iterdir(self):             return self._resolve().iterdir()
+    def relative_to(self, *args: Any) -> Path:
+        return self._resolve().relative_to(*args)
+
+    def with_name(self, name: str) -> Path:
+        return self._resolve().with_name(name)
+
+    def with_suffix(self, suffix: str) -> Path:
+        return self._resolve().with_suffix(suffix)
+
+    def glob(self, pattern: str):
+        return self._resolve().glob(pattern)
+
+    def rglob(self, pattern: str):
+        return self._resolve().rglob(pattern)
+
+    def iterdir(self):
+        return self._resolve().iterdir()
 
 
 # ── Directory constants ───────────────────────────────────────────────────────
@@ -195,64 +248,68 @@ REPORTS_DIR   = _LazyPath("reports")
 SRC_DIR       = _LazyPath("src")
 TESTS_DIR     = _LazyPath("tests")
 
+
 # ── Misc ──────────────────────────────────────────────────────────────────────
 
-SPEC_PATH = _LazyPath("spec.md")   # per-project, không phải repo root
+SPEC_PATH = _LazyPath("spec.md")  # per-project, không phải repo root
 
 
 # ── state/ ────────────────────────────────────────────────────────────────────
 
-SCAFFOLD_JSON   = _LazyPath("state/scaffold.json")        # owner: 02_scaffold_gemini
-SPEC_COMPRESSED = _LazyPath("cache/spec_compressed.md")   # owner: 02_scaffold_gemini
-PLAN_JSON       = _LazyPath("state/plan.json")            # owner: 03b_implement_glm
-SPEC_DELTA      = _LazyPath("cache/spec_delta.json")      # owner: spec_diff
-SPEC_APPLIED    = _LazyPath("state/spec_applied.json")    # owner: spec_diff
-PLAN_NOTES      = _LazyPath("state/plan_notes.json")      # owner: 07_update_knowledge
+SCAFFOLD_JSON   = _LazyPath("state/scaffold.json")               # owner: 02_scaffold_gemini
+PLAN_JSON       = _LazyPath("state/plan.json")                   # owner: 03b_implement_glm
+PLAN_MINI       = _LazyPath("state/plan_mini.json")              # owner: 03b_implement_glm
+SPEC_APPLIED    = _LazyPath("state/spec_applied.json")           # owner: spec_diff
+PLAN_NOTES      = _LazyPath("state/plan_notes.json")             # owner: 07_update_knowledge
+ENRICHED_PROMPT = _LazyPath("state/enriched_prompt.md")          # owner: harness / prompt enrichment
+CLARIFIED_REQ   = _LazyPath("state/clarified_requirement.md")    # owner: 00_clarificator
+
+# Backward-compatible / design-friendly aliases.
+PLAN = PLAN_JSON
+CLARIFIED_REQUEST = CLARIFIED_REQ
 
 
-# ── run/ ─────────────────────────────────────────────────────────────────────
+# ── cache/ ────────────────────────────────────────────────────────────────────
 
-IMPL_RECORD     = _LazyPath("run/impl_record.json")       # owner: 03a_implement_qwen
-TEST_REPORT     = _LazyPath("run/test_report.json")       # owner: 04_test_and_iterate
-JUDGE_RAW       = _LazyPath("run/judge_raw.json")         # owner: 06_judge_deepseek
+SPEC_COMPRESSED = _LazyPath("cache/spec_compressed.md")          # owner: 02_scaffold_gemini
+SPEC_DELTA      = _LazyPath("cache/spec_delta.json")             # owner: spec_diff
+ABSORBER_CACHE  = _LazyPath("cache/absorber_cache.json")         # owner: 01_absorber
+
+
+# ── run/ ──────────────────────────────────────────────────────────────────────
+
+IMPL_RECORD              = _LazyPath("run/impl_record.json")              # owner: 03a_implement_qwen
+TEST_REPORT              = _LazyPath("run/test_report.json")              # owner: 04_test_and_iterate
+JUDGE_RAW                = _LazyPath("run/judge_raw.json")                # owner: 06_judge_deepseek
+ANALYSIS_MINI            = _LazyPath("run/analysis_mini.json")            # owner: 03b_implement_glm
+CLARIFICATION_REPORT     = _LazyPath("run/clarification_report.json")     # owner: 00_clarificator
+CLARIFICATION_QUESTIONS  = _LazyPath("run/clarification_questions.md")    # owner: 00_clarificator
 
 
 # ── knowledge/current/ ────────────────────────────────────────────────────────
 
-FINDINGS        = _LazyPath("knowledge/current/findings.md")        # owner: 07_fix_from_judge
-FINDINGS_NOTES  = _LazyPath("knowledge/current/findings_notes.md")  # owner: 07_update_knowledge
-SPEC_ADDENDUM   = _LazyPath("knowledge/current/spec_addendum.md")   # owner: 06_judge_deepseek
-KNOWLEDGE_BASE  = _LazyPath("knowledge/current/base.md")            # owner: 07_update_knowledge
+FINDINGS          = _LazyPath("knowledge/current/findings.md")           # owner: 07_fix_from_judge
+FINDINGS_NOTES    = _LazyPath("knowledge/current/findings_notes.md")     # owner: 07_update_knowledge
+SPEC_ADDENDUM     = _LazyPath("knowledge/current/spec_addendum.md")      # owner: 06_judge_deepseek
+KNOWLEDGE_BASE    = _LazyPath("knowledge/current/base.md")               # owner: 07_update_knowledge
+CODEBASE_MAP      = _LazyPath("knowledge/current/codebase_map.md")       # owner: 01_absorber
+CONFIG_MAP        = _LazyPath("knowledge/current/config_map.json")       # owner: 01_absorber
+BLAME_MAP         = _LazyPath("knowledge/current/blame_map.md")          # owner: 01_absorber
+CLARIFICATION_LOG = _LazyPath("knowledge/current/clarification_log.md")  # owner: 00_clarificator
 
 
-# ── knowledge/history/ ───────────────────────────────────────────────────────
+# ── knowledge/history/ ────────────────────────────────────────────────────────
 
-UPDATE_LOG      = _LazyPath("knowledge/history/update_log.json")    # owner: 07_update_knowledge
-FIX_LOG         = _LazyPath("knowledge/history/fix_log.json")       # owner: 07_fix_from_judge
-SPEC_CHANGELOG  = _LazyPath("knowledge/history/spec.changelog")     # owner: spec_diff
+UPDATE_LOG     = _LazyPath("knowledge/history/update_log.json")     # owner: 07_update_knowledge
+FIX_LOG        = _LazyPath("knowledge/history/fix_log.json")        # owner: 07_fix_from_judge
+SPEC_CHANGELOG = _LazyPath("knowledge/history/spec.changelog")      # owner: spec_diff
+GIT_HISTORY    = _LazyPath("knowledge/history/git_history.json")    # owner: 01_absorber
 
 
 # ── reports/ ─────────────────────────────────────────────────────────────────
 
-SUMMARY         = _LazyPath("reports/summary.md")         # owner: 05_report
-JUDGE_REPORT    = _LazyPath("reports/judge_report.md")    # owner: 06_judge_deepseek
-
-
-# ── absorber ─────────────────────────────────────────────────────────────────
-
-CODEBASE_MAP   = _LazyPath("knowledge/current/codebase_map.md")     # owner: 01_absorber
-CONFIG_MAP     = _LazyPath("knowledge/current/config_map.json")     # owner: 01_absorber
-BLAME_MAP      = _LazyPath("knowledge/current/blame_map.md")        # owner: 01_absorber
-GIT_HISTORY    = _LazyPath("knowledge/history/git_history.json")    # owner: 01_absorber
-ABSORBER_CACHE = _LazyPath("cache/absorber_cache.json")             # owner: 01_absorber
-
-
-# ── clarification ────────────────────────────────────────────────────────────
-
-CLARIFICATION_REPORT    = _LazyPath("run/clarification_report.json")   # owner: 00_clarificator
-CLARIFICATION_QUESTIONS = _LazyPath("run/clarification_questions.md")  # owner: 00_clarificator
-CLARIFICATION_LOG       = _LazyPath("knowledge/current/clarification_log.md")  # owner: 00_clarificator
-CLARIFIED_REQ           = _LazyPath("state/clarified_requirement.md")  # owner: 00_clarificator
+SUMMARY      = _LazyPath("reports/summary.md")       # owner: 05_report
+JUDGE_REPORT = _LazyPath("reports/judge_report.md")  # owner: 06_judge_deepseek
 
 
 # ── ensure_dirs ───────────────────────────────────────────────────────────────
