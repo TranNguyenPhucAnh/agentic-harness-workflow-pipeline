@@ -295,7 +295,6 @@ def capture_human_fix(dry_run: bool) -> None:
         print(f"  ✓ Fix record appended to {UPDATE_LOG_PATH}")
 
     print(f"\n[07b] Human fix captured. Minimax will use this pattern on next run.")
-    print(f"[07b] To verify: python harness.py --test-only --skip-judge")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -669,12 +668,7 @@ def main() -> None:
     print(f"  Spec bumps needed  : {spec_bumps}  ← edit spec.md manually")
 
     if spec_bumps:
-        print(f"\n  After editing spec.md:")
-        print(f"    python harness.py")
-
-    if not args.dry_run and applied > 0:
-        print(f"\n  Next run will use these learnings automatically.")
-        print(f"  To verify: python harness.py --test-only --skip-judge")
+        print(f"\n  Spec bumps detected — edit spec.md manually before next run.")
 
 
 if __name__ == "__main__":
