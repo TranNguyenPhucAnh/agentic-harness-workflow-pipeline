@@ -1436,8 +1436,6 @@ def main() -> None:
     if not args.skip_git:
         print(f"  git_history.json → {GIT_HISTORY}")
         print(f"  blame_map.md     → {BLAME_MAP}")
-    print(f"\n  Next: python harness.py --skip-absorb")
-    print(f"        (or review codebase_map.md before running pipeline)\n")
 
 
 if __name__ == "__main__":
