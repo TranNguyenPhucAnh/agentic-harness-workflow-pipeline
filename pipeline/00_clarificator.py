@@ -1368,7 +1368,7 @@ def main() -> None:
 
     _print_banner(f"Done — {len(decisions)} decisions recorded  [{project_name}]")
     print(f"  Workspace log: {CLARIFICATION_LOG}")
-    print(f"  Next step:     python 01_estimator.py --input {CLARIFIED_REQ}\n")
+    print(f"  Artifacts     → {CLARIFIED_REQ}")
 
 
 if __name__ == "__main__":
