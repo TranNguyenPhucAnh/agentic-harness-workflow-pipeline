@@ -1,32 +1,47 @@
 """
 pipeline/02_scaffold_gemini.py
-Step 2 — Call Gemini 2.5 Flash to generate scaffold JSON from spec.md
+==============================
+Step 2 — Generate scaffold JSON from spec.md and materialize source/test stubs.
 
-Writes:
-    artifacts_<slug>/state/scaffold.json       ← full scaffold with stubs + test files
-    artifacts_<slug>/src/**                    ← individual stub source files
-    artifacts_<slug>/tests/**                  ← individual test files
-    artifacts_<slug>/cache/spec_compressed.md  ← compressed spec for downstream use
+This step is intended for the FULL pipeline. Mini runs should normally skip this
+step and use the mini planner/implementer flow instead.
+
+Writes, owner: 02_scaffold_gemini:
+  artifacts_<slug>/state/scaffold.json
+  artifacts_<slug>/src/**
+  artifacts_<slug>/tests/**
+  artifacts_<slug>/cache/spec_compressed.md
+
+Reads:
+  artifacts_<slug>/spec.md
+
+Direct execution:
+  python 02_scaffold_gemini.py --project my-app
+  PIPELINE_PROJECT=my-app python 02_scaffold_gemini.py
+
+Required environment:
+  GEMINI_API_KEY=<your-key>
+
+Optional environment:
+  GEMINI_MODEL=gemini-2.5-flash
 
 For taxonomy details see docs/artifacts.md
 """
 
-import os
+from __future__ import annotations
+
+import argparse
 import json
+import os
+import random
 import re
 import sys
 import textwrap
-import httpx
-from pathlib import Path
-import random
 import time
+from pathlib import Path
+from typing import Any
 
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-GEMINI_MODEL   = "gemini-2.5-flash"
-GEMINI_URL     = (
-    f"https://generativelanguage.googleapis.com/v1beta/models/"
-    f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-)
+import httpx
 
 # === WRITE AUTHORITY: 02_scaffold_gemini ===
 # OWNS  : artifacts_<slug>/state/scaffold.json
@@ -35,41 +50,143 @@ GEMINI_URL     = (
 #         artifacts_<slug>/tests/**
 # READS : artifacts_<slug>/spec.md
 
-import sys
-sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent.parent))
-from artifacts.paths import (
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from artifacts.paths import (  # noqa: E402
+    SCAFFOLD_JSON,
+    SPEC_COMPRESSED,
     SPEC_PATH,
-    SCAFFOLD_JSON, SPEC_COMPRESSED,
-    SRC_DIR, TESTS_DIR,
+    SRC_DIR,
+    TESTS_DIR,
     ensure_dirs,
 )
-ensure_dirs()
+
+
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+MAX_OUTPUT_TOKENS = 32768
+
 
 SYSTEM_PROMPT = textwrap.dedent("""
-    You are a senior TypeScript/React architect.
-    You will receive a technical spec (spec.md) for a React + Vite + TypeScript project.
+    You are a senior software architect generating a scaffold from a technical spec.
+
+    You will receive spec.md. The spec is the source of truth. Follow its stack,
+    file tree, output schema, naming, testing framework, and acceptance criteria.
 
     Your task:
-    1. Read the spec carefully, especially §7 (file tree) and §8 (output schema).
-    2. Produce a SINGLE valid JSON object matching the schema in §8 EXACTLY.
+    1. Read the spec carefully, especially the file tree and output schema sections.
+    2. Produce a SINGLE valid JSON object matching the schema requested by the spec.
     3. The JSON MUST be valid and parseable by JSON.parse / json.loads.
-        Requirements:
-        - Use double quotes " for all JSON strings.
-        - Escape any internal " characters as \".
-        - If you output TypeScript code in a "code" field, it MUST be a single JSON string value with all newlines as \n and all quotes properly escaped.
-        - Do NOT use single quotes ' for JSON string delimiters.
-        - Do NOT include comments or trailing commas in the JSON.
-    4. For non-test files: output interfaces + function signatures + JSDoc only.
-       Use `throw new Error('not implemented')` for all function bodies.
-    5. For test files: output complete, runnable vitest tests.
-    6. Do NOT wrap your response in markdown fences. Output raw JSON only.
-    7. Do NOT add files not listed in §7 of the spec.
+
+    JSON requirements:
+    - Use double quotes " for all JSON strings.
+    - Escape any internal " characters as \\".
+    - If you output code in a "code" field, it MUST be a single JSON string value
+      with all newlines as \\n and all quotes properly escaped.
+    - Do NOT use single quotes ' as JSON string delimiters.
+    - Do NOT include comments.
+    - Do NOT include trailing commas.
+    - Do NOT wrap the response in markdown fences.
+    - Output raw JSON only.
+
+    Scaffold requirements:
+    - Do NOT add files not listed by the spec's file tree.
+    - For non-test files, generate interfaces/types/function signatures/stubs as
+      requested by the spec. If the spec asks for stubs, use explicit
+      "not implemented" placeholders.
+    - For test files, generate complete runnable tests using the framework
+      specified by the spec.
+    - Preserve file paths exactly as specified by the spec unless the output
+      schema explicitly says otherwise.
 """).strip()
 
 
-# ── API call ──────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI / project setup
+# ─────────────────────────────────────────────────────────────────────────────
 
-def _extract_gemini_text(raw: dict) -> str:
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Generate scaffold JSON/files from spec.md.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""
+            Examples:
+              python 02_scaffold_gemini.py --project my-app
+              PIPELINE_PROJECT=my-app python 02_scaffold_gemini.py
+
+              python 02_scaffold_gemini.py --project my-app --model gemini-2.5-flash
+              python 02_scaffold_gemini.py --project my-app --dry-run
+        """),
+    )
+    parser.add_argument(
+        "--project",
+        default=None,
+        help=(
+            "Project name for direct execution. Sets PIPELINE_PROJECT before "
+            "resolving artifact paths."
+        ),
+    )
+    parser.add_argument(
+        "--model",
+        default=os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
+        help=f"Gemini model name. Default: env GEMINI_MODEL or {DEFAULT_GEMINI_MODEL}.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Call model and validate scaffold, but do not write files.",
+    )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=5,
+        help="Max retries for transient model/API failures. Default: 5.",
+    )
+    return parser
+
+
+def _configure_project(
+    project: str | None,
+    parser: argparse.ArgumentParser,
+) -> None:
+    """
+    Configure project context for direct execution.
+
+    Harness normally sets PIPELINE_PROJECT before invoking this script.
+    Direct usage can pass --project.
+    """
+    if project:
+        os.environ["PIPELINE_PROJECT"] = project
+        return
+
+    if os.environ.get("PIPELINE_PROJECT"):
+        return
+
+    parser.error(
+        "PIPELINE_PROJECT is not set. Use --project <name> or export "
+        "PIPELINE_PROJECT=<name> before running 02_scaffold_gemini.py directly."
+    )
+
+
+def _require_api_key(parser: argparse.ArgumentParser) -> str:
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        parser.error(
+            "GEMINI_API_KEY is not set. Export GEMINI_API_KEY=<your-key> and retry."
+        )
+    return api_key
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# API call
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _gemini_url(model: str, api_key: str) -> str:
+    return (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{model}:generateContent?key={api_key}"
+    )
+
+
+def _extract_gemini_text(raw: dict[str, Any]) -> str:
     try:
         parts = raw["candidates"][0]["content"]["parts"]
     except (KeyError, IndexError, TypeError) as exc:
@@ -83,155 +200,324 @@ def _extract_gemini_text(raw: dict) -> str:
 
     return text
 
-def call_gemini(spec_content: str, max_retries: int = 5) -> dict:
+
+def call_gemini(
+    spec_content: str,
+    *,
+    api_key: str,
+    model: str,
+    max_retries: int = 5,
+) -> dict[str, Any]:
     payload = {
         "system_instruction": {
-            "parts": [{"text": SYSTEM_PROMPT}]
+            "parts": [{"text": SYSTEM_PROMPT}],
         },
         "contents": [
             {
                 "role": "user",
-                "parts": [{"text": f"Here is spec.md:\n\n{spec_content}"}]
+                "parts": [{"text": f"Here is spec.md:\n\n{spec_content}"}],
             }
         ],
         "generationConfig": {
             "temperature": 0.2,
-            "maxOutputTokens": 32768,
+            "maxOutputTokens": MAX_OUTPUT_TOKENS,
             "responseMimeType": "application/json",
-        }
+        },
     }
 
-    print("[02] Calling Gemini 2.5 Flash …")
+    print(f"[02] Calling Gemini model: {model} …")
 
     timeout = httpx.Timeout(120.0, connect=30.0)
+    url = _gemini_url(model, api_key)
 
     with httpx.Client(timeout=timeout) as client:
         for attempt in range(1, max_retries + 1):
             try:
-                r = client.post(GEMINI_URL, json=payload)
-                r.raise_for_status()
+                resp = client.post(url, json=payload)
+                resp.raise_for_status()
 
-                raw = r.json()
+                raw = resp.json()
                 text = _extract_gemini_text(raw)
                 return _parse_json(text)
 
-            except httpx.HTTPStatusError as e:
-                status = e.response.status_code if e.response else None
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code if exc.response else None
 
-                if status == 503 and attempt < max_retries:
+                if status in {429, 500, 502, 503, 504} and attempt < max_retries:
                     wait = (2 ** (attempt - 1)) + random.uniform(0, 1)
-                    print(f"[02] Gemini 503 overloaded, retry {attempt}/{max_retries} in {wait:.1f}s …")
+                    print(
+                        f"[02][warn] API status {status}, retry "
+                        f"{attempt}/{max_retries} in {wait:.1f}s …"
+                    )
                     time.sleep(wait)
                     continue
 
+                print(f"[02][error] API call failed: {exc}", file=sys.stderr)
+                raise
+
+            except httpx.TransportError as exc:
+                if attempt < max_retries:
+                    wait = (2 ** (attempt - 1)) + random.uniform(0, 1)
+                    print(
+                        f"[02][warn] Transport error, retry "
+                        f"{attempt}/{max_retries} in {wait:.1f}s: {exc}"
+                    )
+                    time.sleep(wait)
+                    continue
+
+                print(f"[02][error] Transport error: {exc}", file=sys.stderr)
                 raise
 
     raise RuntimeError("Gemini call failed after retries")
 
-# ── JSON extraction ───────────────────────────────────────────────────────────
 
-def _parse_json(raw: str) -> dict:
-    """Robust JSON extraction — handles accidental markdown fences."""
-    cleaned = re.sub(r"^```[a-z]*\n?", "", raw.strip())
+# ─────────────────────────────────────────────────────────────────────────────
+# JSON parsing / validation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _parse_json(raw: str) -> dict[str, Any]:
+    """
+    Robust JSON extraction.
+
+    Handles accidental markdown fences and, as a fallback, extracts the outermost
+    JSON object.
+    """
+    cleaned = raw.strip()
+    cleaned = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", cleaned)
     cleaned = re.sub(r"\n?```$", "", cleaned.strip())
 
     try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError as e:
-        print(f" Primary JSON parse failed: {e}", file=sys.stderr)
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError as exc:
+        print(f"[02][warn] Primary JSON parse failed: {exc}", file=sys.stderr)
+    else:
+        if not isinstance(parsed, dict):
+            raise ValueError("Model returned JSON, but top-level value is not an object.")
+        return parsed
 
-    # Fallback: find outermost { ... } block
     match = re.search(r"\{.*\}", cleaned, re.DOTALL)
     if match:
         candidate = match.group()
         try:
-            return json.loads(candidate)
-        except json.JSONDecodeError as e:
-            print(f" JSON parse failed even after extracting outer {{...}} block: {e}", file=sys.stderr)
-            # Heuristic hint
-            if "'LOW' | 'MED' | 'HIGH'" in candidate or "export type" in candidate:
-                print(" Hint: Gemini likely emitted raw TypeScript with single quotes "
-                      "inside the JSON string. Tighten SYSTEM_PROMPT to require valid JSON "
-                      "and escaped code strings.", file=sys.stderr)
-            print(f" Raw output (first 500 chars):\n{cleaned[:500]}", file=sys.stderr)
-            sys.exit(1)
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError as exc:
+            print(
+                f"[02][error] JSON parse failed after extracting outer object: {exc}",
+                file=sys.stderr,
+            )
+            print(f"[02][error] Raw output first 1000 chars:\n{cleaned[:1000]}", file=sys.stderr)
+            raise SystemExit(1) from exc
 
-    print(" No JSON object found in Gemini response.", file=sys.stderr)
-    print(f" Raw output (first 500 chars):\n{cleaned[:500]}", file=sys.stderr)
-    sys.exit(1)
-    
+        if not isinstance(parsed, dict):
+            raise ValueError("Extracted JSON top-level value is not an object.")
+        return parsed
+
+    print("[02][error] No JSON object found in model response.", file=sys.stderr)
+    print(f"[02][error] Raw output first 1000 chars:\n{cleaned[:1000]}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def _validate_scaffold(scaffold: dict[str, Any]) -> None:
+    required = {"scaffold_version", "files", "implementation_instructions"}
+    missing = required - set(scaffold.keys())
+    if missing:
+        raise ValueError(f"scaffold JSON missing required keys: {sorted(missing)}")
+
+    files = scaffold.get("files")
+    if not isinstance(files, list):
+        raise ValueError('scaffold["files"] must be a list')
+
+    for idx, entry in enumerate(files):
+        if not isinstance(entry, dict):
+            raise ValueError(f"scaffold files[{idx}] must be an object")
+
+        file_path = entry.get("file_path")
+        if not isinstance(file_path, str) or not file_path.strip():
+            raise ValueError(f"scaffold files[{idx}].file_path must be a non-empty string")
+
+        code = entry.get("code")
+        if not isinstance(code, str):
+            raise ValueError(f"scaffold files[{idx}].code must be a string")
+
+        is_test = entry.get("is_test", False)
+        if not isinstance(is_test, bool):
+            raise ValueError(f"scaffold files[{idx}].is_test must be boolean when present")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Spec compression
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _compress_spec(spec: str) -> str:
     """
     Create compressed version of spec.md for downstream models.
-    Removes §0 (meta/pipeline instructions for Gemini) and §8 (Gemini output schema).
-    Keeps §1-7, §9-11 (component specs, types, AC).
-    Saves ~35% tokens on every downstream call.
+
+    Removes sections commonly useful only for scaffold-generation instructions:
+      - ## 0.
+      - ## 8.
+
+    Keeps the rest of the spec intact.
     """
     lines = spec.splitlines()
     out: list[str] = []
+
     skip = False
-    SKIP_HEADERS  = ("## 0.", "## 8.")
-    RESUME_PREFIX = "## "
+    skip_headers = ("## 0.", "## 8.")
+    resume_prefix = "## "
+
     for line in lines:
-        if any(line.startswith(h) for h in SKIP_HEADERS):
+        if any(line.startswith(h) for h in skip_headers):
             skip = True
-        elif skip and line.startswith(RESUME_PREFIX) and not any(line.startswith(h) for h in SKIP_HEADERS):
+        elif (
+            skip
+            and line.startswith(resume_prefix)
+            and not any(line.startswith(h) for h in skip_headers)
+        ):
             skip = False
+
         if not skip:
             out.append(line)
+
     return "\n".join(out)
 
-# ── File writer ───────────────────────────────────────────────────────────────
 
-def write_files(scaffold: dict, spec: str) -> None:
-    # Write scaffold.json to state/
+# ─────────────────────────────────────────────────────────────────────────────
+# File writer
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _safe_relative_path(raw_path: str) -> Path:
+    """
+    Convert model-provided path to safe relative path.
+
+    Rejects:
+      - absolute paths
+      - path traversal using ..
+      - empty paths
+    """
+    normalized = raw_path.replace("\\", "/").strip()
+    rel = Path(normalized)
+
+    if not normalized:
+        raise ValueError("empty file_path is not allowed")
+
+    if rel.is_absolute():
+        raise ValueError(f"absolute file_path is not allowed: {raw_path}")
+
+    if any(part == ".." for part in rel.parts):
+        raise ValueError(f"path traversal is not allowed: {raw_path}")
+
+    return rel
+
+
+def _destination_for_entry(entry: dict[str, Any]) -> Path:
+    file_path = entry["file_path"]
+    is_test = entry.get("is_test", False)
+
+    rel = _safe_relative_path(file_path)
+
+    if is_test:
+        parts = rel.parts
+        if parts and parts[0] == "tests":
+            rel = Path(*parts[1:]) if len(parts) > 1 else Path(rel.name)
+        return TESTS_DIR / rel
+
+    parts = rel.parts
+    if parts and parts[0] == "src":
+        rel = Path(*parts[1:]) if len(parts) > 1 else Path(rel.name)
+    return SRC_DIR / rel
+
+
+def write_files(scaffold: dict[str, Any], spec: str) -> None:
+    SCAFFOLD_JSON.parent.mkdir(parents=True, exist_ok=True)
     SCAFFOLD_JSON.write_text(json.dumps(scaffold, indent=2))
     print(f"[02] Scaffold JSON → {SCAFFOLD_JSON}")
 
-    # Write individual source and test stubs into artifacts_<slug>/src/ and tests/
     for entry in scaffold["files"]:
-        file_path = entry["file_path"]           # e.g. "src/App.tsx" or "tests/App.test.tsx"
-        is_test   = entry.get("is_test", False)
-
-        if is_test:
-            # strip leading "tests/" prefix if present, resolve under TESTS_DIR
-            rel = file_path[len("tests/"):] if file_path.startswith("tests/") else file_path
-            dest = TESTS_DIR / rel
-        else:
-            # strip leading "src/" prefix if present, resolve under SRC_DIR
-            rel = file_path[len("src/"):] if file_path.startswith("src/") else file_path
-            dest = SRC_DIR / rel
+        dest = _destination_for_entry(entry)
 
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(entry["code"])
-        tag = "TEST" if is_test else "SRC "
+
+        tag = "TEST" if entry.get("is_test", False) else "SRC "
         print(f"[02] [{tag}] {dest}")
 
-    # Write compressed spec to cache/
     compressed = _compress_spec(spec)
     SPEC_COMPRESSED.parent.mkdir(parents=True, exist_ok=True)
     SPEC_COMPRESSED.write_text(compressed)
-    savings = round((1 - len(compressed) / len(spec)) * 100)
-    print(f"[02] Compressed spec → {SPEC_COMPRESSED}  ({savings}% smaller)")
 
-    # NOTE: instructions_qwen.txt and pipeline_context.json are removed.
-    # Qwen will read from scaffold.json["implementation_instructions"]["for_qwen"].
+    savings = 0
+    if spec:
+        savings = round((1 - len(compressed) / len(spec)) * 100)
 
+    print(f"[02] Compressed spec → {SPEC_COMPRESSED} ({savings}% smaller)")
     print("[02] Done.")
 
-# ── Main ──────────────────────────────────────────────────────────────────────
 
-def main():
-    spec     = SPEC_PATH.read_text()
-    scaffold = call_gemini(spec)
+def preview_files(scaffold: dict[str, Any], spec: str) -> None:
+    print("[02] --dry-run: scaffold validated. No files written.")
+    print(f"[02] Would write scaffold JSON → {SCAFFOLD_JSON}")
 
-    required = {"scaffold_version", "files", "implementation_instructions"}
-    missing  = required - set(scaffold.keys())
-    if missing:
-        print(f"[02] ERROR: scaffold JSON missing keys: {missing}", file=sys.stderr)
+    for entry in scaffold["files"]:
+        dest = _destination_for_entry(entry)
+        tag = "TEST" if entry.get("is_test", False) else "SRC "
+        print(f"[02] Would write [{tag}] {dest}")
+
+    compressed = _compress_spec(spec)
+    savings = round((1 - len(compressed) / len(spec)) * 100) if spec else 0
+    print(f"[02] Would write compressed spec → {SPEC_COMPRESSED} ({savings}% smaller)")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    parser = _build_parser()
+    args = parser.parse_args()
+
+    _configure_project(args.project, parser)
+
+    # Important: do not call ensure_dirs() at import-time.
+    # PIPELINE_PROJECT must be available before artifact paths are resolved.
+    ensure_dirs()
+
+    api_key = _require_api_key(parser)
+
+    if not SPEC_PATH.exists():
+        print(f"[02][error] spec.md not found: {SPEC_PATH}", file=sys.stderr)
+        print(
+            "[02][hint] This is a full-only scaffold step. Ensure the full flow "
+            "created spec.md before running 02_scaffold_gemini.py.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
+    spec = SPEC_PATH.read_text(errors="replace")
+
+    scaffold = call_gemini(
+        spec,
+        api_key=api_key,
+        model=args.model,
+        max_retries=args.max_retries,
+    )
+
+    try:
+        _validate_scaffold(scaffold)
+    except ValueError as exc:
+        print(f"[02][error] Invalid scaffold JSON: {exc}", file=sys.stderr)
+        print(
+            f"[02][debug] Scaffold first 1000 chars:\n"
+            f"{json.dumps(scaffold, indent=2)[:1000]}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if args.dry_run:
+        preview_files(scaffold, spec)
+        return
+
     write_files(scaffold, spec)
+
 
 if __name__ == "__main__":
     main()
