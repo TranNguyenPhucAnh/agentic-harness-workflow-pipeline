@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-pipeline/03a_implement_qwen.py
+pipeline/08_executor.py
 ==============================
 Step 3a — Qwen 3.6 Plus as EXECUTOR.
 
