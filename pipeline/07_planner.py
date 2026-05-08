@@ -1,5 +1,5 @@
 """
-pipeline/03b_implement_glm.py
+pipeline/07_planner.py
 =============================
 Step 3b — GLM 5.1 as PLANNER (reasoning-heavy, no code output).
 
