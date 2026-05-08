@@ -1,5 +1,5 @@
 """
-pipeline/01_absorber.py
+pipeline/02_absorber.py
 =======================
 Step 1 — Absorb an existing codebase into the knowledge layer.
 
