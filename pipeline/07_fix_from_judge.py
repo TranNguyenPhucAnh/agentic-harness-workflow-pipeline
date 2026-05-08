@@ -1,76 +1,105 @@
 """
 pipeline/07_fix_from_judge.py
-Step 7 — Fix blocking issues identified by the DeepSeek judge.
+=============================
+Step 7 — Fix blocking issues identified by the judge.
 
 Called automatically by harness.py when 06_judge_deepseek.py exits with
-verdict NEEDS_REVISION.  Human approval is NOT required for blocking issues
-because the judge already classified them; this script acts on that verdict.
+verdict NEEDS_REVISION. Human approval is not required for judge-classified
+blocking issues, but this script must still enforce scope safety.
 
-What this script does
-─────────────────────
-1. Parse reports/judge_raw.json → extract blocking_issues + non_blocking_notes
-2. Map each blocking issue to the source file(s) it affects
-3. For each blocking issue → call Minimax once with:
-     spec + affected src files + judge's exact description
-4. Apply patches (scope-locked to src/ only — never tests/)
-5. Run vitest to confirm fixes (exit 1 if still failing)
-6. Write artifacts_<slug>/knowledge/current/findings.md — injected into Minimax/Qwen prompts on
-   future runs so the same mistakes are not repeated
+Supports:
+  - FULL flow:
+      Uses spec/spec_compressed + judge finding + affected src files.
+      Patch scope defaults to src/** only. Never patches tests.
+      Runs Vitest confirmation unless skipped.
 
-Writes
-──────
-    artifacts_<slug>/knowledge/current/findings.md     ← persistent cross-run memory
-    artifacts_<slug>/run/update_log.json               ← this run's fix log (merged)
-    src/**                                      ← patched files
+  - MINI targeted flow:
+      Uses clarified_requirement.md + plan_mini.json + analysis_mini.json
+      + impl_record.json + judge finding.
+      Patch scope is strictly limited to plan_mini.target_files.
+      If a judge finding requires a file outside target_files, this script
+      rejects auto-fix and escalates to human instead of broadening scope.
+      Confirmation uses lightweight verifier dispatch by file extension.
 
-Does NOT
-────────
-    - Modify test files
-    - Modify spec.md  (spec changes require human + version bump)
-    - Re-run the judge (harness.py does that after this script exits 0)
+Writes:
+  artifacts_<slug>/knowledge/current/findings.md
+  artifacts_<slug>/knowledge/history/fix_log.json or configured FIX_LOG path
+  target source/config/query files when allowed
+
+Reads:
+  artifacts_<slug>/run/judge_raw.json
+  artifacts_<slug>/run/impl_record.json
+  artifacts_<slug>/state/plan_mini.json
+  artifacts_<slug>/run/analysis_mini.json
+  artifacts_<slug>/knowledge/current/clarified_requirement.md
+  artifacts_<slug>/knowledge/current/enriched_prompt.md
+  artifacts_<slug>/knowledge/current/base.md
+  artifacts_<slug>/cache/spec_compressed.md
+  artifacts_<slug>/spec.md
+  artifacts_<slug>/state/plan.json
+  artifacts_<slug>/state/plan_notes.json
+
+Direct execution:
+  python 07_fix_from_judge.py --project my-app
+  PIPELINE_PROJECT=my-app python 07_fix_from_judge.py
+
+Required environment:
+  OPENROUTER_API_KEY=<your-key>
 
 For taxonomy details see docs/artifacts.md
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
+import py_compile
 import re
 import subprocess
 import sys
-import httpx
-from dataclasses import dataclass, asdict
+import textwrap
+import time
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-import time
+from typing import Any, Callable
+
+import httpx
 
 # === WRITE AUTHORITY: 07_fix_from_judge ===
-# OWNS  : artifacts_<slug>/knowledge/history/fix_log.json
-#         artifacts_<slug>/knowledge/current/findings.md
-# READS : artifacts_<slug>/run/judge_raw.json,
-#         artifacts_<slug>/knowledge/current/findings_notes.md,
-#         artifacts_<slug>/knowledge/current/base.md,
-#         artifacts_<slug>/cache/spec_compressed.md,
-#         artifacts_<slug>/state/plan.json,
-#         artifacts_<slug>/state/plan_notes.json
+# OWNS  : artifacts_<slug>/knowledge/current/findings.md
+#         artifacts_<slug>/knowledge/history/fix_log.json or FIX_LOG path
+# READS : judge/planner/context/test artifacts
+# WRITES: allowed source/target files only
 
-import sys as _sys
-_sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent))
-from artifacts.paths import (
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from artifacts.paths import (  # noqa: E402
+    ANALYSIS_MINI,
+    CLARIFIED_REQ,
+    ENRICHED_PROMPT,
+    FINDINGS as FINDINGS_PATH,
+    FIX_LOG as FIX_REPORT_PATH,
+    IMPL_RECORD,
+    JUDGE_RAW as JUDGE_RAW_PATH,
+    KNOWLEDGE_BASE,
+    PLAN_JSON as GLM_PLAN_PATH,
+    PLAN_MINI,
+    PLAN_NOTES as PLAN_NOTES_PATH,
+    SPEC_COMPRESSED,
     SPEC_PATH,
     SRC_DIR,
+    TEST_REPORT,
     artifact_root,
-    JUDGE_RAW as JUDGE_RAW_PATH,
-    FIX_LOG as FIX_REPORT_PATH,
-    FINDINGS as FINDINGS_PATH,
-    KNOWLEDGE_BASE,
-    SPEC_COMPRESSED,
-    PLAN_JSON as GLM_PLAN_PATH,
-    PLAN_NOTES as PLAN_NOTES_PATH,
     ensure_dirs,
 )
-ensure_dirs()
+
+
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+DEFAULT_MINIMAX_MODEL = "minimax/minimax-m2.7"
+DEFAULT_QWEN_MODEL = "qwen/qwen3.6-plus"
+
+MAX_FILE_CHARS = 80_000
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -80,209 +109,662 @@ ensure_dirs()
 @dataclass
 class JudgeFinding:
     description: str
-    severity:    str          # "blocking" | "non_blocking"
-    files:       list[str]    # src/ paths this finding affects
-    section:     str = ""     # judge section that flagged it (for context)
+    severity: str
+    files: list[str]
+    section: str = ""
 
 
 @dataclass
 class FixRecord:
-    finding:     str
-    files:       list[str]
-    patched:     bool
+    finding: str
+    files: list[str]
+    patched: bool
     files_written: list[str]
-    note:        str
+    note: str
+    escalated: bool = False
+    escalated_to: str = ""
+    rejected_files: list[str] | None = None
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# CLI / project setup
+# ════════════════════════════════════════════════════════════════════════════
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Apply scoped fixes for judge blocking issues.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""
+            Examples:
+              python 07_fix_from_judge.py --project my-app
+              PIPELINE_PROJECT=my-app python 07_fix_from_judge.py
+
+              python 07_fix_from_judge.py --project my-app --verbose
+              python 07_fix_from_judge.py --project my-app --skip-confirm
+              python 07_fix_from_judge.py --project my-app --fix-non-blocking
+        """),
+    )
+    parser.add_argument(
+        "--project",
+        default=None,
+        help="Project name for direct execution. Sets PIPELINE_PROJECT.",
+    )
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument(
+        "--fix-blocking",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Fix blocking issues. Default: true.",
+    )
+    parser.add_argument(
+        "--fix-non-blocking",
+        action="store_true",
+        default=False,
+        help="Also attempt to fix non-blocking notes. Default: false.",
+    )
+    parser.add_argument(
+        "--skip-confirm",
+        "--skip-vitest",
+        dest="skip_confirm",
+        action="store_true",
+        help="Skip post-fix verification/confirmation.",
+    )
+    parser.add_argument(
+        "--minimax-model",
+        default=os.environ.get("FIX_MINIMAX_MODEL", DEFAULT_MINIMAX_MODEL),
+    )
+    parser.add_argument(
+        "--qwen-model",
+        default=os.environ.get("FIX_QWEN_MODEL", DEFAULT_QWEN_MODEL),
+    )
+    return parser
+
+
+def _configure_project(
+    project: str | None,
+    parser: argparse.ArgumentParser,
+) -> None:
+    if project:
+        os.environ["PIPELINE_PROJECT"] = project
+        return
+
+    if os.environ.get("PIPELINE_PROJECT"):
+        return
+
+    parser.error(
+        "PIPELINE_PROJECT is not set. Use --project <name> or export "
+        "PIPELINE_PROJECT=<name> before running 07_fix_from_judge.py directly."
+    )
+
+
+def _require_openrouter_key(parser: argparse.ArgumentParser) -> str:
+    api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    if not api_key:
+        parser.error(
+            "OPENROUTER_API_KEY is not set. Export OPENROUTER_API_KEY=<your-key> and retry."
+        )
+    return api_key
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Safe loaders / scope detection
+# ════════════════════════════════════════════════════════════════════════════
+
+def _read_json(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(errors="replace"))
+    except Exception as exc:
+        print(f"[07][warn] Could not parse JSON {path}: {exc}", file=sys.stderr)
+        return default
+
+
+def _read_text(path: Path) -> str:
+    if not path.exists():
+        return ""
+    try:
+        return path.read_text(errors="replace")
+    except Exception as exc:
+        print(f"[07][warn] Could not read {path}: {exc}", file=sys.stderr)
+        return ""
+
+
+def _load_impl_record() -> dict[str, Any]:
+    rec = _read_json(IMPL_RECORD, {})
+    return rec if isinstance(rec, dict) else {}
+
+
+def _load_plan_mini() -> dict[str, Any]:
+    plan = _read_json(PLAN_MINI, {})
+    return plan if isinstance(plan, dict) else {}
+
+
+def _load_analysis_mini() -> dict[str, Any]:
+    analysis = _read_json(ANALYSIS_MINI, {})
+    return analysis if isinstance(analysis, dict) else {}
+
+
+def _load_test_report() -> dict[str, Any]:
+    report = _read_json(TEST_REPORT, {})
+    return report if isinstance(report, dict) else {}
+
+
+def _current_scope() -> str:
+    rec = _load_impl_record()
+    scope = rec.get("scope")
+    if scope in {"full", "mini"}:
+        return scope
+
+    report = _load_test_report()
+    scope = report.get("scope")
+    if scope in {"full", "mini"}:
+        return scope
+
+    if PLAN_MINI.exists() or ANALYSIS_MINI.exists():
+        return "mini"
+
+    return "full"
+
+
+def _extract_file_list(value: Any) -> list[str]:
+    files: list[str] = []
+
+    if not isinstance(value, list):
+        return files
+
+    for item in value:
+        if isinstance(item, str):
+            files.append(item)
+        elif isinstance(item, dict):
+            path = item.get("path") or item.get("file_path") or item.get("file")
+            if isinstance(path, str):
+                files.append(path)
+
+    return sorted(set(files))
+
+
+def _mini_allowed_files() -> set[str]:
+    plan = _load_plan_mini()
+    return set(_extract_file_list(plan.get("target_files", [])))
+
+
+def _implemented_files() -> set[str]:
+    rec = _load_impl_record()
+    return set(_extract_file_list(rec.get("files", [])))
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Path helpers
+# ════════════════════════════════════════════════════════════════════════════
+
+def _safe_rel(raw: str) -> Path:
+    normalized = raw.replace("\\", "/").strip()
+    rel = Path(normalized)
+
+    if not normalized:
+        raise ValueError("empty path")
+
+    if rel.is_absolute():
+        raise ValueError(f"absolute path not allowed: {raw}")
+
+    if any(part == ".." for part in rel.parts):
+        raise ValueError(f"path traversal not allowed: {raw}")
+
+    return rel
+
+
+def _resolve_artifact_path(rel: str) -> Path:
+    safe = _safe_rel(rel)
+    raw = safe.as_posix()
+
+    if raw.startswith("src/"):
+        return SRC_DIR / raw[len("src/"):]
+
+    return artifact_root() / safe
+
+
+def _path_exists(rel: str) -> bool:
+    try:
+        return _resolve_artifact_path(rel).exists()
+    except Exception:
+        return False
+
+
+def _read_file_for_prompt(rel: str) -> str:
+    try:
+        path = _resolve_artifact_path(rel)
+    except Exception as exc:
+        return f"[invalid path: {exc}]"
+
+    if not path.exists():
+        return f"[file not found: {path}]"
+
+    text = path.read_text(errors="replace")
+    if len(text) > MAX_FILE_CHARS:
+        return text[:MAX_FILE_CHARS] + f"\n\n[truncated: {len(text)} chars total]"
+    return text
+
+
+def _lang_for_path(rel: str) -> str:
+    ext = Path(rel).suffix.lower()
+    mapping = {
+        ".ts": "typescript",
+        ".tsx": "tsx",
+        ".js": "javascript",
+        ".jsx": "jsx",
+        ".py": "python",
+        ".sql": "sql",
+        ".json": "json",
+        ".yaml": "yaml",
+        ".yml": "yaml",
+        ".toml": "toml",
+        ".md": "markdown",
+        ".txt": "text",
+        ".ini": "ini",
+        ".cfg": "ini",
+        ".conf": "text",
+        ".sh": "bash",
+    }
+    return mapping.get(ext, "")
+
+
+def _format_file_block(rel: str) -> str:
+    code = _read_file_for_prompt(rel)
+    lang = _lang_for_path(rel)
+    return f"### {rel}\n```{lang}\n{code}\n```"
+
+
+def _is_test_path(rel: str) -> bool:
+    lowered = rel.lower()
+    return rel.startswith("tests/") or ".test." in lowered or ".spec." in lowered
 
 
 # ════════════════════════════════════════════════════════════════════════════
 # API
 # ════════════════════════════════════════════════════════════════════════════
 
-def _openrouter_call(model_id: str, messages: list, max_tokens: int = 32768) -> str:
-    import time
-    api_key = os.environ["OPENROUTER_API_KEY"]
+def _openrouter_call(
+    model_id: str,
+    messages: list[dict[str, str]],
+    *,
+    api_key: str,
+    max_tokens: int = 32768,
+) -> str:
     for attempt in range(2):
-        r = httpx.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={"Authorization": f"Bearer {api_key}",
-                     "Content-Type": "application/json"},
-            json={"model": model_id, "messages": messages,
-                  "temperature": 0.1, "max_tokens": max_tokens},
+        response = httpx.post(
+            OPENROUTER_URL,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model_id,
+                "messages": messages,
+                "temperature": 0.1,
+                "max_tokens": max_tokens,
+            },
             timeout=300,
         )
-        r.raise_for_status()
-        data     = r.json()
-        usage    = data.get("usage", {})
-        print(f"    [tokens] {model_id}: "
-              f"prompt={usage.get('prompt_tokens','?')}, "
-              f"completion={usage.get('completion_tokens','?')}")
-        content = data["choices"][0]["message"]["content"]
+        response.raise_for_status()
+
+        data = response.json()
+        usage = data.get("usage", {})
+        print(
+            f"    [tokens] {model_id}: "
+            f"prompt={usage.get('prompt_tokens', '?')}, "
+            f"completion={usage.get('completion_tokens', '?')}"
+        )
+
+        content = data["choices"][0]["message"].get("content", "")
         if content and content.strip():
-            return content
+            return content.strip()
+
         if attempt == 0:
-            print(f"    [warn] empty response from {model_id}, retrying in 3s …",
-                  file=sys.stderr)
+            print(
+                f"    [warn] empty response from {model_id}, retrying in 3s …",
+                file=sys.stderr,
+            )
             time.sleep(3)
+
     return ""
 
 
-def call_minimax(messages: list) -> str:
-    return _openrouter_call("minimax/minimax-m2.7", messages)
-
-
-def call_qwen(messages: list) -> str:
-    return _openrouter_call("qwen/qwen3.6-plus", messages)
-
-
 # ════════════════════════════════════════════════════════════════════════════
-# Parse judge_raw.json
+# Judge response parsing
 # ════════════════════════════════════════════════════════════════════════════
 
-def load_judge_verdict() -> dict:
+def _strip_json_fences(raw: str) -> str:
+    text = raw.strip()
+    text = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", text)
+    text = re.sub(r"\n?```$", "", text.strip())
+    return text
+
+
+def _parse_json_object(raw: str) -> dict[str, Any]:
+    text = _strip_json_fences(raw)
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if not match:
+            raise
+        parsed = json.loads(match.group())
+
+    if not isinstance(parsed, dict):
+        raise ValueError("JSON top-level is not an object")
+
+    return parsed
+
+
+def load_judge_verdict() -> dict[str, Any]:
     if not JUDGE_RAW_PATH.exists():
         print(f"[07] ERROR: {JUDGE_RAW_PATH} not found.", file=sys.stderr)
         print("[07] Run 06_judge_deepseek.py first.", file=sys.stderr)
         sys.exit(1)
-    raw_data = json.loads(JUDGE_RAW_PATH.read_text())
+
+    raw_data = _read_json(JUDGE_RAW_PATH, {})
+    if not isinstance(raw_data, dict):
+        print(f"[07] ERROR: invalid judge_raw.json shape: {JUDGE_RAW_PATH}", file=sys.stderr)
+        sys.exit(1)
+
     raw_resp = raw_data.get("response", "")
-    raw_resp = re.sub(r"^```[a-z]*\n?", "", raw_resp.strip())
-    raw_resp = re.sub(r"\n?```$",        "", raw_resp.strip())
+    if not isinstance(raw_resp, str) or not raw_resp.strip():
+        print("[07] ERROR: judge_raw.json has empty response.", file=sys.stderr)
+        sys.exit(1)
+
     try:
-        return json.loads(raw_resp)
-    except json.JSONDecodeError as e:
-        print(f"[07] ERROR: could not parse judge response JSON: {e}", file=sys.stderr)
+        return _parse_json_object(raw_resp)
+    except Exception as exc:
+        print(f"[07] ERROR: could not parse judge response JSON: {exc}", file=sys.stderr)
+        print(f"[07] Raw first 1000 chars:\n{raw_resp[:1000]}", file=sys.stderr)
         sys.exit(1)
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# File mapping — which src files does each finding affect?
+# Finding → file mapping
 # ════════════════════════════════════════════════════════════════════════════
 
-_RE_SRC_PATH = re.compile(r"src/[\w/]+\.(?:ts|tsx)")
+_RE_ANY_REL_PATH = re.compile(
+    r"(?:src|queries|dags|config|configs|sql|scripts|app|lib|tests)/"
+    r"[\w.\-/]+\."
+    r"(?:ts|tsx|js|jsx|py|sql|json|ya?ml|toml|md|txt|ini|cfg|conf|sh)"
+)
+
+_RE_SRC_PATH = re.compile(r"src/[\w.\-/]+\.(?:ts|tsx|js|jsx)")
+
 
 _KEYWORD_FILES: dict[str, list[str]] = {
-    "useSensorData":  ["src/hooks/useSensorData.ts", "src/data/demoConstants.ts"],
-    "useReplay":      ["src/hooks/useReplay.ts"],
-    "demoConstants":  ["src/data/demoConstants.ts"],
-    "useMemo":        ["src/hooks/useSensorData.ts"],
+    "useSensorData": ["src/hooks/useSensorData.ts", "src/data/demoConstants.ts"],
+    "useReplay": ["src/hooks/useReplay.ts"],
+    "demoConstants": ["src/data/demoConstants.ts"],
+    "useMemo": ["src/hooks/useSensorData.ts"],
     "requestAnimationFrame": ["src/hooks/useReplay.ts"],
-    "rAF":            ["src/hooks/useReplay.ts"],
-    "setInterval":    ["src/hooks/useReplay.ts"],
-    "anomaly":        ["src/hooks/useSensorData.ts"],
-    "jumpToNext":     ["src/hooks/useReplay.ts"],
-    "windowStart":    ["src/hooks/useReplay.ts"],
-    "duplicate":      ["src/hooks/useSensorData.ts", "src/data/demoConstants.ts"],
+    "rAF": ["src/hooks/useReplay.ts"],
+    "setInterval": ["src/hooks/useReplay.ts"],
+    "anomaly": ["src/hooks/useSensorData.ts"],
+    "jumpToNext": ["src/hooks/useReplay.ts"],
+    "windowStart": ["src/hooks/useReplay.ts"],
+    "duplicate": ["src/hooks/useSensorData.ts", "src/data/demoConstants.ts"],
 }
 
-_COMPONENT_SCAN_KEYWORDS = {"theme", "tailwind", "bg-white", "text-gray-800",
-                             "dark theme", "light theme", "colour", "color"}
+_COMPONENT_SCAN_KEYWORDS = {
+    "theme",
+    "tailwind",
+    "bg-white",
+    "text-gray-800",
+    "dark theme",
+    "light theme",
+    "colour",
+    "color",
+}
 
 
-def _infer_files(text: str) -> list[str]:
+def _infer_full_files(text: str) -> list[str]:
     found: list[str] = []
 
-    for m in _RE_SRC_PATH.findall(text):
-        if m not in found:
-            found.append(m)
+    for match in _RE_SRC_PATH.findall(text):
+        if match not in found and _path_exists(match):
+            found.append(match)
 
     text_lower = text.lower()
-    for kw, files in _KEYWORD_FILES.items():
-        if kw.lower() in text_lower:
-            for f in files:
-                rel_path = SRC_DIR / f.replace("src/", "", 1) if f.startswith("src/") else SRC_DIR / f
-                if f not in found and rel_path.exists():
-                    found.append(f)
+    for keyword, files in _KEYWORD_FILES.items():
+        if keyword.lower() in text_lower:
+            for rel in files:
+                if rel not in found and _path_exists(rel):
+                    found.append(rel)
 
-    if any(kw in text_lower for kw in _COMPONENT_SCAN_KEYWORDS):
+    if any(keyword in text_lower for keyword in _COMPONENT_SCAN_KEYWORDS):
         comp_dir = SRC_DIR / "components"
         if comp_dir.exists():
-            for p in sorted(comp_dir.rglob("*.tsx")):
-                rel = "src/" + str(p.relative_to(SRC_DIR))
+            for path in sorted(comp_dir.rglob("*.tsx")):
+                rel = "src/" + str(path.relative_to(SRC_DIR)).replace("\\", "/")
                 if rel not in found:
                     found.append(rel)
 
-    return [f for f in found if (SRC_DIR / f.replace("src/", "", 1)).exists()]
+    return found
 
 
-def extract_findings(verdict: dict) -> tuple[list[JudgeFinding], list[JudgeFinding]]:
+def _infer_mini_files(text: str) -> tuple[list[str], list[str]]:
+    """
+    Return:
+      (allowed_mapped_files, rejected_out_of_scope_files)
+    """
+    allowed = _mini_allowed_files()
+    implemented = _implemented_files()
+
+    candidates: set[str] = set()
+
+    for match in _RE_ANY_REL_PATH.findall(text):
+        candidates.add(match)
+
+    # If judge did not mention concrete files, fall back to implemented/target
+    # files, but still within mini allowed set.
+    if not candidates:
+        candidates.update(implemented)
+        candidates.update(allowed)
+
+    mapped: list[str] = []
+    rejected: list[str] = []
+
+    for rel in sorted(candidates):
+        if rel in allowed:
+            mapped.append(rel)
+        else:
+            rejected.append(rel)
+
+    return mapped, rejected
+
+
+def _section_notes(verdict: dict[str, Any]) -> dict[str, str]:
     sections = verdict.get("sections", {})
-    section_notes = {k: v.get("notes", "") for k, v in sections.items()}
+    if not isinstance(sections, dict):
+        return {}
+
+    notes: dict[str, str] = {}
+    for key, value in sections.items():
+        if isinstance(value, dict):
+            notes[key] = str(value.get("notes", ""))
+    return notes
+
+
+def extract_findings(
+    verdict: dict[str, Any],
+    *,
+    scope: str,
+) -> tuple[list[JudgeFinding], list[JudgeFinding], list[str]]:
+    section_notes = _section_notes(verdict)
+
+    scope_rejections: list[str] = []
+
+    def map_files(description: str, section_hint: str = "") -> list[str]:
+        combined = description + " " + section_notes.get(section_hint, "")
+
+        if scope == "mini":
+            mapped, rejected = _infer_mini_files(combined)
+            for rel in rejected:
+                scope_rejections.append(
+                    f"Judge finding references `{rel}`, which is outside plan_mini.target_files."
+                )
+            return mapped
+
+        return _infer_full_files(combined)
 
     blocking: list[JudgeFinding] = []
     for desc in verdict.get("blocking_issues", []):
         section_hint = ""
+        desc_text = str(desc)
+
         for sec_name, notes in section_notes.items():
-            if any(word in notes.lower() for word in desc.lower().split()[:4]):
+            first_words = desc_text.lower().split()[:4]
+            if first_words and any(word in notes.lower() for word in first_words):
                 section_hint = sec_name
                 break
-        blocking.append(JudgeFinding(
-            description=desc,
-            severity="blocking",
-            files=_infer_files(desc + " " + section_notes.get(section_hint, "")),
-            section=section_hint,
-        ))
+
+        blocking.append(
+            JudgeFinding(
+                description=desc_text,
+                severity="blocking",
+                files=map_files(desc_text, section_hint),
+                section=section_hint,
+            )
+        )
 
     non_blocking: list[JudgeFinding] = []
     for desc in verdict.get("non_blocking_notes", []):
-        non_blocking.append(JudgeFinding(
-            description=desc,
-            severity="non_blocking",
-            files=_infer_files(desc),
-            section="",
-        ))
+        desc_text = str(desc)
+        non_blocking.append(
+            JudgeFinding(
+                description=desc_text,
+                severity="non_blocking",
+                files=map_files(desc_text),
+                section="",
+            )
+        )
 
-    return blocking, non_blocking
+    return blocking, non_blocking, scope_rejections
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Context builders
+# ════════════════════════════════════════════════════════════════════════════
+
+def _load_full_context() -> str:
+    spec = _read_text(SPEC_COMPRESSED) or _read_text(SPEC_PATH)
+    if not spec:
+        return "[spec.md missing]"
+
+    parts = ["## spec.md\n\n" + spec]
+
+    plan = _read_json(GLM_PLAN_PATH, None)
+    if isinstance(plan, dict):
+        parts.append("## plan.json\n\n```json\n" + json.dumps(plan, indent=2) + "\n```")
+
+    plan_notes = _read_json(PLAN_NOTES_PATH, None)
+    if plan_notes:
+        parts.append(
+            "## plan_notes.json\n\n```json\n"
+            + json.dumps(plan_notes, indent=2)
+            + "\n```"
+        )
+
+    kb = _read_text(KNOWLEDGE_BASE)
+    if kb:
+        parts.append("## Knowledge base\n\n" + kb)
+
+    return "\n\n---\n\n".join(parts)
+
+
+def _load_mini_context() -> str:
+    parts: list[str] = []
+
+    clarified = _read_text(CLARIFIED_REQ)
+    if clarified:
+        parts.append("## clarified_requirement.md\n\n" + clarified)
+    else:
+        parts.append("## clarified_requirement.md\n\n[missing]")
+
+    enriched = _read_text(ENRICHED_PROMPT)
+    if enriched:
+        parts.append("## enriched_prompt.md\n\n" + enriched)
+
+    plan = _load_plan_mini()
+    if plan:
+        parts.append("## plan_mini.json\n\n```json\n" + json.dumps(plan, indent=2) + "\n```")
+    else:
+        parts.append("## plan_mini.json\n\n[missing]")
+
+    analysis = _load_analysis_mini()
+    if analysis:
+        parts.append(
+            "## analysis_mini.json\n\n```json\n"
+            + json.dumps(analysis, indent=2)
+            + "\n```"
+        )
+
+    impl = _load_impl_record()
+    if impl:
+        parts.append("## impl_record.json\n\n```json\n" + json.dumps(impl, indent=2) + "\n```")
+
+    kb = _read_text(KNOWLEDGE_BASE)
+    if kb:
+        parts.append("## Knowledge base\n\n" + kb)
+
+    return "\n\n---\n\n".join(parts)
+
+
+def _load_run_context() -> str:
+    return _load_mini_context() if _current_scope() == "mini" else _load_full_context()
 
 
 # ════════════════════════════════════════════════════════════════════════════
 # Fix prompts
 # ════════════════════════════════════════════════════════════════════════════
 
-JUDGE_FIX_SYSTEM_MINIMAX = """\
-You are a senior TypeScript engineer fixing issues identified by a code reviewer (judge).
+JUDGE_FIX_SYSTEM_FULL_MINIMAX = """\
+You are a senior TypeScript engineer fixing issues identified by a code reviewer.
 
 The judge has already diagnosed the problem. Your job is to implement the fix precisely.
 
-Context you will receive:
-1. spec.md — authoritative requirements
-2. The exact judge finding (what is wrong and why)
-3. All affected source files
-
 Rules:
-- Fix ONLY what the judge finding describes — do not refactor unrelated code
-- If fixing a duplicate implementation: remove the hook from the wrong file,
-  keep it only in src/hooks/; demoConstants.ts should export only constants
-- TypeScript strict — no `any`
-- Tailwind only — no inline styles (exception: dynamic width percentages)
-- Output raw JSON only, no markdown fences:
+- Fix ONLY what the judge finding describes.
+- Do not refactor unrelated code.
+- Patch source files only.
+- Never modify tests.
+- TypeScript strict; avoid `any`.
+- Preserve public interfaces unless the judge finding explicitly requires a change.
+- Output raw JSON only, no markdown fences.
 
+Return:
 {
   "files": [
     {
       "file_path": "src/hooks/useSensorData.ts",
       "code": "<full corrected file content>",
-      "change_summary": "one sentence describing what was changed"
+      "change_summary": "one sentence"
     }
   ],
-  "root_cause": "one sentence: the precise bug",
-  "fix_summary": "one sentence: what was done to fix it"
+  "root_cause": "one sentence",
+  "fix_summary": "one sentence"
 }
 
-IMPORTANT: Return ALL affected files in the files array, even if only one changed.
+IMPORTANT: Return all affected files in the files array.
 """
 
-JUDGE_FIX_SYSTEM_QWEN = """\
+JUDGE_FIX_SYSTEM_FULL_QWEN = """\
 You are a senior TypeScript/React developer fixing a surface issue identified by a judge.
 
-The judge has diagnosed the problem. Fix it precisely — do not touch unrelated code.
-
-Context: spec.md + judge finding + affected source files.
-
 Rules:
-- Tailwind only — use dark theme classes: bg-gray-800/900, text-gray-100/200/300
-- TypeScript strict — no `any`
-- Output raw JSON only, no markdown fences:
+- Fix only the judge finding.
+- Do not touch unrelated code.
+- Patch source files only.
+- Never modify tests.
+- Tailwind only when styling is involved.
+- TypeScript strict; avoid `any`.
+- Output raw JSON only, no markdown fences.
 
+Return:
 {
   "files": [
     {
@@ -295,132 +777,288 @@ Rules:
 }
 """
 
+JUDGE_FIX_SYSTEM_MINI = """\
+You are fixing a blocking issue from a judge in a MINI targeted run.
 
-def _load_spec() -> str:
-    if SPEC_COMPRESSED.exists():
-        return SPEC_COMPRESSED.read_text()
-    return SPEC_PATH.read_text()
+Critical scope rule:
+- You may ONLY write files explicitly listed in plan_mini.target_files.
+- Do NOT add new files.
+- Do NOT modify tests unless tests are explicitly listed in plan_mini.target_files.
+- If the fix requires a file outside target_files, return:
+  {
+    "files": [],
+    "root_cause": "...",
+    "fix_summary": "Cannot safely auto-fix because required file is outside mini target scope."
+  }
+
+Context you receive:
+- clarified requirement
+- plan_mini.json
+- analysis_mini.json
+- impl_record.json
+- judge finding
+- allowed affected files
+
+Rules:
+- Fix only what the judge finding describes.
+- Preserve the mini task boundary.
+- Keep changes minimal.
+- Respect the file's language/format.
+- Output raw JSON only, no markdown fences.
+
+Return:
+{
+  "files": [
+    {
+      "file_path": "queries/example.sql",
+      "code": "<full corrected file content>",
+      "change_summary": "one sentence"
+    }
+  ],
+  "root_cause": "one sentence",
+  "fix_summary": "one sentence"
+}
+"""
 
 
-def _read_safe(path: Path) -> str:
-    return path.read_text() if path.exists() else f"// FILE NOT FOUND: {path}\n"
+_SURFACE_KEYWORDS = {
+    "theme",
+    "tailwind",
+    "colour",
+    "color",
+    "bg-",
+    "text-",
+    "dark",
+    "light",
+    "class",
+    "aria",
+    "selector",
+    "label",
+}
 
 
-def _parse_fix_response(raw: str, label: str) -> dict | None:
-    raw = re.sub(r"^```[a-z]*\n?", "", raw.strip())
-    raw = re.sub(r"\n?```$",        "", raw.strip())
+def _choose_agent_and_prompt(
+    finding: JudgeFinding,
+    *,
+    scope: str,
+) -> tuple[str, str]:
+    if scope == "mini":
+        return "minimax", JUDGE_FIX_SYSTEM_MINI
+
+    text_lower = finding.description.lower()
+    if finding.severity == "non_blocking" and any(kw in text_lower for kw in _SURFACE_KEYWORDS):
+        return "qwen", JUDGE_FIX_SYSTEM_FULL_QWEN
+
+    if any(kw in text_lower for kw in _SURFACE_KEYWORDS):
+        return "qwen", JUDGE_FIX_SYSTEM_FULL_QWEN
+
+    return "minimax", JUDGE_FIX_SYSTEM_FULL_MINIMAX
+
+
+def _parse_fix_response(raw: str, label: str) -> dict[str, Any] | None:
+    if not raw.strip():
+        return None
+
     try:
-        return json.loads(raw)
-    except json.JSONDecodeError as e:
-        print(f"    [07] JSON parse failed for {label}: {e}", file=sys.stderr)
-        print(f"    [07] Raw (first 300): {raw[:300]}", file=sys.stderr)
+        return _parse_json_object(raw)
+    except Exception as exc:
+        print(f"    [07] JSON parse failed for {label}: {exc}", file=sys.stderr)
+        print(f"    [07] Raw first 500 chars: {raw[:500]}", file=sys.stderr)
         return None
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Fix executor
+# Scope guards / patch executor
 # ════════════════════════════════════════════════════════════════════════════
 
-_SURFACE_KEYWORDS = {"theme", "tailwind", "colour", "color", "bg-", "text-",
-                     "dark", "light", "class"}
+def _allowed_to_write(rel: str, *, scope: str) -> tuple[bool, str]:
+    try:
+        _safe_rel(rel)
+    except Exception as exc:
+        return False, str(exc)
 
+    if _is_test_path(rel):
+        return False, "test file writes are rejected by judge-fix step"
 
-def _choose_agent(finding: JudgeFinding) -> tuple[str, str]:
-    text_lower = finding.description.lower()
-    if finding.severity == "non_blocking" and \
-            any(kw in text_lower for kw in _SURFACE_KEYWORDS):
-        return "qwen", JUDGE_FIX_SYSTEM_QWEN
-    return "minimax", JUDGE_FIX_SYSTEM_MINIMAX
+    if scope == "mini":
+        allowed = _mini_allowed_files()
+        if rel not in allowed:
+            return False, f"`{rel}` is outside plan_mini.target_files"
+        return True, ""
+
+    if not rel.startswith("src/"):
+        return False, "full judge-fix may only patch src/**"
+
+    return True, ""
 
 
 def fix_finding(
     finding: JudgeFinding,
-    spec:    str,
-    verdict: dict,
+    verdict: dict[str, Any],
+    *,
+    api_key: str,
+    minimax_model: str,
+    qwen_model: str,
     verbose: bool,
 ) -> FixRecord:
+    scope = _current_scope()
+
     if not finding.files:
-        print(f"  [07] No files mapped for: {finding.description[:60]}… — skipping")
+        note = "no files mapped"
+        if scope == "mini":
+            note += " — judge finding did not map to any plan_mini.target_files"
+        else:
+            note += " — check heuristics or add explicit path in judge finding"
+
+        print(f"  [07] No files mapped for: {finding.description[:80]}… — skipping")
         return FixRecord(
-            finding=finding.description, files=[],
-            patched=False, files_written=[],
-            note="no files mapped — check heuristics or add explicit path in judge finding",
+            finding=finding.description,
+            files=[],
+            patched=False,
+            files_written=[],
+            note=note,
+            escalated=True,
+            escalated_to="human",
         )
 
-    agent_label, system = _choose_agent(finding)
-    call_fn = call_minimax if agent_label == "minimax" else call_qwen
+    # Preflight: do not call model if mapped files violate write scope.
+    rejected: list[str] = []
+    allowed_files: list[str] = []
 
-    files_block = ""
-    for fp in finding.files:
-        disk = SRC_DIR / fp.replace("src/", "", 1) if fp.startswith("src/") else SRC_DIR / fp
-        code = _read_safe(disk)
-        files_block += f"\n### {fp}\n```typescript\n{code}\n```\n"
+    for rel in finding.files:
+        ok, reason = _allowed_to_write(rel, scope=scope)
+        if ok:
+            allowed_files.append(rel)
+        else:
+            rejected.append(f"{rel}: {reason}")
+
+    if rejected:
+        print("  [07] Scope violation before model call — auto-fix rejected:", file=sys.stderr)
+        for item in rejected:
+            print(f"       - {item}", file=sys.stderr)
+
+        return FixRecord(
+            finding=finding.description,
+            files=finding.files,
+            patched=False,
+            files_written=[],
+            note="scope violation; auto-fix rejected",
+            escalated=True,
+            escalated_to="human",
+            rejected_files=rejected,
+        )
+
+    agent_label, system = _choose_agent_and_prompt(finding, scope=scope)
+    model_id = minimax_model if agent_label == "minimax" else qwen_model
+
+    files_block = "\n\n".join(_format_file_block(rel) for rel in allowed_files)
 
     sections_block = ""
     if finding.section:
         sec = verdict.get("sections", {}).get(finding.section, {})
-        if sec.get("notes"):
+        if isinstance(sec, dict) and sec.get("notes"):
             sections_block = (
                 f"\n### Judge section notes ({finding.section})\n"
                 f"{sec['notes']}\n"
             )
 
+    allowed_block = ""
+    if scope == "mini":
+        allowed = sorted(_mini_allowed_files())
+        allowed_block = (
+            "\n### Mini allowed write set — STRICT\n"
+            + "\n".join(f"- `{rel}`" for rel in allowed)
+            + "\n"
+        )
+
     user_content = (
-        f"### spec.md\n\n{spec}\n\n"
-        f"### Judge finding (blocking issue to fix)\n"
-        f"{finding.description}\n"
+        f"### Run context\n\n{_load_run_context()}\n\n"
+        f"### Judge finding to fix\n{finding.description}\n"
         f"{sections_block}\n"
-        f"### Affected source files\n{files_block}"
+        f"{allowed_block}\n"
+        f"### Affected files you may edit\n\n{files_block}"
     )
 
     messages = [
         {"role": "system", "content": system},
-        {"role": "user",   "content": user_content},
+        {"role": "user", "content": user_content},
     ]
 
-    print(f"  [07] → {agent_label.upper()} fixing: {finding.description[:70]}…")
+    print(f"  [07] → {agent_label.upper()} fixing: {finding.description[:90]}…")
     if verbose:
-        print(f"  [07]   files: {finding.files}")
+        print(f"  [07]   scope: {scope}")
+        print(f"  [07]   files: {allowed_files}")
 
-    raw = call_fn(messages).strip()
+    raw = _openrouter_call(model_id, messages, api_key=api_key).strip()
     if not raw:
         return FixRecord(
-            finding=finding.description, files=finding.files,
-            patched=False, files_written=[],
+            finding=finding.description,
+            files=finding.files,
+            patched=False,
+            files_written=[],
             note="model returned empty response",
         )
 
     patch = _parse_fix_response(raw, finding.description[:40])
     if not patch:
         return FixRecord(
-            finding=finding.description, files=finding.files,
-            patched=False, files_written=[],
+            finding=finding.description,
+            files=finding.files,
+            patched=False,
+            files_written=[],
             note="JSON parse failed",
         )
 
     written: list[str] = []
-    for entry in patch.get("files", []):
-        out_rel  = entry.get("file_path", "")
-        out_path = SRC_DIR / out_rel.replace("src/", "", 1) if out_rel.startswith("src/") else None
+    rejected_after_model: list[str] = []
 
-        if not out_rel.startswith("src/"):
-            print(f"  [07] ⚠ Scope violation: {out_rel} not under src/ — rejected",
-                  file=sys.stderr)
-            continue
-        if "test" in out_rel.lower():
-            print(f"  [07] ⚠ Tried to write test file {out_rel} — rejected",
-                  file=sys.stderr)
+    patch_files = patch.get("files", [])
+    if not isinstance(patch_files, list):
+        patch_files = []
+
+    for entry in patch_files:
+        if not isinstance(entry, dict):
             continue
 
+        out_rel = str(entry.get("file_path", "")).strip()
+        code = entry.get("code")
+
+        ok, reason = _allowed_to_write(out_rel, scope=scope)
+        if not ok:
+            msg = f"{out_rel}: {reason}"
+            rejected_after_model.append(msg)
+            print(f"  [07] ⚠ Scope violation: {msg} — rejected", file=sys.stderr)
+            continue
+
+        if not isinstance(code, str):
+            msg = f"{out_rel}: missing code string"
+            rejected_after_model.append(msg)
+            print(f"  [07] ⚠ Invalid patch: {msg} — rejected", file=sys.stderr)
+            continue
+
+        out_path = _resolve_artifact_path(out_rel)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(entry["code"])
+        out_path.write_text(code)
+
         written.append(out_rel)
         change = entry.get("change_summary", "")
         print(f"  [07] ✓ Wrote {out_rel}" + (f" — {change}" if change else ""))
 
-    fix_summary = patch.get("fix_summary", "")
-    root_cause  = patch.get("root_cause", "")
+    fix_summary = str(patch.get("fix_summary", ""))
+    root_cause = str(patch.get("root_cause", ""))
     note = f"{root_cause} | {fix_summary}" if root_cause else fix_summary
+
+    if rejected_after_model and not written:
+        return FixRecord(
+            finding=finding.description,
+            files=finding.files,
+            patched=False,
+            files_written=[],
+            note=note or "all model patches rejected by scope guard",
+            escalated=True,
+            escalated_to="human",
+            rejected_files=rejected_after_model,
+        )
 
     return FixRecord(
         finding=finding.description,
@@ -428,29 +1066,141 @@ def fix_finding(
         patched=bool(written),
         files_written=written,
         note=note,
+        escalated=bool(rejected_after_model and not written),
+        escalated_to="human" if rejected_after_model and not written else "",
+        rejected_files=rejected_after_model or None,
     )
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# vitest confirm
+# Confirmation / verifier dispatch
 # ════════════════════════════════════════════════════════════════════════════
 
 def run_vitest_confirm() -> tuple[bool, str]:
-    print("\n[07] Running vitest to confirm fixes …")
+    print("\n[07] Running Vitest to confirm fixes …")
     result = subprocess.run(
         ["npx", "vitest", "run", "--reporter=verbose"],
-        cwd=artifact_root(), capture_output=True, text=True,
+        cwd=artifact_root(),
+        capture_output=True,
+        text=True,
     )
     output = result.stdout + "\n" + result.stderr
     passed = result.returncode == 0
     summary = next(
-        (l.strip() for l in output.splitlines()
-         if ("passed" in l or "failed" in l) and "test" in l.lower()),
+        (
+            line.strip()
+            for line in output.splitlines()
+            if ("passed" in line or "failed" in line) and "test" in line.lower()
+        ),
         "no summary line found",
     )
     icon = "✓" if passed else "✗"
-    print(f"[07] vitest {icon} {summary}")
+    print(f"[07] Vitest {icon} {summary}")
     return passed, output
+
+
+def _verify_python(path: Path) -> tuple[bool, str]:
+    try:
+        py_compile.compile(str(path), doraise=True)
+        return True, "py_compile OK"
+    except Exception as exc:
+        return False, f"py_compile failed: {exc}"
+
+
+def _verify_json(path: Path) -> tuple[bool, str]:
+    try:
+        json.loads(path.read_text(errors="replace"))
+        return True, "JSON parse OK"
+    except Exception as exc:
+        return False, f"JSON parse failed: {exc}"
+
+
+def _verify_toml(path: Path) -> tuple[bool, str]:
+    try:
+        import tomllib
+        tomllib.loads(path.read_text(errors="replace"))
+        return True, "TOML parse OK"
+    except Exception as exc:
+        return False, f"TOML parse failed: {exc}"
+
+
+def _verify_yaml(path: Path) -> tuple[bool, str]:
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        text = path.read_text(errors="replace")
+        if "\t" in text:
+            return False, "YAML basic check failed: tabs found; install PyYAML for full parse"
+        return True, "YAML basic check OK; PyYAML not installed"
+
+    try:
+        yaml.safe_load(path.read_text(errors="replace"))
+        return True, "YAML parse OK"
+    except Exception as exc:
+        return False, f"YAML parse failed: {exc}"
+
+
+def run_mini_confirm(files_written: list[str]) -> tuple[bool, str]:
+    print("\n[07] Running mini verifier to confirm fixes …")
+
+    if not files_written:
+        return False, "no files written"
+
+    checks: list[str] = []
+    all_ok = True
+    ts_like = False
+
+    for rel in sorted(set(files_written)):
+        path = _resolve_artifact_path(rel)
+        ext = path.suffix.lower()
+
+        if not path.exists():
+            ok, msg = False, f"file not found: {path}"
+        elif ext == ".py":
+            ok, msg = _verify_python(path)
+        elif ext == ".json":
+            ok, msg = _verify_json(path)
+        elif ext in {".yaml", ".yml"}:
+            ok, msg = _verify_yaml(path)
+        elif ext == ".toml":
+            ok, msg = _verify_toml(path)
+        elif ext in {".ts", ".tsx", ".js", ".jsx"}:
+            ts_like = True
+            ok, msg = True, "TS/JS file written; Vitest will run if package.json exists"
+        else:
+            ok, msg = True, "basic existence check OK"
+
+        status = "PASS" if ok else "FAIL"
+        checks.append(f"{status} {rel}: {msg}")
+        print(f"[07][mini] {status} {rel} — {msg}")
+        all_ok = all_ok and ok
+
+    package_json = artifact_root() / "package.json"
+    if ts_like and package_json.exists():
+        vitest_ok, vitest_output = run_vitest_confirm()
+        all_ok = all_ok and vitest_ok
+        checks.append("VITEST " + ("PASS" if vitest_ok else "FAIL"))
+        checks.append(vitest_output[-1200:])
+    elif ts_like:
+        checks.append("VITEST SKIPPED: package.json not found")
+
+    return all_ok, "\n".join(checks)
+
+
+def run_confirm(
+    *,
+    scope: str,
+    files_written: list[str],
+    skip_confirm: bool,
+) -> tuple[bool, str]:
+    if skip_confirm:
+        print("\n[07] Skipping confirmation (--skip-confirm)")
+        return True, "skipped"
+
+    if scope == "mini":
+        return run_mini_confirm(files_written)
+
+    return run_vitest_confirm()
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -458,71 +1208,111 @@ def run_vitest_confirm() -> tuple[bool, str]:
 # ════════════════════════════════════════════════════════════════════════════
 
 def write_judge_findings(
-    blocking:     list[JudgeFinding],
+    blocking: list[JudgeFinding],
     non_blocking: list[JudgeFinding],
-    fix_records:  list[FixRecord],
-    verdict:      dict,
+    fix_records: list[FixRecord],
+    verdict: dict[str, Any],
+    *,
+    scope: str,
 ) -> None:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    scores = {k: v.get("score", "?")
-              for k, v in verdict.get("sections", {}).items() if "score" in v}
+
+    sections = verdict.get("sections", {})
+    scores: dict[str, Any] = {}
+    if isinstance(sections, dict):
+        for key, value in sections.items():
+            if isinstance(value, dict) and "score" in value:
+                scores[key] = value.get("score")
 
     lines = [
         f"# Judge findings — {now}",
-        f"_Verdict: {verdict.get('verdict')} | "
+        f"_Scope: {scope} | Verdict: {verdict.get('verdict')} | "
         f"Scores: {', '.join(f'{k}={v}/5' for k, v in scores.items())}_",
         "",
-        "## Blocking issues (were fixed in this run — do not reintroduce)",
+        "## Blocking issues",
         "",
     ]
 
-    fixed_set  = {r.finding for r in fix_records if r.patched}
-    failed_set = {r.finding for r in fix_records if not r.patched}
+    fixed_set = {record.finding for record in fix_records if record.patched}
+    failed_set = {record.finding for record in fix_records if not record.patched}
 
-    for f in blocking:
-        status = "✓ fixed" if f.description in fixed_set else "✗ fix failed — needs human"
-        lines.append(f"- [{status}] {f.description}")
-        if f.files:
-            lines.append(f"  → files: {', '.join(f.files)}")
+    for finding in blocking:
+        if finding.description in fixed_set:
+            status = "✓ fixed"
+        elif finding.description in failed_set:
+            status = "✗ fix failed or rejected — needs human"
+        else:
+            status = "not attempted"
+
+        lines.append(f"- [{status}] {finding.description}")
+        if finding.files:
+            lines.append(f"  → files: {', '.join(finding.files)}")
 
     lines += [
         "",
-        "## Non-blocking notes (watch out on future runs)",
+        "## Non-blocking notes",
         "",
     ]
-    for f in non_blocking:
-        lines.append(f"- {f.description}")
+
+    for finding in non_blocking:
+        lines.append(f"- {finding.description}")
+        if finding.files:
+            lines.append(f"  → files: {', '.join(finding.files)}")
 
     lines += [
         "",
-        "## Patterns to avoid (extracted from judge analysis)",
+        "## Patterns to avoid",
         "",
-        "### Architecture",
     ]
 
-    arch_notes = verdict.get("sections", {}).get("architecture", {}).get("notes", "")
-    if arch_notes:
-        lines.append(arch_notes)
+    if isinstance(sections, dict):
+        for section_name in (
+            "architecture_scope",
+            "architecture",
+            "code_quality",
+            "requirement_compliance",
+            "spec_compliance",
+            "test_quality",
+        ):
+            section = sections.get(section_name, {})
+            if isinstance(section, dict) and section.get("notes"):
+                lines += [
+                    f"### {section_name}",
+                    str(section.get("notes")),
+                    "",
+                ]
 
     lines += [
-        "",
-        "### Code quality",
-    ]
-    quality_notes = verdict.get("sections", {}).get("code_quality", {}).get("notes", "")
-    if quality_notes:
-        lines.append(quality_notes)
-
-    lines += [
-        "",
         "---",
         "_This file is auto-generated. Do not edit manually._",
         "_To clear findings, delete this file before next run._",
     ]
 
     FINDINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    FINDINGS_PATH.write_text("\n".join(lines) + "\n")
+    FINDINGS_PATH.write_text("\n".join(lines).rstrip() + "\n")
     print(f"\n[07] Findings written → {FINDINGS_PATH}")
-    print("[07] Injected into Minimax + Qwen prompts on next run.")
+    print("[07] Findings will be injected into future repair prompts.")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Fix log
+# ════════════════════════════════════════════════════════════════════════════
+
+def append_fix_log(report: dict[str, Any]) -> None:
+    FIX_REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    existing: list[Any] = []
+    if FIX_REPORT_PATH.exists():
+        try:
+            loaded = json.loads(FIX_REPORT_PATH.read_text(errors="replace"))
+            if isinstance(loaded, list):
+                existing = loaded
+        except Exception:
+            existing = []
+
+    existing.append(report)
+    FIX_REPORT_PATH.write_text(json.dumps(existing, indent=2))
+    print(f"\n[07] Fix log appended → {FIX_REPORT_PATH}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -530,16 +1320,18 @@ def write_judge_findings(
 # ════════════════════════════════════════════════════════════════════════════
 
 def main() -> None:
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--verbose",        action="store_true")
-    parser.add_argument("--fix-blocking",   action="store_true", default=True,
-                        help="Fix blocking issues (default: True)")
-    parser.add_argument("--fix-non-blocking", action="store_true", default=False,
-                        help="Also attempt to fix non-blocking notes (default: False)")
-    parser.add_argument("--skip-vitest",    action="store_true",
-                        help="Skip vitest confirm after fixes (for debugging)")
+    parser = _build_parser()
     args = parser.parse_args()
+
+    _configure_project(args.project, parser)
+
+    # Important: project env must be configured before ensure_dirs().
+    ensure_dirs()
+
+    api_key = _require_openrouter_key(parser)
+
+    scope = _current_scope()
+    print(f"[07] Scope detected: {scope}")
 
     verdict = load_judge_verdict()
 
@@ -547,25 +1339,28 @@ def main() -> None:
         print("[07] Judge already APPROVED — nothing to fix.")
         sys.exit(0)
 
-    print(f"[07] Judge verdict: {verdict['verdict']}")
-    print(f"[07] Summary: {verdict.get('summary','')[:120]}")
+    print(f"[07] Judge verdict: {verdict.get('verdict')}")
+    print(f"[07] Summary: {str(verdict.get('summary', ''))[:160]}")
 
-    blocking, non_blocking = extract_findings(verdict)
+    blocking, non_blocking, scope_rejections = extract_findings(verdict, scope=scope)
+
+    if scope_rejections:
+        print("\n[07] Mini scope warnings from judge findings:")
+        for item in sorted(set(scope_rejections)):
+            print(f"  ⚠ {item}")
 
     print(f"\n[07] Blocking issues ({len(blocking)}):")
-    for f in blocking:
-        mapped = f.files or ["(no files mapped)"]
-        print(f"  • {f.description[:80]}")
+    for finding in blocking:
+        mapped = finding.files or ["(no files mapped)"]
+        print(f"  • {finding.description[:100]}")
         print(f"    files: {mapped}")
 
     print(f"\n[07] Non-blocking notes ({len(non_blocking)}):")
-    for f in non_blocking:
-        mapped = f.files or ["(no files mapped)"]
-        print(f"  • {f.description[:80]}")
-        print(f"    files: {mapped}, agent: {_choose_agent(f)[0]}")
-
-    spec = _load_spec()
-    fix_records: list[FixRecord] = []
+    for finding in non_blocking:
+        mapped = finding.files or ["(no files mapped)"]
+        agent, _ = _choose_agent_and_prompt(finding, scope=scope)
+        print(f"  • {finding.description[:100]}")
+        print(f"    files: {mapped}, agent: {agent}")
 
     to_fix: list[JudgeFinding] = []
     if args.fix_blocking:
@@ -573,77 +1368,114 @@ def main() -> None:
     if args.fix_non_blocking:
         to_fix.extend(non_blocking)
 
+    fix_records: list[FixRecord] = []
+
     if not to_fix:
-        print("\n[07] Nothing to fix (no target findings).")
+        print("\n[07] Nothing to fix.")
     else:
         print(f"\n[07] Fixing {len(to_fix)} finding(s) …")
         for finding in to_fix:
-            record = fix_finding(finding, spec, verdict, verbose=args.verbose)
+            record = fix_finding(
+                finding,
+                verdict,
+                api_key=api_key,
+                minimax_model=args.minimax_model,
+                qwen_model=args.qwen_model,
+                verbose=args.verbose,
+            )
             fix_records.append(record)
 
-    vitest_passed = False
-    vitest_summary = "skipped"
+    files_written = sorted({
+        rel
+        for record in fix_records
+        for rel in record.files_written
+    })
 
-    if fix_records and not args.skip_vitest:
-        vitest_passed, vitest_output = run_vitest_confirm()
-        vitest_summary = vitest_output[-800:]
-    elif args.skip_vitest:
-        print("\n[07] Skipping vitest (--skip-vitest)")
-        vitest_passed = True
+    confirm_passed = False
+    confirm_summary = "not run"
 
-    write_judge_findings(blocking, non_blocking, fix_records, verdict)
+    if fix_records:
+        confirm_passed, confirm_summary = run_confirm(
+            scope=scope,
+            files_written=files_written,
+            skip_confirm=args.skip_confirm,
+        )
+    elif args.skip_confirm:
+        confirm_passed = True
+        confirm_summary = "skipped"
+    else:
+        confirm_passed = False
+        confirm_summary = "no fixes attempted"
 
-    n_patched = sum(1 for r in fix_records if r.patched)
+    write_judge_findings(
+        blocking,
+        non_blocking,
+        fix_records,
+        verdict,
+        scope=scope,
+    )
+
+    n_patched = sum(1 for record in fix_records if record.patched)
+    n_escalated = sum(1 for record in fix_records if record.escalated)
+
     report = {
-        "timestamp":        datetime.now(timezone.utc).isoformat(),
-        "judge_verdict":    verdict.get("verdict"),
-        "blocking_count":   len(blocking),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "scope": scope,
+        "judge_verdict": verdict.get("verdict"),
+        "blocking_count": len(blocking),
         "non_blocking_count": len(non_blocking),
-        "fix_attempts":     len(fix_records),
-        "fixes_patched":    n_patched,
-        "vitest_passed":    vitest_passed,
-        "vitest_summary":   vitest_summary,
-        "records":          [asdict(r) for r in fix_records],
+        "fix_attempts": len(fix_records),
+        "fixes_patched": n_patched,
+        "escalated_count": n_escalated,
+        "confirm_passed": confirm_passed,
+        "confirm_summary": confirm_summary[-2000:] if isinstance(confirm_summary, str) else confirm_summary,
+        "scope_rejections": sorted(set(scope_rejections)),
+        "records": [asdict(record) for record in fix_records],
     }
-    FIX_REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    existing_fixes: list = []
-    if FIX_REPORT_PATH.exists():
-        try:
-            existing_fixes = json.loads(FIX_REPORT_PATH.read_text())
-        except Exception:
-            existing_fixes = []
-    existing_fixes.append(report)
-    FIX_REPORT_PATH.write_text(json.dumps(existing_fixes, indent=2))
-    print(f"\n[07] Fix log appended → {FIX_REPORT_PATH}")
+    append_fix_log(report)
 
-    print(f"\n{'='*50}")
-    print(f"  STEP 7 SUMMARY")
-    print(f"{'='*50}")
+    print(f"\n{'=' * 50}")
+    print("  STEP 7 SUMMARY")
+    print(f"{'=' * 50}")
+    print(f"  Scope:              {scope}")
     print(f"  Blocking issues:    {len(blocking)}")
     print(f"  Fixes applied:      {n_patched}/{len(fix_records)}")
-    print(f"  vitest after fix:   {'✓ PASS' if vitest_passed else '✗ FAIL'}")
+    print(f"  Escalated:          {n_escalated}")
+    print(f"  Confirm after fix:  {'✓ PASS' if confirm_passed else '✗ FAIL'}")
 
-    for r in fix_records:
-        icon = "✅" if r.patched else "❌"
-        print(f"  {icon} {r.finding[:65]}")
-        if r.files_written:
-            for fw in r.files_written:
-                print(f"     → {fw}")
-        if r.note:
-            print(f"     note: {r.note[:80]}")
+    for record in fix_records:
+        icon = "✅" if record.patched else "❌"
+        esc = " ESCALATED" if record.escalated else ""
+        print(f"  {icon}{esc} {record.finding[:80]}")
+        for written in record.files_written:
+            print(f"     → {written}")
+        if record.rejected_files:
+            for rejected in record.rejected_files:
+                print(f"     rejected: {rejected}")
+        if record.note:
+            print(f"     note: {record.note[:120]}")
 
-    failed_fixes = [r for r in fix_records if not r.patched]
-    if failed_fixes:
-        print(f"\n[07] ⚠ {len(failed_fixes)} fix(es) failed — needs human review:")
-        for r in failed_fixes:
-            print(f"     • {r.finding[:80]}")
-            print(f"       {r.note}")
+    failed_or_escalated = [
+        record
+        for record in fix_records
+        if not record.patched or record.escalated
+    ]
 
-    if not vitest_passed and not args.skip_vitest:
-        print("\n[07] Tests still failing after judge fixes — human review needed.")
+    if failed_or_escalated:
+        print(f"\n[07] ⚠ {len(failed_or_escalated)} fix(es) failed/rejected/escalated:")
+        for record in failed_or_escalated:
+            print(f"     • {record.finding[:100]}")
+            print(f"       {record.note}")
+
+    if not confirm_passed and not args.skip_confirm:
+        print("\n[07] Confirmation failed after judge fixes — human review needed.")
         sys.exit(1)
 
-    print("\n[07] Done. harness.py will re-run judge to confirm improvement.")
+    if any(record.escalated for record in fix_records):
+        print("\n[07] Some fixes escalated due to scope/safety constraints.", file=sys.stderr)
+        sys.exit(1)
+
+    print("\n[07] Done. harness.py can re-run judge to confirm improvement.")
     sys.exit(0)
 
 
