@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-08_prompt_agent.py
+04_enricher.py
 ==================
 Prompt Agent — nhận clarified artifacts + knowledge layer + raw input của user,
 enrich thành một structured prompt đủ context cho model xịn downstream (spec agent).
