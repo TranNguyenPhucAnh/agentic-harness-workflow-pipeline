@@ -1,4 +1,3 @@
-```python
 #!/usr/bin/env python3
 """
 harness.py — Orchestrator for the LLM pipeline.
