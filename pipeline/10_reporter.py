@@ -1,5 +1,5 @@
 """
-pipeline/05_report.py
+pipeline/10_reporter.py
 =====================
 Step 5b — Aggregate pipeline artifacts into reports/summary.md.
 
