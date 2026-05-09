@@ -1,7 +1,7 @@
 """
 pipeline/09_debugger.py
-===============================
-Step 4+5 — Test / verify / iterate.
+=======================
+Step 9 — Test / verify / iterate.
 
 FULL mode:
   Clustered repair loop:
@@ -10,14 +10,15 @@ FULL mode:
     - Apply static fixes.
     - Use Qwen for surface/component bugs.
     - Use Minimax for hook/data/type/util logic bugs.
-    - Write merged test_report.json.
+    - Write debugger_session_test_summary.json.
 
 MINI mode:
   Safe targeted verification:
-    - Detect scope from run/impl_record.json.
-    - Do not require spec.md.
-    - Build context from clarified_requirement.md, plan_mini.json,
-      analysis_mini.json, impl_record.json.
+    - Detect scope from execution/executor_session_manifest.json.
+    - Do not require the canonical spec.
+    - Build context from clarificator_requirement_synthesis.md,
+      planner_mini_execution_plan.json, planner_mini_impact_analysis.json,
+      executor_session_manifest.json.
     - Dispatch lightweight verifiers by target file extension:
         .py                  → py_compile
         .json                → json parse
@@ -27,28 +28,36 @@ MINI mode:
     - For TS/Vitest projects, can still run the full Vitest repair loop.
 
 Writes:
-  artifacts_<slug>/run/test_report.json
+  artifacts_<slug>/execution/debugger_session_test_summary.json
+  artifacts_<slug>/src/**    repair loop patches, if needed
+  artifacts_<slug>/tests/**  fragile-test repair, if auditor allows
 
 Reads:
-  artifacts_<slug>/spec.md
-  artifacts_<slug>/cache/spec_compressed.md
-  artifacts_<slug>/state/plan.json
-  artifacts_<slug>/state/plan_notes.json
-  artifacts_<slug>/state/plan_mini.json
-  artifacts_<slug>/run/analysis_mini.json
-  artifacts_<slug>/run/impl_record.json
-  artifacts_<slug>/knowledge/current/findings.md
-  artifacts_<slug>/knowledge/current/findings_notes.md
-  artifacts_<slug>/knowledge/current/base.md
+  artifacts_<slug>/specwright_spec_<slug>.md
+  artifacts_<slug>/cache/scaffolder_compressed_spec.md
+  artifacts_<slug>/state/planner_full_execution_plan.json
+  artifacts_<slug>/state/planner_mini_execution_plan.json
+  artifacts_<slug>/state/planner_mini_impact_analysis.json
+  artifacts_<slug>/state/clarificator_requirement_synthesis.md
+  artifacts_<slug>/execution/enricher_session_enriched_prompt.md
+  artifacts_<slug>/execution/executor_session_manifest.json
+  artifacts_<slug>/knowledge/current/patcher_findings_snapshot.md
+  artifacts_<slug>/knowledge/current/archivist_knowledge_log.md
+  artifacts_<slug>/src/**
+  artifacts_<slug>/tests/**
 
 Direct execution:
-  python 04_test_and_iterate.py --project my-app
-  PIPELINE_PROJECT=my-app python 04_test_and_iterate.py
+  python 09_debugger.py --project my-app
+  PIPELINE_PROJECT=my-app python 09_debugger.py
 
 Required for repair loop:
   OPENROUTER_API_KEY=<your-key>
 
-For taxonomy details see docs/artifacts.md
+At the end of each run, prints:
+  - artifacts/files read
+  - artifacts/files created/updated/overwritten/appended
+
+For taxonomy details see artifacts/TAXONOMY.md
 """
 
 from __future__ import annotations
@@ -67,29 +76,40 @@ from typing import Any, Callable
 
 import httpx
 
-# === WRITE AUTHORITY: 04_test_and_iterate ===
-# OWNS  : artifacts_<slug>/run/test_report.json
-# READS : spec / plans / findings / knowledge / generated source/tests
+# === WRITE AUTHORITY: debugger ===
+# OWNS  : artifacts_<slug>/execution/debugger_session_test_summary.json
+#         artifacts_<slug>/src/**    repair patches, if needed
+#         artifacts_<slug>/tests/**  fragile-test patches, if auditor allows
+# READS : artifacts_<slug>/specwright_spec_<slug>.md
+#         artifacts_<slug>/cache/scaffolder_compressed_spec.md
+#         artifacts_<slug>/state/planner_full_execution_plan.json
+#         artifacts_<slug>/state/planner_mini_execution_plan.json
+#         artifacts_<slug>/state/planner_mini_impact_analysis.json
+#         artifacts_<slug>/state/clarificator_requirement_synthesis.md
+#         artifacts_<slug>/execution/enricher_session_enriched_prompt.md
+#         artifacts_<slug>/execution/executor_session_manifest.json
+#         artifacts_<slug>/knowledge/current/patcher_findings_snapshot.md
+#         artifacts_<slug>/knowledge/current/archivist_knowledge_log.md
+#         artifacts_<slug>/src/**
+#         artifacts_<slug>/tests/**
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from artifacts.paths import (  # noqa: E402
-    ANALYSIS_MINI,
-    CACHE_DIR,
+    ARCHIVIST_KNOWLEDGE_LOG,
     CLARIFIED_REQ,
-    ENRICHED_PROMPT,
-    FINDINGS as FINDINGS_PATH,
-    FINDINGS_NOTES as FINDINGS_NOTES_PATH,
-    IMPL_RECORD,
-    KNOWLEDGE_BASE,
-    PLAN_JSON as GLM_PLAN,
-    PLAN_MINI,
-    PLAN_NOTES as GLM_PLAN_NOTES,
-    SPEC_PATH,
+    DEBUGGER_SESSION_TEST_SUMMARY,
+    ENRICHER_SESSION_PROMPT,
+    EXECUTOR_SESSION_MANIFEST,
+    PATCHER_FINDINGS_SNAPSHOT,
+    PLANNER_FULL_PLAN,
+    PLANNER_MINI_IMPACT,
+    PLANNER_MINI_PLAN,
+    SCAFFOLDER_COMPRESSED_SPEC,
     SRC_DIR,
-    TEST_REPORT,
     TESTS_DIR,
     artifact_root,
     ensure_dirs,
+    get_spec_path,
 )
 
 
@@ -101,6 +121,38 @@ MINIMAX_SCOPE_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"^src/types/"),
     re.compile(r"^src/utils/"),
 ]
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Artifact/file access tracking
+# ════════════════════════════════════════════════════════════════════════════
+
+_ARTIFACTS_READ: set[str] = set()
+_ARTIFACTS_WRITTEN: set[str] = set()
+
+
+def _track_read(path: Any) -> None:
+    _ARTIFACTS_READ.add(str(path))
+
+
+def _track_write(path: Any) -> None:
+    _ARTIFACTS_WRITTEN.add(str(path))
+
+
+def _print_artifact_access_summary() -> None:
+    print("[09] Artifacts/files read:")
+    if _ARTIFACTS_READ:
+        for item in sorted(_ARTIFACTS_READ):
+            print(f"[09]   READ  {item}")
+    else:
+        print("[09]   READ  (none)")
+
+    print("[09] Artifacts/files created/updated/overwritten/appended:")
+    if _ARTIFACTS_WRITTEN:
+        for item in sorted(_ARTIFACTS_WRITTEN):
+            print(f"[09]   WRITE {item}")
+    else:
+        print("[09]   WRITE (none)")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -174,6 +226,7 @@ class IterationRecord:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
+        prog="09_debugger.py",
         description="Run tests/verifiers and optionally repair failing clusters.",
     )
     parser.add_argument(
@@ -211,7 +264,7 @@ def _configure_project(
 
     parser.error(
         "PIPELINE_PROJECT is not set. Use --project <name> or export "
-        "PIPELINE_PROJECT=<name> before running 04_test_and_iterate.py directly."
+        "PIPELINE_PROJECT=<name> before running 09_debugger.py directly."
     )
 
 
@@ -219,17 +272,26 @@ def _configure_project(
 # Scope / context loaders
 # ════════════════════════════════════════════════════════════════════════════
 
-def _read_json(path: Path, default: Any) -> Any:
+def _read_json(path: Any, default: Any) -> Any:
     if not path.exists():
         return default
     try:
-        return json.loads(path.read_text())
+        _track_read(path)
+        return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return default
 
 
+def _read_text_if_exists(path: Any, *, errors: str = "replace") -> str:
+    if not path.exists():
+        return ""
+    _track_read(path)
+    return path.read_text(errors=errors)
+
+
 def _load_impl_record() -> dict[str, Any]:
-    return _read_json(IMPL_RECORD, {})
+    data = _read_json(EXECUTOR_SESSION_MANIFEST, {})
+    return data if isinstance(data, dict) else {}
 
 
 def _current_scope() -> str:
@@ -239,11 +301,14 @@ def _current_scope() -> str:
 
 
 def _load_spec_or_full_context() -> str:
-    compressed = CACHE_DIR / "spec_compressed.md"
-    if compressed.exists():
-        return compressed.read_text(errors="replace")
-    if SPEC_PATH.exists():
-        return SPEC_PATH.read_text(errors="replace")
+    if SCAFFOLDER_COMPRESSED_SPEC.exists():
+        return _read_text_if_exists(SCAFFOLDER_COMPRESSED_SPEC).strip()
+
+    spec_path = get_spec_path()
+    if spec_path.exists():
+        _track_read(spec_path)
+        return spec_path.read_text(errors="replace").strip()
+
     return ""
 
 
@@ -252,34 +317,34 @@ def _load_mini_context() -> str:
 
     if CLARIFIED_REQ.exists():
         parts.append(
-            "## clarified_requirement.md\n\n"
-            + CLARIFIED_REQ.read_text(errors="replace").strip()
+            "## clarificator_requirement_synthesis.md\n\n"
+            + _read_text_if_exists(CLARIFIED_REQ).strip()
         )
 
-    if ENRICHED_PROMPT.exists():
+    if ENRICHER_SESSION_PROMPT.exists():
         parts.append(
-            "## enriched_prompt.md\n\n"
-            + ENRICHED_PROMPT.read_text(errors="replace").strip()
+            "## enricher_session_enriched_prompt.md\n\n"
+            + _read_text_if_exists(ENRICHER_SESSION_PROMPT).strip()
         )
 
-    if PLAN_MINI.exists():
+    if PLANNER_MINI_PLAN.exists():
         parts.append(
-            "## plan_mini.json\n\n```json\n"
-            + PLAN_MINI.read_text(errors="replace").strip()
+            "## planner_mini_execution_plan.json\n\n```json\n"
+            + _read_text_if_exists(PLANNER_MINI_PLAN).strip()
             + "\n```"
         )
 
-    if ANALYSIS_MINI.exists():
+    if PLANNER_MINI_IMPACT.exists():
         parts.append(
-            "## analysis_mini.json\n\n```json\n"
-            + ANALYSIS_MINI.read_text(errors="replace").strip()
+            "## planner_mini_impact_analysis.json\n\n```json\n"
+            + _read_text_if_exists(PLANNER_MINI_IMPACT).strip()
             + "\n```"
         )
 
-    if IMPL_RECORD.exists():
+    if EXECUTOR_SESSION_MANIFEST.exists():
         parts.append(
-            "## impl_record.json\n\n```json\n"
-            + IMPL_RECORD.read_text(errors="replace").strip()
+            "## executor_session_manifest.json\n\n```json\n"
+            + _read_text_if_exists(EXECUTOR_SESSION_MANIFEST).strip()
             + "\n```"
         )
 
@@ -297,41 +362,46 @@ def _load_run_context() -> str:
     return ctx or "(spec context unavailable)"
 
 
-def _load_glm_global_notes() -> str:
-    """Merge global_notes from plan.json and plan_notes.json."""
+def _load_planner_global_notes() -> str:
+    """
+    Load global_notes from planner_full_execution_plan.json and augment with
+    archivist_knowledge_log.md.
+
+    Legacy state/plan_notes.json was removed and merged into
+    archivist_knowledge_log.md.
+    """
     parts: list[str] = []
 
-    if GLM_PLAN.exists():
+    if PLANNER_FULL_PLAN.exists():
         try:
-            note = json.loads(GLM_PLAN.read_text()).get("global_notes", "")
-            if note:
-                parts.append(str(note))
+            plan = _read_json(PLANNER_FULL_PLAN, {})
+            if isinstance(plan, dict):
+                note = plan.get("global_notes", "")
+                if note:
+                    parts.append(str(note))
         except Exception:
             pass
 
-    if GLM_PLAN_NOTES.exists():
-        try:
-            notes = json.loads(GLM_PLAN_NOTES.read_text())
-            if isinstance(notes, list):
-                for entry in notes:
-                    if isinstance(entry, dict) and entry.get("note"):
-                        parts.append(str(entry["note"]))
-            elif isinstance(notes, dict) and notes.get("global_notes"):
-                parts.append(str(notes["global_notes"]))
-        except Exception:
-            pass
+    kb = _load_knowledge_base()
+    if kb:
+        parts.append("Accumulated knowledge:\n" + kb)
 
     return "\n\n---\n\n".join(parts)
 
 
 def _load_judge_findings() -> str:
-    """Merge findings.md + findings_notes.md."""
+    """
+    Load patcher_findings_snapshot.md and archivist_knowledge_log.md.
+
+    Legacy findings.md is now patcher_findings_snapshot.md.
+    Legacy findings_notes.md is now merged into archivist_knowledge_log.md.
+    """
     parts: list[str] = []
 
-    for fpath in (FINDINGS_PATH, FINDINGS_NOTES_PATH):
+    for fpath in (PATCHER_FINDINGS_SNAPSHOT, ARCHIVIST_KNOWLEDGE_LOG):
         if fpath.exists():
             try:
-                text = fpath.read_text(errors="replace").strip()
+                text = _read_text_if_exists(fpath).strip()
                 if text:
                     parts.append(text)
             except Exception:
@@ -341,10 +411,10 @@ def _load_judge_findings() -> str:
 
 
 def _load_knowledge_base() -> str:
-    if not KNOWLEDGE_BASE.exists():
+    if not ARCHIVIST_KNOWLEDGE_LOG.exists():
         return ""
 
-    content = KNOWLEDGE_BASE.read_text(errors="replace").strip()
+    content = _read_text_if_exists(ARCHIVIST_KNOWLEDGE_LOG).strip()
     lines = content.splitlines()
     body_lines = [
         line
@@ -485,8 +555,8 @@ def _is_under(path: Path, root: Path) -> bool:
 
 
 def _plan_mini_target_files() -> set[str]:
-    plan = _read_json(PLAN_MINI, {})
-    targets = plan.get("target_files", [])
+    plan = _read_json(PLANNER_MINI_PLAN, {})
+    targets = plan.get("target_files", []) if isinstance(plan, dict) else []
     allowed: set[str] = set()
 
     if isinstance(targets, list):
@@ -512,6 +582,7 @@ def _mini_allowed_to_write(rel_path: str) -> bool:
 
 def _read_file_safe(path: Path) -> str:
     if path.exists():
+        _track_read(path)
         return path.read_text(errors="replace")
     return f"// FILE NOT FOUND: {path}\n"
 
@@ -547,6 +618,7 @@ def _package_json_exists() -> bool:
 
 def _verify_python(path: Path) -> tuple[bool, str]:
     try:
+        _track_read(path)
         py_compile.compile(str(path), doraise=True)
         return True, "py_compile OK"
     except Exception as exc:
@@ -555,6 +627,7 @@ def _verify_python(path: Path) -> tuple[bool, str]:
 
 def _verify_json(path: Path) -> tuple[bool, str]:
     try:
+        _track_read(path)
         json.loads(path.read_text(errors="replace"))
         return True, "JSON parse OK"
     except Exception as exc:
@@ -564,6 +637,7 @@ def _verify_json(path: Path) -> tuple[bool, str]:
 def _verify_toml(path: Path) -> tuple[bool, str]:
     try:
         import tomllib
+        _track_read(path)
         tomllib.loads(path.read_text(errors="replace"))
         return True, "TOML parse OK"
     except Exception as exc:
@@ -571,6 +645,8 @@ def _verify_toml(path: Path) -> tuple[bool, str]:
 
 
 def _verify_yaml(path: Path) -> tuple[bool, str]:
+    _track_read(path)
+
     try:
         import yaml  # type: ignore
     except Exception:
@@ -632,10 +708,13 @@ def _run_mini_verifiers(verbose: bool = False) -> tuple[bool, dict[str, Any]]:
             ok, msg = _verify_toml(path)
         elif ext in {".ts", ".tsx", ".js", ".jsx"}:
             ts_like = True
+            _track_read(path)
             ok, msg = True, "TS/JS file present; Vitest will run if package.json exists"
         elif ext in {".sql", ".md", ".txt", ".cfg", ".conf", ".ini"}:
+            _track_read(path)
             ok, msg = True, "basic existence check OK"
         else:
+            _track_read(path)
             ok, msg = True, "basic existence check OK"
 
         checks.append({
@@ -647,12 +726,12 @@ def _run_mini_verifiers(verbose: bool = False) -> tuple[bool, dict[str, Any]]:
 
         if verbose:
             status = "PASS" if ok else "FAIL"
-            print(f"[04][mini] {status} {rel} — {msg}")
+            print(f"[09][mini] {status} {rel} — {msg}")
 
     all_basic_ok = all(c["passed"] for c in checks)
 
     if ts_like and _package_json_exists():
-        print("[04][mini] TS/JS targets detected and package.json exists — running Vitest.")
+        print("[09][mini] TS/JS targets detected and package.json exists — running Vitest.")
         vitest_ok, vitest_output = run_vitest()
         checks.append({
             "file": "(vitest)",
@@ -801,11 +880,13 @@ def _static_fix_transform(path: Path) -> tuple[bool, str]:
     if not path.exists():
         return False, "file not found"
 
+    _track_read(path)
     original = path.read_text(errors="replace")
     patched = _RE_JSX_GENERIC.sub(r"\1\3", original)
 
     if patched != original:
         path.write_text(patched)
+        _track_write(path)
         return True, "removed JSX generic type param causing esbuild parse error"
 
     return False, "no static transform pattern matched"
@@ -815,6 +896,7 @@ def _static_fix_src(path: Path) -> tuple[bool, str]:
     if not path.exists():
         return False, "file not found"
 
+    _track_read(path)
     original = path.read_text(errors="replace")
     patched = _RE_TEMPLATE_WIDTH.sub(r"`${Math.round(\2)}\3", original)
     patched = _RE_FLOAT_WIDTH.sub(
@@ -824,6 +906,7 @@ def _static_fix_src(path: Path) -> tuple[bool, str]:
 
     if patched != original:
         path.write_text(patched)
+        _track_write(path)
         return True, "rounded floating-point percentage widths"
 
     return False, "no static src pattern matched"
@@ -892,7 +975,7 @@ def _build_qwen_system_with_findings(findings: str) -> str:
         return FIX_SYSTEM_QWEN
 
     return (
-        "## Previous judge findings — avoid regressions\n"
+        "## Previous judge/patcher/archivist findings — avoid regressions\n"
         f"{findings[:6000]}\n\n---\n\n"
         + FIX_SYSTEM_QWEN
     )
@@ -900,12 +983,12 @@ def _build_qwen_system_with_findings(findings: str) -> str:
 
 def _build_minimax_system(global_notes: str, judge_findings: str = "") -> str:
     notes_block = (
-        f"\n## GLM Architect's Global Notes\n{global_notes}\n"
+        f"\n## Planner global notes and accumulated knowledge\n{global_notes}\n"
         if global_notes else ""
     )
 
     findings_block = (
-        f"\n## Judge findings from previous runs\n{judge_findings}\n"
+        f"\n## Judge/patcher findings from previous runs\n{judge_findings}\n"
         if judge_findings else ""
     )
 
@@ -1101,6 +1184,7 @@ def repair_test_file(
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(code)
+    _track_write(out_path)
 
     print(f"    [P0-fix] ✓ Test updated — {patch.get('explanation', '(no explanation)')}")
     for change in patch.get("changes_made", []):
@@ -1175,7 +1259,7 @@ def _call_repair(
     if _current_scope() == "mini" and not _mini_allowed_to_write(out_rel):
         print(
             f"    [{layer_name}] Mini scope violation: tried to write {out_rel}; "
-            "not in plan_mini.target_files. Patch rejected.",
+            "not in planner_mini_execution_plan.target_files. Patch rejected.",
             file=sys.stderr,
         )
         return False, f"mini scope violation: {out_rel}"
@@ -1187,6 +1271,7 @@ def _call_repair(
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(code)
+    _track_write(out_path)
 
     root_cause = patch.get("root_cause", "")
     summary = f"{root_cause} — {explanation}" if root_cause else explanation
@@ -1388,9 +1473,13 @@ def repair_cluster(
 # ════════════════════════════════════════════════════════════════════════════
 
 def _write_report(report: dict[str, Any]) -> None:
-    TEST_REPORT.parent.mkdir(parents=True, exist_ok=True)
-    TEST_REPORT.write_text(json.dumps(report, indent=2))
-    print(f"\n[04] Merged report → {TEST_REPORT}")
+    DEBUGGER_SESSION_TEST_SUMMARY.parent.mkdir(parents=True, exist_ok=True)
+    DEBUGGER_SESSION_TEST_SUMMARY.write_text(
+        json.dumps(report, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    _track_write(DEBUGGER_SESSION_TEST_SUMMARY)
+    print(f"\n[09] Debugger session test summary → {DEBUGGER_SESSION_TEST_SUMMARY}")
 
 
 def _write_mini_report(passed: bool, details: dict[str, Any]) -> None:
@@ -1427,17 +1516,17 @@ def _run_full_vitest_loop(
     verbose: bool,
     no_repair: bool,
 ) -> bool:
-    global_notes = _load_glm_global_notes()
+    global_notes = _load_planner_global_notes()
     if global_notes:
         print(
-            f"[04] GLM global_notes loaded ({len(global_notes)} chars) "
+            f"[09] Planner/global knowledge loaded ({len(global_notes)} chars) "
             "— will be injected into Minimax prompts"
         )
 
     judge_findings = _load_judge_findings()
     if judge_findings:
         print(
-            f"[04] Judge findings loaded ({len(judge_findings)} chars) "
+            f"[09] Patcher/archivist findings loaded ({len(judge_findings)} chars) "
             "— injected into repair prompts"
         )
 
@@ -1446,7 +1535,7 @@ def _run_full_vitest_loop(
     escalated_log: list[dict[str, Any]] = []
 
     for iteration in range(1, max_iter + 1):
-        tag = f"[04][{iteration}/{max_iter}]"
+        tag = f"[09][{iteration}/{max_iter}]"
 
         print(f"\n{tag} Phase B — running Vitest …")
         passed, output = run_vitest()
@@ -1618,7 +1707,7 @@ def _run_full_vitest_loop(
     _write_report(report)
 
     if escalated_log:
-        print(f"[04] ⚠ {len(escalated_log)} cluster(s) escalated")
+        print(f"[09] ⚠ {len(escalated_log)} cluster(s) escalated")
 
     return final_passed
 
@@ -1636,46 +1725,74 @@ def main() -> None:
     # Important: PIPELINE_PROJECT must be configured before ensure_dirs().
     ensure_dirs()
 
-    scope = _current_scope()
-    print(f"[04] Scope detected: {scope}")
+    exit_code = 0
 
-    if scope == "mini":
-        passed, mini_details = _run_mini_verifiers(verbose=args.verbose)
+    try:
+        scope = _current_scope()
+        print(f"[09] Scope detected: {scope}")
 
-        # If mini is TS/Vitest and failed, optionally allow the existing repair loop.
-        checks = mini_details.get("checks", [])
-        vitest_failed = any(
-            c.get("kind") == "vitest" and not c.get("passed")
-            for c in checks
-            if isinstance(c, dict)
-        )
+        if scope == "mini":
+            passed, mini_details = _run_mini_verifiers(verbose=args.verbose)
 
-        if vitest_failed and not args.no_repair:
-            print("[04][mini] Vitest failed; entering TS repair loop with mini context.")
+            # If mini is TS/Vitest and failed, optionally allow the existing repair loop.
+            checks = mini_details.get("checks", [])
+            vitest_failed = any(
+                c.get("kind") == "vitest" and not c.get("passed")
+                for c in checks
+                if isinstance(c, dict)
+            )
+
+            if vitest_failed and not args.no_repair:
+                print("[09][mini] Vitest failed; entering TS repair loop with mini context.")
+                final_passed = _run_full_vitest_loop(
+                    max_iter=args.max_iter,
+                    max_cluster_attempts=args.max_cluster_attempts,
+                    verbose=args.verbose,
+                    no_repair=args.no_repair,
+                )
+                if not final_passed:
+                    exit_code = 1
+            else:
+                _write_mini_report(passed, mini_details)
+                if not passed:
+                    exit_code = 1
+
+        else:
             final_passed = _run_full_vitest_loop(
                 max_iter=args.max_iter,
                 max_cluster_attempts=args.max_cluster_attempts,
                 verbose=args.verbose,
                 no_repair=args.no_repair,
             )
+
             if not final_passed:
-                sys.exit(1)
-            return
+                exit_code = 1
 
-        _write_mini_report(passed, mini_details)
-        if not passed:
-            sys.exit(1)
-        return
+    except Exception as exc:
+        print(f"[09] ERROR: {exc}", file=sys.stderr)
 
-    final_passed = _run_full_vitest_loop(
-        max_iter=args.max_iter,
-        max_cluster_attempts=args.max_cluster_attempts,
-        verbose=args.verbose,
-        no_repair=args.no_repair,
-    )
+        # Best-effort failure report.
+        try:
+            _write_report(
+                {
+                    "impl": "qwen+minimax",
+                    "scope": "unknown",
+                    "final_status": "FAIL",
+                    "total_iterations": 0,
+                    "iterations": [],
+                    "escalated": [],
+                    "error": str(exc),
+                }
+            )
+        except Exception:
+            pass
 
-    if not final_passed:
-        sys.exit(1)
+        exit_code = 1
+
+    finally:
+        _print_artifact_access_summary()
+
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

@@ -1,29 +1,32 @@
-#!/usr/bin/env python3
 """
 03_clarificator.py
 ==================
 Clarificator agent — upstream nhất trong pipeline.
 
 Nhận raw requirement (file hoặc text), phân tích holes/conflicts/assumptions,
-tổ chức Q&A với user theo 3-tier system, và output clarified_requirement.md
+tổ chức Q&A với user theo 3-tier system, và output clarificator_requirement_synthesis.md
 cùng với structured report cho downstream steps.
 
 Usage:
-    python pipeline/00_clarificator.py --project my-app --input requirement.pdf
-    python pipeline/00_clarificator.py --project my-app --input spec_draft.md
-    python pipeline/00_clarificator.py --project my-app --text "Build a dashboard..."
-    python pipeline/00_clarificator.py --project my-app
-    python pipeline/00_clarificator.py
+    python pipeline/03_clarificator.py --project my-app --input requirement.pdf
+    python pipeline/03_clarificator.py --project my-app --input spec_draft.md
+    python pipeline/03_clarificator.py --project my-app --text "Build a dashboard..."
+    python pipeline/03_clarificator.py --project my-app
+    python pipeline/03_clarificator.py
 
 When called by harness.py, PIPELINE_PROJECT is already set.
 When run directly, --project or interactive project prompt is used and
 PIPELINE_PROJECT is set before any artifact path is resolved.
 
-Artifacts produced (owner: 00_clarificator):
-    artifacts_<slug>/run/clarification_report.json
-    artifacts_<slug>/run/clarification_questions.md
-    artifacts_<slug>/knowledge/current/clarification_log.md
-    artifacts_<slug>/state/clarified_requirement.md
+Artifacts produced (owner: clarificator):
+    artifacts_<slug>/execution/clarificator_session_raw.json        (session)
+    artifacts_<slug>/execution/clarificator_session_questions.md    (session)
+    artifacts_<slug>/knowledge/current/clarificator_decision_log.md (append-only log)
+    artifacts_<slug>/state/clarificator_requirement_synthesis.md    (persistent)
+
+At the end of each run, prints:
+    - artifacts/files read
+    - artifacts/files created/updated/overwritten/appended
 """
 
 from __future__ import annotations
@@ -49,14 +52,61 @@ _REPO_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
 
 from artifacts.paths import (  # type: ignore  # noqa: E402
-    KNOWLEDGE_BASE,
-    CLARIFICATION_REPORT,
-    CLARIFICATION_QUESTIONS,
-    CLARIFICATION_LOG,
+    ARCHIVIST_KNOWLEDGE_LOG,
+    CLARIFICATOR_DECISION_LOG,
+    CLARIFICATOR_SESSION_QUESTIONS,
+    CLARIFICATOR_SESSION_RAW,
     CLARIFIED_REQ,
     ensure_dirs,
     get_project_name,
 )
+
+# Local aliases — map canonical constants to the short names used internally
+KNOWLEDGE_BASE          = ARCHIVIST_KNOWLEDGE_LOG
+CLARIFICATION_REPORT    = CLARIFICATOR_SESSION_RAW
+CLARIFICATION_QUESTIONS = CLARIFICATOR_SESSION_QUESTIONS
+CLARIFICATION_LOG       = CLARIFICATOR_DECISION_LOG
+
+# === WRITE AUTHORITY: clarificator ===
+# OWNS  : artifacts_<slug>/execution/clarificator_session_raw.json
+#         artifacts_<slug>/execution/clarificator_session_questions.md
+#         artifacts_<slug>/knowledge/current/clarificator_decision_log.md
+#         artifacts_<slug>/state/clarificator_requirement_synthesis.md
+# READS : artifacts_<slug>/knowledge/current/archivist_knowledge_log.md
+#         artifacts_<slug>/knowledge/current/clarificator_decision_log.md (self, prior sessions)
+#         optional user-provided requirement file
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Artifact/file access tracking
+# ════════════════════════════════════════════════════════════════════════════
+
+_ARTIFACTS_READ: set[str] = set()
+_ARTIFACTS_WRITTEN: set[str] = set()
+
+
+def _track_read(path: Any) -> None:
+    _ARTIFACTS_READ.add(str(path))
+
+
+def _track_write(path: Any) -> None:
+    _ARTIFACTS_WRITTEN.add(str(path))
+
+
+def _print_artifact_access_summary() -> None:
+    print("[03] Artifacts/files read:")
+    if _ARTIFACTS_READ:
+        for item in sorted(_ARTIFACTS_READ):
+            print(f"[03]   READ  {item}")
+    else:
+        print("[03]   READ  (none)")
+
+    print("[03] Artifacts/files created/updated/overwritten/appended:")
+    if _ARTIFACTS_WRITTEN:
+        for item in sorted(_ARTIFACTS_WRITTEN):
+            print(f"[03]   WRITE {item}")
+    else:
+        print("[03]   WRITE (none)")
 
 
 # ── Model config ──────────────────────────────────────────────────────────────
@@ -97,6 +147,8 @@ def _wrap(text: str, indent: int = 0) -> str:
 
 def _read_pdf(path: Path) -> str:
     """Extract text from PDF via pdftotext (poppler) or pypdf fallback."""
+    _track_read(path)
+
     try:
         result = subprocess.run(
             ["pdftotext", "-layout", str(path), "-"],
@@ -123,8 +175,10 @@ def _read_input_file(path: Path) -> str:
     if suffix == ".pdf":
         text = _read_pdf(path)
         if not text.strip():
-            print(f"[00][warn] PDF extraction returned empty text from {path.name}.")
+            print(f"[clarificator][warn] PDF extraction returned empty text from {path.name}.")
         return text
+
+    _track_read(path)
 
     try:
         return path.read_text(encoding="utf-8")
@@ -158,8 +212,8 @@ def _parse_json_response(raw: str, label: str) -> dict[str, Any]:
                 raise RuntimeError(f"{label} parsed as {type(parsed).__name__}, expected object.")
             return parsed
         except json.JSONDecodeError as exc:
-            print(f"[00][error] Failed to parse {label}: {exc}", file=sys.stderr)
-            print(f"[00][error] Raw output, first 800 chars:\n{raw[:800]}", file=sys.stderr)
+            print(f"[clarificator][error] Failed to parse {label}: {exc}", file=sys.stderr)
+            print(f"[clarificator][error] Raw output, first 800 chars:\n{raw[:800]}", file=sys.stderr)
             raise
 
     raise RuntimeError(f"No JSON object found in {label}.")
@@ -168,6 +222,7 @@ def _parse_json_response(raw: str, label: str) -> dict[str, Any]:
 def _load_clarification_log() -> str:
     """Load project clarification log. Requires PIPELINE_PROJECT to be set."""
     if CLARIFICATION_LOG.exists():
+        _track_read(CLARIFICATION_LOG)
         return CLARIFICATION_LOG.read_text(encoding="utf-8")
     return ""
 
@@ -201,11 +256,12 @@ def _load_knowledge_context() -> str:
     parts: list[str] = []
 
     if KNOWLEDGE_BASE.exists():
-        parts.append(f"=== base.md ===\n{KNOWLEDGE_BASE.read_text(encoding='utf-8')}")
+        _track_read(KNOWLEDGE_BASE)
+        parts.append(f"=== archivist_knowledge_log.md ===\n{KNOWLEDGE_BASE.read_text(encoding='utf-8')}")
 
     log_text = _load_clarification_log()
     if log_text:
-        parts.append(f"=== clarification_log.md ===\n{log_text}")
+        parts.append(f"=== clarificator_decision_log.md ===\n{log_text}")
 
     return "\n\n".join(parts)
 
@@ -232,10 +288,10 @@ def _resolve_project(arg_project: str | None) -> str:
         pass
 
     print()
-    print("[00] No --project specified and PIPELINE_PROJECT not set.")
+    print("[clarificator] No --project specified and PIPELINE_PROJECT not set.")
     name = input("  Enter project name: ").strip()
     if not name:
-        print("[00] Project name cannot be empty.", file=sys.stderr)
+        print("[clarificator] Project name cannot be empty.", file=sys.stderr)
         sys.exit(1)
     return name
 
@@ -250,16 +306,17 @@ def _list_projects() -> None:
     )
 
     if not projects:
-        print("[00] No artifacts_* project workspaces found.")
+        print("[clarificator] No artifacts_* project workspaces found.")
         return
 
-    print("[00] Known project workspaces:")
+    print("[clarificator] Known project workspaces:")
     for p in projects:
         slug = p.name.removeprefix("artifacts_")
-        log = p / "knowledge" / "current" / "clarification_log.md"
+        log = p / "knowledge" / "current" / "clarificator_decision_log.md"
         sessions = 0
         if log.exists():
             try:
+                _track_read(log)
                 sessions = len(re.findall(r"^## \d{4}-", log.read_text(encoding="utf-8"), re.MULTILINE))
             except Exception:
                 sessions = 0
@@ -292,7 +349,7 @@ def _call_llm(
         model_id = model
 
     if not api_key:
-        print("\n[00][offline] No API key found. Paste LLM response then EOF:")
+        print("\n[clarificator][offline] No API key found. Paste LLM response then EOF:")
         return sys.stdin.read()
 
     payload = {
@@ -324,7 +381,7 @@ def _call_llm(
         return content
 
     except Exception as exc:
-        print(f"[00][error] LLM call failed: {exc}", file=sys.stderr)
+        print(f"[clarificator][error] LLM call failed: {exc}", file=sys.stderr)
         raise
 
 
@@ -557,7 +614,7 @@ Rules:
 - MAXIMUM 3 new findings.
 - Only policy-shaping follow-ups: architecture, access control, workflow design,
   compliance posture. Do NOT ask about labels, copy, exact thresholds, retry counts,
-  scheduling intervals, or developer-decideable details.
+  scheduling intervals, or developer-decidable details.
 """
 
 
@@ -595,7 +652,7 @@ Output only JSON."""
         raw = _call_llm(_DELTA_SYSTEM, user_msg, max_tokens=_MAX_TOKENS_DELTA)
         result = _parse_json_response(raw, "delta analysis")
     except Exception as exc:
-        print(f"  [00][delta] Delta analysis failed ({exc}), continuing without update.")
+        print(f"  [clarificator][delta] Delta analysis failed ({exc}), continuing without update.")
         return [], []
 
     new_findings = result.get("new_findings", [])
@@ -740,7 +797,7 @@ def _batch_derive_impacts(decisions: list[dict[str, Any]]) -> None:
     if not pending:
         return
 
-    print(f"\n[00] Deriving impact statements ({len(pending)} decisions) ...")
+    print(f"\n[clarificator] Deriving impact statements ({len(pending)} decisions) ...")
     for decision in pending:
         decision["impact"] = _derive_impact(
             decision["question"],
@@ -969,11 +1026,14 @@ def _write_report(
         "conflicts": conflicts,
     }
 
+    CLARIFICATION_REPORT.parent.mkdir(parents=True, exist_ok=True)
     CLARIFICATION_REPORT.write_text(
         json.dumps(report, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
-    print(f"\n[00] ✓ Report → {CLARIFICATION_REPORT}")
+    _track_write(CLARIFICATION_REPORT)
+
+    print(f"\n[clarificator] ✓ Report → {CLARIFICATION_REPORT}")
 
 
 def _write_questions_md(
@@ -1055,8 +1115,11 @@ def _write_questions_md(
                 lines.append(f"  Existing decision: _{conflict['source_b']}_")
             lines.append("")
 
+    CLARIFICATION_QUESTIONS.parent.mkdir(parents=True, exist_ok=True)
     CLARIFICATION_QUESTIONS.write_text("\n".join(lines), encoding="utf-8")
-    print(f"[00] ✓ Questions → {CLARIFICATION_QUESTIONS}")
+    _track_write(CLARIFICATION_QUESTIONS)
+
+    print(f"[clarificator] ✓ Questions → {CLARIFICATION_QUESTIONS}")
 
 
 def _append_to_log(
@@ -1096,15 +1159,20 @@ def _append_to_log(
 
     content = "\n\n" + "\n\n".join(blocks) + "\n"
 
+    CLARIFICATION_LOG.parent.mkdir(parents=True, exist_ok=True)
     with CLARIFICATION_LOG.open("a", encoding="utf-8") as fh:
         fh.write(content)
+    _track_write(CLARIFICATION_LOG)
 
-    print(f"[00] ✓ Log appended → {CLARIFICATION_LOG}")
+    print(f"[clarificator] ✓ Log appended → {CLARIFICATION_LOG}")
 
 
 def _write_clarified_req(content: str) -> None:
+    CLARIFIED_REQ.parent.mkdir(parents=True, exist_ok=True)
     CLARIFIED_REQ.write_text(content, encoding="utf-8")
-    print(f"[00] ✓ Clarified requirement → {CLARIFIED_REQ}")
+    _track_write(CLARIFIED_REQ)
+
+    print(f"[clarificator] ✓ Clarified requirement → {CLARIFIED_REQ}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1115,14 +1183,14 @@ def _gather_requirement(args: argparse.Namespace) -> str:
     if args.input:
         path = Path(args.input)
         if not path.exists():
-            print(f"[00][error] File not found: {path}", file=sys.stderr)
+            print(f"[clarificator][error] File not found: {path}", file=sys.stderr)
             sys.exit(1)
 
-        print(f"[00] Reading requirement from {path.name} ...")
+        print(f"[clarificator] Reading requirement from {path.name} ...")
         text = _read_input_file(path)
 
         if not text.strip():
-            print(f"[00][error] Could not extract text from {path.name}.", file=sys.stderr)
+            print(f"[clarificator][error] Could not extract text from {path.name}.", file=sys.stderr)
             sys.exit(1)
 
         return text
@@ -1130,13 +1198,13 @@ def _gather_requirement(args: argparse.Namespace) -> str:
     if args.text:
         return args.text
 
-    print("[00] Paste / type requirement below.")
+    print("[clarificator] Paste / type requirement below.")
     print("     Press Ctrl-D (Unix) or Ctrl-Z Enter (Windows) to finish.\n")
 
     try:
         return sys.stdin.read().strip()
     except KeyboardInterrupt:
-        print("\n[00] Aborted.")
+        print("\n[clarificator] Aborted.")
         sys.exit(0)
 
 
@@ -1146,7 +1214,7 @@ def _gather_requirement(args: argparse.Namespace) -> str:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="00_clarificator — requirement analysis & Q&A agent"
+        description="03_clarificator — requirement analysis & Q&A agent"
     )
     parser.add_argument(
         "--project",
@@ -1166,7 +1234,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-synth",
         action="store_true",
-        help="Skip synthesis step; do not generate clarified_requirement.md",
+        help="Skip synthesis step; do not generate clarificator_requirement_synthesis.md",
     )
     parser.add_argument(
         "--dry-run",
@@ -1182,139 +1250,143 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    parser = _build_parser()
-    args = parser.parse_args()
+    try:
+        parser = _build_parser()
+        args = parser.parse_args()
 
-    # --list-projects must work without PIPELINE_PROJECT.
-    if args.list_projects and not args.project and not os.environ.get("PIPELINE_PROJECT"):
-        _list_projects()
-        return
+        # --list-projects must work without PIPELINE_PROJECT.
+        if args.list_projects and not args.project and not os.environ.get("PIPELINE_PROJECT"):
+            _list_projects()
+            return
 
-    # Resolve and set project BEFORE ensure_dirs() or any LazyPath operation.
-    project_name = _resolve_project(args.project)
-    os.environ["PIPELINE_PROJECT"] = project_name
-    ensure_dirs()
+        # Resolve and set project BEFORE ensure_dirs() or any LazyPath operation.
+        project_name = _resolve_project(args.project)
+        os.environ["PIPELINE_PROJECT"] = project_name
+        ensure_dirs()
 
-    if args.list_projects:
-        _list_projects()
-        return
+        if args.list_projects:
+            _list_projects()
+            return
 
-    print(f"[00] Workspace: {project_name!r}")
+        print(f"[clarificator] Workspace: {project_name!r}")
 
-    requirement_text = _gather_requirement(args)
-    if not requirement_text.strip():
-        print("[00][error] Empty requirement input.", file=sys.stderr)
-        sys.exit(1)
+        requirement_text = _gather_requirement(args)
+        if not requirement_text.strip():
+            print("[clarificator][error] Empty requirement input.", file=sys.stderr)
+            sys.exit(1)
 
-    req_hash = _sha256(requirement_text)
-    session_id = _now_iso()
+        req_hash = _sha256(requirement_text)
+        session_id = _now_iso()
 
-    # ── Load knowledge context ────────────────────────────────────────────────
-    log_text = _load_clarification_log()
-    standalone = not (KNOWLEDGE_BASE.exists() or bool(log_text))
+        # ── Load knowledge context ────────────────────────────────────────────────
+        log_text = _load_clarification_log()
+        standalone = not (KNOWLEDGE_BASE.exists() or bool(log_text))
 
-    if standalone:
-        print("[00] Standalone mode — no knowledge context found for this workspace.")
-        knowledge_context = ""
-        answered_qa_pairs: list[dict[str, str]] = []
-    else:
-        print("[00] Loading knowledge context ...")
-        knowledge_context = _load_knowledge_context()
-        answered_qa_pairs = _extract_answered_qa_pairs(log_text)
-        if answered_qa_pairs:
-            print(f"[00] Loaded {len(answered_qa_pairs)} past Q/A pairs for semantic dedup")
+        if standalone:
+            print("[clarificator] Standalone mode — no knowledge context found for this workspace.")
+            knowledge_context = ""
+            answered_qa_pairs: list[dict[str, str]] = []
+        else:
+            print("[clarificator] Loading knowledge context ...")
+            knowledge_context = _load_knowledge_context()
+            answered_qa_pairs = _extract_answered_qa_pairs(log_text)
+            if answered_qa_pairs:
+                print(f"[clarificator] Loaded {len(answered_qa_pairs)} past Q/A pairs for semantic dedup")
 
-    # ── Phase 1+2: Analyze ────────────────────────────────────────────────────
-    print("[00] Analyzing requirement ...")
-    analysis = _analyze(requirement_text, knowledge_context, answered_qa_pairs)
+        # ── Phase 1+2: Analyze ────────────────────────────────────────────────────
+        print("[clarificator] Analyzing requirement ...")
+        analysis = _analyze(requirement_text, knowledge_context, answered_qa_pairs)
 
-    inferred_name = analysis.get("project_name", "Unknown")
-    if project_name.lower() == "unknown" and inferred_name != "Unknown":
-        project_name = inferred_name
-        print(f"[00] Project name inferred from requirement: {project_name!r}")
+        inferred_name = analysis.get("project_name", "Unknown")
+        if project_name.lower() == "unknown" and inferred_name != "Unknown":
+            project_name = inferred_name
+            print(f"[clarificator] Project name inferred from requirement: {project_name!r}")
 
-    findings = analysis.get("findings", [])
-    conflicts = analysis.get("conflicts", [])
-    clarified_sum = analysis.get("clarified_summary", "")
+        findings = analysis.get("findings", [])
+        conflicts = analysis.get("conflicts", [])
+        clarified_sum = analysis.get("clarified_summary", "")
 
-    if not isinstance(findings, list):
-        findings = []
-    if not isinstance(conflicts, list):
-        conflicts = []
+        if not isinstance(findings, list):
+            findings = []
+        if not isinstance(conflicts, list):
+            conflicts = []
 
-    if not findings and not conflicts:
-        print("[00] ✓ No ambiguities found — requirement is already clear.")
-        if not args.dry_run:
-            _write_clarified_req(requirement_text)
-        return
+        if not findings and not conflicts:
+            print("[clarificator] ✓ No ambiguities found — requirement is already clear.")
+            if not args.dry_run:
+                _write_clarified_req(requirement_text)
+            return
 
-    print(f"[00] Found {len(findings)} findings, {len(conflicts)} conflicts.")
+        print(f"[clarificator] Found {len(findings)} findings, {len(conflicts)} conflicts.")
 
-    if args.dry_run:
-        _print_banner("Dry run — findings only")
-        for finding in _sort_findings(findings):
-            _print_finding(finding, 0, len(findings))
-        if conflicts:
-            print("\n⚠️  Conflicts:")
-            for conflict in conflicts:
-                print(f"  {conflict['id']}: {conflict['description']}")
-        return
+        if args.dry_run:
+            _print_banner("Dry run — findings only")
+            for finding in _sort_findings(findings):
+                _print_finding(finding, 0, len(findings))
+            if conflicts:
+                print("\n⚠️  Conflicts:")
+                for conflict in conflicts:
+                    print(f"  {conflict['id']}: {conflict['description']}")
+            return
 
-    _write_questions_md(project_name, session_id, _sort_findings(findings), conflicts)
+        _write_questions_md(project_name, session_id, _sort_findings(findings), conflicts)
 
-    decisions, unresolved = _run_interactive_loop(
-        findings,
-        project_name,
-        requirement_text,
-    )
-
-    if unresolved:
-        loud = [
-            item for item in unresolved
-            if item.get("category") == "business" or item.get("priority") == "blocking"
-        ]
-        silent = [item for item in unresolved if item not in loud]
-
-        if loud:
-            print(
-                f"\n[00][warn] {len(loud)} blocking question(s) could not be resolved "
-                "(unmet or circular dependencies) — review before proceeding:"
-            )
-            for item in loud:
-                print(f"  ⚠️  {item['id']}: {item['text'][:70]}...")
-
-        if silent:
-            print(
-                f"\n[00] {len(silent)} low-priority question(s) skipped due to "
-                "inconsistent dependencies (recorded in report)."
-            )
-
-    _batch_derive_impacts(decisions)
-
-    _write_report(
-        session_id,
-        req_hash,
-        project_name,
-        decisions,
-        unresolved,
-        conflicts,
-        findings,
-    )
-    _append_to_log(session_id, project_name, decisions, conflicts)
-
-    if not args.no_synth:
-        print("\n[00] Synthesizing clarified requirement ...")
-        clarified_md = _synthesize_requirement(
+        decisions, unresolved = _run_interactive_loop(
+            findings,
+            project_name,
             requirement_text,
-            decisions,
-            conflicts,
-            clarified_sum,
         )
-        _write_clarified_req(clarified_md)
 
-    _print_banner(f"Done — {len(decisions)} decisions recorded  [{project_name}]")
-    print(f"  Workspace log: {CLARIFICATION_LOG}")
-    print(f"  Artifacts     → {CLARIFIED_REQ}")
+        if unresolved:
+            loud = [
+                item for item in unresolved
+                if item.get("category") == "business" or item.get("priority") == "blocking"
+            ]
+            silent = [item for item in unresolved if item not in loud]
+
+            if loud:
+                print(
+                    f"\n[clarificator][warn] {len(loud)} blocking question(s) could not be resolved "
+                    "(unmet or circular dependencies) — review before proceeding:"
+                )
+                for item in loud:
+                    print(f"  ⚠️  {item['id']}: {item['text'][:70]}...")
+
+            if silent:
+                print(
+                    f"\n[clarificator] {len(silent)} low-priority question(s) skipped due to "
+                    "inconsistent dependencies (recorded in report)."
+                )
+
+        _batch_derive_impacts(decisions)
+
+        _write_report(
+            session_id,
+            req_hash,
+            project_name,
+            decisions,
+            unresolved,
+            conflicts,
+            findings,
+        )
+        _append_to_log(session_id, project_name, decisions, conflicts)
+
+        if not args.no_synth:
+            print("\n[clarificator] Synthesizing clarified requirement ...")
+            clarified_md = _synthesize_requirement(
+                requirement_text,
+                decisions,
+                conflicts,
+                clarified_sum,
+            )
+            _write_clarified_req(clarified_md)
+
+        _print_banner(f"Done — {len(decisions)} decisions recorded  [{project_name}]")
+        print(f"  Workspace log: {CLARIFICATION_LOG}")
+        print(f"  Artifacts     → {CLARIFIED_REQ}")
+
+    finally:
+        _print_artifact_access_summary()
 
 
 if __name__ == "__main__":
