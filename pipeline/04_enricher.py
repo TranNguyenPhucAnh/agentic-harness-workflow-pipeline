@@ -6,29 +6,28 @@ Prompt Agent — nhận clarified artifacts + knowledge layer + raw input của 
 enrich thành một structured prompt đủ context cho model xịn downstream (spec agent).
 
 Vị trí trong luồng:
-    00_clarificator → [08_prompt_agent] → 09_spec_agent → spec_<slug>.md → harness
+    03_clarificator → [04_enricher] → 05_specwright → specwright_spec_<slug>.md → harness
 
 Inputs (đọc từ artifacts của project hiện tại):
-    state/clarified_requirement.md      — output chính của clarificator
-    run/clarification_report.json       — decisions, conflicts, metadata
-    run/mini_analysis.md                — nếu mini mode đã chạy (optional)
-    knowledge/current/base.md           — knowledge base (nếu có)
-    knowledge/current/codebase_map.md   — absorber output (nếu có)
-    knowledge/current/config_map.json   — absorber output (nếu có)
-    knowledge/current/blame_map.md      — absorber output (nếu có)
+    state/clarificator_requirement_synthesis.md        — output chính của clarificator
+    execution/clarificator_session_raw.json            — decisions, conflicts, metadata
+    knowledge/current/archivist_knowledge_log.md       — knowledge base (nếu có)
+    knowledge/current/absorber_codebase_map.md         — absorber output (nếu có)
+    knowledge/current/absorber_config_map.json         — absorber output (nếu có)
+    knowledge/current/absorber_blame_map.md            — absorber output (nếu có)
 
 Output (ghi vào artifacts của project):
-    run/enriched_prompt.md              — enriched prompt, user review trước khi gửi spec agent
+    execution/enricher_session_enriched_prompt.md      — enriched prompt, user review trước khi gửi spec agent
 
 Usage:
-    python 08_prompt_agent.py --project my-app
-    python 08_prompt_agent.py --project my-app --extra-context "Focus on backend only"
-    python 08_prompt_agent.py --project my-app --dry-run
+    python 04_enricher.py --project my-app
+    python 04_enricher.py --project my-app --extra-context "Focus on backend only"
+    python 04_enricher.py --project my-app --dry-run
 
-    # Thường được gọi tự động từ 00_clarificator.py khi user chọn mode full.
+    # Thường được gọi tự động từ 03_clarificator.py khi user chọn mode full.
 
-Artifacts produced (owner: 08_prompt_agent):
-    artifacts_<slug>/run/enriched_prompt.md
+Artifacts produced (owner: enricher):
+    artifacts_<slug>/execution/enricher_session_enriched_prompt.md
 """
 
 from __future__ import annotations
@@ -49,18 +48,31 @@ import httpx
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from artifacts.paths import (  # type: ignore
     CLARIFIED_REQ,
-    CLARIFICATION_REPORT,
-    KNOWLEDGE_BASE,
-    CODEBASE_MAP,
-    CONFIG_MAP,
-    BLAME_MAP,
-    _LazyPath,
+    CLARIFICATOR_SESSION_RAW,
+    ARCHIVIST_KNOWLEDGE_LOG,
+    ABSORBER_CODEBASE_MAP,
+    ABSORBER_CONFIG_MAP,
+    ABSORBER_BLAME_MAP,
+    ENRICHER_SESSION_PROMPT,
     ensure_dirs,
 )
 
-# Local paths owned by adjacent scripts — read-only here
-MINI_ANALYSIS   = _LazyPath("run/mini_analysis.md")     # owner: 00_clarificator (read-only)
-ENRICHED_PROMPT = _LazyPath("run/enriched_prompt.md")   # owner: 08_prompt_agent
+# Local aliases — map canonical constants to the short names used internally
+CLARIFICATION_REPORT = CLARIFICATOR_SESSION_RAW
+KNOWLEDGE_BASE       = ARCHIVIST_KNOWLEDGE_LOG
+CODEBASE_MAP         = ABSORBER_CODEBASE_MAP
+CONFIG_MAP           = ABSORBER_CONFIG_MAP
+BLAME_MAP            = ABSORBER_BLAME_MAP
+ENRICHED_PROMPT      = ENRICHER_SESSION_PROMPT
+
+# NOTE: run/mini_analysis.md (MINI_ANALYSIS) has been removed — deprecated with mini_mode.py.
+# enricher no longer reads it.
+
+# === WRITE AUTHORITY: enricher ===
+# OWNS  : artifacts_<slug>/execution/enricher_session_enriched_prompt.md
+# READS : clarificator_requirement_synthesis.md, clarificator_session_raw.json,
+#         archivist_knowledge_log.md, absorber_codebase_map.md,
+#         absorber_config_map.json, absorber_blame_map.md
 
 
 # ── Model config ──────────────────────────────────────────────────────────────
@@ -104,7 +116,7 @@ def _call_llm(system: str, user: str, model: str = _ENRICH_MODEL, max_tokens: in
         model_id = model
 
     if not api_key:
-        print("\n[08][offline] No API key found. Paste LLM response then EOF (Ctrl-D):")
+        print("\n[enricher][offline] No API key found. Paste LLM response then EOF (Ctrl-D):")
         return sys.stdin.read()
 
     try:
@@ -126,7 +138,7 @@ def _call_llm(system: str, user: str, model: str = _ENRICH_MODEL, max_tokens: in
             data = resp.json()
         return data["choices"][0]["message"]["content"]
     except Exception as exc:
-        print(f"[08][error] LLM call failed: {exc}")
+        print(f"[enricher][error] LLM call failed: {exc}")
         raise
 
 
@@ -149,23 +161,17 @@ def _load_clarification_report() -> dict:
     return {}
 
 
-def _load_mini_analysis() -> str:
-    if MINI_ANALYSIS.exists():
-        return MINI_ANALYSIS.read_text(encoding="utf-8")
-    return ""
-
-
 def _load_knowledge_layer() -> str:
     """Load all available knowledge layer artifacts for the current project."""
     parts: list[str] = []
     if CODEBASE_MAP.exists():
-        parts.append(f"=== codebase_map.md ===\n{CODEBASE_MAP.read_text(encoding='utf-8')}")
+        parts.append(f"=== absorber_codebase_map.md ===\n{CODEBASE_MAP.read_text(encoding='utf-8')}")
     if CONFIG_MAP.exists():
-        parts.append(f"=== config_map.json ===\n{CONFIG_MAP.read_text(encoding='utf-8')}")
+        parts.append(f"=== absorber_config_map.json ===\n{CONFIG_MAP.read_text(encoding='utf-8')}")
     if BLAME_MAP.exists():
-        parts.append(f"=== blame_map.md ===\n{BLAME_MAP.read_text(encoding='utf-8')}")
+        parts.append(f"=== absorber_blame_map.md ===\n{BLAME_MAP.read_text(encoding='utf-8')}")
     if KNOWLEDGE_BASE.exists():
-        parts.append(f"=== base.md ===\n{KNOWLEDGE_BASE.read_text(encoding='utf-8')}")
+        parts.append(f"=== archivist_knowledge_log.md ===\n{KNOWLEDGE_BASE.read_text(encoding='utf-8')}")
     return "\n\n".join(parts)
 
 
@@ -276,7 +282,6 @@ def _enrich(
     clarified_req: str,
     report: dict,
     knowledge_layer: str,
-    mini_analysis: str,
     extra_context: str,
 ) -> str:
     decisions_block = _summarize_decisions(report)
@@ -297,9 +302,6 @@ CLARIFICATION DECISIONS:
 
 CONFLICTS:
 {conflicts_block}
-
-MINI ANALYSIS (from pre-implementation review, if available):
-{mini_analysis if mini_analysis.strip() else "(not available — mini mode was not run)"}
 
 KNOWLEDGE LAYER (existing codebase artifacts, if available):
 {knowledge_layer if knowledge_layer.strip() else "(not available — absorber has not run for this project)"}
@@ -328,7 +330,7 @@ def _review_prompt(enriched: str) -> tuple[str, bool]:
 
     print("\n  [1] confirm — send this prompt to spec agent")
     print("  [2] edit    — open $EDITOR to modify (writes to temp file)")
-    print("  [3] abort   — stop here, enriched_prompt.md saved for manual review\n")
+    print("  [3] abort   — stop here, enricher_session_enriched_prompt.md saved for manual review\n")
 
     while True:
         choice = input("  → Choose 1 / 2 / 3: ").strip()
@@ -337,9 +339,9 @@ def _review_prompt(enriched: str) -> tuple[str, bool]:
         if choice in ("2", "edit"):
             edited = _open_in_editor(enriched)
             if edited and edited.strip():
-                print("\n[08] Updated prompt loaded.")
+                print("\n[enricher] Updated prompt loaded.")
                 return edited, True
-            print("[08] Editor returned empty content — keeping original.")
+            print("[enricher] Editor returned empty content — keeping original.")
             return enriched, True
         if choice in ("3", "abort"):
             return enriched, False
@@ -361,10 +363,10 @@ def _open_in_editor(content: str) -> str:
         subprocess.run([editor, tmp_path], check=True)
         return Path(tmp_path).read_text(encoding="utf-8")
     except FileNotFoundError:
-        print(f"[08][warn] Editor '{editor}' not found. Set $EDITOR env var.")
+        print(f"[enricher][warn] Editor '{editor}' not found. Set $EDITOR env var.")
         return content
     except subprocess.CalledProcessError as exc:
-        print(f"[08][warn] Editor exited with error: {exc}")
+        print(f"[enricher][warn] Editor exited with error: {exc}")
         return content
     finally:
         try:
@@ -380,19 +382,19 @@ def _open_in_editor(content: str) -> str:
 def _launch_spec_agent(project_name: str) -> None:
     script = Path(__file__).parent / "09_spec_agent.py"
     if not script.exists():
-        print(f"\n[08][warn] 09_spec_agent.py not found at {script}")
-        print(f"[08]       Create it first, then run:")
+        print(f"\n[enricher][warn] 09_spec_agent.py not found at {script}")
+        print(f"[enricher]       Create it first, then run:")
         print(f"           python 09_spec_agent.py --project {project_name!r}")
         return
 
-    print(f"\n[08] Launching spec agent → {script.name}")
+    print(f"\n[enricher] Launching spec agent → {script.name}")
     try:
         subprocess.run(
             [sys.executable, str(script), "--project", project_name],
             check=False,
         )
     except KeyboardInterrupt:
-        print("\n[08] Spec agent interrupted.")
+        print("\n[enricher] Spec agent interrupted.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -408,10 +410,10 @@ def _resolve_project(arg_project: str | None) -> str:
     except RuntimeError:
         pass
     print()
-    print("[08] No --project specified and PIPELINE_PROJECT not set.")
+    print("[enricher] No --project specified and PIPELINE_PROJECT not set.")
     name = input("  Enter project name: ").strip()
     if not name:
-        print("[08] Project name cannot be empty.")
+        print("[enricher] Project name cannot be empty.")
         sys.exit(1)
     return name
 
@@ -422,7 +424,7 @@ def _resolve_project(arg_project: str | None) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="08_prompt_agent — enrich clarified requirement into a structured spec prompt"
+        description="04_enricher — enrich clarified requirement into a structured spec prompt"
     )
     parser.add_argument("--project",       metavar="NAME",
                         help="Project workspace name. Prompted if omitted.")
@@ -438,42 +440,36 @@ def main() -> None:
     project_name = _resolve_project(args.project)
     os.environ["PIPELINE_PROJECT"] = project_name
     ensure_dirs()
-    print(f"[08] Workspace: {project_name!r}")
+    print(f"[enricher] Workspace: {project_name!r}")
 
     # ── Load inputs ───────────────────────────────────────────────────────────
     clarified_req = _load_clarified_req()
     if not clarified_req.strip():
         print(
-            "[08][error] clarified_requirement.md not found or empty.\n"
-            "           Run 00_clarificator.py first."
+            "[enricher][error] clarificator_requirement_synthesis.md not found or empty.\n"
+            "           Run 03_clarificator.py first."
         )
         sys.exit(1)
-    print(f"[08] Loaded clarified_requirement.md ({len(clarified_req)} chars)")
+    print(f"[enricher] Loaded clarificator_requirement_synthesis.md ({len(clarified_req)} chars)")
 
     report = _load_clarification_report()
     n_decisions = len(report.get("decisions", []))
-    print(f"[08] Loaded clarification_report.json ({n_decisions} decisions)")
-
-    mini_analysis = _load_mini_analysis()
-    if mini_analysis.strip():
-        print("[08] Loaded mini_analysis.md")
-    else:
-        print("[08] mini_analysis.md not found — will proceed without it")
+    print(f"[enricher] Loaded clarificator_session_raw.json ({n_decisions} decisions)")
 
     knowledge_layer = _load_knowledge_layer()
     if knowledge_layer.strip():
         parts = []
-        if CODEBASE_MAP.exists(): parts.append("codebase_map")
-        if CONFIG_MAP.exists():   parts.append("config_map")
-        if BLAME_MAP.exists():    parts.append("blame_map")
-        if KNOWLEDGE_BASE.exists(): parts.append("base")
-        print(f"[08] Knowledge layer loaded: {', '.join(parts)}")
+        if CODEBASE_MAP.exists():   parts.append("absorber_codebase_map")
+        if CONFIG_MAP.exists():     parts.append("absorber_config_map")
+        if BLAME_MAP.exists():      parts.append("absorber_blame_map")
+        if KNOWLEDGE_BASE.exists(): parts.append("archivist_knowledge_log")
+        print(f"[enricher] Knowledge layer loaded: {', '.join(parts)}")
     else:
-        print("[08] No knowledge layer found — proceeding in greenfield mode")
+        print("[enricher] No knowledge layer found — proceeding in greenfield mode")
 
     # ── Enrich ────────────────────────────────────────────────────────────────
     _print_banner(f"Enriching prompt — {project_name}")
-    print("[08] Calling LLM to build enriched prompt ...")
+    print("[enricher] Calling LLM to build enriched prompt ...")
 
     try:
         enriched = _enrich(
@@ -481,11 +477,10 @@ def main() -> None:
             clarified_req  = clarified_req,
             report         = report,
             knowledge_layer= knowledge_layer,
-            mini_analysis  = mini_analysis,
             extra_context  = args.extra_context,
         )
     except Exception as exc:
-        print(f"[08][error] Enrichment failed: {exc}")
+        print(f"[enricher][error] Enrichment failed: {exc}")
         sys.exit(1)
 
     # ── Dry run: print and exit ───────────────────────────────────────────────
@@ -494,7 +489,7 @@ def main() -> None:
         print(enriched.strip())
         return
 
-    # ── Write enriched_prompt.md ──────────────────────────────────────────────
+    # ── Write enricher_session_enriched_prompt.md ────────────────────────────
     header = (
         f"# Enriched Prompt — {project_name}\n"
         f"Generated: {_now_iso()}\n\n"
@@ -502,7 +497,7 @@ def main() -> None:
     )
     final_content = header + enriched.strip() + "\n"
     ENRICHED_PROMPT.write_text(final_content, encoding="utf-8")
-    print(f"[08] ✓ Enriched prompt → {ENRICHED_PROMPT}")
+    print(f"[enricher] ✓ Enriched prompt → {ENRICHED_PROMPT}")
 
     # ── Review ────────────────────────────────────────────────────────────────
     if args.no_review:
@@ -514,10 +509,10 @@ def main() -> None:
         if final_prompt != enriched:
             updated = header + final_prompt.strip() + "\n"
             ENRICHED_PROMPT.write_text(updated, encoding="utf-8")
-            print(f"[08] ✓ Enriched prompt updated → {ENRICHED_PROMPT}")
+            print(f"[enricher] ✓ Enriched prompt updated → {ENRICHED_PROMPT}")
 
     if not should_continue:
-        _print_banner("Stopped — enriched_prompt.md saved for manual review")
+        _print_banner("Stopped — enricher_session_enriched_prompt.md saved for manual review")
         print(f"  Review:   {ENRICHED_PROMPT}")
         print(f"  Continue: python 09_spec_agent.py --project {project_name!r}\n")
         return
