@@ -1,7 +1,7 @@
 """
 pipeline/06_scaffolder.py
 =========================
-Step 6 — Generate scaffold JSON from spec and materialize source/test stubs.
+Step 6 — Generate scaffold JSON from canonical spec and materialize source/test stubs.
 
 This step is intended for the FULL pipeline. Mini runs should normally skip this
 step and use the mini planner/implementer flow instead.
@@ -24,6 +24,10 @@ Required environment:
 
 Optional environment:
   GEMINI_MODEL=gemini-2.5-flash
+
+At the end of each run, prints:
+  - artifacts/files read
+  - artifacts/files created/updated/overwritten/appended
 
 For taxonomy details see artifacts/TAXONOMY.md
 """
@@ -63,6 +67,38 @@ from artifacts.paths import (  # noqa: E402
 
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 MAX_OUTPUT_TOKENS = 32768
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Artifact/file access tracking
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ARTIFACTS_READ: set[str] = set()
+_ARTIFACTS_WRITTEN: set[str] = set()
+
+
+def _track_read(path: Any) -> None:
+    _ARTIFACTS_READ.add(str(path))
+
+
+def _track_write(path: Any) -> None:
+    _ARTIFACTS_WRITTEN.add(str(path))
+
+
+def _print_artifact_access_summary() -> None:
+    print("[06] Artifacts/files read:")
+    if _ARTIFACTS_READ:
+        for item in sorted(_ARTIFACTS_READ):
+            print(f"[06]   READ  {item}")
+    else:
+        print("[06]   READ  (none)")
+
+    print("[06] Artifacts/files created/updated/overwritten/appended:")
+    if _ARTIFACTS_WRITTEN:
+        for item in sorted(_ARTIFACTS_WRITTEN):
+            print(f"[06]   WRITE {item}")
+    else:
+        print("[06]   WRITE (none)")
 
 
 SYSTEM_PROMPT = textwrap.dedent("""
@@ -106,6 +142,7 @@ SYSTEM_PROMPT = textwrap.dedent("""
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
+        prog="06_scaffolder.py",
         description="Generate scaffold JSON/files from the canonical spec.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""
@@ -431,6 +468,7 @@ def _destination_for_entry(entry: dict[str, Any]) -> Path:
 def write_files(scaffold: dict[str, Any], spec: str) -> None:
     SCAFFOLD_JSON.parent.mkdir(parents=True, exist_ok=True)
     SCAFFOLD_JSON.write_text(json.dumps(scaffold, indent=2))
+    _track_write(SCAFFOLD_JSON)
     print(f"[06] Scaffold JSON → {SCAFFOLD_JSON}")
 
     for entry in scaffold["files"]:
@@ -438,6 +476,7 @@ def write_files(scaffold: dict[str, Any], spec: str) -> None:
 
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(entry["code"])
+        _track_write(dest)
 
         tag = "TEST" if entry.get("is_test", False) else "SRC "
         print(f"[06] [{tag}] {dest}")
@@ -445,6 +484,7 @@ def write_files(scaffold: dict[str, Any], spec: str) -> None:
     compressed = _compress_spec(spec)
     SCAFFOLDER_COMPRESSED_SPEC.parent.mkdir(parents=True, exist_ok=True)
     SCAFFOLDER_COMPRESSED_SPEC.write_text(compressed)
+    _track_write(SCAFFOLDER_COMPRESSED_SPEC)
 
     savings = 0
     if spec:
@@ -473,52 +513,69 @@ def preview_files(scaffold: dict[str, Any], spec: str) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    parser = _build_parser()
-    args = parser.parse_args()
-
-    _configure_project(args.project, parser)
-
-    # Important: do not call ensure_dirs() at import-time.
-    # PIPELINE_PROJECT must be available before artifact paths are resolved.
-    ensure_dirs()
-
-    api_key = _require_api_key(parser)
-
-    spec_path = get_spec_path()
-    if not spec_path.exists():
-        print(f"[06][error] canonical spec not found: {spec_path}", file=sys.stderr)
-        print(
-            "[06][hint] This is a full-only scaffold step. Ensure specwright "
-            "created the canonical spec before running 06_scaffolder.py.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    spec = spec_path.read_text(errors="replace")
-
-    scaffold = call_gemini(
-        spec,
-        api_key=api_key,
-        model=args.model,
-        max_retries=args.max_retries,
-    )
+    exit_code = 0
 
     try:
-        _validate_scaffold(scaffold)
-    except ValueError as exc:
-        print(f"[06][error] Invalid scaffold JSON: {exc}", file=sys.stderr)
-        print(
-            f"[06][debug] Scaffold first 1000 chars:\n"
-            f"{json.dumps(scaffold, indent=2)[:1000]}",
-            file=sys.stderr,
+        parser = _build_parser()
+        args = parser.parse_args()
+
+        _configure_project(args.project, parser)
+
+        # Important: do not call ensure_dirs() at import-time.
+        # PIPELINE_PROJECT must be available before artifact paths are resolved.
+        ensure_dirs()
+
+        api_key = _require_api_key(parser)
+
+        spec_path = get_spec_path()
+        if not spec_path.exists():
+            print(f"[06][error] canonical spec not found: {spec_path}", file=sys.stderr)
+            print(
+                "[06][hint] This is a full-only scaffold step. Ensure specwright "
+                "created the canonical spec before running 06_scaffolder.py.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        _track_read(spec_path)
+        spec = spec_path.read_text(errors="replace")
+
+        scaffold = call_gemini(
+            spec,
+            api_key=api_key,
+            model=args.model,
+            max_retries=args.max_retries,
         )
-        sys.exit(1)
 
-    if args.dry_run:
-        preview_files(scaffold, spec)
-        return
+        try:
+            _validate_scaffold(scaffold)
+        except ValueError as exc:
+            print(f"[06][error] Invalid scaffold JSON: {exc}", file=sys.stderr)
+            print(
+                f"[06][debug] Scaffold first 1000 chars:\n"
+                f"{json.dumps(scaffold, indent=2)[:1000]}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
-    write_files(scaffold, spec)
+        if args.dry_run:
+            preview_files(scaffold, spec)
+            return
+
+        write_files(scaffold, spec)
+
+    except SystemExit as exc:
+        code = exc.code
+        exit_code = code if isinstance(code, int) else 1
+
+    except Exception as exc:
+        print(f"[06][error] Scaffolder failed: {exc}", file=sys.stderr)
+        exit_code = 1
+
+    finally:
+        _print_artifact_access_summary()
+
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
