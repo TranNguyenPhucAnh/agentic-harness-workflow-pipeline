@@ -1,5 +1,5 @@
 """
-pipeline/06_judge_deepseek.py
+pipeline/11_judge.py
 =============================
 Step 6 — DeepSeek V3.2 as Judge / Validator.
 

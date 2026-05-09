@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-09_spec_agent.py
+05_specwright.py
 ================
 Spec Agent — nhận enriched prompt từ 08_prompt_agent, gửi cho model xịn,
 nhận về spec.md, cho user review/edit, rồi hỏi có muốn kích hoạt

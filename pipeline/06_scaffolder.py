@@ -1,5 +1,5 @@
 """
-pipeline/02_scaffold_gemini.py
+pipeline/06_scaffolder.py
 ==============================
 Step 2 — Generate scaffold JSON from spec.md and materialize source/test stubs.
 

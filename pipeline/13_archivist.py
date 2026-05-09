@@ -1,5 +1,5 @@
 """
-pipeline/07_update_knowledge.py
+pipeline/13_archivist.py
 Step 7b — Long-term knowledge distillation after human review.
 
 Two modes:

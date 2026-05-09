@@ -1,7 +1,6 @@
-```python
 #!/usr/bin/env python3
 """
-00_clarificator.py
+03_clarificator.py
 ==================
 Clarificator agent — upstream nhất trong pipeline.
 
