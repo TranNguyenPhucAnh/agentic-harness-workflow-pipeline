@@ -112,21 +112,6 @@ STEP_ENV_KEYS: dict[str, list[str]] = {
     "patcher": ["OPENROUTER_API_KEY"],
 }
 
-LEGACY_STEP_ALIASES: dict[str, str] = {
-    "absorb": "absorber",
-    "clarify": "clarificator",
-    "scaffold": "scaffolder",
-    "plan": "planner",
-    "implement": "executor",
-    "test": "debugger",
-    "report": "reporter",
-    "fix": "patcher",
-}
-
-CANONICAL_TO_LEGACY_STEP: dict[str, str] = {
-    canonical: legacy for legacy, canonical in LEGACY_STEP_ALIASES.items()
-}
-
 SCOPE_CHOICES = ("full", "mini")
 
 
@@ -506,9 +491,7 @@ def _artifact_rel(path: Any) -> str:
 
 
 def _canonical_step(step: str | None) -> str | None:
-    if step is None:
-        return None
-    return LEGACY_STEP_ALIASES.get(step, step)
+    return step
 
 
 def _prev_src_dir() -> Path:
@@ -570,9 +553,6 @@ def load_delta() -> dict | None:
 def delta_requires(delta: dict | None, step: str) -> bool:
     """
     True if spectracker delta says step must re-run, or delta unavailable.
-
-    Tolerates old delta keys during migration:
-      scaffold/plan/implement
     """
     if delta is None:
         return True
@@ -583,10 +563,6 @@ def delta_requires(delta: dict | None, step: str) -> bool:
 
     if step in rerun_steps:
         return bool(rerun_steps.get(step))
-
-    legacy = CANONICAL_TO_LEGACY_STEP.get(step)
-    if legacy and legacy in rerun_steps:
-        return bool(rerun_steps.get(legacy))
 
     return True
 
@@ -773,7 +749,7 @@ def _run_judge_fix_loop(args: argparse.Namespace, results: dict[str, bool]) -> N
 def _run_fix_from_existing_judge(args: argparse.Namespace, results: dict[str, bool]) -> None:
     raw_path = JUDGE_SESSION_VERDICT_RAW
     if not raw_path.exists():
-        print("[harness] --patcher-only: execution/judge_session_verdict_raw.json not found.")
+        print("[harness] --repair-from-judge: execution/judge_session_verdict_raw.json not found.")
         print("          Run the full pipeline first to generate a judge report.")
         results["patcher_from_judge"] = False
         return
@@ -858,29 +834,58 @@ def _validate_scope(scope: str) -> None:
         _die(f"Invalid --scope {scope!r}. Expected one of: {', '.join(SCOPE_CHOICES)}")
 
 
+def _selected_single_steps(args: argparse.Namespace) -> list[str]:
+    return [step for step in STEPS if getattr(args, step, False)]
+
+
+def _has_range_selection(args: argparse.Namespace) -> bool:
+    return bool(
+        getattr(args, "from_step", None)
+        or getattr(args, "until_step", None)
+    )
+
+
+def _validate_execution_mode_conflicts(args: argparse.Namespace) -> None:
+    """
+    Keep harness CLI semantics strict:
+
+      range mode       : --from-<step> [--until-<step>]
+      single-step mode : --<step>
+      repair flow      : --repair-from-judge
+
+    These modes must not be mixed.
+    """
+    single_steps = _selected_single_steps(args)
+
+    if len(single_steps) > 1:
+        _die(
+            "Only one step shorthand allowed at a time, got: "
+            + " ".join(f"--{step}" for step in single_steps)
+        )
+
+    active_modes: list[str] = []
+
+    if _has_range_selection(args):
+        active_modes.append("range mode (--from-*/--until-*)")
+
+    if single_steps:
+        active_modes.append(f"single-step mode (--{single_steps[0]})")
+
+    if getattr(args, "repair_from_judge", False):
+        active_modes.append("repair flow (--repair-from-judge)")
+
+    if len(active_modes) > 1:
+        _die("Cannot mix execution modes: " + " + ".join(active_modes))
+
+
 def _resolve_run_range(args: argparse.Namespace) -> tuple[str, str]:
     from_step = _canonical_step(getattr(args, "from_step", None))
     until_step = _canonical_step(getattr(args, "until_step", None))
 
-    shorthands = [step for step in STEPS if getattr(args, step, False)]
-    shorthands += [
-        canonical
-        for legacy, canonical in LEGACY_STEP_ALIASES.items()
-        if getattr(args, legacy, False)
-    ]
+    shorthands = _selected_single_steps(args)
 
-    if shorthands and (from_step or until_step):
-        _die(f"Cannot mix --{shorthands[0]} shorthand with --from/--until flags.")
-
-    unique_shorthands = list(dict.fromkeys(shorthands))
-    if len(unique_shorthands) > 1:
-        _die(
-            "Only one step shorthand allowed at a time, got: "
-            + " ".join(f"--{step}" for step in unique_shorthands)
-        )
-
-    if unique_shorthands:
-        return unique_shorthands[0], unique_shorthands[0]
+    if shorthands:
+        return shorthands[0], shorthands[0]
 
     if until_step and not from_step:
         _die(f"--until-{until_step} requires --from-<step>.")
@@ -1271,10 +1276,7 @@ Examples:
   python harness.py --project demo --scope mini --from-clarificator --until-executor
   python harness.py --project demo --dry-run
   python harness.py --project demo --no-trace-artifacts
-
-Legacy aliases still work:
-  python harness.py --from-implement --until-test --dry-run
-  python harness.py --scaffold
+  python harness.py --project demo --repair-from-judge
 """,
     )
 
@@ -1324,29 +1326,6 @@ Legacy aliases still work:
             dest=step,
             action="store_true",
             help=f"Run only step '{step}'.",
-        )
-
-    # Hidden legacy aliases.
-    for legacy, canonical in LEGACY_STEP_ALIASES.items():
-        parser.add_argument(
-            f"--from-{legacy}",
-            dest="from_step",
-            action="store_const",
-            const=canonical,
-            help=argparse.SUPPRESS,
-        )
-        parser.add_argument(
-            f"--until-{legacy}",
-            dest="until_step",
-            action="store_const",
-            const=canonical,
-            help=argparse.SUPPRESS,
-        )
-        parser.add_argument(
-            f"--{legacy}",
-            dest=legacy,
-            action="store_true",
-            help=argparse.SUPPRESS,
         )
 
     parser.add_argument(
@@ -1404,11 +1383,12 @@ Legacy aliases still work:
         help="Run judge but skip auto-patcher step.",
     )
     parser.add_argument(
-        "--patcher-only",
+        "--repair-from-judge",
+        dest="repair_from_judge",
         action="store_true",
         help=(
             "Consume existing execution/judge_session_verdict_raw.json, "
-            "then run patcher and one post-patch judge."
+            "then run patcher, refresh reporter, and run one post-patch judge."
         ),
     )
     parser.add_argument(
@@ -1466,6 +1446,7 @@ def main() -> None:
     args = parser.parse_args()
 
     _validate_scope(args.scope)
+    _validate_execution_mode_conflicts(args)
 
     if not args.project:
         args.project = _interactive_project_select(ROOT)
@@ -1500,14 +1481,15 @@ def main() -> None:
         )
         return
 
-    # --patcher-only special flow.
-    if args.patcher_only:
+    # --repair-from-judge special flow.
+    if args.repair_from_judge:
         results: dict[str, bool] = {}
 
         if args.dry_run:
             print(
                 "\n[harness] DRY RUN — would consume existing "
-                "execution/judge_session_verdict_raw.json and run patcher."
+                "execution/judge_session_verdict_raw.json, run patcher, "
+                "refresh reporter, and re-run judge."
             )
             return
 
