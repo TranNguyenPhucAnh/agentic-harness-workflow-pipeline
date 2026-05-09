@@ -22,11 +22,11 @@ Naming convention
     _synopsis  = high-level narrative, không đi vào chi tiết
 
 Module prefixes (owner):
-  spectracker   01_spectracker.py   track spec version changes
-  absorber      02_absorber.py      scan codebase, build knowledge maps
-  clarificator  03_clarificator.py  clarify requirements via Q&A
-  enricher      04_enricher.py      enrich context into structured prompt
-  specwright    05_specwright.py    generate/update spec
+  absorber      01_absorber.py      scan codebase, build knowledge maps
+  clarificator  02_clarificator.py  clarify requirements via Q&A
+  enricher      03_enricher.py      enrich context into structured prompt
+  specwright    04_specwright.py    generate/update spec
+  spectracker   05_spectracker.py   track spec version changes
   scaffolder    06_scaffolder.py    generate stub + test files
   planner       07_planner.py       decompose work into execution plan
   executor      08_executor.py      implement src/ files
@@ -127,7 +127,7 @@ def get_spec_path() -> Path:
     Return resolved spec path with project slug embedded.
     Always use this function — not SPEC_PATH — for actual file operations.
     Slug in filename enables cross-project spec extraction without renaming.
-    owner: specwright (05_specwright.py)
+    owner: specwright (04_specwright.py)
     """
     return _artifact_root() / f"specwright_spec_{get_project_slug()}.md"
 
@@ -261,7 +261,7 @@ RUN_DIR = EXECUTION_DIR
 
 # ── state/ ────────────────────────────────────────────────────────────────────
 
-# owner:     clarificator (03_clarificator.py)
+# owner:     clarificator (02_clarificator.py)
 # consumers: enricher, specwright (fallback if enriched prompt absent)
 # lifecycle: persistent — overwrite per clarification session
 # purpose:   raw requirement rewritten inline with all clarification decisions resolved
@@ -292,11 +292,13 @@ PLANNER_MINI_PLAN = _LazyPath("state/planner_mini_execution_plan.json")
 # purpose:   planner analysis of which files are impacted by the mini task scope
 PLANNER_MINI_IMPACT = _LazyPath("state/planner_mini_impact_analysis.json")
 
-# owner:     spectracker (01_spectracker.py)
+# owner:     spectracker (05_spectracker.py)
 # consumers: spectracker (self-read for delta diff), harness
 # lifecycle: hybrid — top-level fields overwrite each run;
 #            embedded run_history[] array is append-only
 # purpose:   tracks currently applied spec version + run history for delta computation
+# note:      In full harness runs, updated at finalization time by harness
+#            calling spectracker.write_applied(); ownership remains spectracker.
 SPECTRACKER_APPLIED = _LazyPath("state/spectracker_applied_version.json")
 
 # ── Backward-compatible aliases (state/) ─────────────────────────────────────
@@ -320,7 +322,7 @@ CLARIFIED_REQUEST = CLARIFIED_REQ
 #            Pure cache — fully derivable from spec. Falls back to get_spec_path() if absent.
 SCAFFOLDER_COMPRESSED_SPEC = _LazyPath("cache/scaffolder_compressed_spec.md")
 
-# owner:     spectracker (01_spectracker.py)
+# owner:     spectracker (05_spectracker.py)
 # consumers: harness (decides which steps to rerun)
 # lifecycle: session — overwrite each run
 # purpose:   structured diff between current and previous spec version:
@@ -328,12 +330,12 @@ SCAFFOLDER_COMPRESSED_SPEC = _LazyPath("cache/scaffolder_compressed_spec.md")
 #            Exception: in cache/ but drives harness control flow.
 SPECTRACKER_VERSION_DELTA = _LazyPath("cache/spectracker_session_version_delta.json")
 
-# owner:     absorber (02_absorber.py)
+# owner:     absorber (01_absorber.py)
 # consumers: clarificator, enricher, planner
 # lifecycle: session — overwrite each absorber run (point-in-time codebase snapshot)
 ABSORBER_CODEBASE_SNAPSHOT = _LazyPath("cache/absorber_session_codebase_snapshot.json")
 
-# owner:     absorber (02_absorber.py)
+# owner:     absorber (01_absorber.py)
 # consumers: clarificator, enricher
 # lifecycle: session — overwrite each absorber run (point-in-time git state)
 # note:      moved from knowledge/history/ — snapshot semantics, not a persistent log
@@ -350,20 +352,20 @@ ABSORBER_CACHE  = ABSORBER_CODEBASE_SNAPSHOT
 
 # ── execution/ (renamed from run/) ───────────────────────────────────────────
 
-# owner:     clarificator (03_clarificator.py)
+# owner:     clarificator (02_clarificator.py)
 # consumers: enricher, planner
 # lifecycle: session — overwrite per clarification session
 # purpose:   structured session metadata: decisions[], tier counts, conflicts detected,
 #            unresolved findings list, requirement hash. Machine-readable.
 CLARIFICATOR_SESSION_RAW = _LazyPath("execution/clarificator_session_raw.json")
 
-# owner:     clarificator (03_clarificator.py)
+# owner:     clarificator (02_clarificator.py)
 # consumers: human review
 # lifecycle: session — overwrite per clarification session
 # purpose:   human-readable questions for current session, grouped by tier and priority
 CLARIFICATOR_SESSION_QUESTIONS = _LazyPath("execution/clarificator_session_questions.md")
 
-# owner:     enricher (04_enricher.py)
+# owner:     enricher (03_enricher.py)
 # consumers: specwright
 # lifecycle: session — overwrite per enricher run
 # purpose:   structured prompt enriched with knowledge layer, passed to specwright
@@ -413,24 +415,24 @@ CLARIFICATION_QUESTIONS = CLARIFICATOR_SESSION_QUESTIONS
 
 # ── knowledge/current/ ───────────────────────────────────────────────────────
 
-# owner:     clarificator (03_clarificator.py)
+# owner:     clarificator (02_clarificator.py)
 # consumers: clarificator (next session — semantic dedup of already-answered questions)
 # lifecycle: append-only log across all sessions
 # purpose:   long-term Q&A memory — prevents re-asking semantically equivalent
 #            questions across runs; also surfaced to enricher for context continuity
 CLARIFICATOR_DECISION_LOG = _LazyPath("knowledge/current/clarificator_decision_log.md")
 
-# owner:     absorber (02_absorber.py)
+# owner:     absorber (01_absorber.py)
 # consumers: clarificator, enricher, planner, executor
 # lifecycle: persistent — overwrite per absorber run
 ABSORBER_CODEBASE_MAP = _LazyPath("knowledge/current/absorber_codebase_map.md")
 
-# owner:     absorber (02_absorber.py)
+# owner:     absorber (01_absorber.py)
 # consumers: clarificator, enricher
 # lifecycle: persistent — overwrite per absorber run
 ABSORBER_CONFIG_MAP = _LazyPath("knowledge/current/absorber_config_map.json")
 
-# owner:     absorber (02_absorber.py)
+# owner:     absorber (01_absorber.py)
 # consumers: clarificator, enricher, planner
 # lifecycle: persistent — overwrite per absorber run
 ABSORBER_BLAME_MAP = _LazyPath("knowledge/current/absorber_blame_map.md")
@@ -489,7 +491,7 @@ ARCHIVIST_CURATION_LOG = _LazyPath("knowledge/history/archivist_curation_log.jso
 #            files patched, judge findings that triggered each fix, outcome per file
 PATCHER_ATTEMPT_LOG = _LazyPath("knowledge/history/patcher_attempt_log.json")
 
-# owner:     spectracker (01_spectracker.py)
+# owner:     spectracker (05_spectracker.py)
 # consumers: human review only — no pipeline logic reads this
 # lifecycle: append-only log
 # purpose:   narrative history of all spec version changes over time.
