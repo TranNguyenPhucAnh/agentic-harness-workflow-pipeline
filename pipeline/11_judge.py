@@ -1,31 +1,45 @@
 """
 pipeline/11_judge.py
-=============================
-Step 6 — DeepSeek V3.2 as Judge / Validator.
+====================
+Step 11 — DeepSeek V3.2 as Judge / Validator.
 
 Runs after verification/tests have passed. Aggregates pipeline artifacts into a
 single briefing, sends it to the judge model for final review, and writes:
 
-  artifacts_<slug>/reports/judge_report.md
-  artifacts_<slug>/run/judge_raw.json
+  artifacts_<slug>/execution/judge_session_verdict_raw.json
+  artifacts_<slug>/reports/judge_verdict_summary.md
 
 Supports both:
   - FULL/PARTIAL flow:
-      spec.md/spec_compressed.md, plan.json, scaffold.json, test_report.json,
-      impl_record.json, source files, test files, spec_delta.json.
+      specwright_spec_<slug>.md / scaffolder_compressed_spec.md,
+      planner_full_execution_plan.json,
+      scaffolder_codebase_skeleton.json,
+      debugger_session_test_summary.json,
+      executor_session_manifest.json,
+      source files,
+      test files,
+      spectracker_session_version_delta.json.
   - MINI targeted flow:
-      clarified_requirement.md, enriched_prompt.md, plan_mini.json,
-      analysis_mini.json, impl_record.json, test_report.json, and only the
-      target/implemented files.
+      clarificator_requirement_synthesis.md,
+      enricher_session_enriched_prompt.md,
+      planner_mini_execution_plan.json,
+      planner_mini_impact_analysis.json,
+      executor_session_manifest.json,
+      debugger_session_test_summary.json,
+      and only the target/implemented files.
 
 Direct execution:
-  python 06_judge_deepseek.py --project my-app
-  PIPELINE_PROJECT=my-app python 06_judge_deepseek.py
+  python 11_judge.py --project my-app
+  PIPELINE_PROJECT=my-app python 11_judge.py
 
 Required environment:
   OPENROUTER_API_KEY=<your-key>
 
-For taxonomy details see docs/artifacts.md
+At the end of each run, prints:
+  - artifacts/files read
+  - artifacts/files created/updated/overwritten/appended
+
+For taxonomy details see artifacts/TAXONOMY.md
 """
 
 from __future__ import annotations
@@ -43,31 +57,44 @@ from typing import Any
 
 import httpx
 
-# === WRITE AUTHORITY: 06_judge_deepseek ===
-# OWNS  : artifacts_<slug>/run/judge_raw.json
-#         artifacts_<slug>/reports/judge_report.md
-# READS : spec/plans/impl/test/source artifacts
+# === WRITE AUTHORITY: judge ===
+# OWNS  : artifacts_<slug>/execution/judge_session_verdict_raw.json
+#         artifacts_<slug>/reports/judge_verdict_summary.md
+# READS : artifacts_<slug>/specwright_spec_<slug>.md
+#         artifacts_<slug>/cache/scaffolder_compressed_spec.md
+#         artifacts_<slug>/state/planner_full_execution_plan.json
+#         artifacts_<slug>/state/planner_mini_execution_plan.json
+#         artifacts_<slug>/state/planner_mini_impact_analysis.json
+#         artifacts_<slug>/state/scaffolder_codebase_skeleton.json
+#         artifacts_<slug>/state/clarificator_requirement_synthesis.md
+#         artifacts_<slug>/cache/spectracker_session_version_delta.json
+#         artifacts_<slug>/execution/enricher_session_enriched_prompt.md
+#         artifacts_<slug>/execution/executor_session_manifest.json
+#         artifacts_<slug>/execution/debugger_session_test_summary.json
+#         artifacts_<slug>/knowledge/current/archivist_spec_gaps.md
+#         artifacts_<slug>/src/**
+#         artifacts_<slug>/tests/**
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from artifacts.paths import (  # noqa: E402
-    ANALYSIS_MINI,
+    ARCHIVIST_SPEC_GAPS,
     CLARIFIED_REQ,
-    ENRICHED_PROMPT,
-    IMPL_RECORD,
-    JUDGE_RAW,
-    JUDGE_REPORT,
-    PLAN_JSON as GLM_PLAN_PATH,
-    PLAN_MINI,
+    DEBUGGER_SESSION_TEST_SUMMARY,
+    ENRICHER_SESSION_PROMPT,
+    EXECUTOR_SESSION_MANIFEST,
+    JUDGE_SESSION_VERDICT_RAW,
+    JUDGE_VERDICT_SUMMARY,
+    PLANNER_FULL_PLAN,
+    PLANNER_MINI_IMPACT,
+    PLANNER_MINI_PLAN,
     SCAFFOLD_JSON,
-    SPEC_ADDENDUM,
-    SPEC_COMPRESSED,
-    SPEC_DELTA,
-    SPEC_PATH,
+    SCAFFOLDER_COMPRESSED_SPEC,
+    SPECTRACKER_VERSION_DELTA,
     SRC_DIR,
-    TEST_REPORT,
     TESTS_DIR,
     artifact_root,
     ensure_dirs,
+    get_spec_path,
 )
 
 
@@ -75,6 +102,38 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_MODEL = "deepseek/deepseek-v3.2"
 MAX_BRIEFING_CHARS = 900_000
 MAX_FILE_CHARS = 80_000
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Artifact/file access tracking
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ARTIFACTS_READ: set[str] = set()
+_ARTIFACTS_WRITTEN: set[str] = set()
+
+
+def _track_read(path: Any) -> None:
+    _ARTIFACTS_READ.add(str(path))
+
+
+def _track_write(path: Any) -> None:
+    _ARTIFACTS_WRITTEN.add(str(path))
+
+
+def _print_artifact_access_summary() -> None:
+    print("[11] Artifacts/files read:")
+    if _ARTIFACTS_READ:
+        for item in sorted(_ARTIFACTS_READ):
+            print(f"[11]   READ  {item}")
+    else:
+        print("[11]   READ  (none)")
+
+    print("[11] Artifacts/files created/updated/overwritten/appended:")
+    if _ARTIFACTS_WRITTEN:
+        for item in sorted(_ARTIFACTS_WRITTEN):
+            print(f"[11]   WRITE {item}")
+    else:
+        print("[11]   WRITE (none)")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -98,18 +157,18 @@ For PARTIAL runs:
 - Do NOT block approval for pre-existing issues in reused files.
 
 For MINI targeted runs:
-- Review ONLY the target files listed in plan_mini.target_files and files written
-  in impl_record.files.
+- Review ONLY the target files listed in planner_mini_execution_plan.target_files and files written
+  in executor_session_manifest.files.
 - Do NOT block approval for unrelated pre-existing issues outside the mini target scope.
 - If you notice a problem outside the target scope, mention it as a non-blocking
   note or as "requires broader follow-up", unless it directly breaks the targeted task.
 - Judge whether the targeted change satisfies the clarified requirement and respects
-  plan_mini constraints.
+  planner_mini_execution_plan constraints.
 
 Review dimensions:
 A. REQUIREMENT / SPEC COMPLIANCE
    - FULL/PARTIAL: spec compliance, acceptance criteria.
-   - MINI: clarified requirement + plan_mini compliance.
+   - MINI: clarified requirement + planner_mini_execution_plan compliance.
 B. CODE QUALITY
    - Correctness, maintainability, type/syntax safety, no obvious regressions.
 C. TEST / VERIFIER QUALITY
@@ -158,14 +217,15 @@ Verdict rules:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
+        prog="11_judge.py",
         description="Run final judge review over pipeline artifacts.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""
             Examples:
-              python 06_judge_deepseek.py --project my-app
-              PIPELINE_PROJECT=my-app python 06_judge_deepseek.py
+              python 11_judge.py --project my-app
+              PIPELINE_PROJECT=my-app python 11_judge.py
 
-              python 06_judge_deepseek.py --project my-app --model deepseek/deepseek-v3.2
+              python 11_judge.py --project my-app --model deepseek/deepseek-v3.2
         """),
     )
     parser.add_argument(
@@ -200,7 +260,7 @@ def _configure_project(
 
     parser.error(
         "PIPELINE_PROJECT is not set. Use --project <name> or export "
-        "PIPELINE_PROJECT=<name> before running 06_judge_deepseek.py directly."
+        "PIPELINE_PROJECT=<name> before running 11_judge.py directly."
     )
 
 
@@ -217,54 +277,58 @@ def _require_openrouter_key(parser: argparse.ArgumentParser) -> str:
 # Safe loaders
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _read_json(path: Path, default: Any) -> Any:
+def _read_json(path: Any, default: Any) -> Any:
     if not path.exists():
         return default
     try:
+        _track_read(path)
         return json.loads(path.read_text(errors="replace"))
     except Exception as exc:
-        print(f"[06][warn] Could not parse JSON {path}: {exc}", file=sys.stderr)
+        print(f"[11][warn] Could not parse JSON {path}: {exc}", file=sys.stderr)
         return default
 
 
-def _read_text(path: Path) -> str:
+def _read_text(path: Any) -> str:
     if not path.exists():
         return ""
     try:
+        _track_read(path)
         return path.read_text(errors="replace")
     except Exception as exc:
-        print(f"[06][warn] Could not read {path}: {exc}", file=sys.stderr)
+        print(f"[11][warn] Could not read {path}: {exc}", file=sys.stderr)
         return ""
 
 
 def _load_impl_record() -> dict[str, Any]:
-    rec = _read_json(IMPL_RECORD, {})
+    rec = _read_json(EXECUTOR_SESSION_MANIFEST, {})
     return rec if isinstance(rec, dict) else {}
 
 
 def _load_plan_mini() -> dict[str, Any]:
-    plan = _read_json(PLAN_MINI, {})
+    plan = _read_json(PLANNER_MINI_PLAN, {})
     return plan if isinstance(plan, dict) else {}
 
 
 def _load_analysis_mini() -> dict[str, Any]:
-    analysis = _read_json(ANALYSIS_MINI, {})
+    analysis = _read_json(PLANNER_MINI_IMPACT, {})
     return analysis if isinstance(analysis, dict) else {}
 
 
 def _load_delta() -> dict[str, Any] | None:
-    delta = _read_json(SPEC_DELTA, None)
+    delta = _read_json(SPECTRACKER_VERSION_DELTA, None)
     return delta if isinstance(delta, dict) else None
 
 
 def _load_spec_optional() -> str:
-    if SPEC_COMPRESSED.exists():
-        return _read_text(SPEC_COMPRESSED)
-    return _read_text(SPEC_PATH)
+    if SCAFFOLDER_COMPRESSED_SPEC.exists():
+        return _read_text(SCAFFOLDER_COMPRESSED_SPEC)
+
+    spec_path = get_spec_path()
+    return _read_text(spec_path)
 
 
 def _load_test_report() -> dict[str, Any]:
-    report = _read_json(TEST_REPORT, {})
+    report = _read_json(DEBUGGER_SESSION_TEST_SUMMARY, {})
     return report if isinstance(report, dict) else {}
 
 
@@ -279,7 +343,7 @@ def _detect_scope() -> str:
     if scope in {"full", "mini"}:
         return scope
 
-    if PLAN_MINI.exists() or ANALYSIS_MINI.exists():
+    if PLANNER_MINI_PLAN.exists() or PLANNER_MINI_IMPACT.exists():
         return "mini"
 
     return "full"
@@ -345,6 +409,7 @@ def _read_file_for_briefing(path: Path) -> str:
     if not path.exists():
         return f"[file not found: {path}]"
 
+    _track_read(path)
     text = path.read_text(errors="replace")
     if len(text) > MAX_FILE_CHARS:
         return text[:MAX_FILE_CHARS] + f"\n\n[truncated: {len(text)} chars total]"
@@ -398,6 +463,9 @@ def _collect_files_by_rel_paths(paths: list[str]) -> dict[str, str]:
 def _collect_ts_files(root: Path, prefix: str) -> dict[str, str]:
     files: dict[str, str] = {}
 
+    if not root.exists():
+        return files
+
     for ext in ("*.ts", "*.tsx"):
         for path in sorted(root.rglob(ext)):
             rel = prefix + "/" + str(path.relative_to(root)).replace("\\", "/")
@@ -423,7 +491,22 @@ def _collect_changed_src_files() -> dict[str, str]:
                     for k, v in maybe_stub_map.items()
                 }
 
+            # Fallback for current scaffolder schema: derive stub_map from files[].
+            files = scaffold.get("files", [])
+            if not stub_map and isinstance(files, list):
+                for entry in files:
+                    if (
+                        isinstance(entry, dict)
+                        and not entry.get("is_test")
+                        and isinstance(entry.get("file_path"), str)
+                        and isinstance(entry.get("code"), str)
+                    ):
+                        stub_map[entry["file_path"]] = entry["code"]
+
     changed: dict[str, str] = {}
+
+    if not SRC_DIR.exists():
+        return changed
 
     for ext in ("*.ts", "*.tsx"):
         for path in sorted(SRC_DIR.rglob(ext)):
@@ -536,8 +619,8 @@ def _build_mini_context(
         "**This is a MINI targeted run.**",
         "",
         "**Primary review focus:**",
-        "- Files listed in `plan_mini.target_files`",
-        "- Files written in `impl_record.files`",
+        "- Files listed in `planner_mini_execution_plan.target_files`",
+        "- Files written in `executor_session_manifest.files`",
         "",
         "**Scope rule:**",
         "- Do NOT block approval for unrelated pre-existing issues outside target scope.",
@@ -559,6 +642,12 @@ def _build_mini_context(
         f"Implementation mode: `{mode}`",
     ]
 
+    if analysis_mini:
+        lines += [
+            "",
+            "**Planner impact analysis is included below and should be used to evaluate scope safety.**",
+        ]
+
     return "\n".join(lines)
 
 
@@ -566,28 +655,28 @@ def _append_full_sections(parts: list[str], is_partial: bool, affected_set: set[
     # 1. Spec
     spec = _load_spec_optional()
     if spec:
-        parts.append("## 1. spec.md\n\n" + spec)
+        parts.append("## 1. Canonical Spec\n\n" + spec)
     else:
-        parts.append("## 1. spec.md\n\n_[missing]_")
+        parts.append("## 1. Canonical Spec\n\n_[missing]_")
 
-    # 1b. Spec addendum
-    addendum = _read_text(SPEC_ADDENDUM)
+    # 1b. Spec gaps / addendum
+    addendum = _read_text(ARCHIVIST_SPEC_GAPS)
     if addendum:
         parts.append(
-            "## 1b. Spec Addendum\n\n"
+            "## 1b. Archivist Spec Gaps\n\n"
             + addendum
         )
 
-    # 2. GLM plan
-    if GLM_PLAN_PATH.exists():
-        plan = _read_json(GLM_PLAN_PATH, {})
+    # 2. Planner plan
+    if PLANNER_FULL_PLAN.exists():
+        plan = _read_json(PLANNER_FULL_PLAN, {})
         parts.append(
-            "## 2. GLM 5.1 Architectural Plan\n\n"
-            f"```json\n{json.dumps(plan, indent=2)}\n```"
+            "## 2. Planner Full Execution Plan\n\n"
+            f"```json\n{json.dumps(plan, indent=2, ensure_ascii=False)}\n```"
         )
     else:
         parts.append(
-            "## 2. GLM 5.1 Architectural Plan\n\n"
+            "## 2. Planner Full Execution Plan\n\n"
             "_Not available._"
         )
 
@@ -595,16 +684,16 @@ def _append_full_sections(parts: list[str], is_partial: bool, affected_set: set[
     impl_record = _load_impl_record()
     if impl_record:
         parts.append(
-            "## 3. Implementation Record\n\n"
-            f"```json\n{json.dumps(impl_record, indent=2)}\n```"
+            "## 3. Executor Session Manifest\n\n"
+            f"```json\n{json.dumps(impl_record, indent=2, ensure_ascii=False)}\n```"
         )
 
     # 4. Test report
     test_report = _load_test_report()
     if test_report:
         parts.append(
-            "## 4. Test / Verification Report\n\n"
-            f"```json\n{json.dumps(test_report, indent=2)}\n```"
+            "## 4. Debugger Session Test Summary\n\n"
+            f"```json\n{json.dumps(test_report, indent=2, ensure_ascii=False)}\n```"
         )
 
     # 5. Source files
@@ -655,43 +744,43 @@ def _append_mini_sections(
     impl_record: dict[str, Any],
 ) -> None:
     clarified = _read_text(CLARIFIED_REQ)
-    enriched = _read_text(ENRICHED_PROMPT)
+    enriched = _read_text(ENRICHER_SESSION_PROMPT)
     test_report = _load_test_report()
 
     if clarified:
-        parts.append("## 1. Clarified Requirement\n\n" + clarified)
+        parts.append("## 1. Clarificator Requirement Synthesis\n\n" + clarified)
     else:
-        parts.append("## 1. Clarified Requirement\n\n_[missing]_")
+        parts.append("## 1. Clarificator Requirement Synthesis\n\n_[missing]_")
 
     if enriched:
-        parts.append("## 1b. Enriched Prompt\n\n" + enriched)
+        parts.append("## 1b. Enricher Session Enriched Prompt\n\n" + enriched)
 
     if plan_mini:
         parts.append(
-            "## 2. plan_mini.json\n\n"
-            f"```json\n{json.dumps(plan_mini, indent=2)}\n```"
+            "## 2. Planner Mini Execution Plan\n\n"
+            f"```json\n{json.dumps(plan_mini, indent=2, ensure_ascii=False)}\n```"
         )
     else:
-        parts.append("## 2. plan_mini.json\n\n_[missing]_")
+        parts.append("## 2. Planner Mini Execution Plan\n\n_[missing]_")
 
     if analysis_mini:
         parts.append(
-            "## 3. analysis_mini.json\n\n"
-            f"```json\n{json.dumps(analysis_mini, indent=2)}\n```"
+            "## 3. Planner Mini Impact Analysis\n\n"
+            f"```json\n{json.dumps(analysis_mini, indent=2, ensure_ascii=False)}\n```"
         )
     else:
-        parts.append("## 3. analysis_mini.json\n\n_[missing]_")
+        parts.append("## 3. Planner Mini Impact Analysis\n\n_[missing]_")
 
     if impl_record:
         parts.append(
-            "## 4. impl_record.json\n\n"
-            f"```json\n{json.dumps(impl_record, indent=2)}\n```"
+            "## 4. Executor Session Manifest\n\n"
+            f"```json\n{json.dumps(impl_record, indent=2, ensure_ascii=False)}\n```"
         )
 
     if test_report:
         parts.append(
-            "## 5. Test / Verification Report\n\n"
-            f"```json\n{json.dumps(test_report, indent=2)}\n```"
+            "## 5. Debugger Session Test Summary\n\n"
+            f"```json\n{json.dumps(test_report, indent=2, ensure_ascii=False)}\n```"
         )
 
     target_files = _mini_target_files(plan_mini, impl_record)
@@ -792,7 +881,7 @@ def call_deepseek_judge(
         "Content-Type": "application/json",
     }
 
-    print(f"[06] Calling judge model: {model} …")
+    print(f"[11] Calling judge model: {model} …")
 
     last_error = None
 
@@ -806,7 +895,7 @@ def call_deepseek_judge(
             usage = data.get("usage", {})
             prompt_t = usage.get("prompt_tokens", "?")
             completion_t = usage.get("completion_tokens", "?")
-            print(f"[06] Tokens: prompt={prompt_t}, completion={completion_t}")
+            print(f"[11] Tokens: prompt={prompt_t}, completion={completion_t}")
 
             choice = data["choices"][0]
             msg = choice["message"]
@@ -824,10 +913,10 @@ def call_deepseek_judge(
                 return content.strip(), reasoning_details, usage
 
             last_error = f"Empty content. finish_reason={finish_reason}, message={msg}"
-            print(f"[06][warn] {last_error}", file=sys.stderr)
+            print(f"[11][warn] {last_error}", file=sys.stderr)
 
             if attempt == 0:
-                print("[06] Retrying in 3s …", file=sys.stderr)
+                print("[11] Retrying in 3s …", file=sys.stderr)
                 time.sleep(3)
 
     raise RuntimeError(f"Judge failed after retries: {last_error}")
@@ -847,19 +936,19 @@ def _parse_json(raw: str) -> dict[str, Any]:
     except json.JSONDecodeError:
         match = re.search(r"\{.*\}", text, re.DOTALL)
         if not match:
-            print("[06][error] No JSON object found in judge response.", file=sys.stderr)
-            print(f"[06][error] Raw first 1000 chars:\n{text[:1000]}", file=sys.stderr)
+            print("[11][error] No JSON object found in judge response.", file=sys.stderr)
+            print(f"[11][error] Raw first 1000 chars:\n{text[:1000]}", file=sys.stderr)
             sys.exit(1)
 
         try:
             parsed = json.loads(match.group())
         except json.JSONDecodeError as exc:
-            print(f"[06][error] JSON parse failed: {exc}", file=sys.stderr)
-            print(f"[06][error] Raw first 1000 chars:\n{text[:1000]}", file=sys.stderr)
+            print(f"[11][error] JSON parse failed: {exc}", file=sys.stderr)
+            print(f"[11][error] Raw first 1000 chars:\n{text[:1000]}", file=sys.stderr)
             sys.exit(1)
 
     if not isinstance(parsed, dict):
-        print("[06][error] Judge JSON top-level is not an object.", file=sys.stderr)
+        print("[11][error] Judge JSON top-level is not an object.", file=sys.stderr)
         sys.exit(1)
 
     return parsed
@@ -881,7 +970,7 @@ def render_report(review: dict[str, Any], *, model: str) -> str:
     }.get(verdict, "❓")
 
     lines = [
-        "# Judge Report — Final Review",
+        "# Judge Verdict Summary — Final Review",
         f"_Generated: {now}_",
         f"_Model: {model}_",
         f"_Run type: **{run_type}**_",
@@ -960,6 +1049,47 @@ def render_report(review: dict[str, Any], *, model: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Writers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _write_raw_verdict(
+    *,
+    model: str,
+    scope: str,
+    briefing_chars: int,
+    usage: dict[str, Any],
+    raw_response: str,
+    reasoning_details: list[Any] | None,
+) -> None:
+    JUDGE_SESSION_VERDICT_RAW.parent.mkdir(parents=True, exist_ok=True)
+    JUDGE_SESSION_VERDICT_RAW.write_text(
+        json.dumps(
+            {
+                "model": model,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "scope_detected": scope,
+                "briefing_chars": briefing_chars,
+                "usage": usage,
+                "response": raw_response,
+                "reasoning_details": reasoning_details,
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    _track_write(JUDGE_SESSION_VERDICT_RAW)
+    print(f"[11] Raw response + reasoning saved → {JUDGE_SESSION_VERDICT_RAW}")
+
+
+def _write_report(report_md: str) -> None:
+    JUDGE_VERDICT_SUMMARY.parent.mkdir(parents=True, exist_ok=True)
+    JUDGE_VERDICT_SUMMARY.write_text(report_md, encoding="utf-8")
+    _track_write(JUDGE_VERDICT_SUMMARY)
+    print(f"\n[11] Judge verdict summary written → {JUDGE_VERDICT_SUMMARY}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -972,54 +1102,60 @@ def main() -> None:
     # Important: project env must be configured before ensure_dirs().
     ensure_dirs()
 
-    api_key = _require_openrouter_key(parser)
+    exit_code = 0
 
-    scope = _detect_scope()
-    print(f"[06] Scope detected: {scope}")
-    print("[06] Building pipeline briefing …")
+    try:
+        api_key = _require_openrouter_key(parser)
 
-    briefing = build_briefing(max_chars=args.max_briefing_chars)
-    print(f"[06] Briefing size: {len(briefing):,} chars")
+        scope = _detect_scope()
+        print(f"[11] Scope detected: {scope}")
+        print("[11] Building pipeline briefing …")
 
-    raw_response, reasoning_details, usage = call_deepseek_judge(
-        briefing,
-        api_key=api_key,
-        model=args.model,
-    )
+        briefing = build_briefing(max_chars=args.max_briefing_chars)
+        print(f"[11] Briefing size: {len(briefing):,} chars")
 
-    JUDGE_RAW.parent.mkdir(parents=True, exist_ok=True)
-    JUDGE_RAW.write_text(json.dumps({
-        "model": args.model,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "scope_detected": scope,
-        "briefing_chars": len(briefing),
-        "usage": usage,
-        "response": raw_response,
-        "reasoning_details": reasoning_details,
-    }, indent=2))
-    print(f"[06] Raw response + reasoning saved → {JUDGE_RAW}")
+        raw_response, reasoning_details, usage = call_deepseek_judge(
+            briefing,
+            api_key=api_key,
+            model=args.model,
+        )
 
-    review = _parse_json(raw_response)
+        _write_raw_verdict(
+            model=args.model,
+            scope=scope,
+            briefing_chars=len(briefing),
+            usage=usage,
+            raw_response=raw_response,
+            reasoning_details=reasoning_details,
+        )
 
-    if "run_type" not in review:
-        review["run_type"] = "mini" if scope == "mini" else "full"
+        review = _parse_json(raw_response)
 
-    report_md = render_report(review, model=args.model)
+        if "run_type" not in review:
+            review["run_type"] = "mini" if scope == "mini" else "full"
 
-    JUDGE_REPORT.parent.mkdir(parents=True, exist_ok=True)
-    JUDGE_REPORT.write_text(report_md)
+        report_md = render_report(review, model=args.model)
+        _write_report(report_md)
 
-    print(f"\n[06] Judge report written → {JUDGE_REPORT}")
-    print(f"\n{'=' * 60}")
-    print(report_md)
-    print(f"{'=' * 60}")
+        print(f"\n{'=' * 60}")
+        print(report_md)
+        print(f"{'=' * 60}")
 
-    verdict = review.get("verdict", "")
-    if verdict == "NEEDS_REVISION":
-        print("[06] Judge verdict: NEEDS_REVISION — blocking issues found.", file=sys.stderr)
-        sys.exit(1)
+        verdict = review.get("verdict", "")
+        if verdict == "NEEDS_REVISION":
+            print("[11] Judge verdict: NEEDS_REVISION — blocking issues found.", file=sys.stderr)
+            exit_code = 1
+        else:
+            print(f"[11] Judge verdict: {verdict} ✅")
 
-    print(f"[06] Judge verdict: {verdict} ✅")
+    except Exception as exc:
+        print(f"[11][error] Judge failed: {exc}", file=sys.stderr)
+        exit_code = 1
+
+    finally:
+        _print_artifact_access_summary()
+
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
