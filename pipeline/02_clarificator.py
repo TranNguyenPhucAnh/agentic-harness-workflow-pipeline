@@ -1,5 +1,5 @@
 """
-03_clarificator.py
+02_clarificator.py
 ==================
 Clarificator agent — upstream nhất trong pipeline.
 
@@ -8,11 +8,11 @@ tổ chức Q&A với user theo 3-tier system, và output clarificator_requireme
 cùng với structured report cho downstream steps.
 
 Usage:
-    python pipeline/03_clarificator.py --project my-app --input requirement.pdf
-    python pipeline/03_clarificator.py --project my-app --input spec_draft.md
-    python pipeline/03_clarificator.py --project my-app --text "Build a dashboard..."
-    python pipeline/03_clarificator.py --project my-app
-    python pipeline/03_clarificator.py
+    python pipeline/02_clarificator.py --project my-app --input requirement.pdf
+    python pipeline/02_clarificator.py --project my-app --input spec_draft.md
+    python pipeline/02_clarificator.py --project my-app --text "Build a dashboard..."
+    python pipeline/02_clarificator.py --project my-app
+    python pipeline/02_clarificator.py
 
 When called by harness.py, PIPELINE_PROJECT is already set.
 When run directly, --project or interactive project prompt is used and
@@ -1214,7 +1214,7 @@ def _gather_requirement(args: argparse.Namespace) -> str:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="03_clarificator — requirement analysis & Q&A agent"
+        description="02_clarificator — requirement analysis & Q&A agent"
     )
     parser.add_argument(
         "--project",
