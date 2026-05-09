@@ -23,7 +23,7 @@ Usage:
     python 03_enricher.py --project my-app --extra-context "Focus on backend only"
     python 03_enricher.py --project my-app --dry-run
 
-    # Thường được gọi tự động từ 03_clarificator.py khi user chọn mode full.
+    # Thường được gọi tự động từ 02_clarificator.py khi user chọn mode full.
 
 Artifacts produced (owner: enricher):
     artifacts_<slug>/execution/enricher_session_enriched_prompt.md
@@ -504,7 +504,7 @@ def main() -> None:
         if not clarified_req.strip():
             print(
                 "[enricher][error] clarificator_requirement_synthesis.md not found or empty.\n"
-                "           Run 03_clarificator.py first."
+                "           Run 02_clarificator.py first."
             )
             sys.exit(1)
         print(f"[enricher] Loaded clarificator_requirement_synthesis.md ({len(clarified_req)} chars)")
