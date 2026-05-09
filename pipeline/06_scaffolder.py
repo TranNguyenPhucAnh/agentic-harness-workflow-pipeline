@@ -1,23 +1,23 @@
 """
 pipeline/06_scaffolder.py
-==============================
-Step 2 — Generate scaffold JSON from spec.md and materialize source/test stubs.
+=========================
+Step 6 — Generate scaffold JSON from spec and materialize source/test stubs.
 
 This step is intended for the FULL pipeline. Mini runs should normally skip this
 step and use the mini planner/implementer flow instead.
 
-Writes, owner: 02_scaffold_gemini:
-  artifacts_<slug>/state/scaffold.json
+Writes, owner: scaffolder:
+  artifacts_<slug>/state/scaffolder_codebase_skeleton.json
+  artifacts_<slug>/cache/scaffolder_compressed_spec.md
   artifacts_<slug>/src/**
   artifacts_<slug>/tests/**
-  artifacts_<slug>/cache/spec_compressed.md
 
 Reads:
-  artifacts_<slug>/spec.md
+  artifacts_<slug>/specwright_spec_<slug>.md
 
 Direct execution:
-  python 02_scaffold_gemini.py --project my-app
-  PIPELINE_PROJECT=my-app python 02_scaffold_gemini.py
+  python 06_scaffolder.py --project my-app
+  PIPELINE_PROJECT=my-app python 06_scaffolder.py
 
 Required environment:
   GEMINI_API_KEY=<your-key>
@@ -25,7 +25,7 @@ Required environment:
 Optional environment:
   GEMINI_MODEL=gemini-2.5-flash
 
-For taxonomy details see docs/artifacts.md
+For taxonomy details see artifacts/TAXONOMY.md
 """
 
 from __future__ import annotations
@@ -43,21 +43,21 @@ from typing import Any
 
 import httpx
 
-# === WRITE AUTHORITY: 02_scaffold_gemini ===
-# OWNS  : artifacts_<slug>/state/scaffold.json
-#         artifacts_<slug>/cache/spec_compressed.md
+# === WRITE AUTHORITY: scaffolder ===
+# OWNS  : artifacts_<slug>/state/scaffolder_codebase_skeleton.json
+#         artifacts_<slug>/cache/scaffolder_compressed_spec.md
 #         artifacts_<slug>/src/**
 #         artifacts_<slug>/tests/**
-# READS : artifacts_<slug>/spec.md
+# READS : artifacts_<slug>/specwright_spec_<slug>.md
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from artifacts.paths import (  # noqa: E402
     SCAFFOLD_JSON,
-    SPEC_COMPRESSED,
-    SPEC_PATH,
+    SCAFFOLDER_COMPRESSED_SPEC,
     SRC_DIR,
     TESTS_DIR,
     ensure_dirs,
+    get_spec_path,
 )
 
 
@@ -68,8 +68,9 @@ MAX_OUTPUT_TOKENS = 32768
 SYSTEM_PROMPT = textwrap.dedent("""
     You are a senior software architect generating a scaffold from a technical spec.
 
-    You will receive spec.md. The spec is the source of truth. Follow its stack,
-    file tree, output schema, naming, testing framework, and acceptance criteria.
+    You will receive the canonical spec. The spec is the source of truth. Follow
+    its stack, file tree, output schema, naming, testing framework, and acceptance
+    criteria.
 
     Your task:
     1. Read the spec carefully, especially the file tree and output schema sections.
@@ -105,15 +106,15 @@ SYSTEM_PROMPT = textwrap.dedent("""
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Generate scaffold JSON/files from spec.md.",
+        description="Generate scaffold JSON/files from the canonical spec.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""
             Examples:
-              python 02_scaffold_gemini.py --project my-app
-              PIPELINE_PROJECT=my-app python 02_scaffold_gemini.py
+              python 06_scaffolder.py --project my-app
+              PIPELINE_PROJECT=my-app python 06_scaffolder.py
 
-              python 02_scaffold_gemini.py --project my-app --model gemini-2.5-flash
-              python 02_scaffold_gemini.py --project my-app --dry-run
+              python 06_scaffolder.py --project my-app --model gemini-2.5-flash
+              python 06_scaffolder.py --project my-app --dry-run
         """),
     )
     parser.add_argument(
@@ -162,7 +163,7 @@ def _configure_project(
 
     parser.error(
         "PIPELINE_PROJECT is not set. Use --project <name> or export "
-        "PIPELINE_PROJECT=<name> before running 02_scaffold_gemini.py directly."
+        "PIPELINE_PROJECT=<name> before running 06_scaffolder.py directly."
     )
 
 
@@ -215,7 +216,7 @@ def call_gemini(
         "contents": [
             {
                 "role": "user",
-                "parts": [{"text": f"Here is spec.md:\n\n{spec_content}"}],
+                "parts": [{"text": f"Here is the canonical spec:\n\n{spec_content}"}],
             }
         ],
         "generationConfig": {
@@ -225,7 +226,7 @@ def call_gemini(
         },
     }
 
-    print(f"[02] Calling Gemini model: {model} …")
+    print(f"[06] Calling Gemini model: {model} …")
 
     timeout = httpx.Timeout(120.0, connect=30.0)
     url = _gemini_url(model, api_key)
@@ -246,26 +247,26 @@ def call_gemini(
                 if status in {429, 500, 502, 503, 504} and attempt < max_retries:
                     wait = (2 ** (attempt - 1)) + random.uniform(0, 1)
                     print(
-                        f"[02][warn] API status {status}, retry "
+                        f"[06][warn] API status {status}, retry "
                         f"{attempt}/{max_retries} in {wait:.1f}s …"
                     )
                     time.sleep(wait)
                     continue
 
-                print(f"[02][error] API call failed: {exc}", file=sys.stderr)
+                print(f"[06][error] API call failed: {exc}", file=sys.stderr)
                 raise
 
             except httpx.TransportError as exc:
                 if attempt < max_retries:
                     wait = (2 ** (attempt - 1)) + random.uniform(0, 1)
                     print(
-                        f"[02][warn] Transport error, retry "
+                        f"[06][warn] Transport error, retry "
                         f"{attempt}/{max_retries} in {wait:.1f}s: {exc}"
                     )
                     time.sleep(wait)
                     continue
 
-                print(f"[02][error] Transport error: {exc}", file=sys.stderr)
+                print(f"[06][error] Transport error: {exc}", file=sys.stderr)
                 raise
 
     raise RuntimeError("Gemini call failed after retries")
@@ -289,7 +290,7 @@ def _parse_json(raw: str) -> dict[str, Any]:
     try:
         parsed = json.loads(cleaned)
     except json.JSONDecodeError as exc:
-        print(f"[02][warn] Primary JSON parse failed: {exc}", file=sys.stderr)
+        print(f"[06][warn] Primary JSON parse failed: {exc}", file=sys.stderr)
     else:
         if not isinstance(parsed, dict):
             raise ValueError("Model returned JSON, but top-level value is not an object.")
@@ -302,18 +303,18 @@ def _parse_json(raw: str) -> dict[str, Any]:
             parsed = json.loads(candidate)
         except json.JSONDecodeError as exc:
             print(
-                f"[02][error] JSON parse failed after extracting outer object: {exc}",
+                f"[06][error] JSON parse failed after extracting outer object: {exc}",
                 file=sys.stderr,
             )
-            print(f"[02][error] Raw output first 1000 chars:\n{cleaned[:1000]}", file=sys.stderr)
+            print(f"[06][error] Raw output first 1000 chars:\n{cleaned[:1000]}", file=sys.stderr)
             raise SystemExit(1) from exc
 
         if not isinstance(parsed, dict):
             raise ValueError("Extracted JSON top-level value is not an object.")
         return parsed
 
-    print("[02][error] No JSON object found in model response.", file=sys.stderr)
-    print(f"[02][error] Raw output first 1000 chars:\n{cleaned[:1000]}", file=sys.stderr)
+    print("[06][error] No JSON object found in model response.", file=sys.stderr)
+    print(f"[06][error] Raw output first 1000 chars:\n{cleaned[:1000]}", file=sys.stderr)
     raise SystemExit(1)
 
 
@@ -350,7 +351,7 @@ def _validate_scaffold(scaffold: dict[str, Any]) -> None:
 
 def _compress_spec(spec: str) -> str:
     """
-    Create compressed version of spec.md for downstream models.
+    Create compressed version of the canonical spec for downstream models.
 
     Removes sections commonly useful only for scaffold-generation instructions:
       - ## 0.
@@ -430,7 +431,7 @@ def _destination_for_entry(entry: dict[str, Any]) -> Path:
 def write_files(scaffold: dict[str, Any], spec: str) -> None:
     SCAFFOLD_JSON.parent.mkdir(parents=True, exist_ok=True)
     SCAFFOLD_JSON.write_text(json.dumps(scaffold, indent=2))
-    print(f"[02] Scaffold JSON → {SCAFFOLD_JSON}")
+    print(f"[06] Scaffold JSON → {SCAFFOLD_JSON}")
 
     for entry in scaffold["files"]:
         dest = _destination_for_entry(entry)
@@ -439,32 +440,32 @@ def write_files(scaffold: dict[str, Any], spec: str) -> None:
         dest.write_text(entry["code"])
 
         tag = "TEST" if entry.get("is_test", False) else "SRC "
-        print(f"[02] [{tag}] {dest}")
+        print(f"[06] [{tag}] {dest}")
 
     compressed = _compress_spec(spec)
-    SPEC_COMPRESSED.parent.mkdir(parents=True, exist_ok=True)
-    SPEC_COMPRESSED.write_text(compressed)
+    SCAFFOLDER_COMPRESSED_SPEC.parent.mkdir(parents=True, exist_ok=True)
+    SCAFFOLDER_COMPRESSED_SPEC.write_text(compressed)
 
     savings = 0
     if spec:
         savings = round((1 - len(compressed) / len(spec)) * 100)
 
-    print(f"[02] Compressed spec → {SPEC_COMPRESSED} ({savings}% smaller)")
-    print("[02] Done.")
+    print(f"[06] Compressed spec → {SCAFFOLDER_COMPRESSED_SPEC} ({savings}% smaller)")
+    print("[06] Done.")
 
 
 def preview_files(scaffold: dict[str, Any], spec: str) -> None:
-    print("[02] --dry-run: scaffold validated. No files written.")
-    print(f"[02] Would write scaffold JSON → {SCAFFOLD_JSON}")
+    print("[06] --dry-run: scaffold validated. No files written.")
+    print(f"[06] Would write scaffold JSON → {SCAFFOLD_JSON}")
 
     for entry in scaffold["files"]:
         dest = _destination_for_entry(entry)
         tag = "TEST" if entry.get("is_test", False) else "SRC "
-        print(f"[02] Would write [{tag}] {dest}")
+        print(f"[06] Would write [{tag}] {dest}")
 
     compressed = _compress_spec(spec)
     savings = round((1 - len(compressed) / len(spec)) * 100) if spec else 0
-    print(f"[02] Would write compressed spec → {SPEC_COMPRESSED} ({savings}% smaller)")
+    print(f"[06] Would write compressed spec → {SCAFFOLDER_COMPRESSED_SPEC} ({savings}% smaller)")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -483,16 +484,17 @@ def main() -> None:
 
     api_key = _require_api_key(parser)
 
-    if not SPEC_PATH.exists():
-        print(f"[02][error] spec.md not found: {SPEC_PATH}", file=sys.stderr)
+    spec_path = get_spec_path()
+    if not spec_path.exists():
+        print(f"[06][error] canonical spec not found: {spec_path}", file=sys.stderr)
         print(
-            "[02][hint] This is a full-only scaffold step. Ensure the full flow "
-            "created spec.md before running 02_scaffold_gemini.py.",
+            "[06][hint] This is a full-only scaffold step. Ensure specwright "
+            "created the canonical spec before running 06_scaffolder.py.",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    spec = SPEC_PATH.read_text(errors="replace")
+    spec = spec_path.read_text(errors="replace")
 
     scaffold = call_gemini(
         spec,
@@ -504,9 +506,9 @@ def main() -> None:
     try:
         _validate_scaffold(scaffold)
     except ValueError as exc:
-        print(f"[02][error] Invalid scaffold JSON: {exc}", file=sys.stderr)
+        print(f"[06][error] Invalid scaffold JSON: {exc}", file=sys.stderr)
         print(
-            f"[02][debug] Scaffold first 1000 chars:\n"
+            f"[06][debug] Scaffold first 1000 chars:\n"
             f"{json.dumps(scaffold, indent=2)[:1000]}",
             file=sys.stderr,
         )
