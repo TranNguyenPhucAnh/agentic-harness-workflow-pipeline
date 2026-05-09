@@ -1,11 +1,13 @@
 """
 pipeline/01_spectracker.py
+==========================
 Spec diff engine — detect what changed between spec versions and map to affected files.
 
 Reads:
-    spec.md                                                  ← current spec (single source of truth)
-    artifacts_<slug>/state/spectracker_applied_version.json  ← last successfully applied version
-    artifacts_<slug>/knowledge/history/                      ← raw spec snapshots per version
+    artifacts_<slug>/specwright_spec_<slug>.md                  ← current canonical spec
+    artifacts_<slug>/state/spectracker_applied_version.json     ← last successfully applied version
+    artifacts_<slug>/knowledge/history/                         ← raw spec snapshots per version
+    artifacts_<slug>/knowledge/history/spectracker_version_log.md (for --history)
 
 Writes:
     artifacts_<slug>/cache/spectracker_session_version_delta.json  ← delta for this run (session)
@@ -13,6 +15,14 @@ Writes:
     artifacts_<slug>/knowledge/history/<ver>.md                    ← raw snapshot of current spec (write-once)
     artifacts_<slug>/knowledge/history/<ver>.changelog.md          ← per-version changelog (write-once)
     artifacts_<slug>/knowledge/history/spectracker_version_log.md  ← aggregated version log (append-only)
+
+Direct execution:
+    python 01_spectracker.py --project my-app
+    PIPELINE_PROJECT=my-app python 01_spectracker.py
+
+At the end of each run, prints:
+    - artifacts read
+    - artifacts created/updated/overwritten/appended
 
 For taxonomy details see artifacts/TAXONOMY.md
 """
@@ -22,10 +32,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import sys
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any
 
 # === WRITE AUTHORITY: spectracker ===
 # OWNS  : artifacts_<slug>/cache/spectracker_session_version_delta.json
@@ -33,28 +45,89 @@ from pathlib import Path
 #         artifacts_<slug>/knowledge/history/spectracker_version_log.md
 #         artifacts_<slug>/knowledge/history/<version>.md            (dynamic, write-once)
 #         artifacts_<slug>/knowledge/history/<version>.changelog.md  (dynamic, write-once)
-# READS : spec.md (project root)
+# READS : artifacts_<slug>/specwright_spec_<slug>.md
+#         artifacts_<slug>/state/spectracker_applied_version.json
+#         artifacts_<slug>/knowledge/history/<version>.md            (dynamic snapshots)
+#         artifacts_<slug>/knowledge/history/spectracker_version_log.md
 
 import sys as _sys
 
 _sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from artifacts.paths import (
-    get_spec_path,
+from artifacts.paths import (  # noqa: E402
     HISTORY_DIR,
-    SPECTRACKER_VERSION_LOG,
-    SPECTRACKER_VERSION_DELTA,
     SPECTRACKER_APPLIED,
+    SPECTRACKER_VERSION_DELTA,
+    SPECTRACKER_VERSION_LOG,
     ensure_dirs,
+    get_spec_path,
 )
 
-ensure_dirs()
 
 # Local aliases — map canonical constants to the short names used internally
 KNOWLEDGE_HISTORY_DIR = HISTORY_DIR
 CHANGELOG             = SPECTRACKER_VERSION_LOG
 DELTA_OUT             = SPECTRACKER_VERSION_DELTA
 APPLIED_PATH          = SPECTRACKER_APPLIED
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Artifact access tracking
+# ════════════════════════════════════════════════════════════════════════════
+
+_ARTIFACTS_READ: set[str] = set()
+_ARTIFACTS_WRITTEN: set[str] = set()
+
+
+def _track_read(path: Any) -> None:
+    _ARTIFACTS_READ.add(str(path))
+
+
+def _track_write(path: Any) -> None:
+    _ARTIFACTS_WRITTEN.add(str(path))
+
+
+def _print_artifact_access_summary() -> None:
+    print("[01] Artifacts read:")
+    if _ARTIFACTS_READ:
+        for item in sorted(_ARTIFACTS_READ):
+            print(f"[01]   READ  {item}")
+    else:
+        print("[01]   READ  (none)")
+
+    print("[01] Artifacts created/updated/overwritten/appended:")
+    if _ARTIFACTS_WRITTEN:
+        for item in sorted(_ARTIFACTS_WRITTEN):
+            print(f"[01]   WRITE {item}")
+    else:
+        print("[01]   WRITE (none)")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# CLI / project setup
+# ════════════════════════════════════════════════════════════════════════════
+
+def _configure_project(
+    project: str | None,
+    parser: argparse.ArgumentParser,
+) -> None:
+    """
+    Configure project context for direct execution.
+
+    Harness normally sets PIPELINE_PROJECT before invoking this script.
+    Direct usage can pass --project.
+    """
+    if project:
+        os.environ["PIPELINE_PROJECT"] = project
+        return
+
+    if os.environ.get("PIPELINE_PROJECT"):
+        return
+
+    parser.error(
+        "PIPELINE_PROJECT is not set. Use --project <name> or export "
+        "PIPELINE_PROJECT=<name> before running 01_spectracker.py directly."
+    )
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -258,11 +331,13 @@ def _decide_rerun_steps(
 # History management
 # ════════════════════════════════════════════════════════════════════════════
 
-def _save_snapshot(version: str, text: str) -> None:
+def _save_snapshot(version: str, text: str) -> Path:
     """Save raw spec snapshot to knowledge/history/<ver>.md."""
     KNOWLEDGE_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
     path = KNOWLEDGE_HISTORY_DIR / f"{version}.md"
     path.write_text(text)
+    _track_write(path)
+    return path
 
 
 def _load_latest_snapshot(exclude_version: str) -> tuple[str | None, str | None]:
@@ -283,6 +358,7 @@ def _load_latest_snapshot(exclude_version: str) -> tuple[str | None, str | None]
     for snap in reversed(snapshots):
         ver = snap.stem
         if ver != exclude_version:
+            _track_read(snap)
             return ver, snap.read_text()
 
     return None, None
@@ -290,7 +366,10 @@ def _load_latest_snapshot(exclude_version: str) -> tuple[str | None, str | None]
 
 def _load_snapshot(version: str) -> str | None:
     path = KNOWLEDGE_HISTORY_DIR / f"{version}.md"
-    return path.read_text() if path.exists() else None
+    if not path.exists():
+        return None
+    _track_read(path)
+    return path.read_text()
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -302,6 +381,7 @@ def load_applied() -> dict | None:
         return None
 
     try:
+        _track_read(APPLIED_PATH)
         return json.loads(APPLIED_PATH.read_text())
     except Exception:
         return None
@@ -336,6 +416,7 @@ def write_applied(version: str, steps: list[str], status: str) -> None:
 
     APPLIED_PATH.parent.mkdir(parents=True, exist_ok=True)
     APPLIED_PATH.write_text(json.dumps(applied, indent=2))
+    _track_write(APPLIED_PATH)
 
 
 def print_run_history() -> None:
@@ -411,13 +492,19 @@ def _append_changelog(delta: "SpecDelta") -> None:
 
     # Append to spectracker_version_log.md (append-only log).
     CHANGELOG.parent.mkdir(parents=True, exist_ok=True)
-    existing = CHANGELOG.read_text() if CHANGELOG.exists() else ""
+    if CHANGELOG.exists():
+        _track_read(CHANGELOG)
+        existing = CHANGELOG.read_text()
+    else:
+        existing = ""
     CHANGELOG.write_text(existing + entry)
+    _track_write(CHANGELOG)
 
     # Also save per-version changelog.
     KNOWLEDGE_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
     cl_path = KNOWLEDGE_HISTORY_DIR / f"{delta.to_version}.changelog.md"
     cl_path.write_text(entry)
+    _track_write(cl_path)
 
 
 def print_changelog(n: int = 0) -> None:
@@ -425,6 +512,7 @@ def print_changelog(n: int = 0) -> None:
         print("[spectracker] No changelog yet.")
         return
 
+    _track_read(CHANGELOG)
     content = CHANGELOG.read_text()
 
     if not n:
@@ -443,6 +531,8 @@ def print_changelog(n: int = 0) -> None:
 # ════════════════════════════════════════════════════════════════════════════
 
 def _summarise_change(key: str, old_content: str, new_content: str) -> str:
+    _ = key
+
     old_lines = set(old_content.splitlines())
     new_lines = set(new_content.splitlines())
 
@@ -577,12 +667,23 @@ def compute_delta(
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Main
+# CLI / Main
 # ════════════════════════════════════════════════════════════════════════════
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Spec diff engine")
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="01_spectracker.py",
+        description="Spec diff engine",
+    )
 
+    parser.add_argument(
+        "--project",
+        default=None,
+        help=(
+            "Project name for direct execution. Sets PIPELINE_PROJECT before "
+            "resolving artifact paths."
+        ),
+    )
     parser.add_argument(
         "--show",
         action="store_true",
@@ -606,101 +707,131 @@ def main() -> None:
         help="With --history: show only last N changelog entries (0=all)",
     )
 
-    args = parser.parse_args()
+    return parser
 
-    if args.history:
-        print_changelog(n=args.last)
-        print_run_history()
-        return
 
-    if not get_spec_path().exists():
-        print(f"[spectracker] ERROR: {get_spec_path()} not found.", file=sys.stderr)
-        sys.exit(1)
+def main() -> None:
+    exit_code = 0
 
-    current_text = get_spec_path().read_text()
-    current_ver = parse_spec_version(current_text)
+    try:
+        parser = _build_parser()
+        args = parser.parse_args()
 
-    # Determine baseline.
-    if args.from_version:
-        prev_text = _load_snapshot(args.from_version)
-        if prev_text is None:
-            print(
-                f"[spectracker] ERROR: snapshot {args.from_version} not found.",
-                file=sys.stderr,
-            )
+        _configure_project(args.project, parser)
+
+        # Important: do not call ensure_dirs() at import-time.
+        # PIPELINE_PROJECT must be available before artifact paths are resolved.
+        ensure_dirs()
+
+        if args.history:
+            print_changelog(n=args.last)
+            print_run_history()
+            return
+
+        spec_path = get_spec_path()
+        if not spec_path.exists():
+            print(f"[spectracker] ERROR: {spec_path} not found.", file=sys.stderr)
             sys.exit(1)
 
-        baseline_source = f"--from {args.from_version}"
-    else:
-        last_applied = get_last_applied_version()
+        _track_read(spec_path)
+        current_text = spec_path.read_text()
+        current_ver = parse_spec_version(current_text)
 
-        if last_applied and last_applied != current_ver:
-            prev_text = _load_snapshot(last_applied)
-            baseline_source = f"last applied ({last_applied})"
-
+        # Determine baseline.
+        if args.from_version:
+            prev_text = _load_snapshot(args.from_version)
             if prev_text is None:
                 print(
-                    f"[spectracker] WARN: last applied snapshot {last_applied} "
-                    "not found; falling back to latest snapshot.",
+                    f"[spectracker] ERROR: snapshot {args.from_version} not found.",
                     file=sys.stderr,
                 )
+                sys.exit(1)
+
+            baseline_source = f"--from {args.from_version}"
+        else:
+            last_applied = get_last_applied_version()
+
+            if last_applied and last_applied != current_ver:
+                prev_text = _load_snapshot(last_applied)
+                baseline_source = f"last applied ({last_applied})"
+
+                if prev_text is None:
+                    print(
+                        f"[spectracker] WARN: last applied snapshot {last_applied} "
+                        "not found; falling back to latest snapshot.",
+                        file=sys.stderr,
+                    )
+                    _, prev_text = _load_latest_snapshot(exclude_version=current_ver)
+                    baseline_source = "latest snapshot"
+            else:
                 _, prev_text = _load_latest_snapshot(exclude_version=current_ver)
                 baseline_source = "latest snapshot"
+
+        print(f"[spectracker] Baseline: {baseline_source}")
+
+        delta = compute_delta(current_text, prev_text)
+
+        print(f"[spectracker] {delta.from_version or '(none)'} → {delta.to_version}")
+
+        if delta.is_first_run:
+            print("[spectracker] First run — full pipeline required.")
         else:
-            _, prev_text = _load_latest_snapshot(exclude_version=current_ver)
-            baseline_source = "latest snapshot"
+            print(f"[spectracker] Changed  §: {delta.changed_sections or '(none)'}")
+            print(f"[spectracker] New      §: {delta.new_sections or '(none)'}")
+            print(f"[spectracker] Removed  §: {delta.removed_sections or '(none)'}")
+            print(f"[spectracker] Affected files   : {len(delta.affected_files)}")
 
-    print(f"[spectracker] Baseline: {baseline_source}")
-
-    delta = compute_delta(current_text, prev_text)
-
-    print(f"[spectracker] {delta.from_version or '(none)'} → {delta.to_version}")
-
-    if delta.is_first_run:
-        print("[spectracker] First run — full pipeline required.")
-    else:
-        print(f"[spectracker] Changed  §: {delta.changed_sections or '(none)'}")
-        print(f"[spectracker] New      §: {delta.new_sections or '(none)'}")
-        print(f"[spectracker] Removed  §: {delta.removed_sections or '(none)'}")
-        print(f"[spectracker] Affected files   : {len(delta.affected_files)}")
-
-        for fp in delta.affected_files:
-            note = delta.section_summaries.get(
-                next(
-                    (
-                        k
-                        for k, files in _STATIC_SECTION_FILE_MAP.items()
-                        if fp in files
+            for fp in delta.affected_files:
+                note = delta.section_summaries.get(
+                    next(
+                        (
+                            k
+                            for k, files in _STATIC_SECTION_FILE_MAP.items()
+                            if fp in files
+                        ),
+                        "",
                     ),
                     "",
-                ),
-                "",
+                )
+                print(f"    {fp}" + (f"  ← {note}" if note else ""))
+
+            print(f"[spectracker] Unaffected files : {len(delta.unaffected_files)}")
+            print(
+                "[spectracker] Re-run steps     : "
+                f"{[k for k, v in delta.rerun_steps.items() if v]}"
             )
-            print(f"    {fp}" + (f"  ← {note}" if note else ""))
 
-        print(f"[spectracker] Unaffected files : {len(delta.unaffected_files)}")
-        print(
-            "[spectracker] Re-run steps     : "
-            f"{[k for k, v in delta.rerun_steps.items() if v]}"
-        )
+        if args.show:
+            return
 
-    if args.show:
-        return
+        # Write outputs.
+        DELTA_OUT.parent.mkdir(parents=True, exist_ok=True)
+        DELTA_OUT.write_text(json.dumps(asdict(delta), indent=2))
+        _track_write(DELTA_OUT)
+        print(f"[spectracker] Delta     → {DELTA_OUT}")
 
-    # Write outputs.
-    DELTA_OUT.parent.mkdir(parents=True, exist_ok=True)
-    DELTA_OUT.write_text(json.dumps(asdict(delta), indent=2))
-    print(f"[spectracker] Delta     → {DELTA_OUT}")
+        snapshot_path = _save_snapshot(current_ver, current_text)
+        print(f"[spectracker] Snapshot  → {snapshot_path}")
 
-    _save_snapshot(current_ver, current_text)
-    print(f"[spectracker] Snapshot  → {KNOWLEDGE_HISTORY_DIR}/{current_ver}.md")
+        if delta.from_version != delta.to_version or delta.is_first_run:
+            _append_changelog(delta)
+            print(
+                f"[spectracker] Changelog → {CHANGELOG} "
+                f"(entry for {delta.to_version})"
+            )
 
-    if delta.from_version != delta.to_version or delta.is_first_run:
-        _append_changelog(delta)
-        print(
-            f"[spectracker] Changelog → {CHANGELOG} "
-            f"(entry for {delta.to_version})"
-        )
+    except SystemExit as exc:
+        code = exc.code
+        exit_code = code if isinstance(code, int) else 1
+
+    except Exception as exc:
+        print(f"[spectracker][error] {exc}", file=sys.stderr)
+        exit_code = 1
+
+    finally:
+        _print_artifact_access_summary()
+
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
