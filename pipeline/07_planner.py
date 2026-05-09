@@ -45,6 +45,10 @@ Consumed by:
 
 Does NOT write any src/ files. 08_executor.py is the sole executor.
 
+At the end of each run, prints:
+    - artifacts read
+    - artifacts created/updated/overwritten/appended
+
 For taxonomy details see artifacts/TAXONOMY.md
 """
 
@@ -111,6 +115,38 @@ from artifacts.paths import (  # noqa: E402
     ensure_dirs,
     get_spec_path,
 )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Artifact access tracking
+# ════════════════════════════════════════════════════════════════════════════
+
+_ARTIFACTS_READ: set[str] = set()
+_ARTIFACTS_WRITTEN: set[str] = set()
+
+
+def _track_read(path: Any) -> None:
+    _ARTIFACTS_READ.add(str(path))
+
+
+def _track_write(path: Any) -> None:
+    _ARTIFACTS_WRITTEN.add(str(path))
+
+
+def _print_artifact_access_summary() -> None:
+    print("[07] Artifacts read:")
+    if _ARTIFACTS_READ:
+        for item in sorted(_ARTIFACTS_READ):
+            print(f"[07]   READ  {item}")
+    else:
+        print("[07]   READ  (none)")
+
+    print("[07] Artifacts created/updated/overwritten/appended:")
+    if _ARTIFACTS_WRITTEN:
+        for item in sorted(_ARTIFACTS_WRITTEN):
+            print(f"[07]   WRITE {item}")
+    else:
+        print("[07]   WRITE (none)")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -435,6 +471,8 @@ def _read_optional(path: Any, *, max_chars: int | None = None) -> str:
         if not path.exists():
             return ""
 
+        _track_read(path)
+
         if hasattr(path, "read_text"):
             text = path.read_text(encoding="utf-8")
         else:
@@ -577,6 +615,7 @@ def _load_full_spec() -> str:
     Use scaffolder compressed spec if available, fallback to canonical spec.
     """
     if SCAFFOLDER_COMPRESSED_SPEC.exists():
+        _track_read(SCAFFOLDER_COMPRESSED_SPEC)
         return SCAFFOLDER_COMPRESSED_SPEC.read_text(encoding="utf-8")
 
     spec_path = get_spec_path()
@@ -587,6 +626,7 @@ def _load_full_spec() -> str:
             "  python harness.py --project <name> --scope full"
         )
 
+    _track_read(spec_path)
     return spec_path.read_text(encoding="utf-8")
 
 
@@ -597,6 +637,8 @@ def _load_scaffold() -> dict:
             "Run scaffolder first, for example:\n"
             "  python harness.py --project <name> --scope full --scaffold"
         )
+
+    _track_read(SCAFFOLD_JSON)
     return json.loads(SCAFFOLD_JSON.read_text(encoding="utf-8"))
 
 
@@ -678,6 +720,7 @@ def run_full_scope() -> None:
         json.dumps(plan, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
+    _track_write(PLANNER_FULL_PLAN)
 
     print(f"[07] Full plan written → {PLANNER_FULL_PLAN}")
     print(f"[07] Tasks in plan: {len(plan.get('tasks', []))}")
@@ -974,10 +1017,13 @@ def run_mini_scope() -> None:
         json.dumps(plan_mini, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
+    _track_write(PLANNER_MINI_PLAN)
+
     PLANNER_MINI_IMPACT.write_text(
         json.dumps(impact_analysis, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
+    _track_write(PLANNER_MINI_IMPACT)
 
     print(f"[07] Mini plan written            → {PLANNER_MINI_PLAN}")
     print(f"[07] Mini impact analysis written → {PLANNER_MINI_IMPACT}")
@@ -995,23 +1041,35 @@ def run_mini_scope() -> None:
 # ════════════════════════════════════════════════════════════════════════════
 
 def main() -> None:
-    parser = _build_parser()
-    args = parser.parse_args()
-
-    _configure_project(args.project, parser)
-
-    # Important: do not call ensure_dirs() at import-time.
-    # PIPELINE_PROJECT must be available before artifact paths are resolved.
-    ensure_dirs()
+    exit_code = 0
 
     try:
+        parser = _build_parser()
+        args = parser.parse_args()
+
+        _configure_project(args.project, parser)
+
+        # Important: do not call ensure_dirs() at import-time.
+        # PIPELINE_PROJECT must be available before artifact paths are resolved.
+        ensure_dirs()
+
         if args.scope == "mini":
             run_mini_scope()
         else:
             run_full_scope()
+
+    except SystemExit as exc:
+        code = exc.code
+        exit_code = code if isinstance(code, int) else 1
+
     except Exception as exc:
         print(f"[07] ERROR: {exc}", file=sys.stderr)
-        sys.exit(1)
+        exit_code = 1
+
+    finally:
+        _print_artifact_access_summary()
+
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
