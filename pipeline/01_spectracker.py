@@ -3,17 +3,18 @@ pipeline/01_spectracker.py
 Spec diff engine — detect what changed between spec versions and map to affected files.
 
 Reads:
-    spec.md                                     ← current spec (single source of truth)
-    artifacts_<slug>/state/spec_applied.json    ← last successfully applied version
-    artifacts_<slug>/knowledge/history/         ← raw spec snapshots per version
+    spec.md                                                  ← current spec (single source of truth)
+    artifacts_<slug>/state/spectracker_applied_version.json  ← last successfully applied version
+    artifacts_<slug>/knowledge/history/                      ← raw spec snapshots per version
 
 Writes:
-    artifacts_<slug>/cache/spec_delta.json             ← delta for this run
-    artifacts_<slug>/knowledge/history/<ver>.md        ← raw snapshot of current spec
-    artifacts_<slug>/knowledge/history/<ver>.changelog.md
-    artifacts_<slug>/knowledge/history/spec.changelog  ← aggregated changelog
+    artifacts_<slug>/cache/spectracker_session_version_delta.json  ← delta for this run (session)
+    artifacts_<slug>/state/spectracker_applied_version.json        ← applied version state (hybrid)
+    artifacts_<slug>/knowledge/history/<ver>.md                    ← raw snapshot of current spec (write-once)
+    artifacts_<slug>/knowledge/history/<ver>.changelog.md          ← per-version changelog (write-once)
+    artifacts_<slug>/knowledge/history/spectracker_version_log.md  ← aggregated version log (append-only)
 
-For taxonomy details see docs/artifacts.md
+For taxonomy details see artifacts/TAXONOMY.md
 """
 
 from __future__ import annotations
@@ -26,26 +27,34 @@ import sys
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
-# === WRITE AUTHORITY: spec_diff ===
-# OWNS  : artifacts_<slug>/cache/spec_delta.json
-#         artifacts_<slug>/state/spec_applied.json
-#         artifacts_<slug>/knowledge/history/spec.changelog
-# READS : spec.md
+# === WRITE AUTHORITY: spectracker ===
+# OWNS  : artifacts_<slug>/cache/spectracker_session_version_delta.json
+#         artifacts_<slug>/state/spectracker_applied_version.json
+#         artifacts_<slug>/knowledge/history/spectracker_version_log.md
+#         artifacts_<slug>/knowledge/history/<version>.md            (dynamic, write-once)
+#         artifacts_<slug>/knowledge/history/<version>.changelog.md  (dynamic, write-once)
+# READS : spec.md (project root)
 
 import sys as _sys
 
 _sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from artifacts.paths import (
-    SPEC_PATH,
-    HISTORY_DIR as KNOWLEDGE_HISTORY_DIR,
-    SPEC_CHANGELOG as CHANGELOG,
-    SPEC_DELTA as DELTA_OUT,
-    SPEC_APPLIED as APPLIED_PATH,
+    get_spec_path,
+    HISTORY_DIR,
+    SPECTRACKER_VERSION_LOG,
+    SPECTRACKER_VERSION_DELTA,
+    SPECTRACKER_APPLIED,
     ensure_dirs,
 )
 
 ensure_dirs()
+
+# Local aliases — map canonical constants to the short names used internally
+KNOWLEDGE_HISTORY_DIR = HISTORY_DIR
+CHANGELOG             = SPECTRACKER_VERSION_LOG
+DELTA_OUT             = SPECTRACKER_VERSION_DELTA
+APPLIED_PATH          = SPECTRACKER_APPLIED
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -332,11 +341,11 @@ def write_applied(version: str, steps: list[str], status: str) -> None:
 def print_run_history() -> None:
     applied = load_applied()
     if not applied:
-        print("[spec_diff] No run history yet.")
+        print("[spectracker] No run history yet.")
         return
 
     history = applied.get("run_history", [])
-    print(f"\n[spec_diff] Run history ({len(history)} run(s)):")
+    print(f"\n[spectracker] Run history ({len(history)} run(s)):")
 
     for entry in history:
         icon = "✅" if entry.get("status") == "PASS" else "❌"
@@ -400,8 +409,7 @@ def _append_changelog(delta: "SpecDelta") -> None:
 
     entry = "\n".join(lines)
 
-    # Append to aggregated spec.changelog.
-    # IMPORTANT: previous version used undefined `changelog_path`.
+    # Append to spectracker_version_log.md (append-only log).
     CHANGELOG.parent.mkdir(parents=True, exist_ok=True)
     existing = CHANGELOG.read_text() if CHANGELOG.exists() else ""
     CHANGELOG.write_text(existing + entry)
@@ -413,9 +421,8 @@ def _append_changelog(delta: "SpecDelta") -> None:
 
 
 def print_changelog(n: int = 0) -> None:
-    # IMPORTANT: previous version used undefined `changelog_path`.
     if not CHANGELOG.exists():
-        print("[spec_diff] No changelog yet.")
+        print("[spectracker] No changelog yet.")
         return
 
     content = CHANGELOG.read_text()
@@ -589,7 +596,7 @@ def main() -> None:
     parser.add_argument(
         "--history",
         action="store_true",
-        help="Print aggregated spec.changelog and run history, then exit",
+        help="Print spectracker_version_log.md and run history, then exit",
     )
     parser.add_argument(
         "--last",
@@ -606,11 +613,11 @@ def main() -> None:
         print_run_history()
         return
 
-    if not SPEC_PATH.exists():
-        print(f"[spec_diff] ERROR: {SPEC_PATH} not found.", file=sys.stderr)
+    if not get_spec_path().exists():
+        print(f"[spectracker] ERROR: {get_spec_path()} not found.", file=sys.stderr)
         sys.exit(1)
 
-    current_text = SPEC_PATH.read_text()
+    current_text = get_spec_path().read_text()
     current_ver = parse_spec_version(current_text)
 
     # Determine baseline.
@@ -618,7 +625,7 @@ def main() -> None:
         prev_text = _load_snapshot(args.from_version)
         if prev_text is None:
             print(
-                f"[spec_diff] ERROR: snapshot {args.from_version} not found.",
+                f"[spectracker] ERROR: snapshot {args.from_version} not found.",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -633,7 +640,7 @@ def main() -> None:
 
             if prev_text is None:
                 print(
-                    f"[spec_diff] WARN: last applied snapshot {last_applied} "
+                    f"[spectracker] WARN: last applied snapshot {last_applied} "
                     "not found; falling back to latest snapshot.",
                     file=sys.stderr,
                 )
@@ -643,19 +650,19 @@ def main() -> None:
             _, prev_text = _load_latest_snapshot(exclude_version=current_ver)
             baseline_source = "latest snapshot"
 
-    print(f"[spec_diff] Baseline: {baseline_source}")
+    print(f"[spectracker] Baseline: {baseline_source}")
 
     delta = compute_delta(current_text, prev_text)
 
-    print(f"[spec_diff] {delta.from_version or '(none)'} → {delta.to_version}")
+    print(f"[spectracker] {delta.from_version or '(none)'} → {delta.to_version}")
 
     if delta.is_first_run:
-        print("[spec_diff] First run — full pipeline required.")
+        print("[spectracker] First run — full pipeline required.")
     else:
-        print(f"[spec_diff] Changed  §: {delta.changed_sections or '(none)'}")
-        print(f"[spec_diff] New      §: {delta.new_sections or '(none)'}")
-        print(f"[spec_diff] Removed  §: {delta.removed_sections or '(none)'}")
-        print(f"[spec_diff] Affected files   : {len(delta.affected_files)}")
+        print(f"[spectracker] Changed  §: {delta.changed_sections or '(none)'}")
+        print(f"[spectracker] New      §: {delta.new_sections or '(none)'}")
+        print(f"[spectracker] Removed  §: {delta.removed_sections or '(none)'}")
+        print(f"[spectracker] Affected files   : {len(delta.affected_files)}")
 
         for fp in delta.affected_files:
             note = delta.section_summaries.get(
@@ -671,9 +678,9 @@ def main() -> None:
             )
             print(f"    {fp}" + (f"  ← {note}" if note else ""))
 
-        print(f"[spec_diff] Unaffected files : {len(delta.unaffected_files)}")
+        print(f"[spectracker] Unaffected files : {len(delta.unaffected_files)}")
         print(
-            "[spec_diff] Re-run steps     : "
+            "[spectracker] Re-run steps     : "
             f"{[k for k, v in delta.rerun_steps.items() if v]}"
         )
 
@@ -683,15 +690,15 @@ def main() -> None:
     # Write outputs.
     DELTA_OUT.parent.mkdir(parents=True, exist_ok=True)
     DELTA_OUT.write_text(json.dumps(asdict(delta), indent=2))
-    print(f"[spec_diff] Delta     → {DELTA_OUT}")
+    print(f"[spectracker] Delta     → {DELTA_OUT}")
 
     _save_snapshot(current_ver, current_text)
-    print(f"[spec_diff] Snapshot  → {KNOWLEDGE_HISTORY_DIR}/{current_ver}.md")
+    print(f"[spectracker] Snapshot  → {KNOWLEDGE_HISTORY_DIR}/{current_ver}.md")
 
     if delta.from_version != delta.to_version or delta.is_first_run:
         _append_changelog(delta)
         print(
-            f"[spec_diff] Changelog → {CHANGELOG} "
+            f"[spectracker] Changelog → {CHANGELOG} "
             f"(entry for {delta.to_version})"
         )
 
