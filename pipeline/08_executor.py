@@ -1,8 +1,7 @@
-#!/usr/bin/env python3
 """
 pipeline/08_executor.py
-==============================
-Step 3a — Qwen 3.6 Plus as EXECUTOR.
+=======================
+Step 8 — Qwen 3.6 Plus as EXECUTOR.
 
 This script supports two scopes:
 
@@ -14,9 +13,10 @@ Modes:
     Default, no GLM plan:
         Single API call for all requested non-test stub files.
 
-    With GLM plan (--use-glm-plan):
-        Reads artifacts_<slug>/state/plan.json produced by 03b_implement_glm.py.
-        For each file, injects the matching GLM task:
+    With planner plan (--use-glm-plan):
+        Reads artifacts_<slug>/state/planner_full_execution_plan.json produced
+        by 07_planner.py.
+        For each file, injects the matching planner task:
             - role
             - depends_on
             - sub_tasks
@@ -30,13 +30,13 @@ Delta mode:
         Other restored files in src/ are used as import/context references.
 
 Reads:
-    artifacts_<slug>/spec.md or cache/spec_compressed.md
-    artifacts_<slug>/state/scaffold.json
-    artifacts_<slug>/state/plan.json         optional, with --use-glm-plan
+    artifacts_<slug>/specwright_spec_<slug>.md or cache/scaffolder_compressed_spec.md
+    artifacts_<slug>/state/scaffolder_codebase_skeleton.json
+    artifacts_<slug>/state/planner_full_execution_plan.json         optional, with --use-glm-plan
 
 Writes:
-    artifacts_<slug>/src/**                  non-test files only
-    artifacts_<slug>/run/impl_record.json
+    artifacts_<slug>/src/**                                        non-test files only
+    artifacts_<slug>/execution/executor_session_manifest.json
 
 
 MINI SCOPE
@@ -44,22 +44,26 @@ MINI SCOPE
 Targeted implementation for small daily-driver tasks.
 
 Reads:
-    artifacts_<slug>/state/plan_mini.json
-    artifacts_<slug>/run/analysis_mini.json  optional
-    target files listed in plan_mini.json     optional existing content
+    artifacts_<slug>/state/planner_mini_execution_plan.json
+    artifacts_<slug>/state/planner_mini_impact_analysis.json        optional
+    target files listed in planner_mini_execution_plan.json         optional existing content
 
 Writes:
-    only files listed in state/plan_mini.json target_files
-    artifacts_<slug>/run/impl_record.json
+    only files listed in state/planner_mini_execution_plan.json target_files
+    artifacts_<slug>/execution/executor_session_manifest.json
 
 Rules:
-    - Does NOT read spec.md.
-    - Does NOT require scaffold.json.
+    - Does NOT read the canonical spec.
+    - Does NOT require scaffolder_codebase_skeleton.json.
     - Does NOT do broad rewrites.
-    - Does NOT create/modify files outside plan_mini.target_files.
-    - Does NOT write artifact/state/cache/run/knowledge/reports paths.
+    - Does NOT create/modify files outside planner_mini_execution_plan.target_files.
+    - Does NOT write artifact/state/cache/execution/run/knowledge/reports paths.
 
-For taxonomy details see docs/artifacts.md
+At the end of each run, prints:
+    - artifacts read
+    - artifacts created/updated/overwritten/appended
+
+For taxonomy details see artifacts/TAXONOMY.md
 """
 
 from __future__ import annotations
@@ -81,40 +85,72 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 MODEL = "qwen/qwen3.6-plus"
 
 
-# === WRITE AUTHORITY: 03a_implement_qwen ===
+# === WRITE AUTHORITY: executor ===
 # OWNS full:
-#   artifacts_<slug>/run/impl_record.json
+#   artifacts_<slug>/execution/executor_session_manifest.json
 #   artifacts_<slug>/src/**
 #
 # OWNS mini:
-#   artifacts_<slug>/run/impl_record.json
-#   files explicitly listed in artifacts_<slug>/state/plan_mini.json target_files
+#   artifacts_<slug>/execution/executor_session_manifest.json
+#   files explicitly listed in artifacts_<slug>/state/planner_mini_execution_plan.json target_files
 #
 # READS full:
-#   artifacts_<slug>/spec.md
-#   artifacts_<slug>/cache/spec_compressed.md
-#   artifacts_<slug>/state/scaffold.json
-#   artifacts_<slug>/state/plan.json
+#   artifacts_<slug>/specwright_spec_<slug>.md
+#   artifacts_<slug>/cache/scaffolder_compressed_spec.md
+#   artifacts_<slug>/state/scaffolder_codebase_skeleton.json
+#   artifacts_<slug>/state/planner_full_execution_plan.json
 #
 # READS mini:
-#   artifacts_<slug>/state/plan_mini.json
-#   artifacts_<slug>/run/analysis_mini.json
-#   existing target files listed in plan_mini.json
+#   artifacts_<slug>/state/planner_mini_execution_plan.json
+#   artifacts_<slug>/state/planner_mini_impact_analysis.json
+#   existing target files listed in planner_mini_execution_plan.json
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from artifacts.paths import (  # noqa: E402
-    SPEC_PATH,
-    SPEC_COMPRESSED,
+    EXECUTOR_SESSION_MANIFEST,
+    PLANNER_FULL_PLAN,
+    PLANNER_MINI_IMPACT,
+    PLANNER_MINI_PLAN,
     SCAFFOLD_JSON,
-    PLAN_JSON as GLM_PLAN,
-    PLAN_MINI,
-    ANALYSIS_MINI,
-    IMPL_RECORD,
+    SCAFFOLDER_COMPRESSED_SPEC,
     SRC_DIR,
-    ensure_dirs,
     artifact_root,
+    ensure_dirs,
+    get_spec_path,
 )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Artifact access tracking
+# ════════════════════════════════════════════════════════════════════════════
+
+_ARTIFACTS_READ: set[str] = set()
+_ARTIFACTS_WRITTEN: set[str] = set()
+
+
+def _track_read(path: Any) -> None:
+    _ARTIFACTS_READ.add(str(path))
+
+
+def _track_write(path: Any) -> None:
+    _ARTIFACTS_WRITTEN.add(str(path))
+
+
+def _print_artifact_access_summary() -> None:
+    print("[08] Artifacts read:")
+    if _ARTIFACTS_READ:
+        for item in sorted(_ARTIFACTS_READ):
+            print(f"[08]   READ  {item}")
+    else:
+        print("[08]   READ  (none)")
+
+    print("[08] Artifacts created/updated/overwritten/appended:")
+    if _ARTIFACTS_WRITTEN:
+        for item in sorted(_ARTIFACTS_WRITTEN):
+            print(f"[08]   WRITE {item}")
+    else:
+        print("[08]   WRITE (none)")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -235,6 +271,7 @@ def _is_probably_source_file(path: Path) -> bool:
 def _read_json_file(path: Any, label: str) -> dict[str, Any]:
     if not path.exists():
         raise FileNotFoundError(f"Missing {label}: {path}")
+    _track_read(path)
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise RuntimeError(f"{label} must be a JSON object: {path}")
@@ -245,13 +282,41 @@ def _read_optional_text(path: Any, *, max_chars: int | None = None) -> str:
     try:
         if not path.exists():
             return ""
+        _track_read(path)
         text = path.read_text(encoding="utf-8")
         if max_chars is not None and len(text) > max_chars:
             return text[:max_chars] + f"\n\n<!-- truncated at {max_chars} chars -->"
         return text
     except Exception as exc:
-        print(f"[03a] WARNING: could not read {path}: {exc}", file=sys.stderr)
+        print(f"[08] WARNING: could not read {path}: {exc}", file=sys.stderr)
         return ""
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# CLI / project setup
+# ════════════════════════════════════════════════════════════════════════════
+
+def _configure_project(
+    project: str | None,
+    parser: argparse.ArgumentParser,
+) -> None:
+    """
+    Configure project context for direct execution.
+
+    Harness normally sets PIPELINE_PROJECT before invoking this script.
+    Direct usage can pass --project.
+    """
+    if project:
+        os.environ["PIPELINE_PROJECT"] = project
+        return
+
+    if os.environ.get("PIPELINE_PROJECT"):
+        return
+
+    parser.error(
+        "PIPELINE_PROJECT is not set. Use --project <name> or export "
+        "PIPELINE_PROJECT=<name> before running 08_executor.py directly."
+    )
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -301,17 +366,18 @@ def _is_disallowed_artifact_rel_path(rel: str) -> bool:
     if normalized.startswith("../") or "/../" in f"/{normalized}/":
         return True
 
-    blocked_exact = {
-        "spec.md",
-    }
-    if normalized in blocked_exact:
+    if normalized == "spec.md":
+        return True
+
+    if normalized.startswith("specwright_spec_") and normalized.endswith(".md"):
         return True
 
     blocked_prefixes = (
         "artifacts_",
         "state/",
         "cache/",
-        "run/",
+        "execution/",
+        "run/",       # legacy artifact dir, still blocked for safety
         "knowledge/",
         "reports/",
     )
@@ -333,12 +399,14 @@ def _safe_artifact_output_path(rel_path: str) -> Path | None:
         ../x
         /absolute/path
         state/*
-        run/*
         cache/*
+        execution/*
+        run/*
         knowledge/*
         reports/*
         artifacts_*
         spec.md
+        specwright_spec_<slug>.md
     """
     rel = _normalize_repo_rel_path(rel_path)
 
@@ -366,9 +434,22 @@ def _safe_artifact_output_path(rel_path: str) -> Path | None:
 # ════════════════════════════════════════════════════════════════════════════
 
 def _load_spec() -> str:
-    if SPEC_COMPRESSED.exists():
-        return SPEC_COMPRESSED.read_text(encoding="utf-8")
-    return SPEC_PATH.read_text(encoding="utf-8")
+    """
+    Use scaffolder compressed spec if available, fallback to canonical spec.
+    """
+    if SCAFFOLDER_COMPRESSED_SPEC.exists():
+        _track_read(SCAFFOLDER_COMPRESSED_SPEC)
+        return SCAFFOLDER_COMPRESSED_SPEC.read_text(encoding="utf-8")
+
+    spec_path = get_spec_path()
+    if not spec_path.exists():
+        raise FileNotFoundError(
+            f"Missing canonical spec: {spec_path}\n"
+            "Run specwright first."
+        )
+
+    _track_read(spec_path)
+    return spec_path.read_text(encoding="utf-8")
 
 
 def _format_stack_section(stack: dict[str, Any] | None) -> str:
@@ -396,7 +477,7 @@ def build_system_prompt_single(
     stack: dict[str, Any] | None = None,
 ) -> str:
     """
-    Single-call prompt used when no GLM plan is available.
+    Single-call prompt used when no planner plan is available.
     """
     stack_section = _format_stack_section(stack)
 
@@ -404,7 +485,7 @@ def build_system_prompt_single(
 You are a senior software developer implementing source files.
 {stack_section}
 You will receive:
-1. A technical spec, spec.md
+1. A technical spec
 2. A scaffold JSON with stub files
 3. Model-specific implementation instructions
 
@@ -443,7 +524,7 @@ def build_system_prompt_per_file(
 You are a senior software developer implementing ONE source file.
 {stack_section}
 You will receive:
-1. The technical spec, spec.md, for full project context
+1. The technical spec for full project context
 2. Optional dependency/context files that were already implemented
 3. Optional task plan produced by a senior architect — follow it carefully
 4. The stub for the SINGLE file you must implement
@@ -550,13 +631,13 @@ def _build_mini_user_message(
         )
 
     analysis_block = (
-        f"\n\n### Mini analysis\n\n{json.dumps(analysis, indent=2, ensure_ascii=False)}"
+        f"\n\n### Mini impact analysis\n\n{json.dumps(analysis, indent=2, ensure_ascii=False)}"
         if analysis
         else ""
     )
 
     return (
-        f"### Mini plan\n\n"
+        f"### Mini execution plan\n\n"
         f"{json.dumps(plan, indent=2, ensure_ascii=False)}"
         f"{analysis_block}\n\n"
         f"### Target-file instruction\n\n"
@@ -698,7 +779,7 @@ def _parse_json(raw: str, label: str) -> dict[str, Any]:
 # ════════════════════════════════════════════════════════════════════════════
 
 def _build_task_block(task: dict[str, Any] | None) -> str:
-    """Format GLM plan task as a prompt section."""
+    """Format planner task as a prompt section."""
     if not task:
         return ""
 
@@ -870,7 +951,7 @@ def implement_file(
 
     stub_code = stub.get("code", "")
     user_msg = (
-        f"### spec.md\n\n{spec}\n\n"
+        f"### canonical spec\n\n{spec}\n\n"
         f"{context_block}\n"
         f"{task_block}\n"
         f"### Stub file to implement: {file_path}\n"
@@ -880,12 +961,12 @@ def implement_file(
     approx_tokens = len(user_msg) // 4
     if approx_tokens > 28000:
         print(
-            f"[03a] ⚠ Large prompt for {file_path}: ~{approx_tokens:,} tokens "
+            f"[08] ⚠ Large prompt for {file_path}: ~{approx_tokens:,} tokens "
             f"(limit ~32k). Response may be truncated.",
             file=sys.stderr,
         )
 
-    print(f"[03a]   → Implementing {file_path} …")
+    print(f"[08]   → Implementing {file_path} …")
     raw = _call_qwen(build_system_prompt_per_file(stack=stack), user_msg)
     result = _parse_json(raw, file_path)
 
@@ -935,12 +1016,12 @@ def implement_all_single_call(
     Single-call mode — all requested files in one request.
     """
     user_msg = (
-        f"### spec.md\n\n{spec}\n\n"
+        f"### canonical spec\n\n{spec}\n\n"
         f"### scaffold, stub files to implement\n\n"
         f"{json.dumps(stub_files, indent=2, ensure_ascii=False)}"
     )
 
-    print("[03a] Calling Qwen 3.6 Plus, single-call mode …")
+    print("[08] Calling Qwen 3.6 Plus, single-call mode …")
 
     raw = _call_qwen(
         build_system_prompt_single(instructions=instructions, stack=stack),
@@ -963,6 +1044,9 @@ def _load_restored_files(only_set: set[str]) -> dict[str, str]:
     """
     Read already-restored src/ files into memory so they can be used as
     import/reference context for Qwen in delta mode.
+
+    These are build outputs, not pipeline artifacts, so they are not included
+    in the artifact access summary.
     """
     restored: dict[str, str] = {}
 
@@ -984,7 +1068,7 @@ def _load_restored_files(only_set: set[str]) -> dict[str, str]:
         try:
             restored[rel] = path.read_text(encoding="utf-8")
         except Exception as exc:
-            print(f"[03a] WARNING: could not read restored file {rel}: {exc}")
+            print(f"[08] WARNING: could not read restored file {rel}: {exc}")
 
     return restored
 
@@ -1003,22 +1087,25 @@ def _write_generated_entry(entry: dict[str, Any]) -> str | None:
     code = entry.get("code")
 
     if not fp or not isinstance(fp, str):
-        print(f"[03a] SKIP malformed entry without file_path: {entry}", file=sys.stderr)
+        print(f"[08] SKIP malformed entry without file_path: {entry}", file=sys.stderr)
         return None
 
     if code is None or not isinstance(code, str):
-        print(f"[03a] SKIP malformed entry without code: {fp}", file=sys.stderr)
+        print(f"[08] SKIP malformed entry without code: {fp}", file=sys.stderr)
         return None
 
     out_path = _safe_src_output_path(fp)
     if out_path is None:
-        print(f"[03a] SKIP outside src/: {fp}", file=sys.stderr)
+        print(f"[08] SKIP outside src/: {fp}", file=sys.stderr)
         return None
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(code, encoding="utf-8")
 
-    print(f"[03a] WROTE {out_path}")
+    # src/** is a build output owned by executor; include it in write summary.
+    _track_write(out_path)
+
+    print(f"[08] WROTE {out_path}")
     return fp
 
 
@@ -1027,32 +1114,36 @@ def _write_generated_entry(entry: dict[str, Any]) -> str | None:
 # ════════════════════════════════════════════════════════════════════════════
 
 def _load_mini_plan() -> dict[str, Any]:
-    if not PLAN_MINI.exists():
+    if not PLANNER_MINI_PLAN.exists():
         raise FileNotFoundError(
-            f"Missing mini plan: {PLAN_MINI}\n"
+            f"Missing mini plan: {PLANNER_MINI_PLAN}\n"
             "Run planner first:\n"
-            "  python harness.py --scope mini --plan"
+            "  python harness.py --project <name> --scope mini --plan"
         )
 
-    plan = _read_json_file(PLAN_MINI, "plan_mini.json")
+    plan = _read_json_file(PLANNER_MINI_PLAN, "planner_mini_execution_plan.json")
     if plan.get("scope") != "mini":
-        print("[03a] WARNING: plan_mini.json has no scope='mini'. Continuing.")
+        print("[08] WARNING: planner_mini_execution_plan.json has no scope='mini'. Continuing.")
 
     targets = plan.get("target_files", [])
     if not isinstance(targets, list):
-        raise RuntimeError("plan_mini.target_files must be a list.")
+        raise RuntimeError("planner_mini_execution_plan.target_files must be a list.")
 
     return plan
 
 
 def _load_mini_analysis() -> dict[str, Any] | None:
-    if not ANALYSIS_MINI.exists():
+    if not PLANNER_MINI_IMPACT.exists():
         return None
     try:
-        data = json.loads(ANALYSIS_MINI.read_text(encoding="utf-8"))
+        _track_read(PLANNER_MINI_IMPACT)
+        data = json.loads(PLANNER_MINI_IMPACT.read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else None
     except Exception as exc:
-        print(f"[03a] WARNING: could not read analysis_mini.json: {exc}", file=sys.stderr)
+        print(
+            f"[08] WARNING: could not read planner_mini_impact_analysis.json: {exc}",
+            file=sys.stderr,
+        )
         return None
 
 
@@ -1072,11 +1163,11 @@ def _mini_allowed_target_paths(plan: dict[str, Any]) -> set[str]:
 def _normalize_mini_target(entry: dict[str, Any]) -> dict[str, Any] | None:
     path = _normalize_repo_rel_path(str(entry.get("path", "")))
     if not path:
-        print(f"[03a] WARNING: skipping mini target without path: {entry}", file=sys.stderr)
+        print(f"[08] WARNING: skipping mini target without path: {entry}", file=sys.stderr)
         return None
 
     if _is_disallowed_artifact_rel_path(path):
-        print(f"[03a] WARNING: skipping disallowed mini target: {path}", file=sys.stderr)
+        print(f"[08] WARNING: skipping disallowed mini target: {path}", file=sys.stderr)
         return None
 
     action = str(entry.get("action", "MODIFY")).strip().upper()
@@ -1092,6 +1183,10 @@ def _normalize_mini_target(entry: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _read_existing_target(path: str) -> str | None:
+    """
+    Reads target source/build-output file, not a pipeline artifact. It is not
+    tracked in artifact read summary.
+    """
     out_path = _safe_artifact_output_path(path)
     if out_path is None:
         return None
@@ -1100,10 +1195,10 @@ def _read_existing_target(path: str) -> str | None:
     try:
         return out_path.read_text(encoding="utf-8")
     except UnicodeDecodeError:
-        print(f"[03a] WARNING: target file is not UTF-8 text: {path}", file=sys.stderr)
+        print(f"[08] WARNING: target file is not UTF-8 text: {path}", file=sys.stderr)
         return None
     except Exception as exc:
-        print(f"[03a] WARNING: could not read target {path}: {exc}", file=sys.stderr)
+        print(f"[08] WARNING: could not read target {path}: {exc}", file=sys.stderr)
         return None
 
 
@@ -1120,7 +1215,7 @@ def _implement_mini_target(
 
     if action == "MODIFY" and existing is None:
         print(
-            f"[03a] WARNING: MODIFY target does not exist yet; treating as CREATE: {path}",
+            f"[08] WARNING: MODIFY target does not exist yet; treating as CREATE: {path}",
             file=sys.stderr,
         )
 
@@ -1134,12 +1229,12 @@ def _implement_mini_target(
     approx_tokens = len(user_msg) // 4
     if approx_tokens > 28000:
         print(
-            f"[03a] ⚠ Large mini prompt for {path}: ~{approx_tokens:,} tokens "
+            f"[08] ⚠ Large mini prompt for {path}: ~{approx_tokens:,} tokens "
             f"(limit ~32k). Response may be truncated.",
             file=sys.stderr,
         )
 
-    print(f"[03a]   → Mini patch {action:<6} {path} …")
+    print(f"[08]   → Mini patch {action:<6} {path} …")
     raw = _call_qwen(build_system_prompt_mini_file(), user_msg)
     result = _parse_json(raw, f"mini target {path}")
 
@@ -1168,14 +1263,14 @@ def _write_mini_result(
 
     if result_path not in allowed_paths:
         print(
-            f"[03a] SKIP mini result outside plan target set: {result_path}",
+            f"[08] SKIP mini result outside plan target set: {result_path}",
             file=sys.stderr,
         )
         return None
 
     out_path = _safe_artifact_output_path(result_path)
     if out_path is None:
-        print(f"[03a] SKIP unsafe mini output path: {result_path}", file=sys.stderr)
+        print(f"[08] SKIP unsafe mini output path: {result_path}", file=sys.stderr)
         return None
 
     action = str(target.get("action", "MODIFY")).upper()
@@ -1183,29 +1278,33 @@ def _write_mini_result(
     if action == "DELETE" or result.get("delete") is True:
         if out_path.exists():
             out_path.unlink()
-            print(f"[03a] DELETED {result_path}")
+            print(f"[08] DELETED {result_path}")
         else:
-            print(f"[03a] DELETE no-op, file not found: {result_path}")
+            print(f"[08] DELETE no-op, file not found: {result_path}")
+
+        _track_write(out_path)
         return result_path
 
     content = result.get("content")
     if content is None or not isinstance(content, str):
-        print(f"[03a] SKIP mini result without content: {result_path}", file=sys.stderr)
+        print(f"[08] SKIP mini result without content: {result_path}", file=sys.stderr)
         return None
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(content, encoding="utf-8")
-    print(f"[03a] WROTE {result_path}")
+    _track_write(out_path)
+
+    print(f"[08] WROTE {result_path}")
     return result_path
 
 
 def run_mini_scope(args: argparse.Namespace) -> tuple[list[str], list[str], dict[str, Any]]:
     """
-    Execute targeted mini implementation from plan_mini.json.
+    Execute targeted mini implementation from planner_mini_execution_plan.json.
 
     Returns (written, failed_files, record_extra).
     """
-    print("[03a] Scope: mini")
+    print("[08] Scope: mini")
 
     plan = _load_mini_plan()
     analysis = _load_mini_analysis()
@@ -1215,7 +1314,7 @@ def run_mini_scope(args: argparse.Namespace) -> tuple[list[str], list[str], dict
 
     for raw in raw_targets:
         if not isinstance(raw, dict):
-            print(f"[03a] WARNING: skipping invalid target entry: {raw!r}", file=sys.stderr)
+            print(f"[08] WARNING: skipping invalid target entry: {raw!r}", file=sys.stderr)
             continue
         normalized = _normalize_mini_target(raw)
         if normalized:
@@ -1229,12 +1328,12 @@ def run_mini_scope(args: argparse.Namespace) -> tuple[list[str], list[str], dict
         }
         before = len(targets)
         targets = [target for target in targets if target["path"] in only_set]
-        print(f"[03a] Mini --only-files: {len(targets)}/{before} target(s) selected.")
+        print(f"[08] Mini --only-files: {len(targets)}/{before} target(s) selected.")
 
-    print(f"[03a] Mini targets: {len(targets)}")
+    print(f"[08] Mini targets: {len(targets)}")
     for target in targets:
         print(
-            f"[03a]   {target.get('action', 'MODIFY'):<6} "
+            f"[08]   {target.get('action', 'MODIFY'):<6} "
             f"{target.get('path')}  risk={target.get('risk', 'medium')}"
         )
 
@@ -1263,13 +1362,17 @@ def run_mini_scope(args: argparse.Namespace) -> tuple[list[str], list[str], dict
                 failed_files.append(fp)
 
         except Exception as exc:
-            print(f"[03a] FAILED mini target {fp}: {exc}", file=sys.stderr)
+            print(f"[08] FAILED mini target {fp}: {exc}", file=sys.stderr)
             failed_files.append(fp)
 
     record_extra = {
         "scope": "mini",
-        "plan": "state/plan_mini.json",
-        "analysis": "run/analysis_mini.json" if ANALYSIS_MINI.exists() else None,
+        "plan": "state/planner_mini_execution_plan.json",
+        "impact_analysis": (
+            "state/planner_mini_impact_analysis.json"
+            if PLANNER_MINI_IMPACT.exists()
+            else None
+        ),
         "task_summary": plan.get("task_summary", ""),
         "target_files": [target.get("path") for target in targets],
     }
@@ -1282,17 +1385,17 @@ def run_mini_scope(args: argparse.Namespace) -> tuple[list[str], list[str], dict
 # ════════════════════════════════════════════════════════════════════════════
 
 def run_full_scope(args: argparse.Namespace) -> tuple[list[str], list[str], dict[str, Any]]:
-    print("[03a] Scope: full")
+    print("[08] Scope: full")
 
     spec = _load_spec()
-    scaffold = _read_json_file(SCAFFOLD_JSON, "scaffold.json")
+    scaffold = _read_json_file(SCAFFOLD_JSON, "scaffolder_codebase_skeleton.json")
 
     instrs = scaffold.get("implementation_instructions", {}).get("for_qwen", "")
     scaffold_stack = scaffold.get("stack")
 
     files = scaffold.get("files", [])
     if not isinstance(files, list):
-        raise RuntimeError("scaffold.json must contain a list field: files")
+        raise RuntimeError("scaffolder_codebase_skeleton.json must contain a list field: files")
 
     all_stubs: list[dict[str, Any]] = [
         file_entry
@@ -1323,35 +1426,35 @@ def run_full_scope(args: argparse.Namespace) -> tuple[list[str], list[str], dict
         ]
 
         print(
-            f"[03a] Delta mode — {len(stub_files)} file(s) to implement, "
+            f"[08] Delta mode — {len(stub_files)} file(s) to implement, "
             f"{len(skipped)} unaffected skipped."
         )
 
         for fp in skipped:
-            print(f"[03a]   SKIP unaffected: {fp}")
+            print(f"[08]   SKIP unaffected: {fp}")
 
         requested_missing = sorted(
             only_set - {file_entry["file_path"] for file_entry in all_stubs}
         )
         for fp in requested_missing:
-            print(f"[03a] WARNING: --only-files path not found in scaffold: {fp}")
+            print(f"[08] WARNING: --only-files path not found in scaffold: {fp}")
 
     else:
         stub_files = all_stubs
 
-    # ── Load GLM plan if requested ────────────────────────────────────────────
+    # ── Load planner plan if requested ────────────────────────────────────────
     plan: dict[str, Any] | None = None
     task_index: dict[str, dict[str, Any]] = {}
     stack: dict[str, Any] | None = scaffold_stack if isinstance(scaffold_stack, dict) else None
 
     if args.use_glm_plan:
-        if not GLM_PLAN.exists():
+        if not PLANNER_FULL_PLAN.exists():
             raise FileNotFoundError(
-                "ERROR: --use-glm-plan set but state/plan.json not found.\n"
-                "Run 03b_implement_glm.py --scope full first."
+                f"ERROR: --use-glm-plan set but full planner plan not found: {PLANNER_FULL_PLAN}\n"
+                "Run 07_planner.py --scope full first."
             )
 
-        plan = _read_json_file(GLM_PLAN, "plan.json")
+        plan = _read_json_file(PLANNER_FULL_PLAN, "planner_full_execution_plan.json")
         task_index = {
             task["file_path"]: task
             for task in plan.get("tasks", [])
@@ -1363,21 +1466,21 @@ def run_full_scope(args: argparse.Namespace) -> tuple[list[str], list[str], dict
             stack = plan_stack
 
         print(
-            f"[03a] GLM plan loaded — {len(task_index)} tasks, "
+            f"[08] Planner full plan loaded — {len(task_index)} tasks, "
             f"order: {plan.get('implementation_order', [])}"
         )
 
         if stack:
-            print(f"[03a] Stack in use:\n{json.dumps(stack, indent=2, ensure_ascii=False)}")
+            print(f"[08] Stack in use:\n{json.dumps(stack, indent=2, ensure_ascii=False)}")
         else:
-            print("[03a] WARNING: GLM plan has no 'stack'; executor will use generic prompt.")
+            print("[08] WARNING: planner plan has no 'stack'; executor will use generic prompt.")
 
     else:
-        print("[03a] No GLM plan — using single-call mode.")
+        print("[08] No planner plan — using single-call mode.")
 
         if stack:
             print(
-                f"[03a] Stack from scaffold in use:\n"
+                f"[08] Stack from scaffold in use:\n"
                 f"{json.dumps(stack, indent=2, ensure_ascii=False)}"
             )
 
@@ -1396,7 +1499,7 @@ def run_full_scope(args: argparse.Namespace) -> tuple[list[str], list[str], dict
 
         if already_written:
             print(
-                f"[03a] Import context seeded with "
+                f"[08] Import context seeded with "
                 f"{len(already_written)} restored file(s)."
             )
 
@@ -1413,7 +1516,7 @@ def run_full_scope(args: argparse.Namespace) -> tuple[list[str], list[str], dict
                     stack=stack,
                 )
             except Exception as exc:
-                print(f"[03a] FAILED to implement {fp}: {exc}", file=sys.stderr)
+                print(f"[08] FAILED to implement {fp}: {exc}", file=sys.stderr)
                 failed_files.append(fp)
                 continue
 
@@ -1434,7 +1537,7 @@ def run_full_scope(args: argparse.Namespace) -> tuple[list[str], list[str], dict
                 stack=stack,
             )
         except Exception as exc:
-            print(f"[03a] FAILED single-call generation: {exc}", file=sys.stderr)
+            print(f"[08] FAILED single-call generation: {exc}", file=sys.stderr)
             failed_files.extend([file_entry["file_path"] for file_entry in stub_files])
             entries = []
 
@@ -1449,7 +1552,7 @@ def run_full_scope(args: argparse.Namespace) -> tuple[list[str], list[str], dict
         else []
     )
 
-    mode = "per-file-with-glm-plan" if plan else "single-call"
+    mode = "per-file-with-planner-plan" if plan else "single-call"
     if only_set:
         mode += "-delta"
 
@@ -1458,7 +1561,7 @@ def run_full_scope(args: argparse.Namespace) -> tuple[list[str], list[str], dict
         "mode": mode,
         "skipped_delta": skipped_delta,
         "stack": stack,
-        "plan": "state/plan.json" if plan else None,
+        "plan": "state/planner_full_execution_plan.json" if plan else None,
     }
 
     return written, failed_files, record_extra
@@ -1486,12 +1589,14 @@ def _write_impl_record(
     }
     record.update(extra)
 
-    IMPL_RECORD.parent.mkdir(parents=True, exist_ok=True)
-    IMPL_RECORD.write_text(
+    EXECUTOR_SESSION_MANIFEST.parent.mkdir(parents=True, exist_ok=True)
+    EXECUTOR_SESSION_MANIFEST.write_text(
         json.dumps(record, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
-    print(f"[03a] Impl record → {IMPL_RECORD}")
+    _track_write(EXECUTOR_SESSION_MANIFEST)
+
+    print(f"[08] Executor session manifest → {EXECUTOR_SESSION_MANIFEST}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1500,23 +1605,33 @@ def _write_impl_record(
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="03a_implement_qwen.py",
+        prog="08_executor.py",
         description="Qwen executor. Implements full scaffold plan or mini targeted plan.",
+    )
+
+    parser.add_argument(
+        "--project",
+        default=None,
+        help=(
+            "Project name for direct execution. Sets PIPELINE_PROJECT before "
+            "resolving artifact paths."
+        ),
     )
 
     parser.add_argument(
         "--scope",
         choices=["full", "mini"],
         default="full",
-        help="Executor scope. full uses scaffold/spec; mini uses plan_mini.json.",
+        help="Executor scope. full uses scaffold/spec; mini uses planner_mini_execution_plan.json.",
     )
 
     parser.add_argument(
         "--use-glm-plan",
         action="store_true",
         help=(
-            "Full scope: inject state/plan.json as per-file implementation guidance. "
-            "Mini scope: accepted for harness compatibility; mini always uses plan_mini.json."
+            "Full scope: inject state/planner_full_execution_plan.json as per-file "
+            "implementation guidance. Mini scope: accepted for harness compatibility; "
+            "mini always uses planner_mini_execution_plan.json."
         ),
     )
 
@@ -1526,7 +1641,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Comma-separated paths to implement. "
             "Full scope: delta mode against scaffold. "
-            "Mini scope: filters plan_mini.target_files."
+            "Mini scope: filters planner_mini_execution_plan.target_files."
         ),
     )
 
@@ -1534,9 +1649,16 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    args = _build_parser().parse_args()
+    parser = _build_parser()
+    args = parser.parse_args()
 
+    _configure_project(args.project, parser)
+
+    # Important: do not call ensure_dirs() at import-time.
+    # PIPELINE_PROJECT must be available before artifact paths are resolved.
     ensure_dirs()
+
+    exit_code = 0
 
     try:
         if args.scope == "mini":
@@ -1565,7 +1687,7 @@ def main() -> None:
             )
 
     except Exception as exc:
-        print(f"[03a] ERROR: {exc}", file=sys.stderr)
+        print(f"[08] ERROR: {exc}", file=sys.stderr)
 
         # Best-effort failure record.
         try:
@@ -1579,19 +1701,24 @@ def main() -> None:
         except Exception:
             pass
 
-        sys.exit(1)
+        exit_code = 1
 
-    if failed_files:
-        print(
-            f"[03a] Done with {len(written)} file(s) written, "
-            f"{len(failed_files)} failed: {failed_files}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    else:
+        if failed_files:
+            print(
+                f"[08] Done with {len(written)} file(s) written, "
+                f"{len(failed_files)} failed: {failed_files}",
+                file=sys.stderr,
+            )
+            exit_code = 1
+        else:
+            print(f"[08] Done — {len(written)} file(s) written.")
 
-    print(f"[03a] Done — {len(written)} file(s) written.")
+    finally:
+        _print_artifact_access_summary()
+
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
     main()
-```
