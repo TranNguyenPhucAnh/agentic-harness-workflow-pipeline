@@ -1,11 +1,11 @@
 """
-04_enricher.py
+03_enricher.py
 ==============
 Prompt Agent — nhận clarified artifacts + knowledge layer + raw input của user,
 enrich thành một structured prompt đủ context cho model xịn downstream (spec agent).
 
 Vị trí trong luồng:
-    03_clarificator → [04_enricher] → 05_specwright → specwright_spec_<slug>.md → harness
+    02_clarificator → [03_enricher] → 04_specwright → 05_spectracker → specwright_spec_<slug>.md → harness
 
 Inputs (đọc từ artifacts của project hiện tại):
     state/clarificator_requirement_synthesis.md        — output chính của clarificator
@@ -19,11 +19,11 @@ Output (ghi vào artifacts của project):
     execution/enricher_session_enriched_prompt.md      — enriched prompt, user review trước khi gửi spec agent
 
 Usage:
-    python 04_enricher.py --project my-app
-    python 04_enricher.py --project my-app --extra-context "Focus on backend only"
-    python 04_enricher.py --project my-app --dry-run
+    python 03_enricher.py --project my-app
+    python 03_enricher.py --project my-app --extra-context "Focus on backend only"
+    python 03_enricher.py --project my-app --dry-run
 
-    # Thường được gọi tự động từ 03_clarificator.py khi user chọn mode full.
+    # Thường được gọi tự động từ 02_clarificator.py khi user chọn mode full.
 
 Artifacts produced (owner: enricher):
     artifacts_<slug>/execution/enricher_session_enriched_prompt.md
@@ -481,7 +481,7 @@ def _resolve_project(arg_project: str | None) -> str:
 def main() -> None:
     try:
         parser = argparse.ArgumentParser(
-            description="04_enricher — enrich clarified requirement into a structured spec prompt"
+            description="03_enricher — enrich clarified requirement into a structured spec prompt"
         )
         parser.add_argument("--project",       metavar="NAME",
                             help="Project workspace name. Prompted if omitted.")
@@ -504,7 +504,7 @@ def main() -> None:
         if not clarified_req.strip():
             print(
                 "[enricher][error] clarificator_requirement_synthesis.md not found or empty.\n"
-                "           Run 03_clarificator.py first."
+                "           Run 02_clarificator.py first."
             )
             sys.exit(1)
         print(f"[enricher] Loaded clarificator_requirement_synthesis.md ({len(clarified_req)} chars)")

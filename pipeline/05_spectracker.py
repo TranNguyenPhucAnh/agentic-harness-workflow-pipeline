@@ -1,5 +1,5 @@
 """
-pipeline/01_spectracker.py
+pipeline/05_spectracker.py
 ==========================
 Spec diff engine — detect what changed between spec versions and map to affected files.
 
@@ -17,8 +17,8 @@ Writes:
     artifacts_<slug>/knowledge/history/spectracker_version_log.md  ← aggregated version log (append-only)
 
 Direct execution:
-    python 01_spectracker.py --project my-app
-    PIPELINE_PROJECT=my-app python 01_spectracker.py
+    python 05_spectracker.py --project my-app
+    PIPELINE_PROJECT=my-app python 05_spectracker.py
 
 At the end of each run, prints:
     - artifacts read
@@ -126,7 +126,7 @@ def _configure_project(
 
     parser.error(
         "PIPELINE_PROJECT is not set. Use --project <name> or export "
-        "PIPELINE_PROJECT=<name> before running 01_spectracker.py directly."
+        "PIPELINE_PROJECT=<name> before running 05_spectracker.py directly."
     )
 
 
@@ -672,7 +672,7 @@ def compute_delta(
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="01_spectracker.py",
+        prog="05_spectracker.py",
         description="Spec diff engine",
     )
 
