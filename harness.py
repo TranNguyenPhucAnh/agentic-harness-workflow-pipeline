@@ -1370,6 +1370,19 @@ def _should_mark_applied(
         return False
 
     if "judge" in steps_to_run:
+        # Check that judge actually ran — not just skipped (e.g. because debugger
+        # failed). A skipped judge sets results["judge"] = True but never writes
+        # judge_r1 into results, so results.keys() won't contain any "judge_r"
+        # entry. Reading the verdict file in that case would pick up a stale
+        # verdict from a previous run, which could incorrectly satisfy the check.
+        judge_actually_ran = any(k.startswith("judge_r") for k in results)
+        if not judge_actually_ran:
+            print(
+                "[harness] Apply record skipped: judge was in run range but did "
+                "not execute (skipped due to test failure or missing env)."
+            )
+            return False
+
         verdict = _read_judge_verdict()
         if verdict not in ("APPROVED", "APPROVED_WITH_NOTES"):
             print(
