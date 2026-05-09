@@ -1,117 +1,36 @@
 """
 harness.py — Orchestrator for the LLM pipeline.
 
+Canonical module pipeline:
+    spectracker   01_spectracker.py
+    absorber      02_absorber.py
+    clarificator  03_clarificator.py
+    enricher      04_enricher.py
+    specwright    05_specwright.py
+    scaffolder    06_scaffolder.py
+    planner       07_planner.py
+    executor      08_executor.py
+    debugger      09_debugger.py
+    reporter      10_reporter.py
+    judge         11_judge.py
+    patcher       12_patcher.py
+    archivist     13_archivist.py
+
 harness.py is the ONLY entrypoint for end-to-end pipeline runs.
-Each script in pipeline/ is a pure step runner: executes one step,
-writes owned artifacts, exits. No step script navigates the pipeline.
+Step scripts are pure runners: execute one step, write owned artifacts, exit.
 
-Pipeline steps (canonical order):
-    spectracker   01_spectracker.py    — track spec version delta, decide reruns
-    absorber      02_absorber.py       — scan codebase, build knowledge maps
-    clarificator  03_clarificator.py   — clarify requirements interactively
-    enricher      04_enricher.py       — enrich context into structured prompt
-    specwright    05_specwright.py     — generate/update canonical spec
-    scaffolder    06_scaffolder.py     — generate stub files + test files
-    planner       07_planner.py        — decompose work into ordered task plan
-    executor      08_executor.py       — implement src/ files guided by plan
-    debugger      09_debugger.py       — vitest loop + repair
-    reporter      10_reporter.py       — aggregate reporter_execution_summary.md
-    judge         11_judge.py          — qualitative review + sign-off
-    patcher       12_patcher.py        — auto-patch NEEDS_REVISION findings
-    archivist     13_archivist.py      — distill knowledge, long-term memory
+Artifact tracing is ON by default:
+    after each step, harness prints declared reads/writes and actual artifact
+    create/update/overwrite/append/delete changes under artifacts_<slug>/.
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SCOPE MODES
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-  --scope full           Spec-driven full pipeline.
-                         Uses spectracker delta, scaffolder skeleton,
-                         planner_full_execution_plan.json.
-
-  --scope mini           Targeted daily-driver pipeline.
-                         Skips spectracker/specwright/scaffolder and routes
-                         planner/executor through mini contracts:
-                             state/planner_mini_execution_plan.json
-                             state/planner_mini_impact_analysis.json
-                         Intended for small changes where spec does not need
-                         to change.
-
-  Legacy --mini PROMPT   Backward-compatible entrypoint delegated to
-                         pipeline/mini_mode.py. Prefer:
-                             python harness.py --scope mini ...
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-PARAMETER REFERENCE
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Generation flags:
-
-  --project NAME         Project name → artifacts_<slug>/.
-                         If omitted, interactive prompt lists existing projects.
-
-  --scope full|mini      Pipeline scope. Default: full.
-
-  --auto-continue        Non-interactive mode. Reserved for interactive state
-                         machine checkpoints; currently means no extra prompts
-                         from harness itself.
-
-  --force                Re-run ALL full-scope generation steps even if
-                         spectracker delta says nothing changed.
-
-  --dry-run              Print what WOULD run without executing anything.
-
-  --only-qwen            Skip planner step; executor runs in single-call mode.
-
-  --retry-impl           Re-implement only files listed as failed in
-                         execution/executor_session_manifest.json.
-
-Range flags:
-
-  --from-STEP            Start from STEP.
-  --until-STEP           Stop after STEP.
-  --STEP                 Run only STEP.
-
-Canonical steps:
-  spectracker, absorber, clarificator, enricher, specwright, scaffolder,
-  planner, executor, debugger, reporter, judge, patcher, archivist
-
-Legacy step aliases still accepted:
-  absorb→absorber, clarify→clarificator, scaffold→scaffolder,
-  plan→planner, implement→executor, test→debugger,
-  report→reporter, fix→patcher
-
-Test loop flags:
-
-  --max-iter N
-  --max-cluster-attempts N
-  --verbose
-
-Judge flags:
-
-  --skip-fix
-  --from-judge
-  --max-judge-rounds N
-
-Clarification:
-
-  --clarify-input FILE
-
-Legacy mini mode:
-
-  --mini PROMPT
-  --files f1 f2 ...
-  --context-file FILE
-  --output-file FILE
-  --task-type TYPE
-
-Requirements:
-    pip install httpx
-    GEMINI_API_KEY, OPENROUTER_API_KEY in .env or exported as env vars
+Disable tracing:
+    python harness.py --no-trace-artifacts
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -120,11 +39,11 @@ import shutil
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 
-# harness.py lives at ROOT level — same level as artifacts/
 ROOT = Path(__file__).parent
 
 # === WRITE AUTHORITY: harness ===
@@ -134,9 +53,6 @@ ROOT = Path(__file__).parent
 
 sys.path.insert(0, str(ROOT))
 
-# LazyPath constants — resolve to the correct project artifact root at use time.
-# ensure_dirs() is called inside main() after --project is parsed and
-# PIPELINE_PROJECT env var is set. Do NOT call ensure_dirs() here.
 from artifacts.paths import (  # noqa: E402
     ARCHIVIST_CURATION_LOG,
     CLARIFICATOR_SESSION_QUESTIONS,
@@ -152,7 +68,7 @@ from artifacts.paths import (  # noqa: E402
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Step registry — single source of truth for pipeline order
+# Step registry
 # ════════════════════════════════════════════════════════════════════════════
 
 STEPS = [
@@ -207,7 +123,6 @@ LEGACY_STEP_ALIASES: dict[str, str] = {
     "fix": "patcher",
 }
 
-# Reverse alias used only for reading old spectracker/spec_delta outputs safely.
 CANONICAL_TO_LEGACY_STEP: dict[str, str] = {
     canonical: legacy for legacy, canonical in LEGACY_STEP_ALIASES.items()
 }
@@ -215,12 +130,318 @@ CANONICAL_TO_LEGACY_STEP: dict[str, str] = {
 SCOPE_CHOICES = ("full", "mini")
 
 
-# NOTE: prev_src is a transient staging dir, not a pipeline artifact.
-# Resolved lazily so it uses the correct project artifact root.
-def _prev_src_dir() -> Path:
+# ════════════════════════════════════════════════════════════════════════════
+# Artifact tracing registry
+# ════════════════════════════════════════════════════════════════════════════
+
+STEP_ARTIFACT_READS: dict[str, list[str]] = {
+    "spectracker": [
+        "specwright_spec_<slug>.md",
+        "state/spectracker_applied_version.json",
+        "knowledge/history/<version>.md",
+    ],
+    "absorber": [],
+    "clarificator": [
+        "cache/absorber_session_codebase_snapshot.json",
+        "cache/absorber_session_git_snapshot.json",
+        "knowledge/current/clarificator_decision_log.md",
+        "knowledge/current/absorber_codebase_map.md",
+        "knowledge/current/absorber_config_map.json",
+        "knowledge/current/absorber_blame_map.md",
+    ],
+    "enricher": [
+        "state/clarificator_requirement_synthesis.md",
+        "execution/clarificator_session_raw.json",
+        "cache/absorber_session_codebase_snapshot.json",
+        "cache/absorber_session_git_snapshot.json",
+        "knowledge/current/clarificator_decision_log.md",
+        "knowledge/current/absorber_codebase_map.md",
+        "knowledge/current/absorber_config_map.json",
+        "knowledge/current/absorber_blame_map.md",
+    ],
+    "specwright": [
+        "execution/enricher_session_enriched_prompt.md",
+        "state/clarificator_requirement_synthesis.md",
+        "knowledge/current/archivist_spec_gaps.md",
+    ],
+    "scaffolder": [
+        "specwright_spec_<slug>.md",
+    ],
+    "planner": [
+        "specwright_spec_<slug>.md",
+        "state/scaffolder_codebase_skeleton.json",
+        "cache/scaffolder_compressed_spec.md",
+        "cache/absorber_session_codebase_snapshot.json",
+        "knowledge/current/absorber_codebase_map.md",
+        "knowledge/current/absorber_blame_map.md",
+        "knowledge/current/archivist_knowledge_log.md",
+        "execution/clarificator_session_raw.json",
+    ],
+    "executor": [
+        "specwright_spec_<slug>.md",
+        "state/scaffolder_codebase_skeleton.json",
+        "state/planner_full_execution_plan.json",
+        "state/planner_mini_execution_plan.json",
+        "state/planner_mini_impact_analysis.json",
+        "cache/scaffolder_compressed_spec.md",
+        "knowledge/current/absorber_codebase_map.md",
+        "knowledge/current/archivist_knowledge_log.md",
+    ],
+    "debugger": [
+        "state/planner_full_execution_plan.json",
+        "state/planner_mini_execution_plan.json",
+        "execution/executor_session_manifest.json",
+        "knowledge/current/patcher_findings_snapshot.md",
+        "knowledge/current/archivist_knowledge_log.md",
+    ],
+    "reporter": [
+        "state/scaffolder_codebase_skeleton.json",
+        "state/planner_full_execution_plan.json",
+        "state/planner_mini_execution_plan.json",
+        "execution/executor_session_manifest.json",
+        "execution/debugger_session_test_summary.json",
+        "cache/spectracker_session_version_delta.json",
+    ],
+    "judge": [
+        "specwright_spec_<slug>.md",
+        "state/scaffolder_codebase_skeleton.json",
+        "state/planner_full_execution_plan.json",
+        "state/planner_mini_execution_plan.json",
+        "execution/executor_session_manifest.json",
+        "execution/debugger_session_test_summary.json",
+        "reports/reporter_execution_summary.md",
+        "knowledge/current/archivist_knowledge_log.md",
+        "knowledge/current/archivist_spec_gaps.md",
+    ],
+    "patcher": [
+        "execution/judge_session_verdict_raw.json",
+        "state/planner_full_execution_plan.json",
+        "state/planner_mini_execution_plan.json",
+        "execution/executor_session_manifest.json",
+        "knowledge/current/archivist_knowledge_log.md",
+        "cache/scaffolder_compressed_spec.md",
+    ],
+    "archivist": [
+        "execution/debugger_session_test_summary.json",
+        "execution/judge_session_verdict_raw.json",
+        "knowledge/current/patcher_findings_snapshot.md",
+        "knowledge/history/patcher_attempt_log.json",
+    ],
+}
+
+STEP_ARTIFACT_WRITES: dict[str, list[str]] = {
+    "spectracker": [
+        "state/spectracker_applied_version.json",
+        "cache/spectracker_session_version_delta.json",
+        "knowledge/history/spectracker_version_log.md",
+        "knowledge/history/<version>.md",
+        "knowledge/history/<version>.changelog.md",
+    ],
+    "absorber": [
+        "cache/absorber_session_codebase_snapshot.json",
+        "cache/absorber_session_git_snapshot.json",
+        "knowledge/current/absorber_codebase_map.md",
+        "knowledge/current/absorber_config_map.json",
+        "knowledge/current/absorber_blame_map.md",
+    ],
+    "clarificator": [
+        "execution/clarificator_session_raw.json",
+        "execution/clarificator_session_questions.md",
+        "state/clarificator_requirement_synthesis.md",
+        "knowledge/current/clarificator_decision_log.md",
+    ],
+    "enricher": [
+        "execution/enricher_session_enriched_prompt.md",
+    ],
+    "specwright": [
+        "specwright_spec_<slug>.md",
+    ],
+    "scaffolder": [
+        "state/scaffolder_codebase_skeleton.json",
+        "cache/scaffolder_compressed_spec.md",
+        "tests/",
+    ],
+    "planner": [
+        "state/planner_full_execution_plan.json",
+        "state/planner_mini_execution_plan.json",
+        "state/planner_mini_impact_analysis.json",
+    ],
+    "executor": [
+        "execution/executor_session_manifest.json",
+        "src/",
+    ],
+    "debugger": [
+        "execution/debugger_session_test_summary.json",
+        "src/",
+    ],
+    "reporter": [
+        "reports/reporter_execution_summary.md",
+    ],
+    "judge": [
+        "execution/judge_session_verdict_raw.json",
+        "reports/judge_verdict_summary.md",
+    ],
+    "patcher": [
+        "execution/patcher_session_fix_summary.md",
+        "knowledge/current/patcher_findings_snapshot.md",
+        "knowledge/history/patcher_attempt_log.json",
+        "src/",
+    ],
+    "archivist": [
+        "knowledge/current/archivist_knowledge_log.md",
+        "knowledge/current/archivist_spec_gaps.md",
+        "knowledge/history/archivist_curation_log.json",
+    ],
+}
+
+
+@dataclass(frozen=True)
+class ArtifactFileState:
+    size: int
+    mtime_ns: int
+    sha256: str
+    content: bytes
+
+
+ArtifactSnapshot = dict[str, ArtifactFileState]
+
+
+def _hash_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _snapshot_artifacts() -> ArtifactSnapshot:
+    """
+    Snapshot files under artifacts_<slug>/.
+
+    Note:
+      - Traces pipeline artifacts only under artifacts_<slug>/.
+      - Excludes harness scratch state/prev_src/.
+      - Root-level src/ and tests/ are build outputs, not artifact files.
+    """
     from artifacts.paths import artifact_root
 
-    return artifact_root() / "state" / "prev_src"
+    root = artifact_root()
+    snapshot: ArtifactSnapshot = {}
+
+    if not root.exists():
+        return snapshot
+
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+
+        rel = path.relative_to(root).as_posix()
+        if rel.startswith("state/prev_src/"):
+            continue
+
+        try:
+            content = path.read_bytes()
+            stat = path.stat()
+        except OSError:
+            continue
+
+        snapshot[rel] = ArtifactFileState(
+            size=stat.st_size,
+            mtime_ns=stat.st_mtime_ns,
+            sha256=_hash_bytes(content),
+            content=content,
+        )
+
+    return snapshot
+
+
+def _classify_artifact_changes(
+    before: ArtifactSnapshot,
+    after: ArtifactSnapshot,
+) -> dict[str, list[str]]:
+    created: list[str] = []
+    appended: list[str] = []
+    overwritten: list[str] = []
+    touched: list[str] = []
+    deleted: list[str] = []
+
+    before_keys = set(before)
+    after_keys = set(after)
+
+    for rel in sorted(after_keys - before_keys):
+        created.append(rel)
+
+    for rel in sorted(before_keys - after_keys):
+        deleted.append(rel)
+
+    for rel in sorted(before_keys & after_keys):
+        old = before[rel]
+        new = after[rel]
+
+        if old.sha256 == new.sha256:
+            if old.mtime_ns != new.mtime_ns:
+                touched.append(rel)
+            continue
+
+        if new.size > old.size and new.content.startswith(old.content):
+            appended.append(rel)
+        else:
+            overwritten.append(rel)
+
+    return {
+        "created": created,
+        "appended": appended,
+        "overwritten": overwritten,
+        "touched": touched,
+        "deleted": deleted,
+    }
+
+
+def _print_artifact_list(title: str, items: list[str], indent: str = "    ") -> None:
+    print(f"{indent}{title}:")
+    if not items:
+        print(f"{indent}  - (none)")
+        return
+    for item in items:
+        print(f"{indent}  - {item}")
+
+
+def _print_artifact_trace(
+    step: str,
+    before: ArtifactSnapshot | None,
+    after: ArtifactSnapshot | None,
+) -> None:
+    print(f"\n[harness] Artifact trace — {step}")
+
+    _print_artifact_list("declared reads", STEP_ARTIFACT_READS.get(step, []))
+    _print_artifact_list("declared writes", STEP_ARTIFACT_WRITES.get(step, []))
+
+    if before is None or after is None:
+        print("    actual changes:")
+        print("      - (not captured)")
+        return
+
+    changes = _classify_artifact_changes(before, after)
+
+    print("    actual changes:")
+    _print_artifact_list("created", changes["created"], indent="      ")
+    _print_artifact_list("appended", changes["appended"], indent="      ")
+    _print_artifact_list("overwritten/updated", changes["overwritten"], indent="      ")
+    _print_artifact_list("touched without content change", changes["touched"], indent="      ")
+    _print_artifact_list("deleted", changes["deleted"], indent="      ")
+
+
+def _run_step_with_trace(
+    step: str,
+    label: str,
+    script: str,
+    args: argparse.Namespace,
+    extra_args: list[str] | None = None,
+) -> bool:
+    before = _snapshot_artifacts() if args.trace_artifacts else None
+    ok = run_step(label, script, extra_args)
+    after = _snapshot_artifacts() if args.trace_artifacts else None
+
+    if args.trace_artifacts:
+        _print_artifact_trace(step, before, after)
+
+    return ok
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -290,15 +511,17 @@ def _canonical_step(step: str | None) -> str | None:
     return LEGACY_STEP_ALIASES.get(step, step)
 
 
+def _prev_src_dir() -> Path:
+    from artifacts.paths import artifact_root
+
+    return artifact_root() / "state" / "prev_src"
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # Project selection
 # ════════════════════════════════════════════════════════════════════════════
 
 def _interactive_project_select(root: Path) -> str:
-    """
-    List existing artifacts_* projects and let the user pick one or create new.
-    Falls back to a plain name prompt if no projects exist yet.
-    """
     projects = sorted(
         p.name.removeprefix("artifacts_")
         for p in root.glob("artifacts_*")
@@ -309,8 +532,7 @@ def _interactive_project_select(root: Path) -> str:
         print("\nExisting projects:")
         for i, project in enumerate(projects, 1):
             print(f"  {i}. {project}")
-        print(f"  {len(projects) + 1}. New project")
-        print()
+        print(f"  {len(projects) + 1}. New project\n")
 
         choice = input("Select project (number or name): ").strip()
 
@@ -349,13 +571,8 @@ def delta_requires(delta: dict | None, step: str) -> bool:
     """
     True if spectracker delta says step must re-run, or delta unavailable.
 
-    Supports both new canonical keys:
-      scaffolder/planner/executor
-
-    and old keys:
+    Tolerates old delta keys during migration:
       scaffold/plan/implement
-
-    This makes harness tolerant during the refactor window.
     """
     if delta is None:
         return True
@@ -406,7 +623,6 @@ def print_delta_summary(delta: dict) -> None:
 # ════════════════════════════════════════════════════════════════════════════
 
 def snapshot_src() -> None:
-    """Save current repo src/ as project-scoped prev_src/ for delta restores."""
     src = ROOT / "src"
     if not src.exists():
         return
@@ -420,10 +636,6 @@ def snapshot_src() -> None:
 
 
 def restore_unaffected_files(delta: dict) -> int:
-    """
-    Copy unaffected src/ files from prev_src/ so executor only implements
-    the files that changed. Returns number of files restored.
-    """
     unaffected = [
         file
         for file in delta.get("unaffected_files", [])
@@ -454,7 +666,6 @@ def restore_unaffected_files(delta: dict) -> int:
 # ════════════════════════════════════════════════════════════════════════════
 
 def _read_judge_verdict() -> str:
-    """Read current verdict from execution/judge_session_verdict_raw.json."""
     raw_path = JUDGE_SESSION_VERDICT_RAW
     if not raw_path.exists():
         return ""
@@ -463,12 +674,10 @@ def _read_judge_verdict() -> str:
         raw_data = json.loads(raw_path.read_text())
         response = raw_data.get("response", "")
 
-        # Existing judge artifacts commonly store model response as fenced JSON.
         if isinstance(response, str):
             response = _re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", response.strip())
             response = _re.sub(r"\n?```$", "", response.strip())
-            parsed = json.loads(response)
-            return parsed.get("verdict", "")
+            return json.loads(response).get("verdict", "")
 
         if isinstance(response, dict):
             return response.get("verdict", "")
@@ -479,34 +688,23 @@ def _read_judge_verdict() -> str:
 
 
 def _scope_args_for_script(script: str, scope: str) -> list[str]:
-    """
-    Return scope args for scripts that support scope.
-
-    Current contract:
-      - 07_planner.py supports --scope full|mini
-      - 08_executor.py supports --scope full|mini
-
-    Other steps remain backward-compatible and receive no --scope unless they
-    are refactored explicitly.
-    """
     if script in {"07_planner.py", "08_executor.py"}:
         return ["--scope", scope]
     return []
 
 
 def _run_judge_fix_loop(args: argparse.Namespace, results: dict[str, bool]) -> None:
-    """
-    Judge → patcher → re-judge loop, up to args.max_judge_rounds times.
-    """
     max_rounds = args.max_judge_rounds
     skip_fix = args.skip_fix
 
     for round_num in range(1, max_rounds + 1):
         round_sfx = f" (round {round_num}/{max_rounds})" if max_rounds > 1 else ""
 
-        ok = run_step(
+        ok = _run_step_with_trace(
+            "judge",
             f"judge{round_sfx}",
             STEP_SCRIPTS["judge"],
+            args,
         )
         results[f"judge_r{round_num}"] = ok
         results["judge"] = ok
@@ -541,9 +739,11 @@ def _run_judge_fix_loop(args: argparse.Namespace, results: dict[str, bool]) -> N
             if getattr(args, "fix_non_blocking", False):
                 patcher_args.append("--fix-non-blocking")
 
-            patch_ok = run_step(
+            patch_ok = _run_step_with_trace(
+                "patcher",
                 f"patcher{round_sfx}",
                 STEP_SCRIPTS["patcher"],
+                args,
                 patcher_args or None,
             )
             results[f"judge_patcher_r{round_num}"] = patch_ok
@@ -554,7 +754,12 @@ def _run_judge_fix_loop(args: argparse.Namespace, results: dict[str, bool]) -> N
                 break
 
             print("\n[harness] Patch applied successfully — re-running reporter + judge …")
-            report_ok = run_step("reporter post-patch", STEP_SCRIPTS["reporter"])
+            report_ok = _run_step_with_trace(
+                "reporter",
+                "reporter post-patch",
+                STEP_SCRIPTS["reporter"],
+                args,
+            )
             results[f"reporter_post_patch_r{round_num}"] = report_ok
             if not report_ok:
                 results["judge"] = False
@@ -566,10 +771,6 @@ def _run_judge_fix_loop(args: argparse.Namespace, results: dict[str, bool]) -> N
 
 
 def _run_fix_from_existing_judge(args: argparse.Namespace, results: dict[str, bool]) -> None:
-    """
-    Feed an existing execution/judge_session_verdict_raw.json into patcher
-    without calling the judge API first. Used when --from-judge is set.
-    """
     raw_path = JUDGE_SESSION_VERDICT_RAW
     if not raw_path.exists():
         print("[harness] --from-judge: execution/judge_session_verdict_raw.json not found.")
@@ -604,9 +805,11 @@ def _run_fix_from_existing_judge(args: argparse.Namespace, results: dict[str, bo
     if getattr(args, "fix_non_blocking", False):
         patcher_args.append("--fix-non-blocking")
 
-    patch_ok = run_step(
+    patch_ok = _run_step_with_trace(
+        "patcher",
         "patcher from existing judge",
         STEP_SCRIPTS["patcher"],
+        args,
         patcher_args or None,
     )
     results["patcher_from_judge"] = patch_ok
@@ -617,7 +820,12 @@ def _run_fix_from_existing_judge(args: argparse.Namespace, results: dict[str, bo
         return
 
     print("\n[harness] Patch applied — refreshing reporter + re-judging …")
-    report_ok = run_step("reporter post-patch", STEP_SCRIPTS["reporter"])
+    report_ok = _run_step_with_trace(
+        "reporter",
+        "reporter post-patch",
+        STEP_SCRIPTS["reporter"],
+        args,
+    )
     results["reporter_post_patch"] = report_ok
 
     if not report_ok:
@@ -628,7 +836,12 @@ def _run_fix_from_existing_judge(args: argparse.Namespace, results: dict[str, bo
         print("[harness] WARNING: cannot re-judge without OPENROUTER_API_KEY.")
         return
 
-    judge_ok = run_step("judge post-patch", STEP_SCRIPTS["judge"])
+    judge_ok = _run_step_with_trace(
+        "judge",
+        "judge post-patch",
+        STEP_SCRIPTS["judge"],
+        args,
+    )
     results["judge_post_patch"] = judge_ok
 
     final = _read_judge_verdict()
@@ -637,7 +850,7 @@ def _run_fix_from_existing_judge(args: argparse.Namespace, results: dict[str, bo
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Range resolution + dry-run
+# Range + dry-run
 # ════════════════════════════════════════════════════════════════════════════
 
 def _validate_scope(scope: str) -> None:
@@ -646,18 +859,6 @@ def _validate_scope(scope: str) -> None:
 
 
 def _resolve_run_range(args: argparse.Namespace) -> tuple[str, str]:
-    """
-    Return (from_step, until_step) after validating all flag combinations.
-
-    Rules:
-        --from-X                    → X .. archivist
-        --from-X --until-Y          → X .. Y
-        --X shorthand               → X .. X
-        no flags                    → spectracker .. archivist
-
-    Mini scope keeps the same canonical order but auto-skips spectracker,
-    specwright, and scaffolder at execution time.
-    """
     from_step = _canonical_step(getattr(args, "from_step", None))
     until_step = _canonical_step(getattr(args, "until_step", None))
 
@@ -705,14 +906,14 @@ def _resolve_run_range(args: argparse.Namespace) -> tuple[str, str]:
 
 
 def _print_dry_run(from_step: str, until_step: str, args: argparse.Namespace) -> None:
-    """Print what would run without executing anything."""
     from_idx = STEPS.index(from_step)
     until_idx = STEPS.index(until_step)
 
     print("\n[harness] DRY RUN — nothing will be executed.")
-    print(f"  Project : {os.environ.get('PIPELINE_PROJECT', '?')}")
-    print(f"  Scope   : {args.scope}")
-    print(f"  Range   : {from_step} → {until_step}")
+    print(f"  Project         : {os.environ.get('PIPELINE_PROJECT', '?')}")
+    print(f"  Scope           : {args.scope}")
+    print(f"  Range           : {from_step} → {until_step}")
+    print(f"  Artifact trace  : {'on' if args.trace_artifacts else 'off'}")
     print()
 
     for i, step in enumerate(STEPS):
@@ -733,13 +934,15 @@ def _print_dry_run(from_step: str, until_step: str, args: argparse.Namespace) ->
     print()
 
     if args.scope == "full" and args.force:
-        print("  --force: spectracker delta checks will be bypassed — all full-scope steps re-run.")
+        print("  --force: spectracker delta checks will be bypassed.")
 
     if args.scope == "mini":
-        print(
-            "  mini scope: spectracker/specwright/scaffolder are skipped; "
-            "planner writes planner_mini_execution_plan.json."
-        )
+        print("  mini scope: spectracker/specwright/scaffolder are skipped.")
+
+    if args.trace_artifacts:
+        print("  artifact trace: will print after every executed step.")
+    else:
+        print("  artifact trace: disabled by --no-trace-artifacts.")
 
     print()
 
@@ -756,43 +959,35 @@ def _run_step(
     results: dict[str, bool],
     tests_passed: bool,
 ) -> bool:
-    """Dispatch a single step with its extra args. Returns success bool."""
-
     if step == "spectracker":
         if args.scope == "mini":
             skip_step("spectracker", "mini scope does not update spec delta")
             return True
-
-        ok = run_step("spectracker", STEP_SCRIPTS["spectracker"])
-        if not ok:
-            print("\n[harness] Spectracker failed.")
-        return ok
+        return _run_step_with_trace(step, "spectracker", STEP_SCRIPTS[step], args)
 
     if step == "absorber":
-        return run_step("absorber", STEP_SCRIPTS["absorber"])
+        return _run_step_with_trace(step, "absorber", STEP_SCRIPTS[step], args)
 
     if step == "clarificator":
         clarify_args: list[str] = []
         if getattr(args, "clarify_input", None):
             clarify_args += ["--input", args.clarify_input]
-
-        ok = run_step("clarificator", STEP_SCRIPTS["clarificator"], clarify_args or None)
-        if not ok:
-            print("\n[harness] Clarificator failed.")
-        return ok
+        return _run_step_with_trace(
+            step,
+            "clarificator",
+            STEP_SCRIPTS[step],
+            args,
+            clarify_args or None,
+        )
 
     if step == "enricher":
-        return run_step("enricher", STEP_SCRIPTS["enricher"])
+        return _run_step_with_trace(step, "enricher", STEP_SCRIPTS[step], args)
 
     if step == "specwright":
         if args.scope == "mini":
             skip_step("specwright", "mini scope does not update canonical spec")
             return True
-
-        ok = run_step("specwright", STEP_SCRIPTS["specwright"])
-        if not ok:
-            print("\n[harness] Specwright failed.")
-        return ok
+        return _run_step_with_trace(step, "specwright", STEP_SCRIPTS[step], args)
 
     if step == "scaffolder":
         if args.scope == "mini":
@@ -810,7 +1005,7 @@ def _run_step(
         if not check_env(STEP_ENV_KEYS.get("scaffolder", [])):
             sys.exit(1)
 
-        ok = run_step("scaffolder", STEP_SCRIPTS["scaffolder"])
+        ok = _run_step_with_trace(step, "scaffolder", STEP_SCRIPTS[step], args)
         if not ok:
             print("\n[harness] Scaffolder failed — stopping.")
         return ok
@@ -831,22 +1026,17 @@ def _run_step(
         if not check_env(STEP_ENV_KEYS.get("planner", [])):
             sys.exit(1)
 
-        planner_args = _scope_args_for_script(STEP_SCRIPTS["planner"], args.scope)
-        ok = run_step("planner", STEP_SCRIPTS["planner"], planner_args)
-
+        planner_args = _scope_args_for_script(STEP_SCRIPTS[step], args.scope)
+        ok = _run_step_with_trace(step, "planner", STEP_SCRIPTS[step], args, planner_args)
         if not ok:
-            print(
-                "\n[harness] Planner failed.\n"
-                "  Tip: --only-qwen to skip planning entirely."
-            )
-
+            print("\n[harness] Planner failed.\n  Tip: --only-qwen to skip planning.")
         return ok
 
     if step == "executor":
         if not check_env(STEP_ENV_KEYS.get("executor", [])):
             sys.exit(1)
 
-        executor_args = _scope_args_for_script(STEP_SCRIPTS["executor"], args.scope)
+        executor_args = _scope_args_for_script(STEP_SCRIPTS[step], args.scope)
 
         if plan_available:
             executor_args.append("--use-glm-plan")
@@ -873,7 +1063,13 @@ def _run_step(
         else:
             mode = "per-file+plan" if plan_available else "single-call"
 
-        ok = run_step(f"executor ({mode})", STEP_SCRIPTS["executor"], executor_args)
+        ok = _run_step_with_trace(
+            step,
+            f"executor ({mode})",
+            STEP_SCRIPTS[step],
+            args,
+            executor_args,
+        )
 
         if not ok:
             _print_impl_failed()
@@ -892,10 +1088,10 @@ def _run_step(
         if args.verbose:
             test_args.append("--verbose")
 
-        return run_step("debugger", STEP_SCRIPTS["debugger"], test_args)
+        return _run_step_with_trace(step, "debugger", STEP_SCRIPTS[step], args, test_args)
 
     if step == "reporter":
-        return run_step("reporter", STEP_SCRIPTS["reporter"])
+        return _run_step_with_trace(step, "reporter", STEP_SCRIPTS[step], args)
 
     if step == "judge":
         if not tests_passed:
@@ -918,16 +1114,12 @@ def _run_step(
         return results.get("patcher_from_judge", False)
 
     if step == "archivist":
-        return run_step("archivist", STEP_SCRIPTS["archivist"])
+        return _run_step_with_trace(step, "archivist", STEP_SCRIPTS[step], args)
 
     return True
 
 
 def _retry_impl_args(executor_args: list[str]) -> list[str] | None:
-    """
-    Build --only-files args from executor_session_manifest failed_files.
-    Returns None on error.
-    """
     if not EXECUTOR_SESSION_MANIFEST.exists():
         print(
             "[harness] --retry-impl: executor_session_manifest.json not found "
@@ -987,13 +1179,14 @@ def _print_summary(
     print("  PIPELINE SUMMARY")
     print(f"{'=' * 60}")
 
-    print(f"  Scope: {args.scope}")
+    print(f"  Scope          : {args.scope}")
+    print(f"  Artifact trace : {'on' if args.trace_artifacts else 'off'}")
 
     if delta and not delta.get("is_first_run"):
         from_version = delta.get("from_version") or "?"
         to_version = delta.get("to_version", "?")
         affected_count = len(delta.get("affected_files", []))
-        print(f"  Spec : {from_version} → {to_version}  ({affected_count} file(s) affected)")
+        print(f"  Spec           : {from_version} → {to_version}  ({affected_count} file(s) affected)")
 
     for key, passed in results.items():
         icon = "✅" if passed else "❌"
@@ -1018,11 +1211,6 @@ def _print_summary(
 
 
 def _load_write_applied():
-    """
-    Load spectracker.write_applied from pipeline/01_spectracker.py.
-
-    During migration, fall back to old pipeline/spec_diff.py if present.
-    """
     candidates = [
         ROOT / "pipeline" / "01_spectracker.py",
         ROOT / "pipeline" / "spec_diff.py",
@@ -1072,18 +1260,17 @@ def _write_apply_record(delta: dict, results: dict[str, bool]) -> None:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="harness.py",
-        description="Pipeline orchestrator. Run full end-to-end or a sub-range of steps.",
+        description="Pipeline orchestrator. Runs full end-to-end or a sub-range of steps.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   python harness.py
-  python harness.py --scope full --from-clarificator
-  python harness.py --scope full --from-executor --until-debugger
-  python harness.py --scope mini --from-clarificator --until-executor
-  python harness.py --scope mini --auto-continue
-  python harness.py --scaffolder
-  python harness.py --dry-run
-  python harness.py --from-debugger --dry-run
+  python harness.py --project demo
+  python harness.py --project demo --scope full --from-clarificator
+  python harness.py --project demo --scope full --from-executor --until-debugger
+  python harness.py --project demo --scope mini --from-clarificator --until-executor
+  python harness.py --project demo --dry-run
+  python harness.py --project demo --no-trace-artifacts
 
 Legacy aliases still work:
   python harness.py --from-implement --until-test --dry-run
@@ -1091,7 +1278,6 @@ Legacy aliases still work:
 """,
     )
 
-    # ── Project ───────────────────────────────────────────────────────────────
     parser.add_argument(
         "--project",
         type=str,
@@ -1103,24 +1289,19 @@ Legacy aliases still work:
         ),
     )
 
-    # ── Scope ─────────────────────────────────────────────────────────────────
     parser.add_argument(
         "--scope",
         choices=list(SCOPE_CHOICES),
         default="full",
-        help=(
-            "Pipeline scope: 'full' runs spec-driven flow; "
-            "'mini' runs targeted planner/executor flow."
-        ),
+        help="Pipeline scope: full or mini.",
     )
 
     parser.add_argument(
         "--auto-continue",
         action="store_true",
-        help="Non-interactive: skip confirmation prompts controlled by harness.",
+        help="Non-interactive mode for harness-level prompts.",
     )
 
-    # ── Flow control: range ───────────────────────────────────────────────────
     for step in STEPS:
         parser.add_argument(
             f"--from-{step}",
@@ -1137,20 +1318,15 @@ Legacy aliases still work:
             help=f"Stop pipeline after step '{step}'.",
         )
 
-    # ── Flow control: shorthand ───────────────────────────────────────────────
     for step in STEPS:
         parser.add_argument(
             f"--{step}",
             dest=step,
             action="store_true",
-            help=(
-                f"Run only step '{step}' "
-                f"(shorthand for --from-{step} --until-{step})."
-            ),
+            help=f"Run only step '{step}'.",
         )
 
-    # ── Legacy step aliases ───────────────────────────────────────────────────
-    # Hidden from help, but kept for backward compatibility.
+    # Hidden legacy aliases.
     for legacy, canonical in LEGACY_STEP_ALIASES.items():
         parser.add_argument(
             f"--from-{legacy}",
@@ -1173,7 +1349,6 @@ Legacy aliases still work:
             help=argparse.SUPPRESS,
         )
 
-    # ── Behaviour modifiers ──────────────────────────────────────────────────
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -1202,21 +1377,21 @@ Legacy aliases still work:
         type=int,
         default=2,
         metavar="N",
-        help="Max judge→patcher→re-judge iterations (default: 2).",
+        help="Max judge→patcher→re-judge iterations.",
     )
     parser.add_argument(
         "--max-iter",
         type=int,
         default=3,
         metavar="N",
-        help="Max vitest→repair outer loops (default: 3).",
+        help="Max vitest→repair outer loops.",
     )
     parser.add_argument(
         "--max-cluster-attempts",
         type=int,
         default=2,
         metavar="N",
-        help="Max LLM repair calls per failing cluster (default: 2).",
+        help="Max LLM repair calls per failing cluster.",
     )
     parser.add_argument(
         "--verbose",
@@ -1232,9 +1407,8 @@ Legacy aliases still work:
         "--from-judge",
         action="store_true",
         help=(
-            "Skip normal flow and consume existing "
-            "execution/judge_session_verdict_raw.json, then run patcher "
-            "and one post-patch judge."
+            "Consume existing execution/judge_session_verdict_raw.json, "
+            "then run patcher and one post-patch judge."
         ),
     )
     parser.add_argument(
@@ -1245,14 +1419,31 @@ Legacy aliases still work:
         help="Pass file path as input to clarificator step.",
     )
 
-    # ── Legacy mini mode ──────────────────────────────────────────────────────
+    parser.add_argument(
+        "--trace-artifacts",
+        dest="trace_artifacts",
+        action="store_true",
+        default=True,
+        help=(
+            "Print artifact reads/writes and actual changes after each step. "
+            "Default: enabled."
+        ),
+    )
+    parser.add_argument(
+        "--no-trace-artifacts",
+        dest="trace_artifacts",
+        action="store_false",
+        help="Disable default artifact tracing.",
+    )
+
+    # Legacy mini mode.
     parser.add_argument(
         "--mini",
         type=str,
         default=None,
         metavar="PROMPT",
         help=(
-            "Legacy mini mode: targeted task delegated to pipeline/mini_mode.py. "
+            "Legacy mini mode delegated to pipeline/mini_mode.py. "
             "Prefer --scope mini."
         ),
     )
@@ -1276,7 +1467,6 @@ def main() -> None:
 
     _validate_scope(args.scope)
 
-    # ── Project resolution ────────────────────────────────────────────────────
     if not args.project:
         args.project = _interactive_project_select(ROOT)
 
@@ -1286,11 +1476,12 @@ def main() -> None:
 
     ensure_dirs()
 
-    print(f"[harness] Project  : {args.project}")
-    print(f"[harness] Workspace: {artifact_root()}")
-    print(f"[harness] Scope    : {args.scope}")
+    print(f"[harness] Project        : {args.project}")
+    print(f"[harness] Workspace      : {artifact_root()}")
+    print(f"[harness] Scope          : {args.scope}")
+    print(f"[harness] Artifact trace : {'on' if args.trace_artifacts else 'off'}")
 
-    # ── Legacy mini mode ──────────────────────────────────────────────────────
+    # Legacy mini mode.
     if args.mini is not None:
         print(
             "[harness] WARNING: --mini is legacy and delegates to pipeline/mini_mode.py.\n"
@@ -1309,9 +1500,10 @@ def main() -> None:
         )
         return
 
-    # ── --from-judge special flow ─────────────────────────────────────────────
+    # --from-judge special flow.
     if args.from_judge:
         results: dict[str, bool] = {}
+
         if args.dry_run:
             print(
                 "\n[harness] DRY RUN — would consume existing "
@@ -1323,7 +1515,6 @@ def main() -> None:
         _print_summary(results, delta=None, args=args, tests_passed=True)
         sys.exit(0 if all(results.values()) else 1)
 
-    # ── Resolve step range ────────────────────────────────────────────────────
     from_step, until_step = _resolve_run_range(args)
 
     if args.dry_run:
@@ -1334,12 +1525,11 @@ def main() -> None:
     until_idx = STEPS.index(until_step)
     steps_to_run = STEPS[from_idx:until_idx + 1]
 
-    print(f"[harness] Steps    : {from_step} → {until_step}")
-    print()
+    print(f"[harness] Steps          : {from_step} → {until_step}\n")
 
     results: dict[str, bool] = {}
 
-    # ── spectracker delta: full scope only ────────────────────────────────────
+    # Spectracker delta preflight when starting mid-pipeline.
     delta: dict | None = None
     needs_delta = (
         args.scope == "full"
@@ -1347,9 +1537,12 @@ def main() -> None:
     )
 
     if needs_delta and "spectracker" not in steps_to_run:
-        # If user starts mid-pipeline, harness still needs current delta to decide
-        # whether scaffolder/planner/executor can be skipped.
-        run_step("spectracker preflight", STEP_SCRIPTS["spectracker"])
+        _run_step_with_trace(
+            "spectracker",
+            "spectracker preflight",
+            STEP_SCRIPTS["spectracker"],
+            args,
+        )
         delta = load_delta()
 
         if delta:
@@ -1362,9 +1555,12 @@ def main() -> None:
     elif args.scope == "mini":
         print("[harness] mini scope: skipping spectracker/specwright/scaffolder contracts.")
 
-    # ── Execute steps ─────────────────────────────────────────────────────────
     tests_passed = True
-    plan_available = PLANNER_MINI_PLAN.exists() if args.scope == "mini" else PLANNER_FULL_PLAN.exists()
+    plan_available = (
+        PLANNER_MINI_PLAN.exists()
+        if args.scope == "mini"
+        else PLANNER_FULL_PLAN.exists()
+    )
 
     for step in steps_to_run:
         ok = _run_step(step, args, delta, plan_available, results, tests_passed)
@@ -1391,12 +1587,10 @@ def main() -> None:
             print(f"\n[harness] {step} failed — stopping pipeline.")
             sys.exit(1)
 
-    # ── Summary ───────────────────────────────────────────────────────────────
     _print_summary(results, delta, args, tests_passed)
 
     all_ok = all(results.values())
 
-    # Persist apply record on full-scope PASS only.
     if args.scope == "full" and all_ok and delta and "executor" in results:
         _write_apply_record(delta, results)
 
