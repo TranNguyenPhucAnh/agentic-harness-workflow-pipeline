@@ -1,7 +1,6 @@
-#!/usr/bin/env python3
 """
 04_enricher.py
-==================
+==============
 Prompt Agent — nhận clarified artifacts + knowledge layer + raw input của user,
 enrich thành một structured prompt đủ context cho model xịn downstream (spec agent).
 
@@ -28,6 +27,10 @@ Usage:
 
 Artifacts produced (owner: enricher):
     artifacts_<slug>/execution/enricher_session_enriched_prompt.md
+
+At the end of each run, prints:
+    - artifacts read
+    - artifacts created/updated/overwritten/appended
 """
 
 from __future__ import annotations
@@ -41,18 +44,19 @@ import sys
 import textwrap
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import httpx
 
 # ── paths ─────────────────────────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from artifacts.paths import (  # type: ignore
-    CLARIFIED_REQ,
-    CLARIFICATOR_SESSION_RAW,
-    ARCHIVIST_KNOWLEDGE_LOG,
+    ABSORBER_BLAME_MAP,
     ABSORBER_CODEBASE_MAP,
     ABSORBER_CONFIG_MAP,
-    ABSORBER_BLAME_MAP,
+    ARCHIVIST_KNOWLEDGE_LOG,
+    CLARIFICATOR_SESSION_RAW,
+    CLARIFIED_REQ,
     ENRICHER_SESSION_PROMPT,
     ensure_dirs,
 )
@@ -70,9 +74,44 @@ ENRICHED_PROMPT      = ENRICHER_SESSION_PROMPT
 
 # === WRITE AUTHORITY: enricher ===
 # OWNS  : artifacts_<slug>/execution/enricher_session_enriched_prompt.md
-# READS : clarificator_requirement_synthesis.md, clarificator_session_raw.json,
-#         archivist_knowledge_log.md, absorber_codebase_map.md,
-#         absorber_config_map.json, absorber_blame_map.md
+# READS : artifacts_<slug>/state/clarificator_requirement_synthesis.md
+#         artifacts_<slug>/execution/clarificator_session_raw.json
+#         artifacts_<slug>/knowledge/current/archivist_knowledge_log.md
+#         artifacts_<slug>/knowledge/current/absorber_codebase_map.md
+#         artifacts_<slug>/knowledge/current/absorber_config_map.json
+#         artifacts_<slug>/knowledge/current/absorber_blame_map.md
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Artifact access tracking
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ARTIFACTS_READ: set[str] = set()
+_ARTIFACTS_WRITTEN: set[str] = set()
+
+
+def _track_read(path: Any) -> None:
+    _ARTIFACTS_READ.add(str(path))
+
+
+def _track_write(path: Any) -> None:
+    _ARTIFACTS_WRITTEN.add(str(path))
+
+
+def _print_artifact_access_summary() -> None:
+    print("[04] Artifacts read:")
+    if _ARTIFACTS_READ:
+        for item in sorted(_ARTIFACTS_READ):
+            print(f"[04]   READ  {item}")
+    else:
+        print("[04]   READ  (none)")
+
+    print("[04] Artifacts created/updated/overwritten/appended:")
+    if _ARTIFACTS_WRITTEN:
+        for item in sorted(_ARTIFACTS_WRITTEN):
+            print(f"[04]   WRITE {item}")
+    else:
+        print("[04]   WRITE (none)")
 
 
 # ── Model config ──────────────────────────────────────────────────────────────
@@ -105,7 +144,12 @@ def _wrap(text: str, indent: int = 0) -> str:
 # LLM call — same thin wrapper pattern as clarificator
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _call_llm(system: str, user: str, model: str = _ENRICH_MODEL, max_tokens: int = _MAX_TOKENS_ENRICH) -> str:
+def _call_llm(
+    system: str,
+    user: str,
+    model: str = _ENRICH_MODEL,
+    max_tokens: int = _MAX_TOKENS_ENRICH,
+) -> str:
     if "/" in model:
         api_key  = os.environ.get("OPENROUTER_API_KEY", "")
         base_url = "https://openrouter.ai/api/v1"
@@ -148,12 +192,14 @@ def _call_llm(system: str, user: str, model: str = _ENRICH_MODEL, max_tokens: in
 
 def _load_clarified_req() -> str:
     if CLARIFIED_REQ.exists():
+        _track_read(CLARIFIED_REQ)
         return CLARIFIED_REQ.read_text(encoding="utf-8")
     return ""
 
 
 def _load_clarification_report() -> dict:
     if CLARIFICATION_REPORT.exists():
+        _track_read(CLARIFICATION_REPORT)
         try:
             return json.loads(CLARIFICATION_REPORT.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
@@ -164,14 +210,23 @@ def _load_clarification_report() -> dict:
 def _load_knowledge_layer() -> str:
     """Load all available knowledge layer artifacts for the current project."""
     parts: list[str] = []
+
     if CODEBASE_MAP.exists():
+        _track_read(CODEBASE_MAP)
         parts.append(f"=== absorber_codebase_map.md ===\n{CODEBASE_MAP.read_text(encoding='utf-8')}")
+
     if CONFIG_MAP.exists():
+        _track_read(CONFIG_MAP)
         parts.append(f"=== absorber_config_map.json ===\n{CONFIG_MAP.read_text(encoding='utf-8')}")
+
     if BLAME_MAP.exists():
+        _track_read(BLAME_MAP)
         parts.append(f"=== absorber_blame_map.md ===\n{BLAME_MAP.read_text(encoding='utf-8')}")
+
     if KNOWLEDGE_BASE.exists():
+        _track_read(KNOWLEDGE_BASE)
         parts.append(f"=== archivist_knowledge_log.md ===\n{KNOWLEDGE_BASE.read_text(encoding='utf-8')}")
+
     return "\n\n".join(parts)
 
 
@@ -180,6 +235,7 @@ def _summarize_decisions(report: dict) -> str:
     decisions = report.get("decisions", [])
     if not decisions:
         return "(no clarification decisions recorded)"
+
     lines: list[str] = []
     for d in decisions:
         pri  = d.get("priority", "").upper()
@@ -380,21 +436,21 @@ def _open_in_editor(content: str) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _launch_spec_agent(project_name: str) -> None:
-    script = Path(__file__).parent / "09_spec_agent.py"
+    script = Path(__file__).parent / "05_specwright.py"
     if not script.exists():
-        print(f"\n[enricher][warn] 09_spec_agent.py not found at {script}")
+        print(f"\n[enricher][warn] 05_specwright.py not found at {script}")
         print(f"[enricher]       Create it first, then run:")
-        print(f"           python 09_spec_agent.py --project {project_name!r}")
+        print(f"           python 05_specwright.py --project {project_name!r}")
         return
 
-    print(f"\n[enricher] Launching spec agent → {script.name}")
+    print(f"\n[enricher] Launching specwright → {script.name}")
     try:
         subprocess.run(
             [sys.executable, str(script), "--project", project_name],
             check=False,
         )
     except KeyboardInterrupt:
-        print("\n[enricher] Spec agent interrupted.")
+        print("\n[enricher] Specwright interrupted.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -423,102 +479,108 @@ def _resolve_project(arg_project: str | None) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="04_enricher — enrich clarified requirement into a structured spec prompt"
-    )
-    parser.add_argument("--project",       metavar="NAME",
-                        help="Project workspace name. Prompted if omitted.")
-    parser.add_argument("--extra-context", metavar="TEXT", default="",
-                        help="Additional free-text context to include in the enriched prompt.")
-    parser.add_argument("--dry-run",       action="store_true",
-                        help="Run enrichment, print result, do not write files or launch spec agent.")
-    parser.add_argument("--no-review",     action="store_true",
-                        help="Skip interactive review — write and forward enriched prompt automatically.")
-    args = parser.parse_args()
-
-    # ── Resolve project ───────────────────────────────────────────────────────
-    project_name = _resolve_project(args.project)
-    os.environ["PIPELINE_PROJECT"] = project_name
-    ensure_dirs()
-    print(f"[enricher] Workspace: {project_name!r}")
-
-    # ── Load inputs ───────────────────────────────────────────────────────────
-    clarified_req = _load_clarified_req()
-    if not clarified_req.strip():
-        print(
-            "[enricher][error] clarificator_requirement_synthesis.md not found or empty.\n"
-            "           Run 03_clarificator.py first."
-        )
-        sys.exit(1)
-    print(f"[enricher] Loaded clarificator_requirement_synthesis.md ({len(clarified_req)} chars)")
-
-    report = _load_clarification_report()
-    n_decisions = len(report.get("decisions", []))
-    print(f"[enricher] Loaded clarificator_session_raw.json ({n_decisions} decisions)")
-
-    knowledge_layer = _load_knowledge_layer()
-    if knowledge_layer.strip():
-        parts = []
-        if CODEBASE_MAP.exists():   parts.append("absorber_codebase_map")
-        if CONFIG_MAP.exists():     parts.append("absorber_config_map")
-        if BLAME_MAP.exists():      parts.append("absorber_blame_map")
-        if KNOWLEDGE_BASE.exists(): parts.append("archivist_knowledge_log")
-        print(f"[enricher] Knowledge layer loaded: {', '.join(parts)}")
-    else:
-        print("[enricher] No knowledge layer found — proceeding in greenfield mode")
-
-    # ── Enrich ────────────────────────────────────────────────────────────────
-    _print_banner(f"Enriching prompt — {project_name}")
-    print("[enricher] Calling LLM to build enriched prompt ...")
-
     try:
-        enriched = _enrich(
-            project_name   = project_name,
-            clarified_req  = clarified_req,
-            report         = report,
-            knowledge_layer= knowledge_layer,
-            extra_context  = args.extra_context,
+        parser = argparse.ArgumentParser(
+            description="04_enricher — enrich clarified requirement into a structured spec prompt"
         )
-    except Exception as exc:
-        print(f"[enricher][error] Enrichment failed: {exc}")
-        sys.exit(1)
+        parser.add_argument("--project",       metavar="NAME",
+                            help="Project workspace name. Prompted if omitted.")
+        parser.add_argument("--extra-context", metavar="TEXT", default="",
+                            help="Additional free-text context to include in the enriched prompt.")
+        parser.add_argument("--dry-run",       action="store_true",
+                            help="Run enrichment, print result, do not write files or launch spec agent.")
+        parser.add_argument("--no-review",     action="store_true",
+                            help="Skip interactive review — write and forward enriched prompt automatically.")
+        args = parser.parse_args()
 
-    # ── Dry run: print and exit ───────────────────────────────────────────────
-    if args.dry_run:
-        _print_banner("Dry run — enriched prompt (not written)")
-        print(enriched.strip())
-        return
+        # ── Resolve project ───────────────────────────────────────────────────────
+        project_name = _resolve_project(args.project)
+        os.environ["PIPELINE_PROJECT"] = project_name
+        ensure_dirs()
+        print(f"[enricher] Workspace: {project_name!r}")
 
-    # ── Write enricher_session_enriched_prompt.md ────────────────────────────
-    header = (
-        f"# Enriched Prompt — {project_name}\n"
-        f"Generated: {_now_iso()}\n\n"
-        f"---\n\n"
-    )
-    final_content = header + enriched.strip() + "\n"
-    ENRICHED_PROMPT.write_text(final_content, encoding="utf-8")
-    print(f"[enricher] ✓ Enriched prompt → {ENRICHED_PROMPT}")
+        # ── Load inputs ───────────────────────────────────────────────────────────
+        clarified_req = _load_clarified_req()
+        if not clarified_req.strip():
+            print(
+                "[enricher][error] clarificator_requirement_synthesis.md not found or empty.\n"
+                "           Run 03_clarificator.py first."
+            )
+            sys.exit(1)
+        print(f"[enricher] Loaded clarificator_requirement_synthesis.md ({len(clarified_req)} chars)")
 
-    # ── Review ────────────────────────────────────────────────────────────────
-    if args.no_review:
-        should_continue = True
-        final_prompt = enriched
-    else:
-        final_prompt, should_continue = _review_prompt(enriched)
-        # If user edited, overwrite the written file with updated content
-        if final_prompt != enriched:
-            updated = header + final_prompt.strip() + "\n"
-            ENRICHED_PROMPT.write_text(updated, encoding="utf-8")
-            print(f"[enricher] ✓ Enriched prompt updated → {ENRICHED_PROMPT}")
+        report = _load_clarification_report()
+        n_decisions = len(report.get("decisions", []))
+        print(f"[enricher] Loaded clarificator_session_raw.json ({n_decisions} decisions)")
 
-    if not should_continue:
-        _print_banner("Stopped — enricher_session_enriched_prompt.md saved for manual review")
-        print(f"  Review:   {ENRICHED_PROMPT}")
-        print(f"  Continue: python 09_spec_agent.py --project {project_name!r}\n")
-        return
+        knowledge_layer = _load_knowledge_layer()
+        if knowledge_layer.strip():
+            parts = []
+            if CODEBASE_MAP.exists():   parts.append("absorber_codebase_map")
+            if CONFIG_MAP.exists():     parts.append("absorber_config_map")
+            if BLAME_MAP.exists():      parts.append("absorber_blame_map")
+            if KNOWLEDGE_BASE.exists(): parts.append("archivist_knowledge_log")
+            print(f"[enricher] Knowledge layer loaded: {', '.join(parts)}")
+        else:
+            print("[enricher] No knowledge layer found — proceeding in greenfield mode")
 
-    # ── Launch spec agent ─────────────────────────────────────────────────────
-    _launch_spec_agent(project_name)
+        # ── Enrich ────────────────────────────────────────────────────────────────
+        _print_banner(f"Enriching prompt — {project_name}")
+        print("[enricher] Calling LLM to build enriched prompt ...")
+
+        try:
+            enriched = _enrich(
+                project_name   = project_name,
+                clarified_req  = clarified_req,
+                report         = report,
+                knowledge_layer= knowledge_layer,
+                extra_context  = args.extra_context,
+            )
+        except Exception as exc:
+            print(f"[enricher][error] Enrichment failed: {exc}")
+            sys.exit(1)
+
+        # ── Dry run: print and exit ───────────────────────────────────────────────
+        if args.dry_run:
+            _print_banner("Dry run — enriched prompt (not written)")
+            print(enriched.strip())
+            return
+
+        # ── Write enricher_session_enriched_prompt.md ────────────────────────────
+        header = (
+            f"# Enriched Prompt — {project_name}\n"
+            f"Generated: {_now_iso()}\n\n"
+            f"---\n\n"
+        )
+        final_content = header + enriched.strip() + "\n"
+        ENRICHED_PROMPT.write_text(final_content, encoding="utf-8")
+        _track_write(ENRICHED_PROMPT)
+        print(f"[enricher] ✓ Enriched prompt → {ENRICHED_PROMPT}")
+
+        # ── Review ────────────────────────────────────────────────────────────────
+        if args.no_review:
+            should_continue = True
+            final_prompt = enriched
+        else:
+            final_prompt, should_continue = _review_prompt(enriched)
+            # If user edited, overwrite the written file with updated content
+            if final_prompt != enriched:
+                updated = header + final_prompt.strip() + "\n"
+                ENRICHED_PROMPT.write_text(updated, encoding="utf-8")
+                _track_write(ENRICHED_PROMPT)
+                print(f"[enricher] ✓ Enriched prompt updated → {ENRICHED_PROMPT}")
+
+        if not should_continue:
+            _print_banner("Stopped — enricher_session_enriched_prompt.md saved for manual review")
+            print(f"  Review:   {ENRICHED_PROMPT}")
+            print(f"  Continue: python 05_specwright.py --project {project_name!r}\n")
+            return
+
+        # ── Launch spec agent ─────────────────────────────────────────────────────
+        _launch_spec_agent(project_name)
+
+    finally:
+        _print_artifact_access_summary()
 
 
 if __name__ == "__main__":
