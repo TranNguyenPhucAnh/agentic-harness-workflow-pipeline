@@ -1,7 +1,7 @@
 """
 pipeline/07_planner.py
-=============================
-Step 3b — GLM 5.1 as PLANNER (reasoning-heavy, no code output).
+======================
+Step 7 — GLM 5.1 as PLANNER (reasoning-heavy, no code output).
 
 This script supports two scopes:
 
@@ -10,15 +10,15 @@ FULL SCOPE
 Spec-driven planner for the full pipeline.
 
 Reads:
-    artifacts_<slug>/spec.md
-    artifacts_<slug>/cache/spec_compressed.md          optional preferred spec source
-    artifacts_<slug>/state/scaffold.json
+    artifacts_<slug>/specwright_spec_<slug>.md
+    artifacts_<slug>/cache/scaffolder_compressed_spec.md          optional preferred spec source
+    artifacts_<slug>/state/scaffolder_codebase_skeleton.json
 
 Writes:
-    artifacts_<slug>/state/plan.json
+    artifacts_<slug>/state/planner_full_execution_plan.json
 
 Consumed by:
-    pipeline/03a_implement_qwen.py --scope full --use-glm-plan
+    pipeline/08_executor.py --scope full --use-glm-plan
 
 
 MINI SCOPE
@@ -26,25 +26,26 @@ MINI SCOPE
 Targeted planner for small daily-driver tasks.
 
 Reads:
-    artifacts_<slug>/state/clarified_requirement.md
-    artifacts_<slug>/state/enriched_prompt.md          optional
-    artifacts_<slug>/knowledge/current/base.md         optional
-    artifacts_<slug>/knowledge/current/codebase_map.md optional
-    artifacts_<slug>/knowledge/current/config_map.json optional
-    artifacts_<slug>/knowledge/current/findings.md     optional
-    artifacts_<slug>/knowledge/current/findings_notes.md optional
-    artifacts_<slug>/knowledge/current/spec_addendum.md optional
+    artifacts_<slug>/state/clarificator_requirement_synthesis.md
+    artifacts_<slug>/execution/enricher_session_enriched_prompt.md          optional
+    artifacts_<slug>/execution/clarificator_session_raw.json                optional
+    artifacts_<slug>/knowledge/current/archivist_knowledge_log.md           optional
+    artifacts_<slug>/knowledge/current/absorber_codebase_map.md             optional
+    artifacts_<slug>/knowledge/current/absorber_config_map.json             optional
+    artifacts_<slug>/knowledge/current/absorber_blame_map.md                optional
+    artifacts_<slug>/knowledge/current/patcher_findings_snapshot.md         optional
+    artifacts_<slug>/knowledge/current/archivist_spec_gaps.md               optional
 
 Writes:
-    artifacts_<slug>/state/plan_mini.json
-    artifacts_<slug>/run/analysis_mini.json
+    artifacts_<slug>/state/planner_mini_execution_plan.json
+    artifacts_<slug>/state/planner_mini_impact_analysis.json
 
 Consumed by:
-    pipeline/03a_implement_qwen.py --scope mini --use-glm-plan
+    pipeline/08_executor.py --scope mini --use-glm-plan
 
-Does NOT write any src/ files. 03a_implement_qwen.py is the sole executor.
+Does NOT write any src/ files. 08_executor.py is the sole executor.
 
-For taxonomy details see docs/artifacts.md
+For taxonomy details see artifacts/TAXONOMY.md
 """
 
 from __future__ import annotations
@@ -66,42 +67,49 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 MODEL = "z-ai/glm-5.1"
 
 
-# === WRITE AUTHORITY: 03b_implement_glm ===
+# === WRITE AUTHORITY: planner ===
 # OWNS full:
-#   artifacts_<slug>/state/plan.json
+#   artifacts_<slug>/state/planner_full_execution_plan.json
 #
 # OWNS mini:
-#   artifacts_<slug>/state/plan_mini.json
-#   artifacts_<slug>/run/analysis_mini.json
+#   artifacts_<slug>/state/planner_mini_execution_plan.json
+#   artifacts_<slug>/state/planner_mini_impact_analysis.json
 #
 # READS full:
-#   artifacts_<slug>/spec.md
-#   artifacts_<slug>/cache/spec_compressed.md
-#   artifacts_<slug>/state/scaffold.json
+#   artifacts_<slug>/specwright_spec_<slug>.md
+#   artifacts_<slug>/cache/scaffolder_compressed_spec.md
+#   artifacts_<slug>/state/scaffolder_codebase_skeleton.json
 #
 # READS mini:
-#   artifacts_<slug>/state/clarified_requirement.md
-#   artifacts_<slug>/state/enriched_prompt.md
-#   artifacts_<slug>/knowledge/current/*
+#   artifacts_<slug>/state/clarificator_requirement_synthesis.md
+#   artifacts_<slug>/execution/enricher_session_enriched_prompt.md
+#   artifacts_<slug>/execution/clarificator_session_raw.json
+#   artifacts_<slug>/knowledge/current/archivist_knowledge_log.md
+#   artifacts_<slug>/knowledge/current/absorber_codebase_map.md
+#   artifacts_<slug>/knowledge/current/absorber_config_map.json
+#   artifacts_<slug>/knowledge/current/absorber_blame_map.md
+#   artifacts_<slug>/knowledge/current/patcher_findings_snapshot.md
+#   artifacts_<slug>/knowledge/current/archivist_spec_gaps.md
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from artifacts.paths import (  # noqa: E402
-    SPEC_PATH,
-    SPEC_COMPRESSED,
-    SCAFFOLD_JSON,
-    PLAN_JSON,
-    PLAN_MINI,
-    ANALYSIS_MINI,
+    ABSORBER_BLAME_MAP,
+    ABSORBER_CODEBASE_MAP,
+    ABSORBER_CONFIG_MAP,
+    ARCHIVIST_KNOWLEDGE_LOG,
+    ARCHIVIST_SPEC_GAPS,
+    CLARIFICATOR_SESSION_RAW,
     CLARIFIED_REQ,
-    ENRICHED_PROMPT,
-    KNOWLEDGE_BASE,
-    CODEBASE_MAP,
-    CONFIG_MAP,
-    FINDINGS,
-    FINDINGS_NOTES,
-    SPEC_ADDENDUM,
+    ENRICHER_SESSION_PROMPT,
+    PATCHER_FINDINGS_SNAPSHOT,
+    PLANNER_FULL_PLAN,
+    PLANNER_MINI_IMPACT,
+    PLANNER_MINI_PLAN,
+    SCAFFOLD_JSON,
+    SCAFFOLDER_COMPRESSED_SPEC,
     ensure_dirs,
+    get_spec_path,
 )
 
 
@@ -245,8 +253,8 @@ You are planning a small, focused change to an existing project.
 
 Your job is NOT to write code.
 Your job is to analyze the request and produce:
-1. A targeted implementation plan: plan_mini.json
-2. A lightweight impact/risk analysis: analysis_mini.json
+1. A targeted implementation plan: planner_mini_execution_plan.json
+2. A lightweight impact/risk analysis: planner_mini_impact_analysis.json
 
 You must be conservative:
 - Do NOT broaden the task.
@@ -254,18 +262,20 @@ You must be conservative:
 - Do NOT modify unrelated files.
 - Preserve existing public APIs unless the request explicitly requires an API change.
 - Prefer the smallest safe set of target files.
-- If unsure whether a file must change, put it in analysis_mini.recommendations or warnings, NOT target_files.
+- If unsure whether a file must change, put it in planner_mini_impact_analysis.recommendations or warnings, NOT target_files.
 
 You will receive:
 - The clarified user request.
 - Optional enriched prompt.
+- Optional clarificator session metadata.
 - Optional project knowledge.
-- Optional codebase/config maps.
-- Optional previous findings.
+- Optional codebase/config/blame maps.
+- Optional previous patcher findings.
+- Optional known spec gaps.
 
 Return ONE raw JSON object with exactly this top-level shape:
 {
-  "plan_mini": {
+  "planner_mini_execution_plan": {
     "plan_version": "1.0.0",
     "scope": "mini",
     "task_summary": "Short description of the requested change",
@@ -297,7 +307,7 @@ Return ONE raw JSON object with exactly this top-level shape:
       "Do not refactor navbar layout"
     ]
   },
-  "analysis_mini": {
+  "planner_mini_impact_analysis": {
     "scope": "mini",
     "possible_changes": [
       {
@@ -337,13 +347,69 @@ Allowed risk values:
 Rules:
 - target_files must contain only files that should be changed by the implementer.
 - Use repo-relative paths only.
-- Do not include artifact paths such as artifacts_*/, state/*, run/*, cache/*, knowledge/*, reports/*.
-- Do not include spec.md unless the user explicitly asks to update spec.md.
+- Do not include artifact paths such as artifacts_*/, state/*, execution/*, run/*, cache/*, knowledge/*, reports/*.
+- Do not include spec.md or specwright_spec_<slug>.md unless the user explicitly asks to update the canonical spec.
 - If a test file should be added/updated, include it either in target_files or test_suggestions depending on whether implementation should patch it.
 - Keep instructions concrete and actionable.
-- analysis_mini should explain risks and impacts, but it must not authorize broad rewrites.
+- planner_mini_impact_analysis should explain risks and impacts, but it must not authorize broad rewrites.
 - Output raw JSON only. No markdown fences. No explanation outside JSON.
 """
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# CLI / project setup
+# ════════════════════════════════════════════════════════════════════════════
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="07_planner.py",
+        description=(
+            "GLM planner step. Writes planner_full_execution_plan.json "
+            "or planner_mini_execution_plan.json + planner_mini_impact_analysis.json."
+        ),
+    )
+    parser.add_argument(
+        "--project",
+        default=None,
+        help=(
+            "Project name for direct execution. Sets PIPELINE_PROJECT before "
+            "resolving artifact paths."
+        ),
+    )
+    parser.add_argument(
+        "--scope",
+        choices=["full", "mini"],
+        default="full",
+        help=(
+            "Planner scope. full writes state/planner_full_execution_plan.json; "
+            "mini writes state/planner_mini_execution_plan.json and "
+            "state/planner_mini_impact_analysis.json."
+        ),
+    )
+    return parser
+
+
+def _configure_project(
+    project: str | None,
+    parser: argparse.ArgumentParser,
+) -> None:
+    """
+    Configure project context for direct execution.
+
+    Harness normally sets PIPELINE_PROJECT before invoking this script.
+    Direct usage can pass --project.
+    """
+    if project:
+        os.environ["PIPELINE_PROJECT"] = project
+        return
+
+    if os.environ.get("PIPELINE_PROJECT"):
+        return
+
+    parser.error(
+        "PIPELINE_PROJECT is not set. Use --project <name> or export "
+        "PIPELINE_PROJECT=<name> before running 07_planner.py directly."
+    )
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -368,13 +434,18 @@ def _read_optional(path: Any, *, max_chars: int | None = None) -> str:
     try:
         if not path.exists():
             return ""
-        text = path.read_text(encoding="utf-8") if hasattr(path, "read_text") else Path(path).read_text(encoding="utf-8")
+
+        if hasattr(path, "read_text"):
+            text = path.read_text(encoding="utf-8")
+        else:
+            text = Path(path).read_text(encoding="utf-8")
+
         text = text.strip()
         if max_chars is not None and len(text) > max_chars:
             return text[:max_chars] + f"\n\n<!-- truncated at {max_chars} chars -->"
         return text
     except Exception as exc:
-        print(f"[03b] WARNING: could not read {path}: {exc}", file=sys.stderr)
+        print(f"[07] WARNING: could not read {path}: {exc}", file=sys.stderr)
         return ""
 
 
@@ -417,12 +488,12 @@ def _parse_json(raw: str, label: str) -> dict:
                 raise RuntimeError(f"{label} parsed as {type(parsed).__name__}, expected object.")
             return parsed
         except json.JSONDecodeError as exc:
-            print(f"[03b] JSON parse failed for {label}: {exc}", file=sys.stderr)
-            print(f"[03b] Raw output (first 1000 chars):\n{raw[:1000]}", file=sys.stderr)
+            print(f"[07] JSON parse failed for {label}: {exc}", file=sys.stderr)
+            print(f"[07] Raw output (first 1000 chars):\n{raw[:1000]}", file=sys.stderr)
             raise RuntimeError(f"Could not parse JSON from {label}") from exc
 
-    print(f"[03b] No JSON object found in {label}.", file=sys.stderr)
-    print(f"[03b] Raw output (first 1000 chars):\n{raw[:1000]}", file=sys.stderr)
+    print(f"[07] No JSON object found in {label}.", file=sys.stderr)
+    print(f"[07] Raw output (first 1000 chars):\n{raw[:1000]}", file=sys.stderr)
     raise RuntimeError(f"No JSON object found in {label}")
 
 
@@ -468,7 +539,7 @@ def _call_glm_json(
         "Content-Type": "application/json",
     }
 
-    print(f"[03b] Calling GLM 5.1 ({label}) …")
+    print(f"[07] Calling GLM 5.1 ({label}) …")
 
     last_error: Exception | None = None
 
@@ -482,16 +553,16 @@ def _call_glm_json(
                 usage = data.get("usage", {})
                 prompt_t = usage.get("prompt_tokens", "?")
                 completion_t = usage.get("completion_tokens", "?")
-                print(f"[03b] Tokens: prompt={prompt_t}, completion={completion_t}")
+                print(f"[07] Tokens: prompt={prompt_t}, completion={completion_t}")
 
                 return _extract_chat_json_response(data, label=label)
 
             except Exception as exc:
                 last_error = exc
-                print(f"[03b] {label} failed: {exc}", file=sys.stderr)
+                print(f"[07] {label} failed: {exc}", file=sys.stderr)
 
                 if attempt == 0:
-                    print("[03b] Retrying in 3s …", file=sys.stderr)
+                    print("[07] Retrying in 3s …", file=sys.stderr)
                     time.sleep(3)
 
     raise RuntimeError(f"{label} failed after retries: {last_error}")
@@ -503,25 +574,35 @@ def _call_glm_json(
 
 def _load_full_spec() -> str:
     """
-    Use compressed spec if available, fallback to full spec.
+    Use scaffolder compressed spec if available, fallback to canonical spec.
     """
-    if SPEC_COMPRESSED.exists():
-        return SPEC_COMPRESSED.read_text(encoding="utf-8")
-    return SPEC_PATH.read_text(encoding="utf-8")
+    if SCAFFOLDER_COMPRESSED_SPEC.exists():
+        return SCAFFOLDER_COMPRESSED_SPEC.read_text(encoding="utf-8")
+
+    spec_path = get_spec_path()
+    if not spec_path.exists():
+        raise FileNotFoundError(
+            f"Missing canonical spec: {spec_path}\n"
+            "Run specwright first, for example:\n"
+            "  python harness.py --project <name> --scope full"
+        )
+
+    return spec_path.read_text(encoding="utf-8")
 
 
 def _load_scaffold() -> dict:
     if not SCAFFOLD_JSON.exists():
         raise FileNotFoundError(
             f"Missing scaffold: {SCAFFOLD_JSON}\n"
-            "Run scaffold first: python harness.py --scope full --scaffold"
+            "Run scaffolder first, for example:\n"
+            "  python harness.py --project <name> --scope full --scaffold"
         )
     return json.loads(SCAFFOLD_JSON.read_text(encoding="utf-8"))
 
 
 def call_glm_full_planner(spec: str, stub_files: list[dict]) -> dict:
     user_message = (
-        f"### spec.md\n\n{spec}\n\n"
+        f"### canonical spec\n\n{spec}\n\n"
         f"### scaffold stub files\n\n"
         f"{json.dumps(stub_files, indent=2, ensure_ascii=False)}"
     )
@@ -541,7 +622,7 @@ def validate_full_plan(plan: dict, stub_files: list[dict]) -> None:
     """
     tasks = plan.get("tasks", [])
     if not isinstance(tasks, list):
-        print("[03b] WARNING: plan.tasks is not a list", file=sys.stderr)
+        print("[07] WARNING: plan.tasks is not a list", file=sys.stderr)
         tasks = []
 
     planned = {
@@ -553,20 +634,20 @@ def validate_full_plan(plan: dict, stub_files: list[dict]) -> None:
     for file_entry in stub_files:
         fp = file_entry.get("file_path")
         if fp and fp not in planned:
-            print(f"[03b] WARNING: stub file not covered by plan: {fp}")
+            print(f"[07] WARNING: stub file not covered by plan: {fp}")
 
     required_keys = {"plan_version", "tasks", "implementation_order"}
     missing = required_keys - set(plan.keys())
     if missing:
-        print(f"[03b] WARNING: plan missing keys: {missing}")
+        print(f"[07] WARNING: plan missing keys: {missing}")
 
     if "scope" not in plan:
         plan["scope"] = "full"
 
     if "stack" not in plan:
-        print("[03b] WARNING: plan missing 'stack' — framework quirks may be generic")
+        print("[07] WARNING: plan missing 'stack' — framework quirks may be generic")
     else:
-        print(f"[03b] Stack detected: {json.dumps(plan['stack'], indent=2, ensure_ascii=False)}")
+        print(f"[07] Stack detected: {json.dumps(plan['stack'], indent=2, ensure_ascii=False)}")
 
 
 def run_full_scope() -> None:
@@ -575,7 +656,10 @@ def run_full_scope() -> None:
 
     files = scaffold.get("files", [])
     if not isinstance(files, list):
-        raise RuntimeError("Invalid scaffold.json: expected top-level key 'files' to be a list.")
+        raise RuntimeError(
+            "Invalid scaffolder_codebase_skeleton.json: expected top-level key "
+            "'files' to be a list."
+        )
 
     stub_files = [
         file_entry
@@ -583,19 +667,22 @@ def run_full_scope() -> None:
         if isinstance(file_entry, dict) and not file_entry.get("is_test")
     ]
 
-    print(f"[03b] Scope: full")
-    print(f"[03b] Planning {len(stub_files)} non-test stub file(s) …")
+    print("[07] Scope: full")
+    print(f"[07] Planning {len(stub_files)} non-test stub file(s) …")
 
     plan = call_glm_full_planner(spec, stub_files)
     validate_full_plan(plan, stub_files)
 
-    PLAN_JSON.parent.mkdir(parents=True, exist_ok=True)
-    PLAN_JSON.write_text(json.dumps(plan, indent=2, ensure_ascii=False), encoding="utf-8")
+    PLANNER_FULL_PLAN.parent.mkdir(parents=True, exist_ok=True)
+    PLANNER_FULL_PLAN.write_text(
+        json.dumps(plan, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
 
-    print(f"[03b] Plan written → {PLAN_JSON}")
-    print(f"[03b] Tasks in plan: {len(plan.get('tasks', []))}")
-    print(f"[03b] Implementation order: {plan.get('implementation_order', [])}")
-    print("[03b] Done. Pass --use-glm-plan to 03a_implement_qwen.py to use this plan.")
+    print(f"[07] Full plan written → {PLANNER_FULL_PLAN}")
+    print(f"[07] Tasks in plan: {len(plan.get('tasks', []))}")
+    print(f"[07] Implementation order: {plan.get('implementation_order', [])}")
+    print("[07] Done. Pass --use-glm-plan to 08_executor.py to use this plan.")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -607,21 +694,21 @@ def _load_mini_request() -> str:
     Load the mini request.
 
     Preferred:
-      1. state/enriched_prompt.md
-      2. state/clarified_requirement.md
+      1. execution/enricher_session_enriched_prompt.md
+      2. state/clarificator_requirement_synthesis.md
 
-    enriched_prompt is optional and may include richer context generated by
-    future harness/state-machine steps. clarified_requirement is the canonical
-    minimum input for mini planning.
+    enricher_session_enriched_prompt is optional and may include richer context
+    generated by the enricher. clarificator_requirement_synthesis is the
+    canonical minimum input for mini planning.
     """
-    enriched = _read_optional(ENRICHED_PROMPT, max_chars=20_000)
+    enriched = _read_optional(ENRICHER_SESSION_PROMPT, max_chars=20_000)
     clarified = _read_optional(CLARIFIED_REQ, max_chars=20_000)
 
     if enriched and clarified:
         return (
             "### Enriched prompt\n"
             f"{enriched}\n\n"
-            "### Clarified requirement\n"
+            "### Clarified requirement synthesis\n"
             f"{clarified}"
         )
 
@@ -634,11 +721,11 @@ def _load_mini_request() -> str:
     raise FileNotFoundError(
         "Mini planner requires a clarified request.\n"
         f"Missing both:\n"
-        f"  - {ENRICHED_PROMPT}\n"
+        f"  - {ENRICHER_SESSION_PROMPT}\n"
         f"  - {CLARIFIED_REQ}\n\n"
-        "Run clarify first, for example:\n"
-        "  python harness.py --scope mini --clarify\n"
-        "or provide/create state/clarified_requirement.md."
+        "Run clarificator/enricher first, for example:\n"
+        "  python harness.py --project <name> --scope mini --clarify\n"
+        "or provide/create state/clarificator_requirement_synthesis.md."
     )
 
 
@@ -650,16 +737,56 @@ def _load_mini_context_bundle() -> str:
     sections: list[str] = []
 
     sources: list[tuple[str, Any, str, int]] = [
-        ("knowledge/current/base.md", KNOWLEDGE_BASE, "text", 30_000),
-        ("knowledge/current/codebase_map.md", CODEBASE_MAP, "text", 35_000),
-        ("knowledge/current/config_map.json", CONFIG_MAP, "json", 20_000),
-        ("knowledge/current/findings.md", FINDINGS, "text", 20_000),
-        ("knowledge/current/findings_notes.md", FINDINGS_NOTES, "text", 15_000),
-        ("knowledge/current/spec_addendum.md", SPEC_ADDENDUM, "text", 15_000),
+        (
+            "execution/clarificator_session_raw.json",
+            CLARIFICATOR_SESSION_RAW,
+            "json",
+            20_000,
+        ),
+        (
+            "knowledge/current/archivist_knowledge_log.md",
+            ARCHIVIST_KNOWLEDGE_LOG,
+            "text",
+            30_000,
+        ),
+        (
+            "knowledge/current/absorber_codebase_map.md",
+            ABSORBER_CODEBASE_MAP,
+            "text",
+            35_000,
+        ),
+        (
+            "knowledge/current/absorber_config_map.json",
+            ABSORBER_CONFIG_MAP,
+            "json",
+            20_000,
+        ),
+        (
+            "knowledge/current/absorber_blame_map.md",
+            ABSORBER_BLAME_MAP,
+            "text",
+            20_000,
+        ),
+        (
+            "knowledge/current/patcher_findings_snapshot.md",
+            PATCHER_FINDINGS_SNAPSHOT,
+            "text",
+            20_000,
+        ),
+        (
+            "knowledge/current/archivist_spec_gaps.md",
+            ARCHIVIST_SPEC_GAPS,
+            "text",
+            15_000,
+        ),
     ]
 
     for label, path, kind, cap in sources:
-        text = _read_json_optional(path, max_chars=cap) if kind == "json" else _read_optional(path, max_chars=cap)
+        text = (
+            _read_json_optional(path, max_chars=cap)
+            if kind == "json"
+            else _read_optional(path, max_chars=cap)
+        )
         if text:
             sections.append(f"### {label}\n{text}")
 
@@ -708,12 +835,16 @@ def _is_disallowed_target_path(path: str) -> bool:
     blocked_prefixes = (
         "artifacts_",
         "state/",
-        "run/",
         "cache/",
+        "execution/",
+        "run/",       # legacy artifact dir, still blocked for safety
         "knowledge/",
         "reports/",
     )
-    if normalized == "spec.md":
+
+    if normalized in {"spec.md"}:
+        return True
+    if normalized.startswith("specwright_spec_") and normalized.endswith(".md"):
         return True
     if normalized.startswith(blocked_prefixes):
         return True
@@ -724,21 +855,30 @@ def _is_disallowed_target_path(path: str) -> bool:
 
 def validate_and_normalize_mini_result(result: dict) -> tuple[dict, dict]:
     """
-    Validate and normalize model output into (plan_mini, analysis_mini).
+    Validate and normalize model output into
+    (planner_mini_execution_plan, planner_mini_impact_analysis).
+
+    Backward compatibility:
+    - Accepts old top-level keys "plan_mini" and "analysis_mini".
+    - Accepts direct mini plan object if it has scope=mini and target_files.
     """
-    if "plan_mini" not in result:
-        # Be forgiving if the model returned the plan directly.
-        if result.get("scope") == "mini" and "target_files" in result:
-            plan = result
-            analysis = {}
-        else:
-            raise RuntimeError("Mini planner response missing top-level 'plan_mini'.")
-    else:
+    if "planner_mini_execution_plan" in result:
+        plan = result.get("planner_mini_execution_plan") or {}
+        analysis = result.get("planner_mini_impact_analysis") or {}
+    elif "plan_mini" in result:
         plan = result.get("plan_mini") or {}
         analysis = result.get("analysis_mini") or {}
+    elif result.get("scope") == "mini" and "target_files" in result:
+        plan = result
+        analysis = {}
+    else:
+        raise RuntimeError(
+            "Mini planner response missing top-level "
+            "'planner_mini_execution_plan'."
+        )
 
     if not isinstance(plan, dict):
-        raise RuntimeError("plan_mini must be a JSON object.")
+        raise RuntimeError("planner_mini_execution_plan must be a JSON object.")
     if not isinstance(analysis, dict):
         analysis = {}
 
@@ -753,7 +893,7 @@ def validate_and_normalize_mini_result(result: dict) -> tuple[dict, dict]:
     if not isinstance(plan["constraints"], list):
         plan["constraints"] = [str(plan["constraints"])]
     if not isinstance(plan["target_files"], list):
-        raise RuntimeError("plan_mini.target_files must be a list.")
+        raise RuntimeError("planner_mini_execution_plan.target_files must be a list.")
     if not isinstance(plan["test_suggestions"], list):
         plan["test_suggestions"] = []
     if not isinstance(plan["out_of_scope"], list):
@@ -762,12 +902,12 @@ def validate_and_normalize_mini_result(result: dict) -> tuple[dict, dict]:
     normalized_targets: list[dict] = []
     for raw_entry in plan["target_files"]:
         if not isinstance(raw_entry, dict):
-            print(f"[03b] WARNING: skipping invalid target_files entry: {raw_entry!r}")
+            print(f"[07] WARNING: skipping invalid target_files entry: {raw_entry!r}")
             continue
 
         path = str(raw_entry.get("path", "")).replace("\\", "/").strip().lstrip("/")
         if _is_disallowed_target_path(path):
-            print(f"[03b] WARNING: dropping disallowed target path: {path!r}")
+            print(f"[07] WARNING: dropping disallowed target path: {path!r}")
             continue
 
         instructions = raw_entry.get("instructions", [])
@@ -781,7 +921,11 @@ def validate_and_normalize_mini_result(result: dict) -> tuple[dict, dict]:
                 "path": path,
                 "action": _normalize_target_action(raw_entry.get("action")),
                 "reason": str(raw_entry.get("reason", "")).strip(),
-                "instructions": [str(item).strip() for item in instructions if str(item).strip()],
+                "instructions": [
+                    str(item).strip()
+                    for item in instructions
+                    if str(item).strip()
+                ],
                 "risk": _normalize_risk(raw_entry.get("risk")),
             }
         )
@@ -789,7 +933,7 @@ def validate_and_normalize_mini_result(result: dict) -> tuple[dict, dict]:
     plan["target_files"] = normalized_targets
 
     if not plan["target_files"]:
-        print("[03b] WARNING: mini plan has no target_files. Implementer may have nothing to do.")
+        print("[07] WARNING: mini plan has no target_files. Implementer may have nothing to do.")
 
     analysis.setdefault("scope", "mini")
     analysis["scope"] = "mini"
@@ -808,62 +952,56 @@ def validate_and_normalize_mini_result(result: dict) -> tuple[dict, dict]:
 
 
 def run_mini_scope() -> None:
-    print("[03b] Scope: mini")
-    print("[03b] Building targeted mini plan …")
+    print("[07] Scope: mini")
+    print("[07] Building targeted mini plan …")
 
     request = _load_mini_request()
     context_bundle = _load_mini_context_bundle()
 
-    print(f"[03b] Request context: {len(request)} chars")
+    print(f"[07] Request context: {len(request)} chars")
     if context_bundle:
-        print(f"[03b] Knowledge context: {len(context_bundle)} chars")
+        print(f"[07] Knowledge context: {len(context_bundle)} chars")
     else:
-        print("[03b] Knowledge context: none")
+        print("[07] Knowledge context: none")
 
     result = call_glm_mini_planner(request, context_bundle)
-    plan_mini, analysis_mini = validate_and_normalize_mini_result(result)
+    plan_mini, impact_analysis = validate_and_normalize_mini_result(result)
 
-    PLAN_MINI.parent.mkdir(parents=True, exist_ok=True)
-    ANALYSIS_MINI.parent.mkdir(parents=True, exist_ok=True)
+    PLANNER_MINI_PLAN.parent.mkdir(parents=True, exist_ok=True)
+    PLANNER_MINI_IMPACT.parent.mkdir(parents=True, exist_ok=True)
 
-    PLAN_MINI.write_text(
+    PLANNER_MINI_PLAN.write_text(
         json.dumps(plan_mini, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
-    ANALYSIS_MINI.write_text(
-        json.dumps(analysis_mini, indent=2, ensure_ascii=False),
+    PLANNER_MINI_IMPACT.write_text(
+        json.dumps(impact_analysis, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
 
-    print(f"[03b] Mini plan written     → {PLAN_MINI}")
-    print(f"[03b] Mini analysis written → {ANALYSIS_MINI}")
-    print(f"[03b] Target files: {len(plan_mini.get('target_files', []))}")
+    print(f"[07] Mini plan written            → {PLANNER_MINI_PLAN}")
+    print(f"[07] Mini impact analysis written → {PLANNER_MINI_IMPACT}")
+    print(f"[07] Target files: {len(plan_mini.get('target_files', []))}")
     for entry in plan_mini.get("target_files", []):
-        print(f"  - {entry.get('action', 'MODIFY'):<6} {entry.get('path')}  risk={entry.get('risk')}")
-    print("[03b] Done. Pass --scope mini --use-glm-plan to 03a_implement_qwen.py.")
+        print(
+            f"  - {entry.get('action', 'MODIFY'):<6} "
+            f"{entry.get('path')}  risk={entry.get('risk')}"
+        )
+    print("[07] Done. Pass --scope mini --use-glm-plan to 08_executor.py.")
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# CLI
+# Main
 # ════════════════════════════════════════════════════════════════════════════
-
-def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="03b_implement_glm.py",
-        description="GLM planner step. Writes full plan.json or mini plan_mini.json.",
-    )
-    parser.add_argument(
-        "--scope",
-        choices=["full", "mini"],
-        default="full",
-        help="Planner scope. full writes state/plan.json; mini writes state/plan_mini.json.",
-    )
-    return parser
-
 
 def main() -> None:
-    args = _build_parser().parse_args()
+    parser = _build_parser()
+    args = parser.parse_args()
 
+    _configure_project(args.project, parser)
+
+    # Important: do not call ensure_dirs() at import-time.
+    # PIPELINE_PROJECT must be available before artifact paths are resolved.
     ensure_dirs()
 
     try:
@@ -872,10 +1010,9 @@ def main() -> None:
         else:
             run_full_scope()
     except Exception as exc:
-        print(f"[03b] ERROR: {exc}", file=sys.stderr)
+        print(f"[07] ERROR: {exc}", file=sys.stderr)
         sys.exit(1)
 
 
 if __name__ == "__main__":
     main()
-```
