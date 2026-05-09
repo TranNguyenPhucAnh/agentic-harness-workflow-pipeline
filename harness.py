@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 harness.py — Orchestrator for the LLM pipeline.
 
@@ -7,30 +6,34 @@ Each script in pipeline/ is a pure step runner: executes one step,
 writes owned artifacts, exits. No step script navigates the pipeline.
 
 Pipeline steps (canonical order):
-    absorb      01_absorber.py         — scan codebase, build knowledge maps
-    clarify     00_clarificator.py     — clarify requirements interactively
-    scaffold    02_scaffold_gemini.py  — generate stub files + test files
-    plan        03b_implement_glm.py   — decompose work into ordered task plan
-    implement   03a_implement_qwen.py  — implement src/ files guided by plan
-    test        04_test_and_iterate.py — vitest loop with Qwen+Minimax repair
-    report      05_report.py           — aggregate summary.md
-    judge       06_judge_deepseek.py   — qualitative review + sign-off
-    fix         07_fix_from_judge.py   — auto-patch NEEDS_REVISION findings
-                └─ re-runs report + judge after each fix, up to --max-judge-rounds
+    spectracker   01_spectracker.py    — track spec version delta, decide reruns
+    absorber      02_absorber.py       — scan codebase, build knowledge maps
+    clarificator  03_clarificator.py   — clarify requirements interactively
+    enricher      04_enricher.py       — enrich context into structured prompt
+    specwright    05_specwright.py     — generate/update canonical spec
+    scaffolder    06_scaffolder.py     — generate stub files + test files
+    planner       07_planner.py        — decompose work into ordered task plan
+    executor      08_executor.py       — implement src/ files guided by plan
+    debugger      09_debugger.py       — vitest loop + repair
+    reporter      10_reporter.py       — aggregate reporter_execution_summary.md
+    judge         11_judge.py          — qualitative review + sign-off
+    patcher       12_patcher.py        — auto-patch NEEDS_REVISION findings
+    archivist     13_archivist.py      — distill knowledge, long-term memory
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 SCOPE MODES
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   --scope full           Spec-driven full pipeline.
-                         Uses spec_diff, scaffold.json, plan.json.
+                         Uses spectracker delta, scaffolder skeleton,
+                         planner_full_execution_plan.json.
 
   --scope mini           Targeted daily-driver pipeline.
-                         Skips scaffold/spec_diff and routes planner/implementer
-                         through mini contracts:
-                             state/plan_mini.json
-                             run/analysis_mini.json
-                         Intended for small changes where spec.md does not need
+                         Skips spectracker/specwright/scaffolder and routes
+                         planner/executor through mini contracts:
+                             state/planner_mini_execution_plan.json
+                             state/planner_mini_impact_analysis.json
+                         Intended for small changes where spec does not need
                          to change.
 
   Legacy --mini PROMPT   Backward-compatible entrypoint delegated to
@@ -53,14 +56,14 @@ Generation flags:
                          from harness itself.
 
   --force                Re-run ALL full-scope generation steps even if
-                         spec_delta says nothing changed.
+                         spectracker delta says nothing changed.
 
   --dry-run              Print what WOULD run without executing anything.
 
-  --only-qwen            Skip GLM plan step; Qwen runs in single-call mode.
+  --only-qwen            Skip planner step; executor runs in single-call mode.
 
   --retry-impl           Re-implement only files listed as failed in
-                         run/impl_record.json.
+                         execution/executor_session_manifest.json.
 
 Range flags:
 
@@ -68,8 +71,14 @@ Range flags:
   --until-STEP           Stop after STEP.
   --STEP                 Run only STEP.
 
-Steps:
-  absorb, clarify, scaffold, plan, implement, test, report, judge, fix
+Canonical steps:
+  spectracker, absorber, clarificator, enricher, specwright, scaffolder,
+  planner, executor, debugger, reporter, judge, patcher, archivist
+
+Legacy step aliases still accepted:
+  absorb→absorber, clarify→clarificator, scaffold→scaffolder,
+  plan→planner, implement→executor, test→debugger,
+  report→reporter, fix→patcher
 
 Test loop flags:
 
@@ -103,6 +112,7 @@ Requirements:
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import re as _re
@@ -128,13 +138,16 @@ sys.path.insert(0, str(ROOT))
 # ensure_dirs() is called inside main() after --project is parsed and
 # PIPELINE_PROJECT env var is set. Do NOT call ensure_dirs() here.
 from artifacts.paths import (  # noqa: E402
-    SPEC_DELTA as DELTA_PATH,
-    PLAN_JSON as GLM_PLAN_PATH,
-    PLAN_MINI as MINI_PLAN_PATH,
-    IMPL_RECORD as IMPL_RECORD_PATH,
-    UPDATE_LOG as UPDATE_LOG_PATH,
-    JUDGE_RAW as JUDGE_RAW_PATH,
-    CLARIFICATION_REPORT,
+    ARCHIVIST_CURATION_LOG,
+    CLARIFICATOR_SESSION_QUESTIONS,
+    EXECUTOR_SESSION_MANIFEST,
+    JUDGE_SESSION_VERDICT_RAW,
+    JUDGE_VERDICT_SUMMARY,
+    PLANNER_FULL_PLAN,
+    PLANNER_MINI_PLAN,
+    REPORTER_EXECUTION_SUMMARY,
+    SPECTRACKER_APPLIED,
+    SPECTRACKER_VERSION_DELTA,
 )
 
 
@@ -143,36 +156,60 @@ from artifacts.paths import (  # noqa: E402
 # ════════════════════════════════════════════════════════════════════════════
 
 STEPS = [
-    "absorb",
-    "clarify",
-    "scaffold",
-    "plan",
-    "implement",
-    "test",
-    "report",
+    "spectracker",
+    "absorber",
+    "clarificator",
+    "enricher",
+    "specwright",
+    "scaffolder",
+    "planner",
+    "executor",
+    "debugger",
+    "reporter",
     "judge",
-    "fix",
+    "patcher",
+    "archivist",
 ]
 
 STEP_SCRIPTS: dict[str, str] = {
-    "absorb": "01_absorber.py",
-    "clarify": "00_clarificator.py",
-    "scaffold": "02_scaffold_gemini.py",
-    "plan": "03b_implement_glm.py",
-    "implement": "03a_implement_qwen.py",
-    "test": "04_test_and_iterate.py",
-    "report": "05_report.py",
-    "judge": "06_judge_deepseek.py",
-    "fix": "07_fix_from_judge.py",
+    "spectracker": "01_spectracker.py",
+    "absorber": "02_absorber.py",
+    "clarificator": "03_clarificator.py",
+    "enricher": "04_enricher.py",
+    "specwright": "05_specwright.py",
+    "scaffolder": "06_scaffolder.py",
+    "planner": "07_planner.py",
+    "executor": "08_executor.py",
+    "debugger": "09_debugger.py",
+    "reporter": "10_reporter.py",
+    "judge": "11_judge.py",
+    "patcher": "12_patcher.py",
+    "archivist": "13_archivist.py",
 }
 
 STEP_ENV_KEYS: dict[str, list[str]] = {
-    "scaffold": ["GEMINI_API_KEY"],
-    "plan": ["OPENROUTER_API_KEY"],
-    "implement": ["OPENROUTER_API_KEY"],
-    "test": ["OPENROUTER_API_KEY"],
+    "scaffolder": ["GEMINI_API_KEY"],
+    "planner": ["OPENROUTER_API_KEY"],
+    "executor": ["OPENROUTER_API_KEY"],
+    "debugger": ["OPENROUTER_API_KEY"],
     "judge": ["OPENROUTER_API_KEY"],
-    "fix": ["OPENROUTER_API_KEY"],
+    "patcher": ["OPENROUTER_API_KEY"],
+}
+
+LEGACY_STEP_ALIASES: dict[str, str] = {
+    "absorb": "absorber",
+    "clarify": "clarificator",
+    "scaffold": "scaffolder",
+    "plan": "planner",
+    "implement": "executor",
+    "test": "debugger",
+    "report": "reporter",
+    "fix": "patcher",
+}
+
+# Reverse alias used only for reading old spectracker/spec_delta outputs safely.
+CANONICAL_TO_LEGACY_STEP: dict[str, str] = {
+    canonical: legacy for legacy, canonical in LEGACY_STEP_ALIASES.items()
 }
 
 SCOPE_CHOICES = ("full", "mini")
@@ -247,6 +284,12 @@ def _artifact_rel(path: Any) -> str:
         return str(path)
 
 
+def _canonical_step(step: str | None) -> str | None:
+    if step is None:
+        return None
+    return LEGACY_STEP_ALIASES.get(step, step)
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # Project selection
 # ════════════════════════════════════════════════════════════════════════════
@@ -294,19 +337,41 @@ def _interactive_project_select(root: Path) -> str:
 # ════════════════════════════════════════════════════════════════════════════
 
 def load_delta() -> dict | None:
-    if not DELTA_PATH.exists():
+    if not SPECTRACKER_VERSION_DELTA.exists():
         return None
     try:
-        return json.loads(DELTA_PATH.read_text())
+        return json.loads(SPECTRACKER_VERSION_DELTA.read_text())
     except Exception:
         return None
 
 
 def delta_requires(delta: dict | None, step: str) -> bool:
-    """True if delta says step must re-run, or delta unavailable."""
+    """
+    True if spectracker delta says step must re-run, or delta unavailable.
+
+    Supports both new canonical keys:
+      scaffolder/planner/executor
+
+    and old keys:
+      scaffold/plan/implement
+
+    This makes harness tolerant during the refactor window.
+    """
     if delta is None:
         return True
-    return delta.get("rerun_steps", {}).get(step, True)
+
+    rerun_steps = delta.get("rerun_steps", {})
+    if not isinstance(rerun_steps, dict):
+        return True
+
+    if step in rerun_steps:
+        return bool(rerun_steps.get(step))
+
+    legacy = CANONICAL_TO_LEGACY_STEP.get(step)
+    if legacy and legacy in rerun_steps:
+        return bool(rerun_steps.get(legacy))
+
+    return True
 
 
 def print_delta_summary(delta: dict) -> None:
@@ -356,7 +421,7 @@ def snapshot_src() -> None:
 
 def restore_unaffected_files(delta: dict) -> int:
     """
-    Copy unaffected src/ files from prev_src/ so Qwen only implements
+    Copy unaffected src/ files from prev_src/ so executor only implements
     the files that changed. Returns number of files restored.
     """
     unaffected = [
@@ -389,17 +454,26 @@ def restore_unaffected_files(delta: dict) -> int:
 # ════════════════════════════════════════════════════════════════════════════
 
 def _read_judge_verdict() -> str:
-    """Read current judge verdict from run/judge_raw.json. Returns '' if unavailable."""
-    raw_path = JUDGE_RAW_PATH
+    """Read current verdict from execution/judge_session_verdict_raw.json."""
+    raw_path = JUDGE_SESSION_VERDICT_RAW
     if not raw_path.exists():
         return ""
 
     try:
         raw_data = json.loads(raw_path.read_text())
         response = raw_data.get("response", "")
-        response = _re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", response.strip())
-        response = _re.sub(r"\n?```$", "", response.strip())
-        return json.loads(response).get("verdict", "")
+
+        # Existing judge artifacts commonly store model response as fenced JSON.
+        if isinstance(response, str):
+            response = _re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", response.strip())
+            response = _re.sub(r"\n?```$", "", response.strip())
+            parsed = json.loads(response)
+            return parsed.get("verdict", "")
+
+        if isinstance(response, dict):
+            return response.get("verdict", "")
+
+        return ""
     except Exception:
         return ""
 
@@ -409,20 +483,20 @@ def _scope_args_for_script(script: str, scope: str) -> list[str]:
     Return scope args for scripts that support scope.
 
     Current contract:
-      - 03b_implement_glm.py supports --scope full|mini
-      - 03a_implement_qwen.py supports --scope full|mini
+      - 07_planner.py supports --scope full|mini
+      - 08_executor.py supports --scope full|mini
 
     Other steps remain backward-compatible and receive no --scope unless they
     are refactored explicitly.
     """
-    if script in {"03b_implement_glm.py", "03a_implement_qwen.py"}:
+    if script in {"07_planner.py", "08_executor.py"}:
         return ["--scope", scope]
     return []
 
 
 def _run_judge_fix_loop(args: argparse.Namespace, results: dict[str, bool]) -> None:
     """
-    Judge → fix → re-judge loop, up to args.max_judge_rounds times.
+    Judge → patcher → re-judge loop, up to args.max_judge_rounds times.
     """
     max_rounds = args.max_judge_rounds
     skip_fix = args.skip_fix
@@ -431,7 +505,7 @@ def _run_judge_fix_loop(args: argparse.Namespace, results: dict[str, bool]) -> N
         round_sfx = f" (round {round_num}/{max_rounds})" if max_rounds > 1 else ""
 
         ok = run_step(
-            f"Step 6 — DeepSeek V3.2 judge{round_sfx}",
+            f"judge{round_sfx}",
             STEP_SCRIPTS["judge"],
         )
         results[f"judge_r{round_num}"] = ok
@@ -450,38 +524,38 @@ def _run_judge_fix_loop(args: argparse.Namespace, results: dict[str, bool]) -> N
                 f"[harness] ⚠ Reached max_judge_rounds ({max_rounds}) "
                 f"with verdict {verdict or '(unknown)'}."
             )
-            print("[harness] Run manually when ready: python pipeline/07_update_knowledge.py")
+            print("[harness] Run archivist when ready: python pipeline/13_archivist.py")
             break
 
         if skip_fix:
             skip_step(
-                f"Step 7 — Fix from judge{round_sfx}",
-                "--skip-fix set — review judge_report.md manually",
+                f"patcher{round_sfx}",
+                "--skip-fix set — review judge_verdict_summary.md manually",
             )
             break
 
         if verdict == "NEEDS_REVISION":
-            fix_args: list[str] = []
+            patcher_args: list[str] = []
             if args.verbose:
-                fix_args.append("--verbose")
+                patcher_args.append("--verbose")
             if getattr(args, "fix_non_blocking", False):
-                fix_args.append("--fix-non-blocking")
+                patcher_args.append("--fix-non-blocking")
 
-            fix_ok = run_step(
-                f"Step 7 — Fix from judge{round_sfx}",
-                STEP_SCRIPTS["fix"],
-                fix_args or None,
+            patch_ok = run_step(
+                f"patcher{round_sfx}",
+                STEP_SCRIPTS["patcher"],
+                patcher_args or None,
             )
-            results[f"judge_fix_r{round_num}"] = fix_ok
+            results[f"judge_patcher_r{round_num}"] = patch_ok
 
-            if not fix_ok:
-                print("\n[harness] ⚠ Judge fix failed; human review required.")
-                print(f"[harness] See {UPDATE_LOG_PATH}")
+            if not patch_ok:
+                print("\n[harness] ⚠ Patcher failed; human review required.")
+                print(f"[harness] See {ARCHIVIST_CURATION_LOG}")
                 break
 
-            print("\n[harness] Fix applied successfully — re-running report + judge …")
-            report_ok = run_step("Step 5b — Aggregate report (post-fix)", STEP_SCRIPTS["report"])
-            results[f"report_post_fix_r{round_num}"] = report_ok
+            print("\n[harness] Patch applied successfully — re-running reporter + judge …")
+            report_ok = run_step("reporter post-patch", STEP_SCRIPTS["reporter"])
+            results[f"reporter_post_patch_r{round_num}"] = report_ok
             if not report_ok:
                 results["judge"] = False
                 break
@@ -493,73 +567,73 @@ def _run_judge_fix_loop(args: argparse.Namespace, results: dict[str, bool]) -> N
 
 def _run_fix_from_existing_judge(args: argparse.Namespace, results: dict[str, bool]) -> None:
     """
-    Feed an existing run/judge_raw.json into the fix loop without calling the
-    judge API first. Used when --from-judge is set.
+    Feed an existing execution/judge_session_verdict_raw.json into patcher
+    without calling the judge API first. Used when --from-judge is set.
     """
-    raw_path = JUDGE_RAW_PATH
+    raw_path = JUDGE_SESSION_VERDICT_RAW
     if not raw_path.exists():
-        print("[harness] --from-judge: run/judge_raw.json not found.")
+        print("[harness] --from-judge: execution/judge_session_verdict_raw.json not found.")
         print("          Run the full pipeline first to generate a judge report.")
-        results["fix_from_judge"] = False
+        results["patcher_from_judge"] = False
         return
 
     verdict = _read_judge_verdict()
     print(f"\n[harness] Existing judge verdict: {verdict or '(unknown)'}")
 
     if verdict in ("APPROVED", "APPROVED_WITH_NOTES"):
-        print(f"[harness] ✅ Already {verdict} — nothing to fix.")
-        results["fix_from_judge"] = True
+        print(f"[harness] ✅ Already {verdict} — nothing to patch.")
+        results["patcher_from_judge"] = True
         return
 
     if verdict != "NEEDS_REVISION":
         print(f"[harness] ⚠ Unrecognised verdict '{verdict}' — stopping.")
-        results["fix_from_judge"] = False
+        results["patcher_from_judge"] = False
         return
 
     if args.skip_fix:
         skip_step(
-            "Step 7 — Fix from judge (existing review)",
-            "--skip-fix set — review judge_report.md manually",
+            "patcher from existing judge",
+            "--skip-fix set — review judge_verdict_summary.md manually",
         )
-        results["fix_from_judge"] = True
+        results["patcher_from_judge"] = True
         return
 
-    fix_args: list[str] = []
+    patcher_args: list[str] = []
     if args.verbose:
-        fix_args.append("--verbose")
+        patcher_args.append("--verbose")
     if getattr(args, "fix_non_blocking", False):
-        fix_args.append("--fix-non-blocking")
+        patcher_args.append("--fix-non-blocking")
 
-    fix_ok = run_step(
-        "Step 7 — Fix from judge (existing review)",
-        STEP_SCRIPTS["fix"],
-        fix_args or None,
+    patch_ok = run_step(
+        "patcher from existing judge",
+        STEP_SCRIPTS["patcher"],
+        patcher_args or None,
     )
-    results["fix_from_judge"] = fix_ok
+    results["patcher_from_judge"] = patch_ok
 
-    if not fix_ok:
-        print("\n[harness] ⚠ Fix failed; human review required.")
-        print(f"[harness] See {UPDATE_LOG_PATH}")
+    if not patch_ok:
+        print("\n[harness] ⚠ Patcher failed; human review required.")
+        print(f"[harness] See {ARCHIVIST_CURATION_LOG}")
         return
 
-    print("\n[harness] Fix applied — refreshing report + re-judging …")
-    report_ok = run_step("Step 5b — Aggregate report (post-fix)", STEP_SCRIPTS["report"])
-    results["report_post_fix"] = report_ok
+    print("\n[harness] Patch applied — refreshing reporter + re-judging …")
+    report_ok = run_step("reporter post-patch", STEP_SCRIPTS["reporter"])
+    results["reporter_post_patch"] = report_ok
 
     if not report_ok:
-        results["fix_from_judge"] = False
+        results["patcher_from_judge"] = False
         return
 
     if not check_env(["OPENROUTER_API_KEY"]):
         print("[harness] WARNING: cannot re-judge without OPENROUTER_API_KEY.")
         return
 
-    judge_ok = run_step("Step 6 — DeepSeek V3.2 judge (post-fix)", STEP_SCRIPTS["judge"])
-    results["judge_post_fix"] = judge_ok
+    judge_ok = run_step("judge post-patch", STEP_SCRIPTS["judge"])
+    results["judge_post_patch"] = judge_ok
 
     final = _read_judge_verdict()
     if final:
-        print(f"\n[harness] Post-fix verdict: {final}")
+        print(f"\n[harness] Post-patch verdict: {final}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -576,36 +650,48 @@ def _resolve_run_range(args: argparse.Namespace) -> tuple[str, str]:
     Return (from_step, until_step) after validating all flag combinations.
 
     Rules:
-        --from-X                    → X .. fix
+        --from-X                    → X .. archivist
         --from-X --until-Y          → X .. Y
         --X shorthand               → X .. X
-        no flags                    → absorb .. fix
+        no flags                    → spectracker .. archivist
 
-    Mini scope keeps the same canonical order but auto-skips scaffold at
-    execution time.
+    Mini scope keeps the same canonical order but auto-skips spectracker,
+    specwright, and scaffolder at execution time.
     """
-    from_step = getattr(args, "from_step", None)
-    until_step = getattr(args, "until_step", None)
+    from_step = _canonical_step(getattr(args, "from_step", None))
+    until_step = _canonical_step(getattr(args, "until_step", None))
 
     shorthands = [step for step in STEPS if getattr(args, step, False)]
+    shorthands += [
+        canonical
+        for legacy, canonical in LEGACY_STEP_ALIASES.items()
+        if getattr(args, legacy, False)
+    ]
 
     if shorthands and (from_step or until_step):
         _die(f"Cannot mix --{shorthands[0]} shorthand with --from/--until flags.")
 
-    if len(shorthands) > 1:
+    unique_shorthands = list(dict.fromkeys(shorthands))
+    if len(unique_shorthands) > 1:
         _die(
             "Only one step shorthand allowed at a time, got: "
-            + " ".join(f"--{step}" for step in shorthands)
+            + " ".join(f"--{step}" for step in unique_shorthands)
         )
 
-    if shorthands:
-        return shorthands[0], shorthands[0]
+    if unique_shorthands:
+        return unique_shorthands[0], unique_shorthands[0]
 
     if until_step and not from_step:
         _die(f"--until-{until_step} requires --from-<step>.")
 
     if not from_step and not until_step:
         return STEPS[0], STEPS[-1]
+
+    if from_step not in STEPS:
+        _die(f"Unknown --from step: {from_step}")
+
+    if until_step and until_step not in STEPS:
+        _die(f"Unknown --until step: {until_step}")
 
     from_idx = STEPS.index(from_step)
     until_idx = STEPS.index(until_step) if until_step else len(STEPS) - 1
@@ -632,25 +718,28 @@ def _print_dry_run(from_step: str, until_step: str, args: argparse.Namespace) ->
     for i, step in enumerate(STEPS):
         in_range = from_idx <= i <= until_idx
         if not in_range:
-            print(f"  ⏭  {step:<12}  (skipped)")
+            print(f"  ⏭  {step:<14}  (skipped)")
             continue
 
-        if args.scope == "mini" and step == "scaffold":
-            print(f"  ⏭  {step:<12}  (skipped: mini scope)")
+        if args.scope == "mini" and step in {"spectracker", "specwright", "scaffolder"}:
+            print(f"  ⏭  {step:<14}  (skipped: mini scope)")
             continue
 
         script = STEP_SCRIPTS[step]
         extra = _scope_args_for_script(script, args.scope)
         suffix = f" {' '.join(extra)}" if extra else ""
-        print(f"  ▶  {step:<12}  {script}{suffix}")
+        print(f"  ▶  {step:<14}  {script}{suffix}")
 
     print()
 
     if args.scope == "full" and args.force:
-        print("  --force: delta checks will be bypassed — all full-scope steps re-run.")
+        print("  --force: spectracker delta checks will be bypassed — all full-scope steps re-run.")
 
     if args.scope == "mini":
-        print("  mini scope: spec_diff/scaffold are skipped; planner writes plan_mini.json.")
+        print(
+            "  mini scope: spectracker/specwright/scaffolder are skipped; "
+            "planner writes planner_mini_execution_plan.json."
+        )
 
     print()
 
@@ -669,74 +758,104 @@ def _run_step(
 ) -> bool:
     """Dispatch a single step with its extra args. Returns success bool."""
 
-    if step == "absorb":
-        return run_step("absorb", STEP_SCRIPTS["absorb"])
+    if step == "spectracker":
+        if args.scope == "mini":
+            skip_step("spectracker", "mini scope does not update spec delta")
+            return True
 
-    if step == "clarify":
+        ok = run_step("spectracker", STEP_SCRIPTS["spectracker"])
+        if not ok:
+            print("\n[harness] Spectracker failed.")
+        return ok
+
+    if step == "absorber":
+        return run_step("absorber", STEP_SCRIPTS["absorber"])
+
+    if step == "clarificator":
         clarify_args: list[str] = []
         if getattr(args, "clarify_input", None):
             clarify_args += ["--input", args.clarify_input]
 
-        ok = run_step("clarify", STEP_SCRIPTS["clarify"], clarify_args or None)
+        ok = run_step("clarificator", STEP_SCRIPTS["clarificator"], clarify_args or None)
         if not ok:
-            print("\n[harness] Clarify failed.")
+            print("\n[harness] Clarificator failed.")
         return ok
 
-    if step == "scaffold":
+    if step == "enricher":
+        return run_step("enricher", STEP_SCRIPTS["enricher"])
+
+    if step == "specwright":
         if args.scope == "mini":
-            skip_step("scaffold", "mini scope uses targeted planner; no scaffold needed")
+            skip_step("specwright", "mini scope does not update canonical spec")
             return True
 
-        if delta and not delta.get("is_first_run") and not delta_requires(delta, "scaffold"):
-            skip_step("scaffold", "delta: §7/§8 unchanged — reusing scaffold.json")
+        ok = run_step("specwright", STEP_SCRIPTS["specwright"])
+        if not ok:
+            print("\n[harness] Specwright failed.")
+        return ok
+
+    if step == "scaffolder":
+        if args.scope == "mini":
+            skip_step("scaffolder", "mini scope uses targeted planner; no skeleton needed")
             return True
 
-        if not check_env(STEP_ENV_KEYS.get("scaffold", [])):
+        if delta and not delta.get("is_first_run") and not delta_requires(delta, "scaffolder"):
+            skip_step(
+                "scaffolder",
+                "delta: scaffold-relevant spec sections unchanged — "
+                "reusing scaffolder_codebase_skeleton.json",
+            )
+            return True
+
+        if not check_env(STEP_ENV_KEYS.get("scaffolder", [])):
             sys.exit(1)
 
-        ok = run_step("scaffold", STEP_SCRIPTS["scaffold"])
+        ok = run_step("scaffolder", STEP_SCRIPTS["scaffolder"])
         if not ok:
-            print("\n[harness] Scaffold failed — stopping.")
+            print("\n[harness] Scaffolder failed — stopping.")
         return ok
 
-    if step == "plan":
+    if step == "planner":
         if args.only_qwen:
-            skip_step("plan", "--only-qwen")
+            skip_step("planner", "--only-qwen")
             return True
 
         if args.scope == "full":
-            if delta and not delta.get("is_first_run") and not delta_requires(delta, "plan"):
-                skip_step("plan", "delta: no affected files — reusing plan.json")
+            if delta and not delta.get("is_first_run") and not delta_requires(delta, "planner"):
+                skip_step(
+                    "planner",
+                    "delta: no affected files — reusing planner_full_execution_plan.json",
+                )
                 return True
 
-        if not check_env(STEP_ENV_KEYS.get("plan", [])):
+        if not check_env(STEP_ENV_KEYS.get("planner", [])):
             sys.exit(1)
 
-        plan_args = _scope_args_for_script(STEP_SCRIPTS["plan"], args.scope)
-        ok = run_step("plan", STEP_SCRIPTS["plan"], plan_args)
+        planner_args = _scope_args_for_script(STEP_SCRIPTS["planner"], args.scope)
+        ok = run_step("planner", STEP_SCRIPTS["planner"], planner_args)
 
         if not ok:
             print(
-                "\n[harness] Plan failed.\n"
+                "\n[harness] Planner failed.\n"
                 "  Tip: --only-qwen to skip planning entirely."
             )
 
         return ok
 
-    if step == "implement":
-        if not check_env(STEP_ENV_KEYS.get("implement", [])):
+    if step == "executor":
+        if not check_env(STEP_ENV_KEYS.get("executor", [])):
             sys.exit(1)
 
-        qwen_args = _scope_args_for_script(STEP_SCRIPTS["implement"], args.scope)
+        executor_args = _scope_args_for_script(STEP_SCRIPTS["executor"], args.scope)
 
         if plan_available:
-            qwen_args.append("--use-glm-plan")
+            executor_args.append("--use-glm-plan")
 
         if args.retry_impl:
-            retry_args = _retry_impl_args(qwen_args)
+            retry_args = _retry_impl_args(executor_args)
             if retry_args is None:
                 return False
-            qwen_args = retry_args
+            executor_args = retry_args
 
         elif args.scope == "full" and delta and not delta.get("is_first_run"):
             restore_unaffected_files(delta)
@@ -746,22 +865,22 @@ def _run_step(
                 if isinstance(file, str) and file.startswith("src/")
             ]
             if src_affected:
-                qwen_args += ["--only-files", ",".join(src_affected)]
-                print(f"[harness] implement: {len(src_affected)} affected file(s) only.")
+                executor_args += ["--only-files", ",".join(src_affected)]
+                print(f"[harness] executor: {len(src_affected)} affected file(s) only.")
 
         if args.scope == "mini":
             mode = "mini-targeted+plan" if plan_available else "mini-targeted"
         else:
             mode = "per-file+plan" if plan_available else "single-call"
 
-        ok = run_step(f"implement ({mode})", STEP_SCRIPTS["implement"], qwen_args)
+        ok = run_step(f"executor ({mode})", STEP_SCRIPTS["executor"], executor_args)
 
         if not ok:
             _print_impl_failed()
 
         return ok
 
-    if step == "test":
+    if step == "debugger":
         test_args = [
             "--impl",
             "qwen",
@@ -773,14 +892,14 @@ def _run_step(
         if args.verbose:
             test_args.append("--verbose")
 
-        return run_step("test", STEP_SCRIPTS["test"], test_args)
+        return run_step("debugger", STEP_SCRIPTS["debugger"], test_args)
 
-    if step == "report":
-        return run_step("report", STEP_SCRIPTS["report"])
+    if step == "reporter":
+        return run_step("reporter", STEP_SCRIPTS["reporter"])
 
     if step == "judge":
         if not tests_passed:
-            skip_step("judge", "tests failed — fix tests before judge sign-off")
+            skip_step("judge", "debugger failed — fix tests before judge sign-off")
             return True
 
         if not check_env(STEP_ENV_KEYS.get("judge", [])):
@@ -790,46 +909,58 @@ def _run_step(
         _run_judge_fix_loop(args, results)
         return results.get("judge", False)
 
-    if step == "fix":
+    if step == "patcher":
         if "judge" in results:
-            skip_step("fix", "already handled by judge loop")
+            skip_step("patcher", "already handled by judge loop")
             return True
 
         _run_fix_from_existing_judge(args, results)
-        return results.get("fix_from_judge", False)
+        return results.get("patcher_from_judge", False)
+
+    if step == "archivist":
+        return run_step("archivist", STEP_SCRIPTS["archivist"])
 
     return True
 
 
-def _retry_impl_args(qwen_args: list[str]) -> list[str] | None:
-    """Build --only-files args from impl_record failed_files. Returns None on error."""
-    if not IMPL_RECORD_PATH.exists():
-        print("[harness] --retry-impl: impl_record.json not found — run full impl first.")
+def _retry_impl_args(executor_args: list[str]) -> list[str] | None:
+    """
+    Build --only-files args from executor_session_manifest failed_files.
+    Returns None on error.
+    """
+    if not EXECUTOR_SESSION_MANIFEST.exists():
+        print(
+            "[harness] --retry-impl: executor_session_manifest.json not found "
+            "— run executor first."
+        )
         return None
 
     try:
-        record = json.loads(IMPL_RECORD_PATH.read_text())
+        record = json.loads(EXECUTOR_SESSION_MANIFEST.read_text())
         failed = record.get("failed_files", [])
 
         if not failed:
-            print("[harness] --retry-impl: no failed_files in impl_record.json — nothing to retry.")
+            print(
+                "[harness] --retry-impl: no failed_files in "
+                "executor_session_manifest.json — nothing to retry."
+            )
             return None
 
-        qwen_args += ["--only-files", ",".join(failed)]
+        executor_args += ["--only-files", ",".join(failed)]
         print(f"[harness] --retry-impl: retrying {len(failed)} failed file(s).")
-        return qwen_args
+        return executor_args
 
     except Exception:
-        print("[harness] --retry-impl: could not read impl_record.json.")
+        print("[harness] --retry-impl: could not read executor_session_manifest.json.")
         return None
 
 
 def _print_impl_failed() -> None:
-    if not IMPL_RECORD_PATH.exists():
+    if not EXECUTOR_SESSION_MANIFEST.exists():
         return
 
     try:
-        record = json.loads(IMPL_RECORD_PATH.read_text())
+        record = json.loads(EXECUTOR_SESSION_MANIFEST.read_text())
         failed = record.get("failed_files", [])
 
         if failed:
@@ -852,8 +983,6 @@ def _print_summary(
     args: argparse.Namespace,
     tests_passed: bool,
 ) -> None:
-    from artifacts.paths import artifact_root
-
     print(f"\n{'=' * 60}")
     print("  PIPELINE SUMMARY")
     print(f"{'=' * 60}")
@@ -874,36 +1003,54 @@ def _print_summary(
     print(f"\n  Overall: {'✅ PASS' if all_ok else '❌ FAIL'}")
 
     print("\n  Reports:")
-    if CLARIFICATION_REPORT.exists() and results.get("clarify"):
-        print(f"    Clarify  → {CLARIFICATION_REPORT}")
-    print(f"    Pipeline → {artifact_root() / 'reports' / 'summary.md'}")
+    if CLARIFICATOR_SESSION_QUESTIONS.exists() and results.get("clarificator"):
+        print(f"    Clarificator → {CLARIFICATOR_SESSION_QUESTIONS}")
+
+    print(f"    Pipeline     → {REPORTER_EXECUTION_SUMMARY}")
 
     if results.get("judge") and tests_passed:
-        print(f"    Judge    → {artifact_root() / 'reports' / 'judge_report.md'}")
+        print(f"    Judge        → {JUDGE_VERDICT_SUMMARY}")
         judge_verdict = _read_judge_verdict()
         if judge_verdict in ("APPROVED_WITH_NOTES", "NEEDS_REVISION"):
             print(f"\n  Judge verdict: {judge_verdict}")
-            print("  Run knowledge update when ready:")
-            print("    python pipeline/07_update_knowledge.py")
+            print("  Run archivist when ready:")
+            print("    python pipeline/13_archivist.py")
 
 
-def _write_apply_record(delta: dict, results: dict[str, bool]) -> None:
-    try:
-        from pipeline.spec_diff import write_applied  # type: ignore
-    except ImportError:
-        import importlib.util
+def _load_write_applied():
+    """
+    Load spectracker.write_applied from pipeline/01_spectracker.py.
 
-        spec = importlib.util.spec_from_file_location(
-            "spec_diff",
-            ROOT / "pipeline" / "spec_diff.py",
-        )
+    During migration, fall back to old pipeline/spec_diff.py if present.
+    """
+    candidates = [
+        ROOT / "pipeline" / "01_spectracker.py",
+        ROOT / "pipeline" / "spec_diff.py",
+    ]
+
+    for path in candidates:
+        if not path.exists():
+            continue
+
+        spec = importlib.util.spec_from_file_location(path.stem, path)
         if spec is None or spec.loader is None:
-            print("[harness] WARNING: could not import spec_diff.write_applied")
-            return
+            continue
 
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        write_applied = module.write_applied
+
+        write_applied = getattr(module, "write_applied", None)
+        if callable(write_applied):
+            return write_applied
+
+    return None
+
+
+def _write_apply_record(delta: dict, results: dict[str, bool]) -> None:
+    write_applied = _load_write_applied()
+    if write_applied is None:
+        print("[harness] WARNING: could not load spectracker.write_applied")
+        return
 
     applied_steps = [key for key, value in results.items() if value]
     write_applied(
@@ -912,10 +1059,8 @@ def _write_apply_record(delta: dict, results: dict[str, bool]) -> None:
         status="PASS",
     )
 
-    from artifacts.paths import SPEC_APPLIED
-
     print(
-        f"\n  Apply record → {SPEC_APPLIED}  "
+        f"\n  Apply record → {SPECTRACKER_APPLIED}  "
         f"(v{delta.get('to_version', '?')} marked as applied)"
     )
 
@@ -932,13 +1077,17 @@ def _build_parser() -> argparse.ArgumentParser:
         epilog="""
 Examples:
   python harness.py
-  python harness.py --scope full --from-clarify
-  python harness.py --scope full --from-implement --until-test
-  python harness.py --scope mini --from-clarify --until-implement
+  python harness.py --scope full --from-clarificator
+  python harness.py --scope full --from-executor --until-debugger
+  python harness.py --scope mini --from-clarificator --until-executor
   python harness.py --scope mini --auto-continue
-  python harness.py --scaffold
+  python harness.py --scaffolder
   python harness.py --dry-run
-  python harness.py --from-test --dry-run
+  python harness.py --from-debugger --dry-run
+
+Legacy aliases still work:
+  python harness.py --from-implement --until-test --dry-run
+  python harness.py --scaffold
 """,
     )
 
@@ -961,7 +1110,7 @@ Examples:
         default="full",
         help=(
             "Pipeline scope: 'full' runs spec-driven flow; "
-            "'mini' runs targeted planner/implementer flow."
+            "'mini' runs targeted planner/executor flow."
         ),
     )
 
@@ -1000,6 +1149,30 @@ Examples:
             ),
         )
 
+    # ── Legacy step aliases ───────────────────────────────────────────────────
+    # Hidden from help, but kept for backward compatibility.
+    for legacy, canonical in LEGACY_STEP_ALIASES.items():
+        parser.add_argument(
+            f"--from-{legacy}",
+            dest="from_step",
+            action="store_const",
+            const=canonical,
+            help=argparse.SUPPRESS,
+        )
+        parser.add_argument(
+            f"--until-{legacy}",
+            dest="until_step",
+            action="store_const",
+            const=canonical,
+            help=argparse.SUPPRESS,
+        )
+        parser.add_argument(
+            f"--{legacy}",
+            dest=legacy,
+            action="store_true",
+            help=argparse.SUPPRESS,
+        )
+
     # ── Behaviour modifiers ──────────────────────────────────────────────────
     parser.add_argument(
         "--dry-run",
@@ -1009,24 +1182,27 @@ Examples:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Re-run all full-scope steps even if spec_delta says nothing changed.",
+        help="Re-run all full-scope steps even if spectracker delta says nothing changed.",
     )
     parser.add_argument(
         "--only-qwen",
         action="store_true",
-        help="Skip GLM plan step; Qwen runs in single-call mode.",
+        help="Skip planner step; executor runs in single-call mode.",
     )
     parser.add_argument(
         "--retry-impl",
         action="store_true",
-        help="Re-implement only files listed as failed in impl_record.json.",
+        help=(
+            "Re-implement only files listed as failed in "
+            "execution/executor_session_manifest.json."
+        ),
     )
     parser.add_argument(
         "--max-judge-rounds",
         type=int,
         default=2,
         metavar="N",
-        help="Max judge→fix→re-judge iterations (default: 2).",
+        help="Max judge→patcher→re-judge iterations (default: 2).",
     )
     parser.add_argument(
         "--max-iter",
@@ -1045,19 +1221,20 @@ Examples:
     parser.add_argument(
         "--verbose",
         action="store_true",
-        help="Print per-cluster debug output during test step.",
+        help="Print per-cluster debug output during debugger step.",
     )
     parser.add_argument(
         "--skip-fix",
         action="store_true",
-        help="Run judge but skip auto-fix step.",
+        help="Run judge but skip auto-patcher step.",
     )
     parser.add_argument(
         "--from-judge",
         action="store_true",
         help=(
-            "Skip normal flow and consume existing run/judge_raw.json, "
-            "then run fix and one post-fix judge."
+            "Skip normal flow and consume existing "
+            "execution/judge_session_verdict_raw.json, then run patcher "
+            "and one post-patch judge."
         ),
     )
     parser.add_argument(
@@ -1065,7 +1242,7 @@ Examples:
         type=str,
         default=None,
         metavar="FILE",
-        help="Pass file path as input to clarify step.",
+        help="Pass file path as input to clarificator step.",
     )
 
     # ── Legacy mini mode ──────────────────────────────────────────────────────
@@ -1136,7 +1313,10 @@ def main() -> None:
     if args.from_judge:
         results: dict[str, bool] = {}
         if args.dry_run:
-            print("\n[harness] DRY RUN — would consume existing run/judge_raw.json and run fix.")
+            print(
+                "\n[harness] DRY RUN — would consume existing "
+                "execution/judge_session_verdict_raw.json and run patcher."
+            )
             return
 
         _run_fix_from_existing_judge(args, results)
@@ -1159,15 +1339,17 @@ def main() -> None:
 
     results: dict[str, bool] = {}
 
-    # ── spec_diff: full scope only ────────────────────────────────────────────
+    # ── spectracker delta: full scope only ────────────────────────────────────
     delta: dict | None = None
-    needs_diff = (
+    needs_delta = (
         args.scope == "full"
-        and any(step in steps_to_run for step in ("scaffold", "plan", "implement"))
+        and any(step in steps_to_run for step in ("scaffolder", "planner", "executor"))
     )
 
-    if needs_diff:
-        run_step("spec diff", "spec_diff.py")
+    if needs_delta and "spectracker" not in steps_to_run:
+        # If user starts mid-pipeline, harness still needs current delta to decide
+        # whether scaffolder/planner/executor can be skipped.
+        run_step("spectracker preflight", STEP_SCRIPTS["spectracker"])
         delta = load_delta()
 
         if delta:
@@ -1178,26 +1360,34 @@ def main() -> None:
             delta = None
 
     elif args.scope == "mini":
-        print("[harness] mini scope: skipping spec_diff and scaffold contracts.")
+        print("[harness] mini scope: skipping spectracker/specwright/scaffolder contracts.")
 
     # ── Execute steps ─────────────────────────────────────────────────────────
     tests_passed = True
-    plan_available = MINI_PLAN_PATH.exists() if args.scope == "mini" else GLM_PLAN_PATH.exists()
+    plan_available = PLANNER_MINI_PLAN.exists() if args.scope == "mini" else PLANNER_FULL_PLAN.exists()
 
     for step in steps_to_run:
         ok = _run_step(step, args, delta, plan_available, results, tests_passed)
         results[step] = ok
 
-        if step == "plan" and ok:
+        if step == "spectracker" and ok and args.scope == "full":
+            delta = load_delta()
+            if delta:
+                print_delta_summary(delta)
+            if args.force:
+                print("[harness] --force: delta ignored — all steps will re-run.")
+                delta = None
+
+        if step == "planner" and ok:
             plan_available = True
 
-        if step == "test":
+        if step == "debugger":
             tests_passed = ok
 
-        if step == "implement" and ok:
+        if step == "executor" and ok:
             snapshot_src()
 
-        if not ok and step in ("scaffold", "implement"):
+        if not ok and step in ("scaffolder", "executor"):
             print(f"\n[harness] {step} failed — stopping pipeline.")
             sys.exit(1)
 
@@ -1207,7 +1397,7 @@ def main() -> None:
     all_ok = all(results.values())
 
     # Persist apply record on full-scope PASS only.
-    if args.scope == "full" and all_ok and delta and "implement" in results:
+    if args.scope == "full" and all_ok and delta and "executor" in results:
         _write_apply_record(delta, results)
 
     sys.exit(0 if all_ok else 1)
