@@ -3,24 +3,39 @@
 ## Architecture
 
 ```
-spec.md
-  └─ Gemini 2.5 Flash  →  scaffold/scaffold.json  (stubs + test files)
-       └─ GLM 5.1       →  scaffold/glm_plan.json  (implementation plan)
-            └─ Qwen 3.6+  →  src/**               (executor, per-file)
-                 └─ vitest + Qwen  →  reports/     (test + targeted repair loop)
-                      └─ DeepSeek V3.2  →  reports/judge_report.md  (judge, green only)
+specwright_spec_<slug>.md
+  └─ spectracker        →  version delta, step skip decisions
+  └─ absorber           →  codebase map, blame map, git snapshot
+  └─ clarificator       →  requirement Q&A → clarificator_requirement_synthesis.md
+       └─ enricher      →  enriched prompt → specwright
+            └─ specwright → specwright_spec_<slug>.md (update)
+  └─ scaffolder         →  scaffolder_codebase_skeleton.json + src/ stubs + tests/
+       └─ planner       →  planner_*_execution_plan.json
+            └─ executor →  src/** (per-file)
+                 └─ debugger   →  vitest + repair loop
+                      └─ reporter    →  reporter_execution_summary.md
+                           └─ judge  →  judge_verdict_summary.md (green only)
+                                └─ patcher   →  auto-fix NEEDS_REVISION findings
+                                     └─ archivist →  long-term knowledge update
 ```
 
-| Step | Model | Role | Output |
-|---|---|---|---|
-| 02 | Gemini 2.5 Flash | Scaffold: stubs + test files from spec | `scaffold/scaffold.json`, `src/` stubs, `tests/` |
-| 03b | GLM 5.1 | Planner: decompose each file into ordered sub-tasks | `scaffold/glm_plan.json` |
-| 03a | Qwen 3.6 Plus | Executor: implement each file guided by plan | `src/**` |
-| 04+05 | vitest + Qwen | Test + cluster repair loop (max N iterations) | `reports/qwen_iterations.json`, `reports/summary.md` |
-| 06 | DeepSeek V3.2 | Judge: qualitative review + sign-off (green only) | `reports/judge_report.md` |
+### Model assignments
 
-**You** edit `spec.md` → push → GitHub Action runs automatically.
-**Claude (Spec Agent)** normalises / generates `spec.md` on request — does NOT call any API.
+| Step | Script | Model | Role |
+|---|---|---|---|
+| 01 | `01_spectracker.py` | — | Spec version diff, step skip decisions |
+| 02 | `02_absorber.py` | — | Scan codebase, build knowledge maps |
+| 03 | `03_clarificator.py` | DeepSeek | Requirement Q&A, clarification synthesis |
+| 04 | `04_enricher.py` | DeepSeek | Enrich context into structured prompt |
+| 05 | `05_specwright.py` | Gemini 2.5 Flash | Generate/update spec |
+| 06 | `06_scaffolder.py` | Gemini 2.5 Flash | Stubs + test files from spec |
+| 07 | `07_planner.py` | GLM 5.1 | Decompose files into ordered sub-tasks |
+| 08 | `08_executor.py` | Qwen 3.6 Plus | Implement src/ files guided by plan |
+| 09 | `09_debugger.py` | vitest + Qwen | Test + cluster repair loop |
+| 10 | `10_reporter.py` | — | Aggregate pipeline summary |
+| 11 | `11_judge.py` | DeepSeek V3.2 | Qualitative review + verdict (green only) |
+| 12 | `12_patcher.py` | Minimax / Qwen | Auto-fix NEEDS_REVISION findings |
+| 13 | `13_archivist.py` | — | Distill judge findings into long-term memory |
 
 ---
 
@@ -28,8 +43,8 @@ spec.md
 
 | Secret | Used by |
 |---|---|
-| `GEMINI_API_KEY` | Step 02 — Gemini scaffold |
-| `OPENROUTER_API_KEY` | Step 03b GLM plan, Step 03a Qwen implement, Step 04 Qwen repair, Step 06 DeepSeek judge |
+| `GEMINI_API_KEY` | scaffolder (06), specwright (05) |
+| `OPENROUTER_API_KEY` | clarificator (03), enricher (04), planner (07), executor (08), debugger (09), judge (11), patcher (12) |
 
 ---
 
@@ -50,77 +65,107 @@ OPENROUTER_API_KEY=<your key>
 
 ### First run — full pipeline
 ```bash
-python harness.py
+python harness.py --project <name>
 ```
-`Gemini scaffold → GLM plan → Qwen impl → vitest → report → DeepSeek judge`
+`spectracker → absorber → clarificator → enricher → specwright → scaffolder → planner → executor → debugger → reporter → judge`
 
 ---
 
-### Spec changed — re-run from scratch
+### Spec changed — rerun full pipeline
 ```bash
-# Edit spec.md (or copy Claude's response over it), then:
-python harness.py
+# Edit specwright_spec_<slug>.md, then:
+python harness.py --project <name>
 ```
+spectracker computes delta automatically — unchanged steps are skipped.
 
-### Spec changed — scaffold is still valid, only impl needs to rerun
-```bash
-python harness.py --skip-scaffold
-# Reuse scaffold.json → GLM re-plan → Qwen re-impl → vitest → judge
-```
+---
 
-### Spec changed — scaffold AND plan still valid
+### Resume from a specific step
 ```bash
-python harness.py --skip-scaffold --skip-plan
-# Reuse scaffold + glm_plan → Qwen re-impl → vitest → judge
+python harness.py --project <name> --from-executor
+python harness.py --project <name> --from-debugger --until-reporter
+python harness.py --project <name> --scaffolder   # run only scaffolder
 ```
 
 ---
 
 ### Debug loop — tests failing, iterate without re-generating
 ```bash
-# Fast loop: skip all generation, skip expensive judge call
-python harness.py --test-only --skip-judge --verbose
+# Fast loop: skip all generation, no judge
+python harness.py --project <name> --from-debugger --until-reporter --verbose
 
 # Once green, run with judge for final sign-off
-python harness.py --test-only
-```
-
-`--test-only` automatically reuses `glm_plan.json` if it exists — no extra API call.
-
-### Override iteration / attempt caps
-```bash
-python harness.py --test-only --skip-judge --max-iter 5 --max-cluster-attempts 3
+python harness.py --project <name> --from-judge
 ```
 
 ---
 
-### Skip GLM planning (Qwen single-call mode)
+### Re-run judge + auto-fix from existing verdict
 ```bash
-python harness.py --only-qwen --skip-judge
-# Gemini scaffold → Qwen single-call impl → vitest → report (no judge)
+# Consume existing judge_session_verdict_raw.json, run patcher + re-judge
+python harness.py --project <name> --resume-judge
 ```
-Use when: GLM quota exhausted, or you want a faster cheaper first-pass.
+
+---
+
+### Skip planner (executor single-call mode)
+```bash
+python harness.py --project <name> --from-executor --only-qwen
+```
+Use when: GLM quota exhausted, or faster cheaper first-pass needed.
+
+---
+
+### Mini scope — targeted change without full spec cycle
+```bash
+python harness.py --project <name> --scope mini --from-clarificator --until-executor
+```
+Mini scope skips spectracker delta check and scaffolder. Planner writes
+`planner_mini_execution_plan.json` instead of full plan.
+
+---
+
+### Override iteration caps
+```bash
+python harness.py --project <name> --from-debugger --max-iter 5 --max-cluster-attempts 3
+```
+
+---
+
+### Dry run — see what would execute
+```bash
+python harness.py --project <name> --dry-run
+python harness.py --project <name> --from-executor --dry-run
+```
 
 ---
 
 ### Decision tree
 
 ```
-Changed spec.md?
-  └─ Full rerun:         python harness.py
+New project or new requirement?
+  └─ Full pipeline:           python harness.py --project <name>
 
-Scaffold still valid?
-  └─ Skip scaffold:      python harness.py --skip-scaffold
+Spec changed, rerun everything?
+  └─ Full pipeline:           python harness.py --project <name>
+     (spectracker auto-skips unchanged steps)
 
-Plan still valid too?
-  └─ Skip both:          python harness.py --skip-scaffold --skip-plan
+Only implementation changed?
+  └─ From executor:           python harness.py --project <name> --from-executor
 
 Tests failing, no re-impl?
-  └─ Debug loop:         python harness.py --test-only --skip-judge --verbose
-  └─ When green:         python harness.py --test-only
+  └─ Debug loop:              python harness.py --project <name> --from-debugger --until-reporter --verbose
+  └─ When green + judge:      python harness.py --project <name> --from-judge
+
+Judge returned NEEDS_REVISION?
+  └─ Auto-fix:                python harness.py --project <name> --resume-judge
+  └─ Manual fix + capture:    python pipeline/13_archivist.py --capture-human-fix
 
 GLM unavailable?
-  └─ Qwen only:          python harness.py --only-qwen --skip-judge
+  └─ Skip planner:            python harness.py --project <name> --from-executor --only-qwen
+
+Small targeted change?
+  └─ Mini scope:              python harness.py --project <name> --scope mini --from-clarificator --until-executor
 ```
 
 ---
@@ -128,50 +173,79 @@ GLM unavailable?
 ## Pipeline file map
 
 ```
-spec.md                              ← YOU edit this (via Claude Spec Agent)
-harness.py                           ← local runner — mirrors GitHub Actions exactly
+specwright_spec_<slug>.md            ← canonical spec (specwright output)
+harness.py                           ← orchestrator — single entrypoint
 .github/workflows/llm-pipeline.yml
 
 pipeline/
-  02_scaffold_gemini.py              ← Gemini 2.5 Flash  → scaffold JSON + stubs + tests
-  03b_implement_glm.py               ← GLM 5.1           → glm_plan.json  [PLANNER]
-  03a_implement_qwen.py              ← Qwen 3.6 Plus     → src/**          [EXECUTOR]
-  04_test_and_iterate.py             ← vitest + L0/L1/L2 cluster repair loop
-  05_report.py                       ← summary.md (pipeline report)
-  06_judge_deepseek.py               ← DeepSeek V3.2     → judge_report.md [JUDGE]
+  01_spectracker.py                  ← spec version diff → step skip decisions
+  02_absorber.py                     ← codebase scan → knowledge maps
+  03_clarificator.py                 ← DeepSeek     → requirement Q&A
+  04_enricher.py                     ← DeepSeek     → enriched prompt
+  05_specwright.py                   ← Gemini        → spec generation/update
+  06_scaffolder.py                   ← Gemini        → stubs + test files
+  07_planner.py                      ← GLM 5.1       → execution plan
+  08_executor.py                     ← Qwen 3.6+     → src/** implementation
+  09_debugger.py                     ← vitest + Qwen → test + repair loop
+  10_reporter.py                     ← pipeline summary
+  11_judge.py                        ← DeepSeek V3.2 → verdict (green only)
+  12_patcher.py                      ← Minimax/Qwen  → auto-fix from verdict
+  13_archivist.py                    ← knowledge distillation
 
-scaffold/
-  scaffold.json                      ← Gemini output (stubs + test files)
-  glm_plan.json                      ← GLM planner output (consumed by 03a)
-  instructions_qwen.txt              ← executor hints for Qwen (from scaffold)
-  impl_qwen.json                     ← record of files written by Qwen
+artifacts/
+  paths.py                           ← SOURCE OF TRUTH for all artifact paths
+  NAMING_RULES.md                    ← artifact naming convention
+  OWNERSHIP.md                       ← ownership + data flow table
+  TAXONOMY.md                        ← full artifact descriptions + lifecycle
 
-src/                                 ← Qwen-implemented source files
-tests/                               ← Gemini-generated test files (read-only)
+artifacts_<slug>/
+  specwright_spec_<slug>.md
 
-reports/
-  qwen_iterations.json               ← per-iteration test + cluster repair log
-  escalated_clusters.json            ← clusters that hit give-up threshold (if any)
-  summary.md                         ← pipeline summary → GitHub Actions tab
-  judge_report.md                    ← DeepSeek V3.2 final review + verdict
-  judge_raw.json                     ← raw judge response + reasoning chain
-```
+  state/
+    clarificator_requirement_synthesis.md
+    scaffolder_codebase_skeleton.json
+    planner_full_execution_plan.json
+    planner_mini_execution_plan.json
+    planner_mini_impact_analysis.json
+    spectracker_applied_version.json
 
----
+  cache/
+    scaffolder_compressed_spec.md
+    spectracker_session_version_delta.json
+    absorber_session_codebase_snapshot.json
+    absorber_session_git_snapshot.json
 
-## Prompting Claude as Spec Agent
+  execution/
+    clarificator_session_raw.json
+    clarificator_session_questions.md
+    enricher_session_enriched_prompt.md
+    executor_session_manifest.json
+    debugger_session_test_summary.json
+    judge_session_verdict_raw.json
+    patcher_session_fix_summary.md
 
-Claude generates or updates `spec.md`. Copy the response, overwrite the file, commit, push.
+  knowledge/
+    current/
+      clarificator_decision_log.md
+      absorber_codebase_map.md
+      absorber_config_map.json
+      absorber_blame_map.md
+      patcher_findings_snapshot.md
+      archivist_spec_gaps.md
+      archivist_knowledge_log.md
+    history/
+      archivist_curation_log.json
+      patcher_attempt_log.json
+      spectracker_version_log.md
+      <version>.md
+      <version>.changelog.md
 
-```
-"Add a <HeatmapPanel> component. Props: events: AnomalyEvent[], days: number.
- Update spec.md §4, §7, §8 and bump version to 1.2.0."
+  reports/
+    reporter_execution_summary.md
+    judge_verdict_summary.md
 
-"The useSensorData hook needs a sensorId parameter for multi-sensor support.
- Update spec.md and bump version."
-
-"Acceptance criterion AC-4 is wrong — useSensorData(7) should return 2016 points
- not 2880. Fix §10 and any affected sections."
+  src/                               ← executor output (implementation)
+  tests/                             ← scaffolder output (read-only after generation)
 ```
 
 ---
@@ -182,7 +256,43 @@ Claude generates or updates `spec.md`. Copy the response, overwrite the file, co
 |---|---|---|
 | `APPROVED` | No blocking issues, avg score ≥ 3.5 | 0 |
 | `APPROVED_WITH_NOTES` | No blocking issues, notable non-blocking notes | 0 |
-| `NEEDS_REVISION` | Blocking issues found — see `reports/judge_report.md` | 1 |
+| `NEEDS_REVISION` | Blocking issues found — see `reports/judge_verdict_summary.md` | 1 |
 
-`NEEDS_REVISION` causes both `harness.py` and the GitHub Actions step to exit non-zero.
-The judge runs **only when vitest is fully green** — it never reviews broken code.
+`NEEDS_REVISION` causes harness and GitHub Actions to exit non-zero.
+Judge runs **only when vitest is fully green** — never reviews broken code.
+After judge, patcher auto-applies fixes then re-runs judge (up to `--max-judge-rounds`).
+
+---
+
+## Knowledge update after judge
+
+After human reviews `reports/judge_verdict_summary.md`:
+
+```bash
+# Interactive — approve/skip each finding
+python pipeline/13_archivist.py
+
+# Accept all suggested actions
+python pipeline/13_archivist.py --accept-all
+
+# After manual fix to code AI couldn't patch
+python pipeline/13_archivist.py --capture-human-fix
+
+# View accumulated knowledge base
+python pipeline/13_archivist.py --show-knowledge
+```
+
+---
+
+## Multi-project
+
+Each project gets its own isolated artifact workspace:
+
+```bash
+python harness.py --project dashboard
+python harness.py --project api-service
+python harness.py --project mobile-app
+```
+
+Artifacts live under `artifacts_dashboard/`, `artifacts_api-service/`, etc.
+`PIPELINE_PROJECT` env var can be used instead of `--project` in CI/CD.
