@@ -39,11 +39,11 @@ spec_addendum.md                 ← spec không phải module name
 
 | Prefix | Script |
 |---|---|
-| `spectracker` | `01_spectracker.py` |
-| `absorber` | `02_absorber.py` |
-| `clarificator` | `03_clarificator.py` |
-| `enricher` | `04_enricher.py` |
-| `specwright` | `05_specwright.py` |
+| `absorber` | `01_absorber.py` |
+| `clarificator` | `02_clarificator.py` |
+| `enricher` | `03_enricher.py` |
+| `specwright` | `04_specwright.py` |
+| `spectracker` | `05_spectracker.py` |
 | `scaffolder` | `06_scaffolder.py` |
 | `planner` | `07_planner.py` |
 | `executor` | `08_executor.py` |
