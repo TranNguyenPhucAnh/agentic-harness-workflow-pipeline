@@ -773,7 +773,7 @@ def _run_judge_fix_loop(args: argparse.Namespace, results: dict[str, bool]) -> N
 def _run_fix_from_existing_judge(args: argparse.Namespace, results: dict[str, bool]) -> None:
     raw_path = JUDGE_SESSION_VERDICT_RAW
     if not raw_path.exists():
-        print("[harness] --from-judge: execution/judge_session_verdict_raw.json not found.")
+        print("[harness] --patcher-only: execution/judge_session_verdict_raw.json not found.")
         print("          Run the full pipeline first to generate a judge report.")
         results["patcher_from_judge"] = False
         return
@@ -1404,7 +1404,7 @@ Legacy aliases still work:
         help="Run judge but skip auto-patcher step.",
     )
     parser.add_argument(
-        "--from-judge",
+        "--patcher-only",
         action="store_true",
         help=(
             "Consume existing execution/judge_session_verdict_raw.json, "
@@ -1500,7 +1500,7 @@ def main() -> None:
         )
         return
 
-    # --from-judge special flow.
+    # --patcher-only special flow.
     if args.from_judge:
         results: dict[str, bool] = {}
 
