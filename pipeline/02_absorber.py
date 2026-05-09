@@ -42,6 +42,14 @@ Writes, owner: absorber (02_absorber.py):
   artifacts_<slug>/cache/absorber_session_codebase_snapshot.json
   artifacts_<slug>/cache/absorber_session_git_snapshot.json
 
+Reads:
+  project source files (target codebase)
+  artifacts_<slug>/cache/absorber_session_codebase_snapshot.json if present
+
+At the end of each run, prints:
+  - artifacts/files read
+  - artifacts/files created/updated/overwritten/appended
+
 For taxonomy details see artifacts/TAXONOMY.md
 """
 
@@ -71,12 +79,13 @@ import httpx
 #         artifacts_<slug>/cache/absorber_session_codebase_snapshot.json
 #         artifacts_<slug>/cache/absorber_session_git_snapshot.json
 # READS : project source files (target codebase)
+#         artifacts_<slug>/cache/absorber_session_codebase_snapshot.json
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from artifacts.paths import (  # noqa: E402
-    ABSORBER_CODEBASE_SNAPSHOT,
     ABSORBER_BLAME_MAP,
     ABSORBER_CODEBASE_MAP,
+    ABSORBER_CODEBASE_SNAPSHOT,
     ABSORBER_CONFIG_MAP,
     ABSORBER_GIT_SNAPSHOT,
     artifact_root,
@@ -89,6 +98,38 @@ BLAME_MAP      = ABSORBER_BLAME_MAP
 CODEBASE_MAP   = ABSORBER_CODEBASE_MAP
 CONFIG_MAP     = ABSORBER_CONFIG_MAP
 GIT_HISTORY    = ABSORBER_GIT_SNAPSHOT
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Artifact/source access tracking
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ARTIFACTS_READ: set[str] = set()
+_ARTIFACTS_WRITTEN: set[str] = set()
+
+
+def _track_read(path: Any) -> None:
+    _ARTIFACTS_READ.add(str(path))
+
+
+def _track_write(path: Any) -> None:
+    _ARTIFACTS_WRITTEN.add(str(path))
+
+
+def _print_artifact_access_summary() -> None:
+    print("[02] Artifacts/files read:")
+    if _ARTIFACTS_READ:
+        for item in sorted(_ARTIFACTS_READ):
+            print(f"[02]   READ  {item}")
+    else:
+        print("[02]   READ  (none)")
+
+    print("[02] Artifacts/files created/updated/overwritten/appended:")
+    if _ARTIFACTS_WRITTEN:
+        for item in sorted(_ARTIFACTS_WRITTEN):
+            print(f"[02]   WRITE {item}")
+    else:
+        print("[02]   WRITE (none)")
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -196,6 +237,8 @@ class AbsorberIgnoreRules:
         if not path.exists():
             return
 
+        _track_read(path)
+
         mode = "skip"
         for raw in path.read_text(errors="replace").splitlines():
             line = raw.strip()
@@ -266,6 +309,7 @@ class AbsorberIgnoreRules:
 def _load_cache() -> dict[str, Any]:
     if ABSORBER_CACHE.exists():
         try:
+            _track_read(ABSORBER_CACHE)
             return json.loads(ABSORBER_CACHE.read_text())
         except Exception:
             pass
@@ -275,10 +319,12 @@ def _load_cache() -> dict[str, Any]:
 def _save_cache(cache: dict[str, Any]) -> None:
     ABSORBER_CACHE.parent.mkdir(parents=True, exist_ok=True)
     ABSORBER_CACHE.write_text(json.dumps(cache, indent=2))
+    _track_write(ABSORBER_CACHE)
 
 
 def _file_hash(path: Path) -> str:
     try:
+        _track_read(path)
         return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
     except Exception:
         return ""
@@ -562,6 +608,7 @@ def extract_content(
 
 def _extract_full(path: Path) -> str:
     try:
+        _track_read(path)
         return path.read_text(errors="replace")
     except Exception as e:
         return f"[read error: {e}]"
@@ -714,6 +761,7 @@ def _extract_signature(path: Path, ext: str, lang: str | None) -> str:
         return _extract_ts_signatures(path)
 
     try:
+        _track_read(path)
         lines = path.read_text(errors="replace").splitlines()
         preview = "\n".join(lines[:50])
         if len(lines) > 50:
@@ -725,6 +773,7 @@ def _extract_signature(path: Path, ext: str, lang: str | None) -> str:
 
 def _extract_python_signatures(path: Path) -> str:
     try:
+        _track_read(path)
         source = path.read_text(errors="replace")
         tree = ast.parse(source)
     except SyntaxError:
@@ -771,6 +820,7 @@ def _extract_python_signatures(path: Path) -> str:
         return "\n".join(lines)
 
     try:
+        _track_read(path)
         return path.read_text(errors="replace")[:500]
     except Exception:
         return "[signature extraction failed]"
@@ -778,6 +828,7 @@ def _extract_python_signatures(path: Path) -> str:
 
 def _extract_ts_signatures(path: Path) -> str:
     try:
+        _track_read(path)
         source = path.read_text(errors="replace")
     except Exception:
         return "[read error]"
@@ -988,6 +1039,7 @@ def _extract_env_vars_from_raw(path: Path, ext: str) -> set[str]:
     """
     _ = ext
     try:
+        _track_read(path)
         raw = path.read_text(errors="replace")
     except Exception:
         return set()
@@ -1064,6 +1116,7 @@ def build_config_map(
         raw = ""
         if abs_path.exists():
             try:
+                _track_read(abs_path)
                 raw = abs_path.read_text(errors="replace")
             except Exception:
                 raw = ""
@@ -1464,162 +1517,184 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    parser = _build_parser()
-    args = parser.parse_args()
+    exit_code = 0
 
-    _configure_project(args.project, parser)
+    try:
+        parser = _build_parser()
+        args = parser.parse_args()
 
-    # Important: do not call ensure_dirs() at import-time.
-    # PIPELINE_PROJECT must be available before artifact paths are resolved.
-    ensure_dirs()
+        _configure_project(args.project, parser)
 
-    using_default_target = args.target is None
-    target: Path = (args.target or artifact_root()).resolve()
+        # Important: do not call ensure_dirs() at import-time.
+        # PIPELINE_PROJECT must be available before artifact paths are resolved.
+        ensure_dirs()
 
-    if not target.exists():
-        print(f"[absorber][error] Target path does not exist: {target}", file=sys.stderr)
-        sys.exit(1)
+        using_default_target = args.target is None
+        target: Path = (args.target or artifact_root()).resolve()
 
-    print(f"\n{'─' * 50}")
-    print(f"  Absorber — {target.name}")
-    print(f"{'─' * 50}\n")
+        if not target.exists():
+            print(f"[absorber][error] Target path does not exist: {target}", file=sys.stderr)
+            sys.exit(1)
 
-    # ── Phase 1: File tree scan ───────────────────────────────────────────────
+        print(f"\n{'─' * 50}")
+        print(f"  Absorber — {target.name}")
+        print(f"{'─' * 50}\n")
 
-    print("[absorber] Phase 1 — Scanning file tree ...")
-    rules_path = target / _IGNORED_FILE
-    rules = AbsorberIgnoreRules(rules_path)
+        # ── Phase 1: File tree scan ───────────────────────────────────────────────
 
-    inventory = scan_files(
-        target,
-        rules,
-        skip_artifact_control_dirs=using_default_target,
-    )
+        print("[absorber] Phase 1 — Scanning file tree ...")
+        rules_path = target / _IGNORED_FILE
+        rules = AbsorberIgnoreRules(rules_path)
 
-    lang_counts: dict[str, int] = {}
-    for entry in inventory:
-        lang = entry["lang"] or "other"
-        lang_counts[lang] = lang_counts.get(lang, 0) + 1
-
-    print(f"[absorber] Found {len(inventory)} files to process")
-    for lang, count in sorted(lang_counts.items(), key=lambda x: -x[1])[:8]:
-        print(f"     {lang}: {count}")
-
-    mode_counts = {"full": 0, "key-only": 0, "signature-only": 0}
-    for entry in inventory:
-        mode_counts[entry["mode"]] = mode_counts.get(entry["mode"], 0) + 1
-
-    print(f"[absorber] Extraction modes: {mode_counts}")
-
-    if using_default_target:
-        skipped = ", ".join(sorted(_ARTIFACT_CONTROL_DIRS))
-        print(f"[absorber] Default target detected; skipping artifact-control dirs: {skipped}")
-
-    if args.dry_run:
-        print("\n[absorber] --dry-run: stopping here. No files written.")
-        return
-
-    # ── Phase 2: Content extraction ───────────────────────────────────────────
-
-    print("\n[absorber] Phase 2 — Extracting content ...")
-    cache = _load_cache()
-    cache_hits = 0
-
-    for i, entry in enumerate(inventory, 1):
-        _, from_cache = extract_content(entry, cache, args.force)
-
-        if from_cache:
-            cache_hits += 1
-
-        if i % 50 == 0:
-            print(f"     {i}/{len(inventory)} files processed ...")
-
-    total_chars = sum(
-        len(cache.get(e["rel_path"], {}).get("content", ""))
-        for e in inventory
-    )
-    est_tokens = total_chars // 4
-
-    print(f"[absorber] Extracted {len(inventory)} files | cache hits: {cache_hits}")
-    print(f"[absorber] Total content: {total_chars:,} chars (~{est_tokens:,} tokens)")
-
-    _save_cache(cache)
-    print(f"[absorber] ✓ Cache saved → {ABSORBER_CACHE}")
-
-    # ── Phase 3: Semantic compression → codebase_map.md ──────────────────────
-
-    if not args.skip_llm:
-        print("\n[absorber] Phase 3 — Semantic compression (LLM) ...")
-        context = _build_extraction_context(inventory, cache)
-
-        try:
-            codebase_map = call_llm_for_map(context, target.name)
-            CODEBASE_MAP.parent.mkdir(parents=True, exist_ok=True)
-            CODEBASE_MAP.write_text(codebase_map)
-            print(f"[absorber] ✓ Codebase map → {CODEBASE_MAP}")
-        except Exception as e:
-            print(f"[absorber][warn] LLM synthesis failed: {e} — skipping codebase_map.md")
-    else:
-        raw_context = _build_extraction_context(inventory, cache)
-        CODEBASE_MAP.parent.mkdir(parents=True, exist_ok=True)
-        CODEBASE_MAP.write_text(
-            "# Codebase Map (raw extraction — no LLM synthesis)\n\n"
-            + raw_context
+        inventory = scan_files(
+            target,
+            rules,
+            skip_artifact_control_dirs=using_default_target,
         )
-        print(f"[absorber] ✓ Raw extraction → {CODEBASE_MAP} (--skip-llm)")
 
-    # ── Phase 4: Config inventory ─────────────────────────────────────────────
+        lang_counts: dict[str, int] = {}
+        for entry in inventory:
+            lang = entry["lang"] or "other"
+            lang_counts[lang] = lang_counts.get(lang, 0) + 1
 
-    print("\n[absorber] Phase 4 — Config inventory ...")
-    config_map = build_config_map(inventory, cache)
+        print(f"[absorber] Found {len(inventory)} files to process")
+        for lang, count in sorted(lang_counts.items(), key=lambda x: -x[1])[:8]:
+            print(f"     {lang}: {count}")
 
-    CONFIG_MAP.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG_MAP.write_text(json.dumps(config_map, indent=2))
+        mode_counts = {"full": 0, "key-only": 0, "signature-only": 0}
+        for entry in inventory:
+            mode_counts[entry["mode"]] = mode_counts.get(entry["mode"], 0) + 1
 
-    print(f"[absorber] ✓ Config map → {CONFIG_MAP}")
-    print(f"     Services detected: {', '.join(config_map['services_detected']) or 'none'}")
-    print(f"     Env vars detected: {len(config_map['env_vars_detected'])}")
+        print(f"[absorber] Extraction modes: {mode_counts}")
 
-    # ── Phase 5: Git crawl ────────────────────────────────────────────────────
+        if using_default_target:
+            skipped = ", ".join(sorted(_ARTIFACT_CONTROL_DIRS))
+            print(f"[absorber] Default target detected; skipping artifact-control dirs: {skipped}")
 
-    if not args.skip_git:
-        print("\n[absorber] Phase 5 — Git crawl ...")
+        if args.dry_run:
+            print("\n[absorber] --dry-run: stopping here. No files written.")
+            return
 
-        scope = args.git_scope or _ask_git_scope()
-        git_data = crawl_git(target, scope)
+        # ── Phase 2: Content extraction ───────────────────────────────────────────
 
-        if git_data:
-            GIT_HISTORY.parent.mkdir(parents=True, exist_ok=True)
-            GIT_HISTORY.write_text(json.dumps(git_data, indent=2))
+        print("\n[absorber] Phase 2 — Extracting content ...")
+        cache = _load_cache()
+        cache_hits = 0
 
-            print(f"[absorber] ✓ Git history → {GIT_HISTORY}")
-            print(
-                f"     Commits: {git_data['total_commits']} | "
-                f"Authors: {len(git_data['authors'])}"
-            )
-            print(f"     Hotspots: {len(git_data['hotspots'])} files")
+        for i, entry in enumerate(inventory, 1):
+            _, from_cache = extract_content(entry, cache, args.force)
 
-            blame_md = build_blame_map(git_data)
-            BLAME_MAP.parent.mkdir(parents=True, exist_ok=True)
-            BLAME_MAP.write_text(blame_md)
+            if from_cache:
+                cache_hits += 1
 
-            print(f"[absorber] ✓ Blame map → {BLAME_MAP}")
+            if i % 50 == 0:
+                print(f"     {i}/{len(inventory)} files processed ...")
+
+        total_chars = sum(
+            len(cache.get(e["rel_path"], {}).get("content", ""))
+            for e in inventory
+        )
+        est_tokens = total_chars // 4
+
+        print(f"[absorber] Extracted {len(inventory)} files | cache hits: {cache_hits}")
+        print(f"[absorber] Total content: {total_chars:,} chars (~{est_tokens:,} tokens)")
+
+        _save_cache(cache)
+        print(f"[absorber] ✓ Cache saved → {ABSORBER_CACHE}")
+
+        # ── Phase 3: Semantic compression → codebase_map.md ──────────────────────
+
+        if not args.skip_llm:
+            print("\n[absorber] Phase 3 — Semantic compression (LLM) ...")
+            context = _build_extraction_context(inventory, cache)
+
+            try:
+                codebase_map = call_llm_for_map(context, target.name)
+                CODEBASE_MAP.parent.mkdir(parents=True, exist_ok=True)
+                CODEBASE_MAP.write_text(codebase_map)
+                _track_write(CODEBASE_MAP)
+                print(f"[absorber] ✓ Codebase map → {CODEBASE_MAP}")
+            except Exception as e:
+                print(f"[absorber][warn] LLM synthesis failed: {e} — skipping codebase_map.md")
         else:
-            print("[absorber] Git crawl skipped or failed.")
-    else:
-        print("\n[absorber] Phase 5 — Git crawl skipped (--skip-git).")
+            raw_context = _build_extraction_context(inventory, cache)
+            CODEBASE_MAP.parent.mkdir(parents=True, exist_ok=True)
+            CODEBASE_MAP.write_text(
+                "# Codebase Map (raw extraction — no LLM synthesis)\n\n"
+                + raw_context
+            )
+            _track_write(CODEBASE_MAP)
+            print(f"[absorber] ✓ Raw extraction → {CODEBASE_MAP} (--skip-llm)")
 
-    # ── Summary ───────────────────────────────────────────────────────────────
+        # ── Phase 4: Config inventory ─────────────────────────────────────────────
 
-    print(f"\n{'─' * 50}")
-    print(f"  Done — {target.name} absorbed")
-    print(f"{'─' * 50}")
-    print(f"  absorber_codebase_map.md              → {CODEBASE_MAP}")
-    print(f"  absorber_config_map.json              → {CONFIG_MAP}")
+        print("\n[absorber] Phase 4 — Config inventory ...")
+        config_map = build_config_map(inventory, cache)
 
-    if not args.skip_git:
-        print(f"  absorber_session_git_snapshot.json    → {GIT_HISTORY}")
-        print(f"  absorber_blame_map.md                 → {BLAME_MAP}")
+        CONFIG_MAP.parent.mkdir(parents=True, exist_ok=True)
+        CONFIG_MAP.write_text(json.dumps(config_map, indent=2))
+        _track_write(CONFIG_MAP)
+
+        print(f"[absorber] ✓ Config map → {CONFIG_MAP}")
+        print(f"     Services detected: {', '.join(config_map['services_detected']) or 'none'}")
+        print(f"     Env vars detected: {len(config_map['env_vars_detected'])}")
+
+        # ── Phase 5: Git crawl ────────────────────────────────────────────────────
+
+        if not args.skip_git:
+            print("\n[absorber] Phase 5 — Git crawl ...")
+
+            scope = args.git_scope or _ask_git_scope()
+            git_data = crawl_git(target, scope)
+
+            if git_data:
+                GIT_HISTORY.parent.mkdir(parents=True, exist_ok=True)
+                GIT_HISTORY.write_text(json.dumps(git_data, indent=2))
+                _track_write(GIT_HISTORY)
+
+                print(f"[absorber] ✓ Git history → {GIT_HISTORY}")
+                print(
+                    f"     Commits: {git_data['total_commits']} | "
+                    f"Authors: {len(git_data['authors'])}"
+                )
+                print(f"     Hotspots: {len(git_data['hotspots'])} files")
+
+                blame_md = build_blame_map(git_data)
+                BLAME_MAP.parent.mkdir(parents=True, exist_ok=True)
+                BLAME_MAP.write_text(blame_md)
+                _track_write(BLAME_MAP)
+
+                print(f"[absorber] ✓ Blame map → {BLAME_MAP}")
+            else:
+                print("[absorber] Git crawl skipped or failed.")
+        else:
+            print("\n[absorber] Phase 5 — Git crawl skipped (--skip-git).")
+
+        # ── Summary ───────────────────────────────────────────────────────────────
+
+        print(f"\n{'─' * 50}")
+        print(f"  Done — {target.name} absorbed")
+        print(f"{'─' * 50}")
+        print(f"  absorber_codebase_map.md              → {CODEBASE_MAP}")
+        print(f"  absorber_config_map.json              → {CONFIG_MAP}")
+
+        if not args.skip_git:
+            print(f"  absorber_session_git_snapshot.json    → {GIT_HISTORY}")
+            print(f"  absorber_blame_map.md                 → {BLAME_MAP}")
+
+    except SystemExit as exc:
+        # Preserve explicit sys.exit(...) behavior but still print access summary.
+        code = exc.code
+        exit_code = code if isinstance(code, int) else 1
+
+    except Exception as exc:
+        print(f"[absorber][error] {exc}", file=sys.stderr)
+        exit_code = 1
+
+    finally:
+        _print_artifact_access_summary()
+
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
