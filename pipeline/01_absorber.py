@@ -1,5 +1,5 @@
 """
-pipeline/02_absorber.py
+pipeline/01_absorber.py
 =======================
 Step 1 — Absorb an existing codebase into the knowledge layer.
 
@@ -23,19 +23,19 @@ Change detection:
   - --force flag bypasses cache
 
 Usage:
-  python 02_absorber.py
-  python 02_absorber.py --project my-app
-  PIPELINE_PROJECT=my-app python 02_absorber.py
+  python 01_absorber.py
+  python 01_absorber.py --project my-app
+  PIPELINE_PROJECT=my-app python 01_absorber.py
 
-  python 02_absorber.py --git-scope 6m
-  python 02_absorber.py --git-scope 500
-  python 02_absorber.py --git-scope all
-  python 02_absorber.py --force
-  python 02_absorber.py --skip-git
-  python 02_absorber.py --dry-run
-  python 02_absorber.py --target /path/to/repo
+  python 01_absorber.py --git-scope 6m
+  python 01_absorber.py --git-scope 500
+  python 01_absorber.py --git-scope all
+  python 01_absorber.py --force
+  python 01_absorber.py --skip-git
+  python 01_absorber.py --dry-run
+  python 01_absorber.py --target /path/to/repo
 
-Writes, owner: absorber (02_absorber.py):
+Writes, owner: absorber (01_absorber.py):
   artifacts_<slug>/knowledge/current/absorber_codebase_map.md
   artifacts_<slug>/knowledge/current/absorber_config_map.json
   artifacts_<slug>/knowledge/current/absorber_blame_map.md
@@ -1449,7 +1449,7 @@ def _configure_project(
 
     parser.error(
         "PIPELINE_PROJECT is not set. Use --project <name> or export "
-        "PIPELINE_PROJECT=<name> before running 02_absorber.py directly."
+        "PIPELINE_PROJECT=<name> before running 01_absorber.py directly."
     )
 
 
@@ -1459,16 +1459,16 @@ def _build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""
             Examples:
-              python 02_absorber.py --project my-app
-              PIPELINE_PROJECT=my-app python 02_absorber.py
+              python 01_absorber.py --project my-app
+              PIPELINE_PROJECT=my-app python 01_absorber.py
 
-              python 02_absorber.py --project my-app --git-scope 6m
-              python 02_absorber.py --project my-app --git-scope 500
-              python 02_absorber.py --project my-app --git-scope all
-              python 02_absorber.py --project my-app --skip-git
-              python 02_absorber.py --project my-app --force
-              python 02_absorber.py --project my-app --target /path/to/repo
-              python 02_absorber.py --project my-app --dry-run
+              python 01_absorber.py --project my-app --git-scope 6m
+              python 01_absorber.py --project my-app --git-scope 500
+              python 01_absorber.py --project my-app --git-scope all
+              python 01_absorber.py --project my-app --skip-git
+              python 01_absorber.py --project my-app --force
+              python 01_absorber.py --project my-app --target /path/to/repo
+              python 01_absorber.py --project my-app --dry-run
         """),
     )
 
