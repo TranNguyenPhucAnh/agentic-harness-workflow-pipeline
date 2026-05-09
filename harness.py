@@ -1501,7 +1501,7 @@ def main() -> None:
         return
 
     # --patcher-only special flow.
-    if args.from_judge:
+    if args.patcher_only:
         results: dict[str, bool] = {}
 
         if args.dry_run:
