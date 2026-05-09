@@ -5,17 +5,48 @@ SOURCE OF TRUTH cho tất cả artifact paths trong pipeline.
 
 RULE: Không file nào được tự define artifact path — chỉ import từ đây.
 
+Naming convention
+─────────────────
+  <owner>_<semantic 2-3 words>.<ext>
+
+  .json = machine-readable
+  .md   = human-readable
+
+  _raw      = unprocessed output, consumed as-is by downstream
+  _log      = append-only, tích lũy across sessions (long-term memory)
+  _session_ = overwrite mỗi pipeline run, không tích lũy
+
+  Suffixes .md:
+    _summary   = condensed overview, rút gọn từ nhiều nguồn
+    _synthesis = rewrite/enrich từ nhiều nguồn thành document liền mạch
+    _synopsis  = high-level narrative, không đi vào chi tiết
+
+Module prefixes (owner):
+  spectracker   01_spectracker.py   track spec version changes
+  absorber      02_absorber.py      scan codebase, build knowledge maps
+  clarificator  03_clarificator.py  clarify requirements via Q&A
+  enricher      04_enricher.py      enrich context into structured prompt
+  specwright    05_specwright.py    generate/update spec
+  scaffolder    06_scaffolder.py    generate stub + test files
+  planner       07_planner.py       decompose work into execution plan
+  executor      08_executor.py      implement src/ files
+  debugger      09_debugger.py      test + repair loop
+  reporter      10_reporter.py      aggregate pipeline summary
+  judge         11_judge.py         qualitative review + verdict
+  patcher       12_patcher.py       fix from judge verdict
+  archivist     13_archivist.py     distill knowledge, long-term memory
+
 Project isolation
 ─────────────────
 Mỗi pipeline run được gắn với một project name (bắt buộc).
 harness.py nhận --project PROJECT_NAME và set env var PIPELINE_PROJECT trước khi
-spawn child processes.  Tất cả scripts đọc env var này qua _artifact_root() dưới đây.
+spawn child processes. Tất cả scripts đọc env var này qua _artifact_root() dưới đây.
 
 Artifact root per-project:
     <repo_root>/artifacts_<project_slug>/
         state/
         cache/
-        run/
+        execution/
         knowledge/current/
         knowledge/history/
         reports/
@@ -25,15 +56,6 @@ dấu gạch ngang đầu/cuối bị trim.
     "My App 1"  → "my-app-1"
     "dashboard" → "dashboard"
     "IoT_MLOps" → "iot-mlops"
-
-Usage trong mỗi pipeline script (không thay đổi so với trước):
-    from artifacts.paths import STATE_DIR, PLAN_JSON, ensure_dirs
-    ensure_dirs()
-    # paths tự động resolve theo PIPELINE_PROJECT env var
-
-Ownership được ghi rõ trên mỗi path:
-  - owner  = script DUY NHẤT được ghi file này
-  - others = chỉ được đọc (read-only)
 """
 
 from __future__ import annotations
@@ -47,10 +69,6 @@ from typing import Any
 # ── Project resolution ────────────────────────────────────────────────────────
 
 def _slugify(name: str) -> str:
-    """
-    Convert project name to a safe directory slug.
-    "My App 1" → "my-app-1",  "IoT_MLOps" → "iot-mlops"
-    """
     slug = name.lower()
     slug = re.sub(r"[^a-z0-9]+", "-", slug)
     slug = slug.strip("-")
@@ -60,10 +78,6 @@ def _slugify(name: str) -> str:
 
 
 def _resolve_project() -> str:
-    """
-    Read project name from PIPELINE_PROJECT env var.
-    Raises RuntimeError if not set — every run must specify a project.
-    """
     name = os.environ.get("PIPELINE_PROJECT", "").strip()
     if not name:
         raise RuntimeError(
@@ -86,19 +100,11 @@ def get_project_slug() -> str:
 
 # ── Roots ─────────────────────────────────────────────────────────────────────
 
-# REPO_ROOT = directory containing this file's parent (i.e. the repo root).
 REPO_ROOT = Path(__file__).parent.parent
-
-# ROOT = alias kept for backward compatibility (all scripts import ROOT).
-ROOT = REPO_ROOT
+ROOT = REPO_ROOT  # backward-compatible alias
 
 
 def _artifact_root() -> Path:
-    """
-    Return the artifact root for the current project.
-    e.g. /path/to/repo/artifacts_my-app
-    Evaluated lazily so PIPELINE_PROJECT can be set after import time.
-    """
     return REPO_ROOT / f"artifacts_{get_project_slug()}"
 
 
@@ -108,13 +114,22 @@ def artifact_root() -> Path:
 
 
 def project_info() -> dict[str, str]:
-    """Return project name, slug, and artifact root as a dict."""
     name = get_project_name()
     return {
         "name": name,
         "slug": _slugify(name),
         "artifact_root": str(_artifact_root()),
     }
+
+
+def get_spec_path() -> Path:
+    """
+    Return resolved spec path with project slug embedded.
+    Always use this function — not SPEC_PATH — for actual file operations.
+    Slug in filename enables cross-project spec extraction without renaming.
+    owner: specwright (05_specwright.py)
+    """
+    return _artifact_root() / f"specwright_spec_{get_project_slug()}.md"
 
 
 # ── LazyPath ──────────────────────────────────────────────────────────────────
@@ -125,20 +140,17 @@ class _LazyPath:
     from the current PIPELINE_PROJECT env var.
 
     This lets all path constants be defined at module level (so `from
-    artifacts.paths import PLAN_JSON` works) while still picking up the correct
-    project-scoped root when the path is actually *used*.
-
-    Supports all common Path operations via delegation.
+    artifacts.paths import PLANNER_FULL_PLAN` works) while still picking up the
+    correct project-scoped root when the path is actually *used*.
     """
     __slots__ = ("_rel",)
 
     def __init__(self, rel: str) -> None:
-        self._rel = rel  # relative path inside the artifact root
+        self._rel = rel
 
     def _resolve(self) -> Path:
         return _artifact_root() / self._rel
 
-    # ── os.fspath / str / repr ────────────────────────────────────────────────
     def __fspath__(self) -> str:
         return str(self._resolve())
 
@@ -154,14 +166,12 @@ class _LazyPath:
     def __hash__(self) -> int:
         return hash(self._resolve())
 
-    # ── Path arithmetic ───────────────────────────────────────────────────────
     def __truediv__(self, other: str | os.PathLike[str]) -> Path:
         return self._resolve() / other
 
     def __rtruediv__(self, other: str | os.PathLike[str]) -> Path:
         return Path(other) / self._resolve()
 
-    # ── Properties ───────────────────────────────────────────────────────────
     @property
     def parent(self) -> Path:
         return self._resolve().parent
@@ -178,7 +188,6 @@ class _LazyPath:
     def suffix(self) -> str:
         return self._resolve().suffix
 
-    # ── File I/O ─────────────────────────────────────────────────────────────
     def read_text(self, **kwargs: Any) -> str:
         return self._resolve().read_text(**kwargs)
 
@@ -194,7 +203,6 @@ class _LazyPath:
     def open(self, *args: Any, **kwargs: Any):
         return self._resolve().open(*args, **kwargs)
 
-    # ── Filesystem ops ────────────────────────────────────────────────────────
     def exists(self) -> bool:
         return self._resolve().exists()
 
@@ -216,7 +224,6 @@ class _LazyPath:
     def rename(self, target: str | os.PathLike[str]) -> Path:
         return self._resolve().rename(target)
 
-    # ── Path helpers ──────────────────────────────────────────────────────────
     def relative_to(self, *args: Any) -> Path:
         return self._resolve().relative_to(*args)
 
@@ -240,7 +247,7 @@ class _LazyPath:
 
 STATE_DIR     = _LazyPath("state")
 CACHE_DIR     = _LazyPath("cache")
-RUN_DIR       = _LazyPath("run")
+EXECUTION_DIR = _LazyPath("execution")      # renamed from run/
 KNOWLEDGE_DIR = _LazyPath("knowledge")
 CURRENT_DIR   = _LazyPath("knowledge/current")
 HISTORY_DIR   = _LazyPath("knowledge/history")
@@ -248,68 +255,281 @@ REPORTS_DIR   = _LazyPath("reports")
 SRC_DIR       = _LazyPath("src")
 TESTS_DIR     = _LazyPath("tests")
 
-
-# ── Misc ──────────────────────────────────────────────────────────────────────
-
-SPEC_PATH = _LazyPath("spec.md")  # per-project, không phải repo root
+# Backward-compatible alias — remove after all scripts migrated off run/
+RUN_DIR = EXECUTION_DIR
 
 
 # ── state/ ────────────────────────────────────────────────────────────────────
 
-SCAFFOLD_JSON   = _LazyPath("state/scaffold.json")               # owner: 02_scaffold_gemini
-PLAN_JSON       = _LazyPath("state/plan.json")                   # owner: 03b_implement_glm
-PLAN_MINI       = _LazyPath("state/plan_mini.json")              # owner: 03b_implement_glm
-SPEC_APPLIED    = _LazyPath("state/spec_applied.json")           # owner: spec_diff
-PLAN_NOTES      = _LazyPath("state/plan_notes.json")             # owner: 07_update_knowledge
-ENRICHED_PROMPT = _LazyPath("state/enriched_prompt.md")          # owner: harness / prompt enrichment
-CLARIFIED_REQ   = _LazyPath("state/clarified_requirement.md")    # owner: 00_clarificator
+# owner:     clarificator (03_clarificator.py)
+# consumers: enricher, specwright (fallback if enriched prompt absent)
+# lifecycle: persistent — overwrite per clarification session
+# purpose:   raw requirement rewritten inline with all clarification decisions resolved
+CLARIFIED_REQ = _LazyPath("state/clarificator_requirement_synthesis.md")
 
-# Backward-compatible / design-friendly aliases.
-PLAN = PLAN_JSON
+# owner:     scaffolder (06_scaffolder.py)
+# consumers: planner, executor, reporter, judge, harness
+# lifecycle: persistent — overwrite when scaffolder reruns
+# purpose:   full stub file tree: signatures, interfaces, JSDoc, test skeletons.
+#            Also carries implementation_instructions.for_executor read by executor.
+SCAFFOLD_JSON = _LazyPath("state/scaffolder_codebase_skeleton.json")
+
+# owner:     planner (07_planner.py)
+# consumers: executor, debugger, reporter, judge, patcher, harness
+# lifecycle: persistent — overwrite per full-scope run
+# purpose:   per-file implementation tasks, dependency order, gotchas, Tailwind hints.
+#            Immutable after planner writes — patcher and debugger read only.
+PLANNER_FULL_PLAN = _LazyPath("state/planner_full_execution_plan.json")
+
+# owner:     planner (07_planner.py)
+# consumers: executor, debugger, reporter, judge, patcher, harness
+# lifecycle: persistent — overwrite per mini-scope run
+PLANNER_MINI_PLAN = _LazyPath("state/planner_mini_execution_plan.json")
+
+# owner:     planner (07_planner.py)
+# consumers: executor
+# lifecycle: persistent — overwrite per mini-scope run
+# purpose:   planner analysis of which files are impacted by the mini task scope
+PLANNER_MINI_IMPACT = _LazyPath("state/planner_mini_impact_analysis.json")
+
+# owner:     spectracker (01_spectracker.py)
+# consumers: spectracker (self-read for delta diff), harness
+# lifecycle: hybrid — top-level fields overwrite each run;
+#            embedded run_history[] array is append-only
+# purpose:   tracks currently applied spec version + run history for delta computation
+SPECTRACKER_APPLIED = _LazyPath("state/spectracker_applied_version.json")
+
+# ── Backward-compatible aliases (state/) ─────────────────────────────────────
+PLAN_JSON         = PLANNER_FULL_PLAN
+PLAN_MINI         = PLANNER_MINI_PLAN
+PLAN              = PLANNER_FULL_PLAN
+SPEC_APPLIED      = SPECTRACKER_APPLIED
 CLARIFIED_REQUEST = CLARIFIED_REQ
+# REMOVED: state/plan_notes.json (PLAN_NOTES)
+#   Rationale: merged into archivist_knowledge_log.md — planner reads knowledge log directly.
+# REMOVED: state/enriched_prompt.md (ENRICHED_PROMPT)
+#   Rationale: moved to execution/ as enricher_session_enriched_prompt.md (session artifact).
 
 
 # ── cache/ ────────────────────────────────────────────────────────────────────
 
-SPEC_COMPRESSED = _LazyPath("cache/spec_compressed.md")          # owner: 02_scaffold_gemini
-SPEC_DELTA      = _LazyPath("cache/spec_delta.json")             # owner: spec_diff
-ABSORBER_CACHE  = _LazyPath("cache/absorber_cache.json")         # owner: 01_absorber
+# owner:     scaffolder (06_scaffolder.py)
+# consumers: planner, executor, patcher
+# lifecycle: persistent — overwrite when spec changes
+# purpose:   token-optimised spec with §0 and §8 stripped (~35% token saving).
+#            Pure cache — fully derivable from spec. Falls back to get_spec_path() if absent.
+SCAFFOLDER_COMPRESSED_SPEC = _LazyPath("cache/scaffolder_compressed_spec.md")
+
+# owner:     spectracker (01_spectracker.py)
+# consumers: harness (decides which steps to rerun)
+# lifecycle: session — overwrite each run
+# purpose:   structured diff between current and previous spec version:
+#            changed_sections, affected_files, rerun_steps.
+#            Exception: in cache/ but drives harness control flow.
+SPECTRACKER_VERSION_DELTA = _LazyPath("cache/spectracker_session_version_delta.json")
+
+# owner:     absorber (02_absorber.py)
+# consumers: clarificator, enricher, planner
+# lifecycle: session — overwrite each absorber run (point-in-time codebase snapshot)
+ABSORBER_CODEBASE_SNAPSHOT = _LazyPath("cache/absorber_session_codebase_snapshot.json")
+
+# owner:     absorber (02_absorber.py)
+# consumers: clarificator, enricher
+# lifecycle: session — overwrite each absorber run (point-in-time git state)
+# note:      moved from knowledge/history/ — snapshot semantics, not a persistent log
+ABSORBER_GIT_SNAPSHOT = _LazyPath("cache/absorber_session_git_snapshot.json")
+
+# ── Backward-compatible aliases (cache/) ─────────────────────────────────────
+SPEC_COMPRESSED = SCAFFOLDER_COMPRESSED_SPEC
+SPEC_DELTA      = SPECTRACKER_VERSION_DELTA
+ABSORBER_CACHE  = ABSORBER_CODEBASE_SNAPSHOT
+# REMOVED: cache/absorber_cache.json → now ABSORBER_CODEBASE_SNAPSHOT
+# REMOVED: knowledge/history/git_history.json (GIT_HISTORY)
+#   Rationale: point-in-time snapshot, not a log → moved to cache/ as ABSORBER_GIT_SNAPSHOT
 
 
-# ── run/ ──────────────────────────────────────────────────────────────────────
+# ── execution/ (renamed from run/) ───────────────────────────────────────────
 
-IMPL_RECORD              = _LazyPath("run/impl_record.json")              # owner: 03a_implement_qwen
-TEST_REPORT              = _LazyPath("run/test_report.json")              # owner: 04_test_and_iterate
-JUDGE_RAW                = _LazyPath("run/judge_raw.json")                # owner: 06_judge_deepseek
-ANALYSIS_MINI            = _LazyPath("run/analysis_mini.json")            # owner: 03b_implement_glm
-CLARIFICATION_REPORT     = _LazyPath("run/clarification_report.json")     # owner: 00_clarificator
-CLARIFICATION_QUESTIONS  = _LazyPath("run/clarification_questions.md")    # owner: 00_clarificator
+# owner:     clarificator (03_clarificator.py)
+# consumers: enricher, planner
+# lifecycle: session — overwrite per clarification session
+# purpose:   structured session metadata: decisions[], tier counts, conflicts detected,
+#            unresolved findings list, requirement hash. Machine-readable.
+CLARIFICATOR_SESSION_RAW = _LazyPath("execution/clarificator_session_raw.json")
+
+# owner:     clarificator (03_clarificator.py)
+# consumers: human review
+# lifecycle: session — overwrite per clarification session
+# purpose:   human-readable questions for current session, grouped by tier and priority
+CLARIFICATOR_SESSION_QUESTIONS = _LazyPath("execution/clarificator_session_questions.md")
+
+# owner:     enricher (04_enricher.py)
+# consumers: specwright
+# lifecycle: session — overwrite per enricher run
+# purpose:   structured prompt enriched with knowledge layer, passed to specwright
+ENRICHER_SESSION_PROMPT = _LazyPath("execution/enricher_session_enriched_prompt.md")
+
+# owner:     executor (08_executor.py)
+# consumers: reporter, judge, patcher, harness
+# lifecycle: session — overwrite per executor run
+# purpose:   manifest of files implemented this run: status per file
+#            (written/skipped/failed), run mode (full/delta/mini), model used
+EXECUTOR_SESSION_MANIFEST = _LazyPath("execution/executor_session_manifest.json")
+
+# owner:     debugger (09_debugger.py)
+# consumers: reporter, judge, archivist
+# lifecycle: session — overwrite per debug run
+# purpose:   summarized test results: pass/fail counts, per-iteration breakdown,
+#            cluster-level repair details, escalated clusters list
+DEBUGGER_SESSION_TEST_SUMMARY = _LazyPath("execution/debugger_session_test_summary.json")
+
+# owner:     judge (11_judge.py)
+# consumers: patcher, archivist, harness
+# lifecycle: session — overwrite per judge run
+# purpose:   raw judge verdict JSON as returned by model, fully unprocessed.
+#            Preserved so patcher and archivist parse independently;
+#            failures debuggable without re-calling the API.
+JUDGE_SESSION_VERDICT_RAW = _LazyPath("execution/judge_session_verdict_raw.json")
+
+# owner:     patcher (12_patcher.py)
+# consumers: human review
+# lifecycle: session — overwrite per patcher run
+# purpose:   human-readable summary: patched files, escalated findings,
+#            scope rejections, confirm pass/fail result
+PATCHER_SESSION_FIX_SUMMARY = _LazyPath("execution/patcher_session_fix_summary.md")
+
+# ── Backward-compatible aliases (execution/) ─────────────────────────────────
+IMPL_RECORD             = EXECUTOR_SESSION_MANIFEST
+TEST_REPORT             = DEBUGGER_SESSION_TEST_SUMMARY
+JUDGE_RAW               = JUDGE_SESSION_VERDICT_RAW
+CLARIFICATION_REPORT    = CLARIFICATOR_SESSION_RAW
+CLARIFICATION_QUESTIONS = CLARIFICATOR_SESSION_QUESTIONS
+# REMOVED: run/analysis_mini.json (ANALYSIS_MINI)
+#   Rationale: legacy artifact from mini_mode.py (no longer used).
+#   Replaced by PLANNER_MINI_IMPACT in state/.
+# REMOVED: run/mini_log.json
+#   Rationale: legacy mini_mode.py artifact, entire mode deprecated.
 
 
-# ── knowledge/current/ ────────────────────────────────────────────────────────
+# ── knowledge/current/ ───────────────────────────────────────────────────────
 
-FINDINGS          = _LazyPath("knowledge/current/findings.md")           # owner: 07_fix_from_judge
-FINDINGS_NOTES    = _LazyPath("knowledge/current/findings_notes.md")     # owner: 07_update_knowledge
-SPEC_ADDENDUM     = _LazyPath("knowledge/current/spec_addendum.md")      # owner: 06_judge_deepseek
-KNOWLEDGE_BASE    = _LazyPath("knowledge/current/base.md")               # owner: 07_update_knowledge
-CODEBASE_MAP      = _LazyPath("knowledge/current/codebase_map.md")       # owner: 01_absorber
-CONFIG_MAP        = _LazyPath("knowledge/current/config_map.json")       # owner: 01_absorber
-BLAME_MAP         = _LazyPath("knowledge/current/blame_map.md")          # owner: 01_absorber
-CLARIFICATION_LOG = _LazyPath("knowledge/current/clarification_log.md")  # owner: 00_clarificator
+# owner:     clarificator (03_clarificator.py)
+# consumers: clarificator (next session — semantic dedup of already-answered questions)
+# lifecycle: append-only log across all sessions
+# purpose:   long-term Q&A memory — prevents re-asking semantically equivalent
+#            questions across runs; also surfaced to enricher for context continuity
+CLARIFICATOR_DECISION_LOG = _LazyPath("knowledge/current/clarificator_decision_log.md")
+
+# owner:     absorber (02_absorber.py)
+# consumers: clarificator, enricher, planner, executor
+# lifecycle: persistent — overwrite per absorber run
+ABSORBER_CODEBASE_MAP = _LazyPath("knowledge/current/absorber_codebase_map.md")
+
+# owner:     absorber (02_absorber.py)
+# consumers: clarificator, enricher
+# lifecycle: persistent — overwrite per absorber run
+ABSORBER_CONFIG_MAP = _LazyPath("knowledge/current/absorber_config_map.json")
+
+# owner:     absorber (02_absorber.py)
+# consumers: clarificator, enricher, planner
+# lifecycle: persistent — overwrite per absorber run
+ABSORBER_BLAME_MAP = _LazyPath("knowledge/current/absorber_blame_map.md")
+
+# owner:     patcher (12_patcher.py)
+# consumers: debugger, archivist
+# lifecycle: persistent — overwrite per patcher run
+# purpose:   per-run snapshot of judge findings processed by patcher:
+#            what was patched, escalated, confirm result.
+#            NOT a persistent log (see patcher_attempt_log.json for that).
+#            Injected into debugger prompts as regression prevention context.
+PATCHER_FINDINGS_SNAPSHOT = _LazyPath("knowledge/current/patcher_findings_snapshot.md")
+
+# owner:     archivist (13_archivist.py)
+# consumers: specwright (next spec revision)
+# lifecycle: persistent — append or curated overwrite by archivist
+# purpose:   spec gaps and edge cases surfaced by judge, human-approved.
+#            Injected into judge briefing so future runs are aware of known gaps.
+#            Human-editable by design.
+ARCHIVIST_SPEC_GAPS = _LazyPath("knowledge/current/archivist_spec_gaps.md")
+
+# owner:     archivist (13_archivist.py)
+# consumers: planner, executor, debugger, patcher, judge
+# lifecycle: append-only log — human controls additions via interactive mode
+# purpose:   accumulated architecture decisions, recurring bug patterns, lessons learned.
+#            Consolidates: base.md + findings_notes.md + plan_notes.json.
+#            Human-editable by design.
+ARCHIVIST_KNOWLEDGE_LOG = _LazyPath("knowledge/current/archivist_knowledge_log.md")
+
+# ── Backward-compatible aliases (knowledge/current/) ─────────────────────────
+FINDINGS          = PATCHER_FINDINGS_SNAPSHOT
+FINDINGS_NOTES    = ARCHIVIST_KNOWLEDGE_LOG
+SPEC_ADDENDUM     = ARCHIVIST_SPEC_GAPS
+KNOWLEDGE_BASE    = ARCHIVIST_KNOWLEDGE_LOG
+CODEBASE_MAP      = ABSORBER_CODEBASE_MAP
+CONFIG_MAP        = ABSORBER_CONFIG_MAP
+BLAME_MAP         = ABSORBER_BLAME_MAP
+CLARIFICATION_LOG = CLARIFICATOR_DECISION_LOG
 
 
-# ── knowledge/history/ ────────────────────────────────────────────────────────
+# ── knowledge/history/ ───────────────────────────────────────────────────────
 
-UPDATE_LOG     = _LazyPath("knowledge/history/update_log.json")     # owner: 07_update_knowledge
-FIX_LOG        = _LazyPath("knowledge/history/fix_log.json")        # owner: 07_fix_from_judge
-SPEC_CHANGELOG = _LazyPath("knowledge/history/spec.changelog")      # owner: spec_diff
-GIT_HISTORY    = _LazyPath("knowledge/history/git_history.json")    # owner: 01_absorber
+# owner:     archivist (13_archivist.py)
+# consumers: human review
+# lifecycle: append-only log
+# purpose:   audit trail of human curation decisions when reviewing judge findings:
+#            which findings were applied, skipped, or escalated to spec bump.
+#            Distinct from patcher_attempt_log — archivist modifies knowledge artifacts,
+#            patcher modifies src/ directly.
+ARCHIVIST_CURATION_LOG = _LazyPath("knowledge/history/archivist_curation_log.json")
+
+# owner:     patcher (12_patcher.py)
+# consumers: human review, archivist
+# lifecycle: append-only log
+# purpose:   longitudinal record of all patcher attempts across runs:
+#            files patched, judge findings that triggered each fix, outcome per file
+PATCHER_ATTEMPT_LOG = _LazyPath("knowledge/history/patcher_attempt_log.json")
+
+# owner:     spectracker (01_spectracker.py)
+# consumers: human review only — no pipeline logic reads this
+# lifecycle: append-only log
+# purpose:   narrative history of all spec version changes over time.
+#            Distinct from spectracker_session_version_delta.json (per-session machine diff).
+SPECTRACKER_VERSION_LOG = _LazyPath("knowledge/history/spectracker_version_log.md")
+
+# NOTE: spectracker also writes dynamic per-version files at runtime:
+#   knowledge/history/<version>.md           — raw spec snapshot at version apply time
+#   knowledge/history/<version>.changelog.md — per-version changelog entry
+# These are write-once, constructed by spectracker using the version string.
+# Cannot be static LazyPath constants — spectracker builds paths at runtime.
+# Consumed internally by spectracker._load_latest_snapshot() for future delta computation.
+
+# ── Backward-compatible aliases (knowledge/history/) ─────────────────────────
+UPDATE_LOG     = ARCHIVIST_CURATION_LOG
+FIX_LOG        = PATCHER_ATTEMPT_LOG
+SPEC_CHANGELOG = SPECTRACKER_VERSION_LOG
 
 
 # ── reports/ ─────────────────────────────────────────────────────────────────
 
-SUMMARY      = _LazyPath("reports/summary.md")       # owner: 05_report
-JUDGE_REPORT = _LazyPath("reports/judge_report.md")  # owner: 06_judge_deepseek
+# owner:     reporter (10_reporter.py)
+# consumers: human review only — no pipeline script parses this
+# lifecycle: persistent — overwrite per reporter run
+# purpose:   human-readable pipeline execution summary:
+#            plan summary, test breakdown, scaffold stats, spec delta, impl record.
+#            On GitHub Actions: piped to $GITHUB_STEP_SUMMARY, not committed to repo.
+REPORTER_EXECUTION_SUMMARY = _LazyPath("reports/reporter_execution_summary.md")
+
+# owner:     judge (11_judge.py)
+# consumers: human review only — no pipeline script parses this
+# lifecycle: persistent — overwrite per judge run
+# purpose:   human-readable verdict: scores, blocking issues with suggested fixes,
+#            non-blocking notes, spec gaps, sign-off status.
+#            Primary artifact for human deciding whether to merge pipeline output.
+JUDGE_VERDICT_SUMMARY = _LazyPath("reports/judge_verdict_summary.md")
+
+# ── Backward-compatible aliases (reports/) ───────────────────────────────────
+SUMMARY      = REPORTER_EXECUTION_SUMMARY
+JUDGE_REPORT = JUDGE_VERDICT_SUMMARY
 
 
 # ── ensure_dirs ───────────────────────────────────────────────────────────────
@@ -326,7 +546,7 @@ def ensure_dirs() -> None:
         "tests",
         "state",
         "cache",
-        "run",
+        "execution",            # renamed from run/
         "knowledge/current",
         "knowledge/history",
         "reports",
