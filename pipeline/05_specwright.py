@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 05_specwright.py
 ================
@@ -29,6 +28,10 @@ Usage:
 
 Artifacts produced (owner: specwright):
     artifacts_<slug>/specwright_spec_<slug>.md         — get_spec_path(), input cho harness.py
+
+At the end of each run, prints:
+    - artifacts read
+    - artifacts created/updated/overwritten/appended
 """
 
 from __future__ import annotations
@@ -42,17 +45,18 @@ import sys
 import textwrap
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import httpx
 
 # ── paths ─────────────────────────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from artifacts.paths import (  # type: ignore
-    get_spec_path,
-    CLARIFIED_REQ,
     CLARIFICATOR_SESSION_RAW,
+    CLARIFIED_REQ,
     ENRICHER_SESSION_PROMPT,
     ensure_dirs,
+    get_spec_path,
 )
 
 # Local aliases — map canonical constants to the short names used internally
@@ -61,9 +65,41 @@ ENRICHED_PROMPT      = ENRICHER_SESSION_PROMPT
 
 # === WRITE AUTHORITY: specwright ===
 # OWNS  : artifacts_<slug>/specwright_spec_<slug>.md   (dynamic path via get_spec_path())
-# READS : enricher_session_enriched_prompt.md,
-#         clarificator_requirement_synthesis.md (fallback),
-#         clarificator_session_raw.json
+# READS : artifacts_<slug>/execution/enricher_session_enriched_prompt.md
+#         artifacts_<slug>/state/clarificator_requirement_synthesis.md (fallback)
+#         artifacts_<slug>/execution/clarificator_session_raw.json
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Artifact access tracking
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ARTIFACTS_READ: set[str] = set()
+_ARTIFACTS_WRITTEN: set[str] = set()
+
+
+def _track_read(path: Any) -> None:
+    _ARTIFACTS_READ.add(str(path))
+
+
+def _track_write(path: Any) -> None:
+    _ARTIFACTS_WRITTEN.add(str(path))
+
+
+def _print_artifact_access_summary() -> None:
+    print("[05] Artifacts read:")
+    if _ARTIFACTS_READ:
+        for item in sorted(_ARTIFACTS_READ):
+            print(f"[05]   READ  {item}")
+    else:
+        print("[05]   READ  (none)")
+
+    print("[05] Artifacts created/updated/overwritten/appended:")
+    if _ARTIFACTS_WRITTEN:
+        for item in sorted(_ARTIFACTS_WRITTEN):
+            print(f"[05]   WRITE {item}")
+    else:
+        print("[05]   WRITE (none)")
 
 
 # ── Model config ──────────────────────────────────────────────────────────────
@@ -146,18 +182,21 @@ def _call_llm(
 
 def _load_enriched_prompt() -> str:
     if ENRICHED_PROMPT.exists():
+        _track_read(ENRICHED_PROMPT)
         return ENRICHED_PROMPT.read_text(encoding="utf-8")
     return ""
 
 
 def _load_clarified_req() -> str:
     if CLARIFIED_REQ.exists():
+        _track_read(CLARIFIED_REQ)
         return CLARIFIED_REQ.read_text(encoding="utf-8")
     return ""
 
 
 def _load_clarification_report() -> dict:
     if CLARIFICATION_REPORT.exists():
+        _track_read(CLARIFICATION_REPORT)
         try:
             return json.loads(CLARIFICATION_REPORT.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
@@ -419,131 +458,8 @@ def _resolve_project(arg_project: str | None) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main
+# Harness instructions
 # ─────────────────────────────────────────────────────────────────────────────
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="05_specwright — generate artifacts_<slug>/specwright_spec_<slug>.md from enriched prompt"
-    )
-    parser.add_argument("--project",   metavar="NAME",
-                        help="Project workspace name. Prompted if omitted.")
-    parser.add_argument("--model",     metavar="MODEL", default=_SPEC_MODEL_DEFAULT,
-                        help=f"Model to use for spec generation. Default: {_SPEC_MODEL_DEFAULT}")
-    parser.add_argument("--dry-run",   action="store_true",
-                        help="Generate spec, print to stdout, do not write file or launch harness.")
-    parser.add_argument("--no-review", action="store_true",
-                        help="Skip interactive review — write spec and ask about harness directly.")
-    parser.add_argument("--no-harness", action="store_true",
-                        help="Write spec but do not offer to launch harness.")
-    args = parser.parse_args()
-
-    # ── Resolve project ───────────────────────────────────────────────────────
-    project_name = _resolve_project(args.project)
-    os.environ["PIPELINE_PROJECT"] = project_name
-    ensure_dirs()
-
-    # get_spec_path() resolves lazily to artifacts_<slug>/specwright_spec_<slug>.md —
-    # the canonical location every downstream pipeline script reads.
-    spec_file = get_spec_path()
-
-    print(f"[specwright] Workspace:  {project_name!r}")
-    print(f"[specwright] Spec target: {spec_file}")
-    print(f"[specwright] Model:       {args.model}")
-
-    # ── Load enriched prompt ──────────────────────────────────────────────────
-    enriched_prompt = _load_enriched_prompt()
-    if enriched_prompt.strip():
-        print(f"[specwright] Loaded enricher_session_enriched_prompt.md ({len(enriched_prompt)} chars)")
-    else:
-        # Fallback: use clarified_req directly (less optimal but functional)
-        print("[specwright][warn] enricher_session_enriched_prompt.md not found — falling back to clarificator_requirement_synthesis.md")
-        enriched_prompt = _load_clarified_req()
-        if not enriched_prompt.strip():
-            print(
-                "[specwright][error] Neither enricher_session_enriched_prompt.md nor clarificator_requirement_synthesis.md found.\n"
-                "            Run 03_clarificator.py → 04_enricher.py first."
-            )
-            sys.exit(1)
-        print(f"[specwright] Loaded clarificator_requirement_synthesis.md as fallback ({len(enriched_prompt)} chars)")
-
-    # ── Check if spec already exists — warn user ──────────────────────────────
-    if spec_file.exists():
-        existing_lines = spec_file.read_text(encoding="utf-8").splitlines()
-        print(f"\n[specwright][warn] {spec_file.name} already exists ({len(existing_lines)} lines).")
-        overwrite = input("  Overwrite? [y/N]: ").strip().lower()
-        if overwrite not in ("y", "yes"):
-            print("[specwright] Aborted — existing spec preserved.")
-            sys.exit(0)
-
-    # ── Generate spec ─────────────────────────────────────────────────────────
-    _print_banner(f"Generating spec — {project_name}")
-    print("[specwright] Calling spec model (this may take 30–60s for complex specs) ...")
-
-    try:
-        raw_spec = _generate_spec(enriched_prompt, model=args.model)
-    except Exception as exc:
-        print(f"[specwright][error] Spec generation failed: {exc}")
-        sys.exit(1)
-
-    # Strip markdown fences if model wrapped output
-    spec = re.sub(r"^```(?:markdown)?\s*|\s*```$", "", raw_spec.strip(), flags=re.MULTILINE)
-
-    # ── Validate structure ────────────────────────────────────────────────────
-    missing = _validate_spec(spec)
-    if missing:
-        print(f"\n[specwright][warn] {len(missing)} expected section(s) not found in generated spec:")
-        for s in missing:
-            print(f"  ✗ {s}")
-        print("  The spec may be incomplete. Review carefully before running harness.")
-    else:
-        print("[specwright] ✓ All required sections present.")
-
-    # ── Dry run ───────────────────────────────────────────────────────────────
-    if args.dry_run:
-        _print_banner("Dry run — spec (not written)")
-        print(spec)
-        return
-
-    # ── Write spec file ───────────────────────────────────────────────────────
-    header = (
-        f"<!-- specwright_spec_{os.environ.get('PIPELINE_PROJECT', 'unknown')} — generated by 05_specwright on {_now_iso()} -->\n"
-        f"<!-- project: {project_name} | model: {args.model} -->\n\n"
-    )
-    final_spec = header + spec.strip() + "\n"
-    spec_file.write_text(final_spec, encoding="utf-8")
-    print(f"[specwright] ✓ Spec written → {spec_file}")
-
-    # ── Review ────────────────────────────────────────────────────────────────
-    if args.no_review or args.no_harness:
-        # Still show summary but skip full review flow
-        lines = spec.strip().splitlines()
-        _print_banner(f"Spec ready — {len(lines)} lines")
-        print(f"  File:  {spec_file}")
-        if not args.no_harness:
-            launch_choice = input("\n  Launch harness now? [y/N]: ").strip().lower()
-            if launch_choice in ("y", "yes"):
-                _launch_harness(project_name)
-            else:
-                _print_harness_instructions(project_name, spec_file)
-        else:
-            _print_harness_instructions(project_name, spec_file)
-        return
-
-    # Full interactive review
-    final_spec_content, run_harness = _review_spec(spec, spec_file)
-
-    # If user edited in review, overwrite file with updated content
-    if final_spec_content != spec:
-        updated = header + final_spec_content.strip() + "\n"
-        spec_file.write_text(updated, encoding="utf-8")
-        print(f"[specwright] ✓ Spec updated → {spec_file}")
-
-    if run_harness:
-        _launch_harness(project_name)
-    else:
-        _print_harness_instructions(project_name, spec_file)
-
 
 def _print_harness_instructions(project_name: str, spec_file: Path) -> None:
     _print_banner("Spec saved — harness not activated")
@@ -553,6 +469,146 @@ def _print_harness_instructions(project_name: str, spec_file: Path) -> None:
     print(f"\n  Or with flags:")
     print(f"    PIPELINE_PROJECT={project_name!r} python harness.py --dry-run")
     print(f"    PIPELINE_PROJECT={project_name!r} python harness.py --skip-judge\n")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    try:
+        parser = argparse.ArgumentParser(
+            description="05_specwright — generate artifacts_<slug>/specwright_spec_<slug>.md from enriched prompt"
+        )
+        parser.add_argument("--project",   metavar="NAME",
+                            help="Project workspace name. Prompted if omitted.")
+        parser.add_argument("--model",     metavar="MODEL", default=_SPEC_MODEL_DEFAULT,
+                            help=f"Model to use for spec generation. Default: {_SPEC_MODEL_DEFAULT}")
+        parser.add_argument("--dry-run",   action="store_true",
+                            help="Generate spec, print to stdout, do not write file or launch harness.")
+        parser.add_argument("--no-review", action="store_true",
+                            help="Skip interactive review — write spec and ask about harness directly.")
+        parser.add_argument("--no-harness", action="store_true",
+                            help="Write spec but do not offer to launch harness.")
+        args = parser.parse_args()
+
+        # ── Resolve project ───────────────────────────────────────────────────────
+        project_name = _resolve_project(args.project)
+        os.environ["PIPELINE_PROJECT"] = project_name
+        ensure_dirs()
+
+        # get_spec_path() resolves lazily to artifacts_<slug>/specwright_spec_<slug>.md —
+        # the canonical location every downstream pipeline script reads.
+        spec_file = get_spec_path()
+
+        print(f"[specwright] Workspace:  {project_name!r}")
+        print(f"[specwright] Spec target: {spec_file}")
+        print(f"[specwright] Model:       {args.model}")
+
+        # ── Load enriched prompt ──────────────────────────────────────────────────
+        enriched_prompt = _load_enriched_prompt()
+        if enriched_prompt.strip():
+            print(f"[specwright] Loaded enricher_session_enriched_prompt.md ({len(enriched_prompt)} chars)")
+        else:
+            # Fallback: use clarified_req directly (less optimal but functional)
+            print("[specwright][warn] enricher_session_enriched_prompt.md not found — falling back to clarificator_requirement_synthesis.md")
+            enriched_prompt = _load_clarified_req()
+            if not enriched_prompt.strip():
+                print(
+                    "[specwright][error] Neither enricher_session_enriched_prompt.md nor clarificator_requirement_synthesis.md found.\n"
+                    "            Run 03_clarificator.py → 04_enricher.py first."
+                )
+                sys.exit(1)
+            print(f"[specwright] Loaded clarificator_requirement_synthesis.md as fallback ({len(enriched_prompt)} chars)")
+
+        # Optional metadata read. This keeps project/session metadata available for
+        # future prompt expansion and makes the declared READS contract observable.
+        clarification_report = _load_clarification_report()
+        if clarification_report:
+            print("[specwright] Loaded clarificator_session_raw.json metadata")
+
+        # ── Check if spec already exists — warn user ──────────────────────────────
+        if spec_file.exists():
+            _track_read(spec_file)
+            existing_lines = spec_file.read_text(encoding="utf-8").splitlines()
+            print(f"\n[specwright][warn] {spec_file.name} already exists ({len(existing_lines)} lines).")
+            overwrite = input("  Overwrite? [y/N]: ").strip().lower()
+            if overwrite not in ("y", "yes"):
+                print("[specwright] Aborted — existing spec preserved.")
+                sys.exit(0)
+
+        # ── Generate spec ─────────────────────────────────────────────────────────
+        _print_banner(f"Generating spec — {project_name}")
+        print("[specwright] Calling spec model (this may take 30–60s for complex specs) ...")
+
+        try:
+            raw_spec = _generate_spec(enriched_prompt, model=args.model)
+        except Exception as exc:
+            print(f"[specwright][error] Spec generation failed: {exc}")
+            sys.exit(1)
+
+        # Strip markdown fences if model wrapped output
+        spec = re.sub(r"^```(?:markdown)?\s*|\s*```$", "", raw_spec.strip(), flags=re.MULTILINE)
+
+        # ── Validate structure ────────────────────────────────────────────────────
+        missing = _validate_spec(spec)
+        if missing:
+            print(f"\n[specwright][warn] {len(missing)} expected section(s) not found in generated spec:")
+            for s in missing:
+                print(f"  ✗ {s}")
+            print("  The spec may be incomplete. Review carefully before running harness.")
+        else:
+            print("[specwright] ✓ All required sections present.")
+
+        # ── Dry run ───────────────────────────────────────────────────────────────
+        if args.dry_run:
+            _print_banner("Dry run — spec (not written)")
+            print(spec)
+            return
+
+        # ── Write spec file ───────────────────────────────────────────────────────
+        header = (
+            f"<!-- specwright_spec_{os.environ.get('PIPELINE_PROJECT', 'unknown')} — generated by 05_specwright on {_now_iso()} -->\n"
+            f"<!-- project: {project_name} | model: {args.model} -->\n\n"
+        )
+        final_spec = header + spec.strip() + "\n"
+        spec_file.write_text(final_spec, encoding="utf-8")
+        _track_write(spec_file)
+        print(f"[specwright] ✓ Spec written → {spec_file}")
+
+        # ── Review ────────────────────────────────────────────────────────────────
+        if args.no_review or args.no_harness:
+            # Still show summary but skip full review flow
+            lines = spec.strip().splitlines()
+            _print_banner(f"Spec ready — {len(lines)} lines")
+            print(f"  File:  {spec_file}")
+            if not args.no_harness:
+                launch_choice = input("\n  Launch harness now? [y/N]: ").strip().lower()
+                if launch_choice in ("y", "yes"):
+                    _launch_harness(project_name)
+                else:
+                    _print_harness_instructions(project_name, spec_file)
+            else:
+                _print_harness_instructions(project_name, spec_file)
+            return
+
+        # Full interactive review
+        final_spec_content, run_harness = _review_spec(spec, spec_file)
+
+        # If user edited in review, overwrite file with updated content
+        if final_spec_content != spec:
+            updated = header + final_spec_content.strip() + "\n"
+            spec_file.write_text(updated, encoding="utf-8")
+            _track_write(spec_file)
+            print(f"[specwright] ✓ Spec updated → {spec_file}")
+
+        if run_harness:
+            _launch_harness(project_name)
+        else:
+            _print_harness_instructions(project_name, spec_file)
+
+    finally:
+        _print_artifact_access_summary()
 
 
 if __name__ == "__main__":
