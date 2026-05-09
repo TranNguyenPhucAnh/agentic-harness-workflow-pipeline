@@ -1,104 +1,156 @@
 """
 pipeline/13_archivist.py
-Step 7b — Long-term knowledge distillation after human review.
+========================
+Step 13 — Long-term knowledge distillation after human review.
 
 Two modes:
 
   A) JUDGE-DRIVEN:
-     Run after reviewing judge_report.md. Processes judge findings → writes
-     spec_addendum.md, plan_notes.json, findings_notes.md, knowledge base.
+     Run after reviewing judge_verdict_summary.md / judge_session_verdict_raw.json.
+     Processes judge findings and writes/updates:
+       - archivist_knowledge_log.md
+       - archivist_spec_gaps.md
+       - archivist_curation_log.json
 
   B) HUMAN-FIX CAPTURE:
      Run after you manually fix code that AI couldn't fix.
      Uses `git diff` to capture what you changed, links it to escalated clusters,
-     and distills a Pattern entry into artifacts_<slug>/knowledge/current/base.md.
-     On next run, base.md is injected into downstream prompts.
+     and distills a Pattern entry into archivist_knowledge_log.md.
+     On next run, archivist_knowledge_log.md is injected into downstream prompts.
 
 Mini-aware behaviour:
-  - Reads plan_mini.json, analysis_mini.json, impl_record.json.
+  - Reads planner_mini_execution_plan.json, planner_mini_impact_analysis.json,
+    executor_session_manifest.json.
   - Human-fix capture diffs mini target files instead of hardcoding src/.
   - Knowledge patterns include mini scope/context where available.
 
 Usage
 ─────
   # After judge review:
-  python pipeline/07_update_knowledge.py
-  python pipeline/07_update_knowledge.py --accept-all
-  python pipeline/07_update_knowledge.py --dry-run
+  python pipeline/13_archivist.py --project my-app
+  python pipeline/13_archivist.py --project my-app --accept-all
+  python pipeline/13_archivist.py --project my-app --dry-run
 
   # After manual human fix:
-  python pipeline/07_update_knowledge.py --capture-human-fix
-  python pipeline/07_update_knowledge.py --capture-human-fix --dry-run
+  python pipeline/13_archivist.py --project my-app --capture-human-fix
+  python pipeline/13_archivist.py --project my-app --capture-human-fix --dry-run
 
-  # View accumulated knowledge base:
-  python pipeline/07_update_knowledge.py --show-knowledge
+  # View accumulated knowledge:
+  python pipeline/13_archivist.py --project my-app --show-knowledge
 
-Writes (judge mode)
-───────────────────
-  artifacts_<slug>/knowledge/current/findings_notes.md
-  artifacts_<slug>/knowledge/current/spec_addendum.md
-  artifacts_<slug>/state/plan_notes.json
-  artifacts_<slug>/knowledge/current/base.md
-  artifacts_<slug>/knowledge/history/update_log.json
+Writes
+──────
+  artifacts_<slug>/knowledge/current/archivist_knowledge_log.md
+  artifacts_<slug>/knowledge/current/archivist_spec_gaps.md
+  artifacts_<slug>/knowledge/history/archivist_curation_log.json
 
-Writes (human-fix capture mode)
-────────────────────────────────
-  artifacts_<slug>/knowledge/history/update_log.json   ← diff + cluster context + root cause
-  artifacts_<slug>/knowledge/current/base.md           ← new Pattern entry appended
-  artifacts_<slug>/knowledge/current/findings_notes.md ← human fix note appended
+Reads
+─────
+  artifacts_<slug>/execution/judge_session_verdict_raw.json
+  artifacts_<slug>/reports/judge_verdict_summary.md
+  artifacts_<slug>/state/planner_full_execution_plan.json
+  artifacts_<slug>/state/planner_mini_execution_plan.json
+  artifacts_<slug>/state/planner_mini_impact_analysis.json
+  artifacts_<slug>/execution/executor_session_manifest.json
+  artifacts_<slug>/execution/debugger_session_test_summary.json
+  artifacts_<slug>/state/clarificator_requirement_synthesis.md
+  artifacts_<slug>/execution/enricher_session_enriched_prompt.md
+  artifacts_<slug>/knowledge/current/patcher_findings_snapshot.md
+  artifacts_<slug>/knowledge/current/archivist_knowledge_log.md
+  artifacts_<slug>/knowledge/current/archivist_spec_gaps.md
+  artifacts_<slug>/specwright_spec_<slug>.md
 
-For taxonomy details see docs/artifacts.md
+At the end of each run, prints:
+  - artifacts/files read
+  - artifacts/files created/updated/overwritten/appended
+
+For taxonomy details see artifacts/TAXONOMY.md
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from textwrap import indent
+from typing import Any
 
-# === WRITE AUTHORITY: 07_update_knowledge ===
-# OWNS  : artifacts_<slug>/knowledge/current/base.md
-#         artifacts_<slug>/knowledge/current/findings_notes.md
-#         artifacts_<slug>/knowledge/history/update_log.json
-#         artifacts_<slug>/state/plan_notes.json
-# READS : artifacts_<slug>/run/judge_raw.json
-#         artifacts_<slug>/state/plan.json
-#         artifacts_<slug>/state/plan_mini.json
-#         artifacts_<slug>/run/analysis_mini.json
-#         artifacts_<slug>/run/impl_record.json
-#         artifacts_<slug>/knowledge/current/spec_addendum.md
-#         artifacts_<slug>/run/test_report.json
+# === WRITE AUTHORITY: archivist ===
+# OWNS  : artifacts_<slug>/knowledge/current/archivist_knowledge_log.md
+#         artifacts_<slug>/knowledge/current/archivist_spec_gaps.md
+#         artifacts_<slug>/knowledge/history/archivist_curation_log.json
+# READS : artifacts_<slug>/execution/judge_session_verdict_raw.json
+#         artifacts_<slug>/reports/judge_verdict_summary.md
+#         artifacts_<slug>/state/planner_full_execution_plan.json
+#         artifacts_<slug>/state/planner_mini_execution_plan.json
+#         artifacts_<slug>/state/planner_mini_impact_analysis.json
+#         artifacts_<slug>/execution/executor_session_manifest.json
+#         artifacts_<slug>/execution/debugger_session_test_summary.json
+#         artifacts_<slug>/state/clarificator_requirement_synthesis.md
+#         artifacts_<slug>/execution/enricher_session_enriched_prompt.md
+#         artifacts_<slug>/knowledge/current/patcher_findings_snapshot.md
+#         artifacts_<slug>/knowledge/current/archivist_knowledge_log.md
+#         artifacts_<slug>/knowledge/current/archivist_spec_gaps.md
+#         artifacts_<slug>/specwright_spec_<slug>.md
 
-import sys as _sys
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-_sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from artifacts.paths import (
-    SPEC_PATH,
+from artifacts.paths import (  # noqa: E402
+    ARCHIVIST_CURATION_LOG,
+    ARCHIVIST_KNOWLEDGE_LOG,
+    ARCHIVIST_SPEC_GAPS,
+    CLARIFIED_REQ,
+    DEBUGGER_SESSION_TEST_SUMMARY,
+    ENRICHER_SESSION_PROMPT,
+    EXECUTOR_SESSION_MANIFEST,
+    JUDGE_SESSION_VERDICT_RAW,
+    JUDGE_VERDICT_SUMMARY,
+    PATCHER_FINDINGS_SNAPSHOT,
+    PLANNER_FULL_PLAN,
+    PLANNER_MINI_IMPACT,
+    PLANNER_MINI_PLAN,
     artifact_root,
-    JUDGE_RAW as JUDGE_RAW_PATH,
-    PLAN_JSON as GLM_PLAN_PATH,
-    PLAN_MINI as PLAN_MINI_PATH,
-    PLAN_NOTES as PLAN_NOTES_PATH,
-    FINDINGS_NOTES as FINDINGS_NOTES_PATH,
-    SPEC_ADDENDUM as ADDENDUM_PATH,
-    KNOWLEDGE_BASE as KNOWLEDGE_BASE_PATH,
-    UPDATE_LOG as UPDATE_LOG_PATH,
-    TEST_REPORT as TEST_REPORT_PATH,
-    ANALYSIS_MINI as ANALYSIS_MINI_PATH,
-    IMPL_RECORD as IMPL_RECORD_PATH,
-    CLARIFIED_REQ as CLARIFIED_REQ_PATH,
-    ENRICHED_PROMPT as ENRICHED_PROMPT_PATH,
     ensure_dirs,
+    get_spec_path,
 )
 
-ensure_dirs()
+
+# ════════════════════════════════════════════════════════════════════════════
+# Artifact/file access tracking
+# ════════════════════════════════════════════════════════════════════════════
+
+_ARTIFACTS_READ: set[str] = set()
+_ARTIFACTS_WRITTEN: set[str] = set()
+
+
+def _track_read(path: Any) -> None:
+    _ARTIFACTS_READ.add(str(path))
+
+
+def _track_write(path: Any) -> None:
+    _ARTIFACTS_WRITTEN.add(str(path))
+
+
+def _print_artifact_access_summary() -> None:
+    print("[13] Artifacts/files read:")
+    if _ARTIFACTS_READ:
+        for item in sorted(_ARTIFACTS_READ):
+            print(f"[13]   READ  {item}")
+    else:
+        print("[13]   READ  (none)")
+
+    print("[13] Artifacts/files created/updated/overwritten/appended:")
+    if _ARTIFACTS_WRITTEN:
+        for item in sorted(_ARTIFACTS_WRITTEN):
+            print(f"[13]   WRITE {item}")
+    else:
+        print("[13]   WRITE (none)")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -116,38 +168,110 @@ class KnowledgeAction:
     note: str = ""
 
 
-ACTION_ADDENDUM = "spec_addendum"
-ACTION_GLM_NOTE = "glm_global_note"
-ACTION_FINDINGS_ADD = "findings_add"
-ACTION_KNOWLEDGE = "knowledge_base"
+ACTION_SPEC_GAP = "spec_gap"
+ACTION_ARCHITECTURE_PATTERN = "architecture_pattern"
+ACTION_FINDING_PATTERN = "finding_pattern"
+ACTION_KNOWLEDGE = "knowledge_log"
 ACTION_SPEC_BUMP = "spec_bump_needed"
 ACTION_SKIP = "skip"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# CLI / project setup
+# ════════════════════════════════════════════════════════════════════════════
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="13_archivist.py",
+        description="Knowledge update: judge-driven or human-fix capture",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    parser.add_argument(
+        "--project",
+        default=None,
+        help="Project name for direct execution. Sets PIPELINE_PROJECT.",
+    )
+    parser.add_argument(
+        "--capture-human-fix",
+        action="store_true",
+        help="Capture manual human fix via git diff → archivist_knowledge_log.md",
+    )
+    parser.add_argument(
+        "--show-knowledge",
+        action="store_true",
+        help="Print archivist_knowledge_log.md and archivist_curation_log.json, then exit",
+    )
+    parser.add_argument(
+        "--accept-all",
+        action="store_true",
+        help="Accept all suggested actions without prompting",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print what would be done without writing anything",
+    )
+    parser.add_argument(
+        "--only-blocking",
+        action="store_true",
+        help="Process only blocking issues",
+    )
+    parser.add_argument(
+        "--only-non-blocking",
+        action="store_true",
+        help="Process only non-blocking notes",
+    )
+
+    return parser
+
+
+def _configure_project(
+    project: str | None,
+    parser: argparse.ArgumentParser,
+) -> None:
+    if project:
+        os.environ["PIPELINE_PROJECT"] = project
+        return
+
+    if os.environ.get("PIPELINE_PROJECT"):
+        return
+
+    parser.error(
+        "PIPELINE_PROJECT is not set. Use --project <name> or export "
+        "PIPELINE_PROJECT=<name> before running 13_archivist.py directly."
+    )
 
 
 # ════════════════════════════════════════════════════════════════════════════
 # Shared artifact helpers / mini context
 # ════════════════════════════════════════════════════════════════════════════
 
-def _load_json(path: Path, default):
+def _load_json(path: Any, default: Any) -> Any:
     if not path.exists():
         return default
     try:
-        return json.loads(path.read_text())
-    except Exception:
+        _track_read(path)
+        return json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except Exception as exc:
+        print(f"[13][warn] Could not parse JSON {path}: {exc}", file=sys.stderr)
         return default
 
 
-def _load_text(path: Path, default: str = "") -> str:
+def _load_text(path: Any, default: str = "") -> str:
     if not path.exists():
         return default
     try:
-        return path.read_text()
-    except Exception:
+        _track_read(path)
+        return path.read_text(encoding="utf-8", errors="replace")
+    except Exception as exc:
+        print(f"[13][warn] Could not read {path}: {exc}", file=sys.stderr)
         return default
 
 
-def _load_impl_record() -> dict:
-    return _load_json(IMPL_RECORD_PATH, {})
+def _load_impl_record() -> dict[str, Any]:
+    rec = _load_json(EXECUTOR_SESSION_MANIFEST, {})
+    return rec if isinstance(rec, dict) else {}
 
 
 def _current_scope() -> str:
@@ -155,28 +279,28 @@ def _current_scope() -> str:
     scope = rec.get("scope")
     if scope:
         return str(scope)
-    if PLAN_MINI_PATH.exists() or ANALYSIS_MINI_PATH.exists():
+    if PLANNER_MINI_PLAN.exists() or PLANNER_MINI_IMPACT.exists():
         return "mini"
     return "full"
 
 
-def _load_mini_context() -> dict:
+def _load_mini_context() -> dict[str, Any]:
     """Load mini planning/analysis/implementation context if present."""
-    plan_mini = _load_json(PLAN_MINI_PATH, {})
-    analysis_mini = _load_json(ANALYSIS_MINI_PATH, {})
+    plan_mini = _load_json(PLANNER_MINI_PLAN, {})
+    analysis_mini = _load_json(PLANNER_MINI_IMPACT, {})
     impl_record = _load_impl_record()
 
     return {
         "scope": _current_scope(),
-        "clarified_requirement": _load_text(CLARIFIED_REQ_PATH).strip(),
-        "enriched_prompt": _load_text(ENRICHED_PROMPT_PATH).strip(),
+        "clarified_requirement": _load_text(CLARIFIED_REQ).strip(),
+        "enriched_prompt": _load_text(ENRICHER_SESSION_PROMPT).strip(),
         "plan_mini": plan_mini,
         "analysis_mini": analysis_mini,
         "impl_record": impl_record,
     }
 
 
-def _mini_target_files(ctx: dict | None = None) -> list[str]:
+def _mini_target_files(ctx: dict[str, Any] | None = None) -> list[str]:
     """Return allowed/expected files for mini runs."""
     ctx = ctx or _load_mini_context()
     out: list[str] = []
@@ -206,7 +330,7 @@ def _mini_target_files(ctx: dict | None = None) -> list[str]:
     return unique
 
 
-def _run_context_summary(ctx: dict | None = None) -> str:
+def _run_context_summary(ctx: dict[str, Any] | None = None) -> str:
     ctx = ctx or _load_mini_context()
     scope = ctx.get("scope", "full")
 
@@ -247,8 +371,26 @@ def _run_context_summary(ctx: dict | None = None) -> str:
     return " | ".join(parts)
 
 
+def _extract_spec_version() -> str:
+    spec_path = get_spec_path()
+    if not spec_path.exists():
+        return "unknown"
+
+    text = _load_text(spec_path)
+    for pattern in (
+        r"^#\s*Version:\s*(\S+)",
+        r"^version:\s*(\S+)",
+        r"^Spec Version:\s*(\S+)",
+    ):
+        m = re.search(pattern, text, re.MULTILINE | re.IGNORECASE)
+        if m:
+            return m.group(1)
+
+    return "unknown"
+
+
 # ════════════════════════════════════════════════════════════════════════════
-# Tầng 1 — Human fix capture
+# Human fix capture
 # ════════════════════════════════════════════════════════════════════════════
 
 def _git_diff_for_paths(paths: list[str]) -> str:
@@ -286,22 +428,26 @@ def _parse_changed_files_from_diff(diff: str) -> list[str]:
     return re.findall(r"^\+\+\+ b/([^\n]+)", diff, re.MULTILINE)
 
 
-def _load_escalated_clusters() -> list[dict]:
-    """Read escalated clusters from test_report.json."""
-    if not TEST_REPORT_PATH.exists():
+def _load_escalated_clusters() -> list[dict[str, Any]]:
+    """Read escalated clusters from debugger_session_test_summary.json."""
+    if not DEBUGGER_SESSION_TEST_SUMMARY.exists():
         return []
 
     try:
-        report = json.loads(TEST_REPORT_PATH.read_text())
-        return report.get("escalated", [])
+        report = _load_json(DEBUGGER_SESSION_TEST_SUMMARY, {})
+        if isinstance(report, dict):
+            escalated = report.get("escalated", [])
+            return escalated if isinstance(escalated, list) else []
     except Exception:
-        return []
+        pass
+
+    return []
 
 
 def _match_clusters_to_files(
     changed_files: list[str],
-    escalated: list[dict],
-) -> list[dict]:
+    escalated: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     """Find escalated clusters whose file/src_file/path matches changed files."""
     matched = []
     changed = set(changed_files)
@@ -322,12 +468,12 @@ def _match_clusters_to_files(
 def _build_knowledge_pattern(
     diff: str,
     changed_files: list[str],
-    matched_clusters: list[dict],
+    matched_clusters: list[dict[str, Any]],
     root_cause: str,
     spec_version: str,
     run_context: str,
 ) -> str:
-    """Build a markdown Pattern entry for knowledge_base.md."""
+    """Build a markdown Pattern entry for archivist_knowledge_log.md."""
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     files_str = "\n".join(f"- `{f}`" for f in changed_files)
 
@@ -354,6 +500,7 @@ def _build_knowledge_pattern(
 
     return (
         f"## Pattern — {now} (spec {spec_version})\n\n"
+        f"**Source:** Human fix capture\n\n"
         f"**Run context:** {run_context}\n\n"
         f"**Files changed by human:**\n{files_str}\n\n"
         + (f"**Root cause:** {root_cause}\n\n" if root_cause else "")
@@ -363,27 +510,29 @@ def _build_knowledge_pattern(
     )
 
 
-def _append_knowledge_base(entry: str, dry_run: bool) -> None:
+def _append_knowledge_log(entry: str, dry_run: bool) -> None:
     if dry_run:
-        print(f"\n[DRY RUN] Would append to {KNOWLEDGE_BASE_PATH}:")
+        print(f"\n[DRY RUN] Would append to {ARCHIVIST_KNOWLEDGE_LOG}:")
         print(indent(entry[:300] + ("…" if len(entry) > 300 else ""), "  "))
         return
 
-    KNOWLEDGE_BASE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    ARCHIVIST_KNOWLEDGE_LOG.parent.mkdir(parents=True, exist_ok=True)
 
-    header = "# Knowledge Base — Human Fix Patterns\n\n"
-    if not KNOWLEDGE_BASE_PATH.exists():
-        KNOWLEDGE_BASE_PATH.write_text(header)
+    header = "# Archivist Knowledge Log\n\n"
+    if not ARCHIVIST_KNOWLEDGE_LOG.exists():
+        ARCHIVIST_KNOWLEDGE_LOG.write_text(header, encoding="utf-8")
+        _track_write(ARCHIVIST_KNOWLEDGE_LOG)
 
-    existing = KNOWLEDGE_BASE_PATH.read_text()
-    KNOWLEDGE_BASE_PATH.write_text(existing + entry)
+    existing = _load_text(ARCHIVIST_KNOWLEDGE_LOG)
+    ARCHIVIST_KNOWLEDGE_LOG.write_text(existing.rstrip() + "\n\n" + entry, encoding="utf-8")
+    _track_write(ARCHIVIST_KNOWLEDGE_LOG)
 
-    print(f"  ✓ Appended pattern to {KNOWLEDGE_BASE_PATH}")
+    print(f"  ✓ Appended pattern to {ARCHIVIST_KNOWLEDGE_LOG}")
 
 
 def capture_human_fix(dry_run: bool) -> None:
-    """Capture human intervention via git diff, update knowledge base."""
-    print("\n[07b] HUMAN FIX CAPTURE MODE")
+    """Capture human intervention via git diff, update archivist knowledge."""
+    print("\n[13] HUMAN FIX CAPTURE MODE")
 
     ctx = _load_mini_context()
     scope = ctx.get("scope", "full")
@@ -395,33 +544,33 @@ def capture_human_fix(dry_run: bool) -> None:
         if mini_files:
             diff_paths = mini_files
 
-    print(f"[07b] Scope: {scope}")
-    print(f"[07b] Scanning git diff for: {', '.join(diff_paths)}")
+    print(f"[13] Scope: {scope}")
+    print(f"[13] Scanning git diff for: {', '.join(diff_paths)}")
 
     diff = _git_diff_for_paths(diff_paths)
     if not diff:
-        print("[07b] No staged/unstaged changes found in selected path(s).")
-        print("      Stage your changes first, or check git status.")
+        print("[13] No staged/unstaged changes found in selected path(s).")
+        print("     Stage your changes first, or check git status.")
         return
 
     if diff.startswith("(git diff failed:"):
-        print(f"[07b] {diff}")
+        print(f"[13] {diff}")
         return
 
     changed_files = _parse_changed_files_from_diff(diff)
     if not changed_files:
-        print("[07b] Could not parse changed files from diff.")
+        print("[13] Could not parse changed files from diff.")
         return
 
     if scope == "mini":
         allowed = set(_mini_target_files(ctx))
         outside = [f for f in changed_files if allowed and f not in allowed]
         if outside:
-            print("[07b] WARNING: changed files outside mini target scope:")
+            print("[13] WARNING: changed files outside mini target scope:")
             for f in outside:
                 print(f"  ! {f}")
 
-    print("[07b] Changed files detected:")
+    print("[13] Changed files detected:")
     for f in changed_files:
         print(f"  {f}")
 
@@ -429,32 +578,24 @@ def capture_human_fix(dry_run: bool) -> None:
     matched = _match_clusters_to_files(changed_files, escalated)
 
     if matched:
-        print(f"\n[07b] Matched {len(matched)} escalated cluster(s) to your fix:")
+        print(f"\n[13] Matched {len(matched)} escalated cluster(s) to your fix:")
         for c in matched:
             print(f"  * {c.get('cluster')} — {c.get('note', '')}")
     else:
         print(
-            "\n[07b] No matching escalated clusters found "
+            "\n[13] No matching escalated clusters found "
             "(fix may be proactive or from judge review)."
         )
 
-    print("\n[07b] Briefly describe the root cause of the bug you fixed.")
-    print("      (Press Enter to skip)")
+    print("\n[13] Briefly describe the root cause of the bug you fixed.")
+    print("     (Press Enter to skip)")
 
     try:
         root_cause = input("  Root cause: ").strip()
     except (EOFError, KeyboardInterrupt):
         root_cause = ""
 
-    spec_version = "unknown"
-    if SPEC_PATH.exists():
-        m = re.search(
-            r"^#\s*Version:\s*(\S+)",
-            SPEC_PATH.read_text(),
-            re.MULTILINE,
-        )
-        if m:
-            spec_version = m.group(1)
+    spec_version = _extract_spec_version()
 
     pattern = _build_knowledge_pattern(
         diff=diff,
@@ -465,7 +606,7 @@ def capture_human_fix(dry_run: bool) -> None:
         run_context=_run_context_summary(ctx),
     )
 
-    _append_knowledge_base(pattern, dry_run)
+    _append_knowledge_log(pattern, dry_run)
 
     if not dry_run and matched:
         regression_note = (
@@ -484,8 +625,8 @@ def capture_human_fix(dry_run: bool) -> None:
                 f"{root_cause or c.get('note', '')}\n"
             )
 
-        _apply_findings(regression_note, dry_run=False)
-        print(f"  ✓ Regression note appended to {FINDINGS_NOTES_PATH}")
+        _apply_knowledge_log(regression_note, dry_run=False)
+        print(f"  ✓ Regression note appended to {ARCHIVIST_KNOWLEDGE_LOG}")
 
     if not dry_run:
         record = {
@@ -499,24 +640,13 @@ def capture_human_fix(dry_run: bool) -> None:
             "matched_clusters": matched,
             "diff_size_lines": len(diff.splitlines()),
         }
+        append_curation_log(record)
 
-        existing_records: list[dict] = []
-        if UPDATE_LOG_PATH.exists():
-            try:
-                existing_records = json.loads(UPDATE_LOG_PATH.read_text())
-            except Exception:
-                existing_records = []
-
-        existing_records.append(record)
-        UPDATE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        UPDATE_LOG_PATH.write_text(json.dumps(existing_records, indent=2))
-        print(f"  ✓ Fix record appended to {UPDATE_LOG_PATH}")
-
-    print("\n[07b] Human fix captured. Future runs will use this pattern.")
+    print("\n[13] Human fix captured. Future runs will use this pattern.")
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Tầng 2 — knowledge_base.md writer from judge findings
+# Knowledge pattern helpers
 # ════════════════════════════════════════════════════════════════════════════
 
 def _blocking_to_knowledge_pattern(
@@ -531,7 +661,7 @@ def _blocking_to_knowledge_pattern(
         f"**Source:** Judge blocking issue\n\n"
         f"**Run context:** {run_context}\n\n"
         f"**Finding:** {finding}\n\n"
-        f"**Inject into:** downstream implementation prompt "
+        f"**Inject into:** downstream planning / implementation / debugging prompts "
         f"(do NOT reintroduce)\n\n"
         f"---\n\n"
     )
@@ -541,30 +671,46 @@ def _blocking_to_knowledge_pattern(
 # Load & parse judge verdict
 # ════════════════════════════════════════════════════════════════════════════
 
-def _load_verdict() -> dict:
-    if not JUDGE_RAW_PATH.exists():
-        print(f"[07b] ERROR: {JUDGE_RAW_PATH} not found.", file=sys.stderr)
+def _load_verdict() -> dict[str, Any]:
+    if not JUDGE_SESSION_VERDICT_RAW.exists():
+        print(f"[13] ERROR: {JUDGE_SESSION_VERDICT_RAW} not found.", file=sys.stderr)
         sys.exit(1)
 
-    raw_obj = json.loads(JUDGE_RAW_PATH.read_text())
-    raw = raw_obj.get("response", "")
+    raw_obj = _load_json(JUDGE_SESSION_VERDICT_RAW, {})
+    if not isinstance(raw_obj, dict):
+        print(f"[13] ERROR: invalid judge raw shape: {JUDGE_SESSION_VERDICT_RAW}", file=sys.stderr)
+        sys.exit(1)
 
-    raw = re.sub(r"^```[a-z]*\n?", "", raw.strip())
+    raw = raw_obj.get("response", "")
+    if not isinstance(raw, str) or not raw.strip():
+        print("[13] ERROR: judge raw has empty response.", file=sys.stderr)
+        sys.exit(1)
+
+    raw = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", raw.strip())
     raw = re.sub(r"\n?```$", "", raw.strip())
 
-    return json.loads(raw)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not match:
+            raise
+        return json.loads(match.group())
 
 
-def _load_previous_fixes() -> dict:
-    """Load existing fix records from update_log.json, not used for decisions."""
-    if not UPDATE_LOG_PATH.exists():
+def _load_previous_curation_summary() -> dict[str, Any]:
+    """Load existing curation records, not used for decisions."""
+    if not ARCHIVIST_CURATION_LOG.exists():
         return {}
 
     try:
-        logs = json.loads(UPDATE_LOG_PATH.read_text())
-        return {"total_records": len(logs)}
+        logs = _load_json(ARCHIVIST_CURATION_LOG, [])
+        if isinstance(logs, list):
+            return {"total_records": len(logs)}
     except Exception:
-        return {}
+        pass
+
+    return {}
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -581,7 +727,7 @@ _SPEC_EDGE_KEYWORDS = {
     "no spec for",
 }
 
-_GLM_NOTE_KEYWORDS = {
+_ARCHITECTURE_PATTERN_KEYWORDS = {
     "requestAnimationFrame",
     "raf",
     "usememo",
@@ -617,11 +763,11 @@ def _suggest_action(
 
     if any(kw in text for kw in _SPEC_BUMP_KEYWORDS):
         content = (
-            "MANUAL ACTION REQUIRED — update spec.md:\n"
+            "MANUAL ACTION REQUIRED — update canonical spec:\n"
             f"Finding: {finding}\n"
             "Suggestion: define behaviour explicitly in the relevant section."
         )
-        return ACTION_SPEC_BUMP, "spec.md (manual)", content
+        return ACTION_SPEC_BUMP, "specwright_spec_<slug>.md (manual)", content
 
     if any(kw in text for kw in _SPEC_EDGE_KEYWORDS):
         content = (
@@ -629,19 +775,23 @@ def _suggest_action(
             f"Behaviour: define exact behaviour for: {finding}\n"
         )
         return (
-            ACTION_ADDENDUM,
-            "artifacts_<slug>/knowledge/current/spec_addendum.md",
+            ACTION_SPEC_GAP,
+            "artifacts_<slug>/knowledge/current/archivist_spec_gaps.md",
             content,
         )
 
-    if any(kw in text for kw in _GLM_NOTE_KEYWORDS) or severity == "blocking":
+    if any(kw in text for kw in _ARCHITECTURE_PATTERN_KEYWORDS) or severity == "blocking":
         content = finding
-        return ACTION_GLM_NOTE, "artifacts_<slug>/state/plan_notes.json", content
+        return (
+            ACTION_ARCHITECTURE_PATTERN,
+            "artifacts_<slug>/knowledge/current/archivist_knowledge_log.md",
+            content,
+        )
 
     content = f"- {finding}"
     return (
-        ACTION_FINDINGS_ADD,
-        "artifacts_<slug>/knowledge/current/findings_notes.md",
+        ACTION_FINDING_PATTERN,
+        "artifacts_<slug>/knowledge/current/archivist_knowledge_log.md",
         content,
     )
 
@@ -650,77 +800,54 @@ def _suggest_action(
 # Apply functions
 # ════════════════════════════════════════════════════════════════════════════
 
-def _apply_addendum(content: str, dry_run: bool) -> None:
+def _apply_spec_gap(content: str, dry_run: bool) -> None:
     if dry_run:
         print(
-            f"  [DRY RUN] Would append to {ADDENDUM_PATH}:\n"
+            f"  [DRY RUN] Would append to {ARCHIVIST_SPEC_GAPS}:\n"
             f"{indent(content, '    ')}"
         )
         return
 
-    ADDENDUM_PATH.parent.mkdir(parents=True, exist_ok=True)
+    ARCHIVIST_SPEC_GAPS.parent.mkdir(parents=True, exist_ok=True)
 
-    mode = "a" if ADDENDUM_PATH.exists() else "w"
-    with open(ADDENDUM_PATH, mode) as f:
-        if mode == "w":
-            f.write(
-                "# Spec addendum\n"
-                "_Edge cases surfaced by judge — inject downstream._\n\n"
-            )
-        f.write(content + "\n")
-
-    print(f"  ✓ Appended to {ADDENDUM_PATH}")
-
-
-def _apply_glm_note(content: str, dry_run: bool) -> None:
-    if dry_run:
-        print(f"  [DRY RUN] Would append to plan_notes.json: {content[:80]}")
-        return
-
-    if not GLM_PLAN_PATH.exists() and not PLAN_MINI_PATH.exists():
-        print("  [warn] No plan.json or plan_mini.json found — skipping planner note.")
-        return
-
-    notes: list = []
-    if PLAN_NOTES_PATH.exists():
-        try:
-            notes = json.loads(PLAN_NOTES_PATH.read_text())
-        except Exception:
-            notes = []
-
-    notes.append(
-        {
-            "note": content,
-            "added": datetime.now(timezone.utc).isoformat(),
-            "scope": _current_scope(),
-        }
+    header = (
+        "# Archivist Spec Gaps\n"
+        "_Edge cases and spec gaps surfaced by judge/human review._\n\n"
     )
 
-    PLAN_NOTES_PATH.parent.mkdir(parents=True, exist_ok=True)
-    PLAN_NOTES_PATH.write_text(json.dumps(notes, indent=2))
+    if not ARCHIVIST_SPEC_GAPS.exists():
+        ARCHIVIST_SPEC_GAPS.write_text(header, encoding="utf-8")
+        _track_write(ARCHIVIST_SPEC_GAPS)
 
-    print("  ✓ Appended to plan_notes.json")
+    existing = _load_text(ARCHIVIST_SPEC_GAPS)
+    ARCHIVIST_SPEC_GAPS.write_text(existing.rstrip() + "\n\n" + content + "\n", encoding="utf-8")
+    _track_write(ARCHIVIST_SPEC_GAPS)
+
+    print(f"  ✓ Appended to {ARCHIVIST_SPEC_GAPS}")
 
 
-def _apply_findings(content: str, dry_run: bool) -> None:
+def _apply_knowledge_log(content: str, dry_run: bool) -> None:
     block = f"\n{content}\n"
 
     if dry_run:
         print(
-            f"  [DRY RUN] Would append to {FINDINGS_NOTES_PATH}:\n"
+            f"  [DRY RUN] Would append to {ARCHIVIST_KNOWLEDGE_LOG}:\n"
             f"{indent(block, '    ')}"
         )
         return
 
-    FINDINGS_NOTES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    ARCHIVIST_KNOWLEDGE_LOG.parent.mkdir(parents=True, exist_ok=True)
 
-    mode = "a" if FINDINGS_NOTES_PATH.exists() else "w"
-    with open(FINDINGS_NOTES_PATH, mode) as f:
-        if mode == "w":
-            f.write("# Judge findings\n_Auto-managed — do not edit manually._\n")
-        f.write(block)
+    header = "# Archivist Knowledge Log\n_Accumulated architecture decisions, bug patterns, and lessons learned._\n"
+    if not ARCHIVIST_KNOWLEDGE_LOG.exists():
+        ARCHIVIST_KNOWLEDGE_LOG.write_text(header, encoding="utf-8")
+        _track_write(ARCHIVIST_KNOWLEDGE_LOG)
 
-    print(f"  ✓ Appended to {FINDINGS_NOTES_PATH}")
+    existing = _load_text(ARCHIVIST_KNOWLEDGE_LOG)
+    ARCHIVIST_KNOWLEDGE_LOG.write_text(existing.rstrip() + "\n\n" + block.strip() + "\n", encoding="utf-8")
+    _track_write(ARCHIVIST_KNOWLEDGE_LOG)
+
+    print(f"  ✓ Appended to {ARCHIVIST_KNOWLEDGE_LOG}")
 
 
 def _print_spec_bump_advice(content: str) -> None:
@@ -732,9 +859,10 @@ def _print_spec_bump_advice(content: str) -> None:
 
 
 APPLY_MAP = {
-    ACTION_ADDENDUM: _apply_addendum,
-    ACTION_GLM_NOTE: _apply_glm_note,
-    ACTION_FINDINGS_ADD: _apply_findings,
+    ACTION_SPEC_GAP: _apply_spec_gap,
+    ACTION_ARCHITECTURE_PATTERN: _apply_knowledge_log,
+    ACTION_FINDING_PATTERN: _apply_knowledge_log,
+    ACTION_KNOWLEDGE: _apply_knowledge_log,
 }
 
 
@@ -760,8 +888,8 @@ def _prompt_action(
         print(f"  Content: {content}")
 
     print(
-        "  Actions: [y] accept  [s] skip  [g] glm_note  "
-        "[a] addendum  [f] findings  [k] knowledge_base"
+        "  Actions: [y] accept  [s] skip  [g] spec_gap  "
+        "[a] architecture_pattern  [f] finding_pattern  [k] knowledge_log"
     )
 
     try:
@@ -772,11 +900,11 @@ def _prompt_action(
     if choice == "s":
         return ACTION_SKIP, content, True
     if choice == "g":
-        return ACTION_GLM_NOTE, content, True
+        return ACTION_SPEC_GAP, content, True
     if choice == "a":
-        return ACTION_ADDENDUM, content, True
+        return ACTION_ARCHITECTURE_PATTERN, content, True
     if choice == "f":
-        return ACTION_FINDINGS_ADD, content, True
+        return ACTION_FINDING_PATTERN, content, True
     if choice == "k":
         return ACTION_KNOWLEDGE, content, True
 
@@ -784,24 +912,34 @@ def _prompt_action(
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Show knowledge base
+# Show knowledge
 # ════════════════════════════════════════════════════════════════════════════
 
 def show_knowledge() -> None:
-    if not KNOWLEDGE_BASE_PATH.exists():
-        print("[07b] No knowledge base yet.")
+    if not ARCHIVIST_KNOWLEDGE_LOG.exists():
+        print("[13] No archivist knowledge log yet.")
     else:
-        print(KNOWLEDGE_BASE_PATH.read_text())
+        print(_load_text(ARCHIVIST_KNOWLEDGE_LOG))
 
-    if UPDATE_LOG_PATH.exists():
+    if ARCHIVIST_SPEC_GAPS.exists():
+        print("\n── Spec gaps ──")
+        print(_load_text(ARCHIVIST_SPEC_GAPS))
+
+    if ARCHIVIST_CURATION_LOG.exists():
         try:
-            logs = json.loads(UPDATE_LOG_PATH.read_text())
+            logs = _load_json(ARCHIVIST_CURATION_LOG, [])
         except Exception:
             logs = []
 
-        print(f"\n── Update log: {len(logs)} total records ──")
+        if not isinstance(logs, list):
+            logs = []
+
+        print(f"\n── Curation log: {len(logs)} total records ──")
 
         for r in logs[-5:]:
+            if not isinstance(r, dict):
+                continue
+
             mode = r.get("mode", "unknown")
             ts = r.get("timestamp", "")[:10] if "timestamp" in r else "?"
             scope = r.get("scope", "?")
@@ -810,7 +948,7 @@ def show_knowledge() -> None:
                 print(
                     f"  {ts}  {mode}  scope={scope}  "
                     f"{len(r.get('changed_files', []))} file(s)  "
-                    f"{r.get('root_cause', '')[:60]}"
+                    f"{str(r.get('root_cause', ''))[:60]}"
                 )
             else:
                 print(
@@ -820,61 +958,45 @@ def show_knowledge() -> None:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Main
+# Curation log
 # ════════════════════════════════════════════════════════════════════════════
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Knowledge update: judge-driven or human-fix capture",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
+def append_curation_log(record: dict[str, Any]) -> None:
+    ARCHIVIST_CURATION_LOG.parent.mkdir(parents=True, exist_ok=True)
 
-    parser.add_argument(
-        "--capture-human-fix",
-        action="store_true",
-        help="Capture manual human fix via git diff → knowledge_base.md",
-    )
-    parser.add_argument(
-        "--show-knowledge",
-        action="store_true",
-        help="Print knowledge_base.md and update log, then exit",
-    )
-    parser.add_argument(
-        "--accept-all",
-        action="store_true",
-        help="Accept all suggested actions without prompting",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Print what would be done without writing anything",
-    )
-    parser.add_argument(
-        "--only-blocking",
-        action="store_true",
-        help="Process only blocking issues",
-    )
-    parser.add_argument(
-        "--only-non-blocking",
-        action="store_true",
-        help="Process only non-blocking notes",
-    )
+    existing_log: list[Any] = []
+    if ARCHIVIST_CURATION_LOG.exists():
+        try:
+            loaded = _load_json(ARCHIVIST_CURATION_LOG, [])
+            if isinstance(loaded, list):
+                existing_log = loaded
+        except Exception:
+            existing_log = []
 
-    args = parser.parse_args()
+    existing_log.append(record)
+    ARCHIVIST_CURATION_LOG.write_text(
+        json.dumps(existing_log, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    _track_write(ARCHIVIST_CURATION_LOG)
 
-    if args.show_knowledge:
-        show_knowledge()
-        return
+    print(f"\n[13] Curation log appended to {ARCHIVIST_CURATION_LOG}")
 
-    if args.capture_human_fix:
-        capture_human_fix(dry_run=args.dry_run)
-        return
 
-    # ── Judge-driven mode ───────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
+# Main judge-driven mode
+# ════════════════════════════════════════════════════════════════════════════
+
+def run_judge_driven(args: argparse.Namespace) -> int:
     interactive = not args.accept_all and not args.dry_run
 
     verdict = _load_verdict()
-    _ = _load_previous_fixes()
+    _ = _load_previous_curation_summary()
+
+    # Optional context reads for richer access trace and future extension.
+    _ = _load_text(JUDGE_VERDICT_SUMMARY)
+    _ = _load_json(PLANNER_FULL_PLAN, {})
+    _ = _load_text(PATCHER_FINDINGS_SNAPSHOT)
 
     run_ctx = _load_mini_context()
     scope = run_ctx.get("scope", "full")
@@ -882,27 +1004,34 @@ def main() -> None:
 
     if verdict.get("verdict") not in ("NEEDS_REVISION", "APPROVED_WITH_NOTES"):
         print(
-            f"[07b] Judge verdict is {verdict.get('verdict')} — "
+            f"[13] Judge verdict is {verdict.get('verdict')} — "
             "no knowledge update needed for APPROVED runs."
         )
-        sys.exit(0)
+        return 0
 
-    print(f"[07b] Knowledge update for verdict: {verdict['verdict']}")
-    print(f"[07b] Run context: {run_summary}")
-    print(f"[07b] Dry-run: {args.dry_run}  |  Interactive: {interactive}")
+    print(f"[13] Knowledge update for verdict: {verdict['verdict']}")
+    print(f"[13] Run context: {run_summary}")
+    print(f"[13] Dry-run: {args.dry_run}  |  Interactive: {interactive}")
 
     sections = verdict.get("sections", {})
-    section_notes_map = {k: v.get("notes", "") for k, v in sections.items()}
+    if not isinstance(sections, dict):
+        sections = {}
+
+    section_notes_map = {
+        k: v.get("notes", "")
+        for k, v in sections.items()
+        if isinstance(v, dict)
+    }
 
     all_findings: list[tuple[str, str]] = []
 
     if not args.only_non_blocking:
         for desc in verdict.get("blocking_issues", []):
-            all_findings.append((desc, "blocking"))
+            all_findings.append((str(desc), "blocking"))
 
     if not args.only_blocking:
         for desc in verdict.get("non_blocking_notes", []):
-            all_findings.append((desc, "non_blocking"))
+            all_findings.append((str(desc), "non_blocking"))
 
         gaps_notes = section_notes_map.get("gaps_risks", "")
         if gaps_notes:
@@ -913,20 +1042,12 @@ def main() -> None:
                     all_findings.append((item, "gap_risk"))
 
     if not all_findings:
-        print("[07b] No findings to process.")
-        sys.exit(0)
+        print("[13] No findings to process.")
+        return 0
 
-    print(f"\n[07b] Processing {len(all_findings)} finding(s) …\n")
+    print(f"\n[13] Processing {len(all_findings)} finding(s) …\n")
 
-    spec_version = "unknown"
-    if SPEC_PATH.exists():
-        m = re.search(
-            r"^#\s*Version:\s*(\S+)",
-            SPEC_PATH.read_text(),
-            re.MULTILINE,
-        )
-        if m:
-            spec_version = m.group(1)
+    spec_version = _extract_spec_version()
 
     actions: list[KnowledgeAction] = []
     now = datetime.now(timezone.utc).isoformat()
@@ -980,7 +1101,7 @@ def main() -> None:
                 spec_version,
                 run_summary,
             )
-            _append_knowledge_base(kb_entry, dry_run=args.dry_run)
+            _append_knowledge_log(kb_entry, dry_run=args.dry_run)
 
         if final_action == ACTION_KNOWLEDGE:
             kb_entry = _blocking_to_knowledge_pattern(
@@ -988,7 +1109,7 @@ def main() -> None:
                 spec_version,
                 run_summary,
             )
-            _append_knowledge_base(kb_entry, dry_run=args.dry_run)
+            _append_knowledge_log(kb_entry, dry_run=args.dry_run)
             continue
 
         apply_fn = APPLY_MAP.get(final_action)
@@ -1014,19 +1135,7 @@ def main() -> None:
             "spec_bumps": sum(1 for a in actions if a.action == ACTION_SPEC_BUMP),
             "details": [asdict(a) for a in actions],
         }
-
-        existing_log: list[dict] = []
-        if UPDATE_LOG_PATH.exists():
-            try:
-                existing_log = json.loads(UPDATE_LOG_PATH.read_text())
-            except Exception:
-                existing_log = []
-
-        existing_log.append(log_entry)
-        UPDATE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        UPDATE_LOG_PATH.write_text(json.dumps(existing_log, indent=2))
-
-        print(f"\n[07b] Audit log appended to {UPDATE_LOG_PATH}")
+        append_curation_log(log_entry)
 
     applied = sum(
         1
@@ -1043,10 +1152,48 @@ def main() -> None:
     print(f"  Findings processed : {len(all_findings)}")
     print(f"  Actions applied    : {applied}")
     print(f"  Skipped            : {skipped}")
-    print(f"  Spec bumps needed  : {spec_bumps}  ← edit spec.md manually")
+    print(f"  Spec bumps needed  : {spec_bumps}  ← edit canonical spec manually")
 
     if spec_bumps:
-        print("\n  Spec bumps detected — edit spec.md manually before next run.")
+        print("\n  Spec bumps detected — edit canonical spec manually before next run.")
+
+    return 0
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Main
+# ════════════════════════════════════════════════════════════════════════════
+
+def main() -> None:
+    parser = _build_parser()
+    args = parser.parse_args()
+
+    _configure_project(args.project, parser)
+
+    # Important: project env must be configured before ensure_dirs().
+    ensure_dirs()
+
+    exit_code = 0
+
+    try:
+        if args.show_knowledge:
+            show_knowledge()
+            return
+
+        if args.capture_human_fix:
+            capture_human_fix(dry_run=args.dry_run)
+            return
+
+        exit_code = run_judge_driven(args)
+
+    except Exception as exc:
+        print(f"[13][error] Archivist failed: {exc}", file=sys.stderr)
+        exit_code = 1
+
+    finally:
+        _print_artifact_access_summary()
+
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
