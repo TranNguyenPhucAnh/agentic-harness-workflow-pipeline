@@ -111,21 +111,11 @@ artifacts_<slug>/
 ## Data Flow
 
 ```
-specwright_spec_<slug>.md
-  │
-  ├─[spectracker]──────► spectracker_applied_version.json
-  │                       spectracker_session_version_delta.json → harness
-  │                       spectracker_version_log.md (append)
-  │                       <version>.md, <version>.changelog.md
-  │
-  └─[scaffolder]───────► scaffolder_codebase_skeleton.json
-                          scaffolder_compressed_spec.md
-
 [absorber]───────────────► absorber_codebase_map.md
                             absorber_config_map.json
                             absorber_blame_map.md
                             absorber_session_codebase_snapshot.json     (cache)
-                            absorber_session_git_snapshot.json  (cache)
+                            absorber_session_git_snapshot.json          (cache)
 
 [clarificator]───────────► clarificator_session_raw.json
                             clarificator_session_questions.md
@@ -135,6 +125,14 @@ specwright_spec_<slug>.md
 [enricher]───────────────► enricher_session_enriched_prompt.md
 
 [specwright]─────────────► specwright_spec_<slug>.md
+                              │
+                              ├─[spectracker]────► spectracker_session_version_delta.json → harness
+                              │                     spectracker_applied_version.json
+                              │                     spectracker_version_log.md (append)
+                              │                     <version>.md, <version>.changelog.md
+                              │
+                              └─[scaffolder]─────► scaffolder_codebase_skeleton.json
+                                                    scaffolder_compressed_spec.md
 
 [planner]────────────────► planner_full_execution_plan.json
                             planner_mini_execution_plan.json
@@ -162,6 +160,20 @@ specwright_spec_<slug>.md
 
 ## Special Notes
 
+### Execution order note
+
+Although spectracker owns the spec delta artifacts, it runs **after specwright** in the canonical full flow because it requires `specwright_spec_<slug>.md`.
+
+Canonical full flow:
+
+```
+absorber → clarificator → enricher → specwright → spectracker → scaffolder → planner → executor → debugger → reporter → judge → patcher → archivist
+```
+
+If the canonical spec does not exist yet, harness skips spectracker preflight and waits until specwright creates the spec. Spectracker itself exits cleanly with a `SKIP` message when run against a missing spec (default non-strict mode); use `--strict` to treat missing spec as exit 1 in CI.
+
+---
+
 ### `specwright_spec_<slug>.md`
 Canonical spec per project. Slug embedded in filename enables cross-project extraction without renaming. Use `get_spec_path()` from `artifacts/paths.py` — not a static constant. Owner is specwright; all other modules read only.
 
@@ -179,6 +191,8 @@ Planner analysis of which files are impacted by the mini task scope. Distinct fr
 
 ### `state/spectracker_applied_version.json`
 Deliberate hybrid lifecycle: top-level fields (current version, last run metadata) overwrite each run; embedded `run_history[]` array is append-only across runs. Rationale: keeps history coupled with current state without an additional artifact. Used by spectracker to determine first-run vs delta, and to load the previous snapshot for diffing.
+
+In full harness runs, `write_applied()` is called by harness **at finalization time** only after the downstream pipeline succeeds — not during spectracker's normal run. This prevents a spec version from being marked applied before executor/debugger/judge completion. Ownership remains spectracker. A manual CLI fallback (`--mark-applied`) is available for recovery.
 
 ### `cache/scaffolder_compressed_spec.md`
 Token-optimised spec with §0 (pipeline meta) and §8 (output schema) stripped — ~35% token saving on downstream API calls. Pure cache: fully derivable from spec. Falls back to `get_spec_path()` if absent. No data here that isn't in source.

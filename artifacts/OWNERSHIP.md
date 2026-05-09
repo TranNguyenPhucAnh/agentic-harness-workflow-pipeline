@@ -30,11 +30,11 @@ Suffixes .md:
 
 | Module | Script | Role |
 |---|---|---|
-| `spectracker` | `01_spectracker.py` | Track spec version changes, decide rerun steps |
-| `absorber` | `02_absorber.py` | Scan codebase, build knowledge maps |
-| `clarificator` | `03_clarificator.py` | Clarify requirements via interactive Q&A |
-| `enricher` | `04_enricher.py` | Enrich context into structured prompt |
-| `specwright` | `05_specwright.py` | Generate/update spec |
+| `absorber` | `01_absorber.py` | Scan codebase, build knowledge maps |
+| `clarificator` | `02_clarificator.py` | Clarify requirements via interactive Q&A |
+| `enricher` | `03_enricher.py` | Enrich context into structured prompt |
+| `specwright` | `04_specwright.py` | Generate/update spec |
+| `spectracker` | `05_spectracker.py` | Track spec version changes, decide rerun steps |
 | `scaffolder` | `06_scaffolder.py` | Generate stub + test files |
 | `planner` | `07_planner.py` | Decompose work into execution plan |
 | `executor` | `08_executor.py` | Implement src/ files |
@@ -71,6 +71,7 @@ Suffixes .md:
 | `spectracker_applied_version.json` | `spectracker` | spectracker (self), harness | hybrid† |
 
 † `spectracker_applied_version.json`: top-level fields overwrite each run; embedded `run_history[]` is append-only.
+In full harness runs, `write_applied()` is called by harness **at finalization time** only after the downstream pipeline succeeds — not during spectracker's normal run. This prevents a spec version from being marked applied before executor/debugger/judge completion. Ownership remains spectracker.
 
 ---
 
@@ -157,22 +158,16 @@ Suffixes .md:
 
 ## Data Flow
 
-```
-specwright_spec_<slug>.md
-  │
-  ├─[spectracker]──────► spectracker_applied_version.json
-  │                       spectracker_session_version_delta.json  → harness (step decisions)
-  │                       spectracker_version_log.md (append)
-  │                       <version>.md, <version>.changelog.md
-  │
-  └─[scaffolder]───────► scaffolder_codebase_skeleton.json
-                          scaffolder_compressed_spec.md
+> **Execution order note:**
+> Spectracker runs **after** specwright has produced `specwright_spec_<slug>.md`.
+> On first runs where no canonical spec exists yet, harness skips spectracker until specwright creates the spec.
 
+```
 [absorber]───────────────► absorber_codebase_map.md
                             absorber_config_map.json
                             absorber_blame_map.md
                             absorber_session_codebase_snapshot.json        (cache, session)
-                            absorber_session_git_snapshot.json     (cache, session)
+                            absorber_session_git_snapshot.json             (cache, session)
 
 [clarificator]───────────► clarificator_session_raw.json           (execution, session)
                             clarificator_session_questions.md      (execution, session)
@@ -182,6 +177,14 @@ specwright_spec_<slug>.md
 [enricher]───────────────► enricher_session_enriched_prompt.md     (execution, session)
 
 [specwright]─────────────► specwright_spec_<slug>.md               (root)
+                              │
+                              ├─[spectracker]────► spectracker_session_version_delta.json  (cache, session)
+                              │                     spectracker_applied_version.json        (state, hybrid)
+                              │                     spectracker_version_log.md (append)    (knowledge/history)
+                              │                     <version>.md, <version>.changelog.md   (knowledge/history)
+                              │
+                              └─[scaffolder]─────► scaffolder_codebase_skeleton.json       (state)
+                                                    scaffolder_compressed_spec.md           (cache)
 
 [planner]────────────────► planner_full_execution_plan.json        (state)
                             planner_mini_execution_plan.json       (state)
