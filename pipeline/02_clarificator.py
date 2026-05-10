@@ -111,8 +111,8 @@ def _print_artifact_access_summary() -> None:
 
 # ── Model config ──────────────────────────────────────────────────────────────
 
-_ANALYZE_MODEL = "deepseek/deepseek-chat"
-_SUGGEST_MODEL = "deepseek/deepseek-chat"
+_ANALYZE_MODEL = "moonshotai/kimi-k2.6"
+_SUGGEST_MODEL = "moonshotai/kimi-k2.6"
 _TIER3_MIN_CONF = 0.75
 
 _MAX_TOKENS_ANALYZE = 8192
