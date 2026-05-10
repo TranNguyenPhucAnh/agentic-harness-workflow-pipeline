@@ -11,14 +11,14 @@ Phases:
   2. Content extraction    — full / key-only / signature-only per file
   3. Semantic compression  — single LLM call → codebase_map.md
   4. Config inventory      — aggregate key-only extractions → config_map.json
-  5. Git crawl             — git log → absorber_session_git_snapshot.json + absorber_blame_map.md
+  5. Git crawl             — git log → absorber_overwrite_git_snapshot.json + absorber_blame_map.md
 
 External integrations optional, graceful fallback:
   - vfs CLI     — signature extraction
   - Serena MCP  — symbol-level call graph, future via subprocess
 
 Change detection:
-  - absorber_session_codebase_snapshot.json tracks file hashes
+  - absorber_overwrite_codebase_snapshot.json tracks file hashes
   - Only re-extracts files that changed since last run
   - --force flag bypasses cache
 
@@ -39,12 +39,12 @@ Writes, owner: absorber (01_absorber.py):
   artifacts_<slug>/knowledge/current/absorber_codebase_map.md
   artifacts_<slug>/knowledge/current/absorber_config_map.json
   artifacts_<slug>/knowledge/current/absorber_blame_map.md
-  artifacts_<slug>/cache/absorber_session_codebase_snapshot.json
-  artifacts_<slug>/cache/absorber_session_git_snapshot.json
+  artifacts_<slug>/cache/absorber_overwrite_codebase_snapshot.json
+  artifacts_<slug>/cache/absorber_overwrite_git_snapshot.json
 
 Reads:
   project source files (target codebase)
-  artifacts_<slug>/cache/absorber_session_codebase_snapshot.json if present
+  artifacts_<slug>/cache/absorber_overwrite_codebase_snapshot.json if present
 
 At the end of each run, prints:
   - artifacts/files read
@@ -76,10 +76,10 @@ import httpx
 # OWNS  : artifacts_<slug>/knowledge/current/absorber_codebase_map.md
 #         artifacts_<slug>/knowledge/current/absorber_config_map.json
 #         artifacts_<slug>/knowledge/current/absorber_blame_map.md
-#         artifacts_<slug>/cache/absorber_session_codebase_snapshot.json
-#         artifacts_<slug>/cache/absorber_session_git_snapshot.json
+#         artifacts_<slug>/cache/absorber_overwrite_codebase_snapshot.json
+#         artifacts_<slug>/cache/absorber_overwrite_git_snapshot.json
 # READS : project source files (target codebase)
-#         artifacts_<slug>/cache/absorber_session_codebase_snapshot.json
+#         artifacts_<slug>/cache/absorber_overwrite_codebase_snapshot.json
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from artifacts.paths import (  # noqa: E402
@@ -117,19 +117,19 @@ def _track_write(path: Any) -> None:
 
 
 def _print_artifact_access_summary() -> None:
-    print("[02] Artifacts/files read:")
+    print("[01] Artifacts/files read:")
     if _ARTIFACTS_READ:
         for item in sorted(_ARTIFACTS_READ):
-            print(f"[02]   READ  {item}")
+            print(f"[01]   READ  {item}")
     else:
-        print("[02]   READ  (none)")
+        print("[01]   READ  (none)")
 
-    print("[02] Artifacts/files created/updated/overwritten/appended:")
+    print("[01] Artifacts/files created/updated/overwritten/appended:")
     if _ARTIFACTS_WRITTEN:
         for item in sorted(_ARTIFACTS_WRITTEN):
-            print(f"[02]   WRITE {item}")
+            print(f"[01]   WRITE {item}")
     else:
-        print("[02]   WRITE (none)")
+        print("[01]   WRITE (none)")
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -1153,7 +1153,7 @@ def build_config_map(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Phase 5 — Git crawl → absorber_session_git_snapshot.json + absorber_blame_map.md
+# Phase 5 — Git crawl → absorber_overwrite_git_snapshot.json + absorber_blame_map.md
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _ask_git_scope() -> str:
@@ -1500,7 +1500,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Ignore absorber_session_codebase_snapshot.json and re-extract all files.",
+        help="Ignore absorber_overwrite_codebase_snapshot.json and re-extract all files.",
     )
     parser.add_argument(
         "--dry-run",
@@ -1679,7 +1679,7 @@ def main() -> None:
         print(f"  absorber_config_map.json              → {CONFIG_MAP}")
 
         if not args.skip_git:
-            print(f"  absorber_session_git_snapshot.json    → {GIT_HISTORY}")
+            print(f"  absorber_overwrite_git_snapshot.json  → {GIT_HISTORY}")
             print(f"  absorber_blame_map.md                 → {BLAME_MAP}")
 
     except SystemExit as exc:
