@@ -36,7 +36,7 @@ Reads:
 
 Writes:
     artifacts_<slug>/src/**                                        non-test files only
-    artifacts_<slug>/execution/executor_session_manifest.json
+    artifacts_<slug>/execution/executor_overwrite_manifest.json
 
 
 MINI SCOPE
@@ -50,7 +50,7 @@ Reads:
 
 Writes:
     only files listed in state/planner_mini_execution_plan.json target_files
-    artifacts_<slug>/execution/executor_session_manifest.json
+    artifacts_<slug>/execution/executor_overwrite_manifest.json
 
 Rules:
     - Does NOT read the canonical spec.
@@ -87,11 +87,11 @@ MODEL = "qwen/qwen3.6-plus"
 
 # === WRITE AUTHORITY: executor ===
 # OWNS full:
-#   artifacts_<slug>/execution/executor_session_manifest.json
+#   artifacts_<slug>/execution/executor_overwrite_manifest.json
 #   artifacts_<slug>/src/**
 #
 # OWNS mini:
-#   artifacts_<slug>/execution/executor_session_manifest.json
+#   artifacts_<slug>/execution/executor_overwrite_manifest.json
 #   files explicitly listed in artifacts_<slug>/state/planner_mini_execution_plan.json target_files
 #
 # READS full:
@@ -108,7 +108,7 @@ MODEL = "qwen/qwen3.6-plus"
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from artifacts.paths import (  # noqa: E402
-    EXECUTOR_SESSION_MANIFEST,
+    EXECUTOR_OVERWRITE_MANIFEST,
     PLANNER_FULL_PLAN,
     PLANNER_MINI_IMPACT,
     PLANNER_MINI_PLAN,
@@ -1589,14 +1589,14 @@ def _write_impl_record(
     }
     record.update(extra)
 
-    EXECUTOR_SESSION_MANIFEST.parent.mkdir(parents=True, exist_ok=True)
-    EXECUTOR_SESSION_MANIFEST.write_text(
+    EXECUTOR_OVERWRITE_MANIFEST.parent.mkdir(parents=True, exist_ok=True)
+    EXECUTOR_OVERWRITE_MANIFEST.write_text(
         json.dumps(record, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
-    _track_write(EXECUTOR_SESSION_MANIFEST)
+    _track_write(EXECUTOR_OVERWRITE_MANIFEST)
 
-    print(f"[08] Executor session manifest → {EXECUTOR_SESSION_MANIFEST}")
+    print(f"[08] Executor manifest → {EXECUTOR_OVERWRITE_MANIFEST}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
