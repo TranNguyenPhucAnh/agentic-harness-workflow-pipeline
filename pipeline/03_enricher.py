@@ -9,14 +9,14 @@ Vị trí trong luồng:
 
 Inputs (đọc từ artifacts của project hiện tại):
     state/clarificator_requirement_synthesis.md        — output chính của clarificator
-    execution/clarificator_session_raw.json            — decisions, conflicts, metadata
+    execution/clarificator_overwrite_raw.json          — decisions, conflicts, metadata
     knowledge/current/archivist_knowledge_log.md       — knowledge base (nếu có)
     knowledge/current/absorber_codebase_map.md         — absorber output (nếu có)
     knowledge/current/absorber_config_map.json         — absorber output (nếu có)
     knowledge/current/absorber_blame_map.md            — absorber output (nếu có)
 
 Output (ghi vào artifacts của project):
-    execution/enricher_session_enriched_prompt.md      — enriched prompt, user review trước khi gửi spec agent
+    execution/enricher_overwrite_enriched_prompt.md    — enriched prompt, user review trước khi gửi spec agent
 
 Usage:
     python 03_enricher.py --project my-app
@@ -26,7 +26,7 @@ Usage:
     # Thường được gọi tự động từ 02_clarificator.py khi user chọn mode full.
 
 Artifacts produced (owner: enricher):
-    artifacts_<slug>/execution/enricher_session_enriched_prompt.md
+    artifacts_<slug>/execution/enricher_overwrite_enriched_prompt.md
 
 At the end of each run, prints:
     - artifacts read
@@ -55,27 +55,27 @@ from artifacts.paths import (  # type: ignore
     ABSORBER_CODEBASE_MAP,
     ABSORBER_CONFIG_MAP,
     ARCHIVIST_KNOWLEDGE_LOG,
-    CLARIFICATOR_SESSION_RAW,
+    CLARIFICATOR_OVERWRITE_RAW,
     CLARIFIED_REQ,
-    ENRICHER_SESSION_PROMPT,
+    ENRICHER_OVERWRITE_PROMPT,
     ensure_dirs,
 )
 
 # Local aliases — map canonical constants to the short names used internally
-CLARIFICATION_REPORT = CLARIFICATOR_SESSION_RAW
+CLARIFICATION_REPORT = CLARIFICATOR_OVERWRITE_RAW
 KNOWLEDGE_BASE       = ARCHIVIST_KNOWLEDGE_LOG
 CODEBASE_MAP         = ABSORBER_CODEBASE_MAP
 CONFIG_MAP           = ABSORBER_CONFIG_MAP
 BLAME_MAP            = ABSORBER_BLAME_MAP
-ENRICHED_PROMPT      = ENRICHER_SESSION_PROMPT
+ENRICHED_PROMPT      = ENRICHER_OVERWRITE_PROMPT
 
 # NOTE: run/mini_analysis.md (MINI_ANALYSIS) has been removed — deprecated with mini_mode.py.
 # enricher no longer reads it.
 
 # === WRITE AUTHORITY: enricher ===
-# OWNS  : artifacts_<slug>/execution/enricher_session_enriched_prompt.md
+# OWNS  : artifacts_<slug>/execution/enricher_overwrite_enriched_prompt.md
 # READS : artifacts_<slug>/state/clarificator_requirement_synthesis.md
-#         artifacts_<slug>/execution/clarificator_session_raw.json
+#         artifacts_<slug>/execution/clarificator_overwrite_raw.json
 #         artifacts_<slug>/knowledge/current/archivist_knowledge_log.md
 #         artifacts_<slug>/knowledge/current/absorber_codebase_map.md
 #         artifacts_<slug>/knowledge/current/absorber_config_map.json
@@ -99,19 +99,19 @@ def _track_write(path: Any) -> None:
 
 
 def _print_artifact_access_summary() -> None:
-    print("[04] Artifacts read:")
+    print("[03] Artifacts read:")
     if _ARTIFACTS_READ:
         for item in sorted(_ARTIFACTS_READ):
-            print(f"[04]   READ  {item}")
+            print(f"[03]   READ  {item}")
     else:
-        print("[04]   READ  (none)")
+        print("[03]   READ  (none)")
 
-    print("[04] Artifacts created/updated/overwritten/appended:")
+    print("[03] Artifacts created/updated/overwritten/appended:")
     if _ARTIFACTS_WRITTEN:
         for item in sorted(_ARTIFACTS_WRITTEN):
-            print(f"[04]   WRITE {item}")
+            print(f"[03]   WRITE {item}")
     else:
-        print("[04]   WRITE (none)")
+        print("[03]   WRITE (none)")
 
 
 # ── Model config ──────────────────────────────────────────────────────────────
@@ -386,7 +386,7 @@ def _review_prompt(enriched: str) -> tuple[str, bool]:
 
     print("\n  [1] confirm — send this prompt to spec agent")
     print("  [2] edit    — open $EDITOR to modify (writes to temp file)")
-    print("  [3] abort   — stop here, enricher_session_enriched_prompt.md saved for manual review\n")
+    print("  [3] abort   — stop here, enricher_overwrite_enriched_prompt.md saved for manual review\n")
 
     while True:
         choice = input("  → Choose 1 / 2 / 3: ").strip()
@@ -511,7 +511,7 @@ def main() -> None:
 
         report = _load_clarification_report()
         n_decisions = len(report.get("decisions", []))
-        print(f"[enricher] Loaded clarificator_session_raw.json ({n_decisions} decisions)")
+        print(f"[enricher] Loaded clarificator_overwrite_raw.json ({n_decisions} decisions)")
 
         knowledge_layer = _load_knowledge_layer()
         if knowledge_layer.strip():
@@ -546,7 +546,7 @@ def main() -> None:
             print(enriched.strip())
             return
 
-        # ── Write enricher_session_enriched_prompt.md ────────────────────────────
+        # ── Write enricher_overwrite_enriched_prompt.md ──────────────────────────
         header = (
             f"# Enriched Prompt — {project_name}\n"
             f"Generated: {_now_iso()}\n\n"
@@ -571,7 +571,7 @@ def main() -> None:
                 print(f"[enricher] ✓ Enriched prompt updated → {ENRICHED_PROMPT}")
 
         if not should_continue:
-            _print_banner("Stopped — enricher_session_enriched_prompt.md saved for manual review")
+            _print_banner("Stopped — enricher_overwrite_enriched_prompt.md saved for manual review")
             print(f"  Review:   {ENRICHED_PROMPT}")
             print(f"  Continue: python 05_specwright.py --project {project_name!r}\n")
             return

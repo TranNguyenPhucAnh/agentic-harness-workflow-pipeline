@@ -3,40 +3,50 @@ pipeline/10_reporter.py
 =======================
 Step 10 — Aggregate pipeline artifacts into reports/reporter_execution_summary.md.
 
+Session model:
+  When PIPELINE_SESSION is set, session-local artifacts resolve under:
+    artifacts_<slug>/sessions/<NNN>/
+
+  When PIPELINE_SESSION is not set, paths.py falls back to the old layout:
+    artifacts_<slug>/
+
 Supports both:
   - FULL flow:
       planner_full_execution_plan.json
       scaffolder_codebase_skeleton.json
-      spectracker_session_version_delta.json
-      debugger_session_test_summary.json
-      executor_session_manifest.json
+      spectracker_overwrite_version_delta.json
+      debugger_overwrite_test_summary.json
+      executor_overwrite_manifest.json
 
   - MINI flow:
       planner_mini_execution_plan.json
       planner_mini_impact_analysis.json
       clarificator_requirement_synthesis.md
-      enricher_session_enriched_prompt.md
-      executor_session_manifest.json
-      debugger_session_test_summary.json
+      enricher_overwrite_enriched_prompt.md
+      executor_overwrite_manifest.json
+      debugger_overwrite_test_summary.json
 
 Writes:
+  artifacts_<slug>/sessions/<NNN>/reports/reporter_execution_summary.md
+  or, without PIPELINE_SESSION:
   artifacts_<slug>/reports/reporter_execution_summary.md
 
 Reads:
-  artifacts_<slug>/state/planner_full_execution_plan.json
-  artifacts_<slug>/state/planner_mini_execution_plan.json
-  artifacts_<slug>/state/planner_mini_impact_analysis.json
-  artifacts_<slug>/execution/debugger_session_test_summary.json
-  artifacts_<slug>/state/scaffolder_codebase_skeleton.json
-  artifacts_<slug>/cache/spectracker_session_version_delta.json
-  artifacts_<slug>/execution/executor_session_manifest.json
-  artifacts_<slug>/reports/judge_verdict_summary.md
-  artifacts_<slug>/state/clarificator_requirement_synthesis.md
-  artifacts_<slug>/execution/enricher_session_enriched_prompt.md
+  artifacts_<slug>/sessions/<NNN>/state/planner_full_execution_plan.json
+  artifacts_<slug>/sessions/<NNN>/state/planner_mini_execution_plan.json
+  artifacts_<slug>/sessions/<NNN>/state/planner_mini_impact_analysis.json
+  artifacts_<slug>/sessions/<NNN>/execution/debugger_overwrite_test_summary.json
+  artifacts_<slug>/sessions/<NNN>/state/scaffolder_codebase_skeleton.json
+  artifacts_<slug>/sessions/<NNN>/cache/spectracker_overwrite_version_delta.json
+  artifacts_<slug>/sessions/<NNN>/execution/executor_overwrite_manifest.json
+  artifacts_<slug>/sessions/<NNN>/reports/judge_verdict_summary.md
+  artifacts_<slug>/sessions/<NNN>/state/clarificator_requirement_synthesis.md
+  artifacts_<slug>/sessions/<NNN>/execution/enricher_overwrite_enriched_prompt.md
 
 Direct execution:
   python 10_reporter.py --project my-app
   PIPELINE_PROJECT=my-app python 10_reporter.py
+  PIPELINE_PROJECT=my-app PIPELINE_SESSION=001 python 10_reporter.py
 
 At the end of each run, prints:
   - artifacts read
@@ -57,24 +67,24 @@ from pathlib import Path
 from typing import Any
 
 # === WRITE AUTHORITY: reporter ===
-# OWNS  : artifacts_<slug>/reports/reporter_execution_summary.md
-# READS : artifacts_<slug>/state/planner_full_execution_plan.json
-#         artifacts_<slug>/state/planner_mini_execution_plan.json
-#         artifacts_<slug>/state/planner_mini_impact_analysis.json
-#         artifacts_<slug>/execution/debugger_session_test_summary.json
-#         artifacts_<slug>/state/scaffolder_codebase_skeleton.json
-#         artifacts_<slug>/cache/spectracker_session_version_delta.json
-#         artifacts_<slug>/execution/executor_session_manifest.json
-#         artifacts_<slug>/reports/judge_verdict_summary.md
-#         artifacts_<slug>/state/clarificator_requirement_synthesis.md
-#         artifacts_<slug>/execution/enricher_session_enriched_prompt.md
+# OWNS  : artifacts_<slug>/sessions/<NNN>/reports/reporter_execution_summary.md
+# READS : artifacts_<slug>/sessions/<NNN>/state/planner_full_execution_plan.json
+#         artifacts_<slug>/sessions/<NNN>/state/planner_mini_execution_plan.json
+#         artifacts_<slug>/sessions/<NNN>/state/planner_mini_impact_analysis.json
+#         artifacts_<slug>/sessions/<NNN>/execution/debugger_overwrite_test_summary.json
+#         artifacts_<slug>/sessions/<NNN>/state/scaffolder_codebase_skeleton.json
+#         artifacts_<slug>/sessions/<NNN>/cache/spectracker_overwrite_version_delta.json
+#         artifacts_<slug>/sessions/<NNN>/execution/executor_overwrite_manifest.json
+#         artifacts_<slug>/sessions/<NNN>/reports/judge_verdict_summary.md
+#         artifacts_<slug>/sessions/<NNN>/state/clarificator_requirement_synthesis.md
+#         artifacts_<slug>/sessions/<NNN>/execution/enricher_overwrite_enriched_prompt.md
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from artifacts.paths import (  # noqa: E402
     CLARIFIED_REQ,
-    DEBUGGER_SESSION_TEST_SUMMARY,
-    ENRICHER_SESSION_PROMPT,
-    EXECUTOR_SESSION_MANIFEST,
+    DEBUGGER_OVERWRITE_TEST_SUMMARY,
+    ENRICHER_OVERWRITE_PROMPT,
+    EXECUTOR_OVERWRITE_MANIFEST,
     JUDGE_VERDICT_SUMMARY,
     PLANNER_FULL_PLAN,
     PLANNER_MINI_IMPACT,
@@ -83,6 +93,9 @@ from artifacts.paths import (  # noqa: E402
     SCAFFOLD_JSON,
     SPECTRACKER_VERSION_DELTA,
     ensure_dirs,
+    get_project_name,
+    get_project_slug,
+    get_session_id,
 )
 
 
@@ -131,6 +144,7 @@ def _build_parser() -> argparse.ArgumentParser:
             Examples:
               python 10_reporter.py --project my-app
               PIPELINE_PROJECT=my-app python 10_reporter.py
+              PIPELINE_PROJECT=my-app PIPELINE_SESSION=001 python 10_reporter.py
         """),
     )
     parser.add_argument(
@@ -138,16 +152,33 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Project name for direct execution. Sets PIPELINE_PROJECT.",
     )
+    parser.add_argument(
+        "--session",
+        default=None,
+        help=(
+            "Optional session id for direct execution. Sets PIPELINE_SESSION. "
+            "Example: --session 1 resolves to sessions/001."
+        ),
+    )
     return parser
 
 
 def _configure_project(
     project: str | None,
+    session: str | None,
     parser: argparse.ArgumentParser,
 ) -> None:
     if project:
         os.environ["PIPELINE_PROJECT"] = project
-        return
+
+    if session is not None:
+        raw = str(session).strip()
+        if not raw:
+            parser.error("--session cannot be empty.")
+        try:
+            os.environ["PIPELINE_SESSION"] = f"{int(raw):03d}"
+        except ValueError:
+            parser.error("--session must be an integer, e.g. --session 1.")
 
     if os.environ.get("PIPELINE_PROJECT"):
         return
@@ -193,7 +224,7 @@ def _load_text(path: Any) -> str:
 
 
 def load_test_report() -> dict[str, Any] | None:
-    return _load_json(DEBUGGER_SESSION_TEST_SUMMARY)
+    return _load_json(DEBUGGER_OVERWRITE_TEST_SUMMARY)
 
 
 def load_planner_full_plan() -> dict[str, Any] | None:
@@ -209,7 +240,7 @@ def load_analysis_mini() -> dict[str, Any] | None:
 
 
 def load_impl_record() -> dict[str, Any] | None:
-    return _load_json(EXECUTOR_SESSION_MANIFEST)
+    return _load_json(EXECUTOR_OVERWRITE_MANIFEST)
 
 
 def _detect_scope(impl_record: dict[str, Any] | None) -> str:
@@ -259,6 +290,8 @@ def _extract_file_list(value: Any) -> list[str]:
       [{"path": "src/a.ts", ...}]
     or:
       [{"file_path": "src/a.ts", ...}]
+    or:
+      [{"file": "src/a.ts", ...}]
     """
     files: list[str] = []
 
@@ -274,26 +307,6 @@ def _extract_file_list(value: Any) -> list[str]:
                 files.append(path)
 
     return files
-
-
-def _append_details_block(
-    lines: list[str],
-    title: str,
-    items: list[str],
-    *,
-    empty: str = "—",
-) -> None:
-    if not items:
-        lines.append(empty)
-        return
-
-    lines += [
-        f"<details><summary>{title}</summary>",
-        "",
-    ]
-    for item in items:
-        lines.append(f"- `{item}`")
-    lines += ["", "</details>", ""]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -463,7 +476,7 @@ def append_mini_plan_section(
 
 def append_mini_requirement_section(lines: list[str]) -> None:
     clarified = _load_text(CLARIFIED_REQ)
-    enriched = _load_text(ENRICHER_SESSION_PROMPT)
+    enriched = _load_text(ENRICHER_OVERWRITE_PROMPT)
 
     if not clarified and not enriched:
         return
@@ -511,7 +524,7 @@ def append_test_results_section(
     ]
 
     if test_report is None:
-        lines.append("| — | — | ⚠️ No report | — | debugger_session_test_summary.json missing |")
+        lines.append("| — | — | ⚠️ No report | — | debugger_overwrite_test_summary.json missing |")
         lines.append("")
         return False
 
@@ -864,9 +877,9 @@ def main() -> None:
     parser = _build_parser()
     args = parser.parse_args()
 
-    _configure_project(args.project, parser)
+    _configure_project(args.project, args.session, parser)
 
-    # Important: project env must be available before ensure_dirs().
+    # Important: project/session env must be available before ensure_dirs().
     ensure_dirs()
 
     exit_code = 0
@@ -882,10 +895,16 @@ def main() -> None:
         plan_mini = load_plan_mini()
         analysis_mini = load_analysis_mini()
 
+        session_id = get_session_id()
+        session_label = session_id if session_id is not None else "legacy/no-session"
+
         lines: list[str] = [
             "# LLM Pipeline Report",
             f"_Generated: {now}_",
             "",
+            f"**Project:** `{get_project_name()}`",
+            f"**Project slug:** `{get_project_slug()}`",
+            f"**Session:** `{session_label}`",
             f"**Scope:** `{scope}`",
             "",
         ]

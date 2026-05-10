@@ -17,24 +17,21 @@ Canonical module pipeline:
     archivist     13_archivist.py
 
 harness.py is the ONLY entrypoint for end-to-end pipeline runs.
-Step scripts are pure runners: execute one step, write owned artifacts, exit.
 
-Spectracker note:
-    Spectracker runs after specwright because it requires the canonical spec:
-        artifacts_<slug>/specwright_spec_<slug>.md
+New design:
+    - Project-global artifacts live under artifacts_<slug>/
+    - Session-local artifacts live under artifacts_<slug>/sessions/<NNN>/
+    - harness owns orchestration metadata only:
+        artifacts_<slug>/session_runs/session_<NNN>_runs.json
+    - step scripts own their artifact writes.
+    - harness may call spectracker.write_applied() during finalization only.
 
-    For mid-pipeline runs starting at scaffolder/planner/executor, harness may
-    run spectracker as a preflight if the canonical spec already exists.
+Session model:
+    Session = logical unit of work.
+    Run     = one harness.py invocation.
 
-    Normal spectracker execution computes a proposed delta only. Harness marks
-    the spec version as applied by calling spectracker.write_applied() only
-    after successful downstream full-scope completion.
-
-Artifact tracing is ON by default:
-    after each step, harness prints declared reads/writes and actual artifact
-    create/update/overwrite/append/delete changes under artifacts_<slug>/.
-
-Disable tracing:
+Artifact tracing is ON by default.
+Disable:
     python harness.py --no-trace-artifacts
 """
 
@@ -50,34 +47,15 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 
 ROOT = Path(__file__).parent
-
-# === WRITE AUTHORITY: harness ===
-# OWNS  : orchestration only; optional legacy mini delegated to mini_mode.py
-# READS : all artifacts
-# NOTE  : step scripts own their respective artifact writes.
-#         Harness may call spectracker.write_applied() during finalization;
-#         ownership of state/spectracker_applied_version.json remains spectracker.
-
 sys.path.insert(0, str(ROOT))
-
-from artifacts.paths import (  # noqa: E402
-    ARCHIVIST_CURATION_LOG,
-    CLARIFICATOR_SESSION_QUESTIONS,
-    EXECUTOR_SESSION_MANIFEST,
-    JUDGE_SESSION_VERDICT_RAW,
-    JUDGE_VERDICT_SUMMARY,
-    PLANNER_FULL_PLAN,
-    PLANNER_MINI_PLAN,
-    REPORTER_EXECUTION_SUMMARY,
-    SPECTRACKER_APPLIED,
-    SPECTRACKER_VERSION_DELTA,
-)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -129,32 +107,32 @@ SCOPE_CHOICES = ("full", "mini")
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Artifact tracing registry
+# Artifact trace declaration registry — new naming/session layout
 # ════════════════════════════════════════════════════════════════════════════
 
 STEP_ARTIFACT_READS: dict[str, list[str]] = {
     "absorber": [],
     "clarificator": [
-        "cache/absorber_session_codebase_snapshot.json",
-        "cache/absorber_session_git_snapshot.json",
+        "sessions/<NNN>/cache/absorber_overwrite_codebase_snapshot.json",
+        "sessions/<NNN>/cache/absorber_overwrite_git_snapshot.json",
         "knowledge/current/clarificator_decision_log.md",
         "knowledge/current/absorber_codebase_map.md",
         "knowledge/current/absorber_config_map.json",
         "knowledge/current/absorber_blame_map.md",
     ],
     "enricher": [
-        "state/clarificator_requirement_synthesis.md",
-        "execution/clarificator_session_raw.json",
-        "cache/absorber_session_codebase_snapshot.json",
-        "cache/absorber_session_git_snapshot.json",
+        "sessions/<NNN>/state/clarificator_requirement_synthesis.md",
+        "sessions/<NNN>/execution/clarificator_overwrite_raw.json",
+        "sessions/<NNN>/cache/absorber_overwrite_codebase_snapshot.json",
+        "sessions/<NNN>/cache/absorber_overwrite_git_snapshot.json",
         "knowledge/current/clarificator_decision_log.md",
         "knowledge/current/absorber_codebase_map.md",
         "knowledge/current/absorber_config_map.json",
         "knowledge/current/absorber_blame_map.md",
     ],
     "specwright": [
-        "execution/enricher_session_enriched_prompt.md",
-        "state/clarificator_requirement_synthesis.md",
+        "sessions/<NNN>/execution/enricher_overwrite_enriched_prompt.md",
+        "sessions/<NNN>/state/clarificator_requirement_synthesis.md",
         "knowledge/current/archivist_spec_gaps.md",
     ],
     "spectracker": [
@@ -168,61 +146,61 @@ STEP_ARTIFACT_READS: dict[str, list[str]] = {
     ],
     "planner": [
         "specwright_spec_<slug>.md",
-        "state/scaffolder_codebase_skeleton.json",
-        "cache/scaffolder_compressed_spec.md",
-        "cache/absorber_session_codebase_snapshot.json",
+        "sessions/<NNN>/state/scaffolder_codebase_skeleton.json",
+        "sessions/<NNN>/cache/scaffolder_compressed_spec.md",
+        "sessions/<NNN>/cache/absorber_overwrite_codebase_snapshot.json",
         "knowledge/current/absorber_codebase_map.md",
         "knowledge/current/absorber_blame_map.md",
         "knowledge/current/archivist_knowledge_log.md",
-        "execution/clarificator_session_raw.json",
+        "sessions/<NNN>/execution/clarificator_overwrite_raw.json",
     ],
     "executor": [
         "specwright_spec_<slug>.md",
-        "state/scaffolder_codebase_skeleton.json",
-        "state/planner_full_execution_plan.json",
-        "state/planner_mini_execution_plan.json",
-        "state/planner_mini_impact_analysis.json",
-        "cache/scaffolder_compressed_spec.md",
+        "sessions/<NNN>/state/scaffolder_codebase_skeleton.json",
+        "sessions/<NNN>/state/planner_full_execution_plan.json",
+        "sessions/<NNN>/state/planner_mini_execution_plan.json",
+        "sessions/<NNN>/state/planner_mini_impact_analysis.json",
+        "sessions/<NNN>/cache/scaffolder_compressed_spec.md",
         "knowledge/current/absorber_codebase_map.md",
         "knowledge/current/archivist_knowledge_log.md",
     ],
     "debugger": [
-        "state/planner_full_execution_plan.json",
-        "state/planner_mini_execution_plan.json",
-        "execution/executor_session_manifest.json",
+        "sessions/<NNN>/state/planner_full_execution_plan.json",
+        "sessions/<NNN>/state/planner_mini_execution_plan.json",
+        "sessions/<NNN>/execution/executor_overwrite_manifest.json",
         "knowledge/current/patcher_findings_snapshot.md",
         "knowledge/current/archivist_knowledge_log.md",
     ],
     "reporter": [
-        "state/scaffolder_codebase_skeleton.json",
-        "state/planner_full_execution_plan.json",
-        "state/planner_mini_execution_plan.json",
-        "execution/executor_session_manifest.json",
-        "execution/debugger_session_test_summary.json",
-        "cache/spectracker_session_version_delta.json",
+        "sessions/<NNN>/state/scaffolder_codebase_skeleton.json",
+        "sessions/<NNN>/state/planner_full_execution_plan.json",
+        "sessions/<NNN>/state/planner_mini_execution_plan.json",
+        "sessions/<NNN>/execution/executor_overwrite_manifest.json",
+        "sessions/<NNN>/execution/debugger_overwrite_test_summary.json",
+        "sessions/<NNN>/cache/spectracker_overwrite_version_delta.json",
     ],
     "judge": [
         "specwright_spec_<slug>.md",
-        "state/scaffolder_codebase_skeleton.json",
-        "state/planner_full_execution_plan.json",
-        "state/planner_mini_execution_plan.json",
-        "execution/executor_session_manifest.json",
-        "execution/debugger_session_test_summary.json",
-        "reports/reporter_execution_summary.md",
+        "sessions/<NNN>/state/scaffolder_codebase_skeleton.json",
+        "sessions/<NNN>/state/planner_full_execution_plan.json",
+        "sessions/<NNN>/state/planner_mini_execution_plan.json",
+        "sessions/<NNN>/execution/executor_overwrite_manifest.json",
+        "sessions/<NNN>/execution/debugger_overwrite_test_summary.json",
+        "sessions/<NNN>/reports/reporter_execution_summary.md",
         "knowledge/current/archivist_knowledge_log.md",
         "knowledge/current/archivist_spec_gaps.md",
     ],
     "patcher": [
-        "execution/judge_session_verdict_raw.json",
-        "state/planner_full_execution_plan.json",
-        "state/planner_mini_execution_plan.json",
-        "execution/executor_session_manifest.json",
+        "sessions/<NNN>/execution/judge_overwrite_verdict_raw.json",
+        "sessions/<NNN>/state/planner_full_execution_plan.json",
+        "sessions/<NNN>/state/planner_mini_execution_plan.json",
+        "sessions/<NNN>/execution/executor_overwrite_manifest.json",
         "knowledge/current/archivist_knowledge_log.md",
-        "cache/scaffolder_compressed_spec.md",
+        "sessions/<NNN>/cache/scaffolder_compressed_spec.md",
     ],
     "archivist": [
-        "execution/debugger_session_test_summary.json",
-        "execution/judge_session_verdict_raw.json",
+        "sessions/<NNN>/execution/debugger_overwrite_test_summary.json",
+        "sessions/<NNN>/execution/judge_overwrite_verdict_raw.json",
         "knowledge/current/patcher_findings_snapshot.md",
         "knowledge/history/patcher_attempt_log.json",
     ],
@@ -230,58 +208,58 @@ STEP_ARTIFACT_READS: dict[str, list[str]] = {
 
 STEP_ARTIFACT_WRITES: dict[str, list[str]] = {
     "absorber": [
-        "cache/absorber_session_codebase_snapshot.json",
-        "cache/absorber_session_git_snapshot.json",
+        "sessions/<NNN>/cache/absorber_overwrite_codebase_snapshot.json",
+        "sessions/<NNN>/cache/absorber_overwrite_git_snapshot.json",
         "knowledge/current/absorber_codebase_map.md",
         "knowledge/current/absorber_config_map.json",
         "knowledge/current/absorber_blame_map.md",
     ],
     "clarificator": [
-        "execution/clarificator_session_raw.json",
-        "execution/clarificator_session_questions.md",
-        "state/clarificator_requirement_synthesis.md",
+        "sessions/<NNN>/execution/clarificator_overwrite_raw.json",
+        "sessions/<NNN>/execution/clarificator_overwrite_questions.md",
+        "sessions/<NNN>/state/clarificator_requirement_synthesis.md",
         "knowledge/current/clarificator_decision_log.md",
     ],
     "enricher": [
-        "execution/enricher_session_enriched_prompt.md",
+        "sessions/<NNN>/execution/enricher_overwrite_enriched_prompt.md",
     ],
     "specwright": [
         "specwright_spec_<slug>.md",
     ],
     "spectracker": [
-        "cache/spectracker_session_version_delta.json",
+        "sessions/<NNN>/cache/spectracker_overwrite_version_delta.json",
         "knowledge/history/spectracker_version_log.md",
         "knowledge/history/<version>.md",
         "knowledge/history/<version>.changelog.md",
         "state/spectracker_applied_version.json  (finalization via write_applied)",
     ],
     "scaffolder": [
-        "state/scaffolder_codebase_skeleton.json",
-        "cache/scaffolder_compressed_spec.md",
+        "sessions/<NNN>/state/scaffolder_codebase_skeleton.json",
+        "sessions/<NNN>/cache/scaffolder_compressed_spec.md",
         "tests/",
     ],
     "planner": [
-        "state/planner_full_execution_plan.json",
-        "state/planner_mini_execution_plan.json",
-        "state/planner_mini_impact_analysis.json",
+        "sessions/<NNN>/state/planner_full_execution_plan.json",
+        "sessions/<NNN>/state/planner_mini_execution_plan.json",
+        "sessions/<NNN>/state/planner_mini_impact_analysis.json",
     ],
     "executor": [
-        "execution/executor_session_manifest.json",
+        "sessions/<NNN>/execution/executor_overwrite_manifest.json",
         "src/",
     ],
     "debugger": [
-        "execution/debugger_session_test_summary.json",
+        "sessions/<NNN>/execution/debugger_overwrite_test_summary.json",
         "src/",
     ],
     "reporter": [
-        "reports/reporter_execution_summary.md",
+        "sessions/<NNN>/reports/reporter_execution_summary.md",
     ],
     "judge": [
-        "execution/judge_session_verdict_raw.json",
-        "reports/judge_verdict_summary.md",
+        "sessions/<NNN>/execution/judge_overwrite_verdict_raw.json",
+        "sessions/<NNN>/reports/judge_verdict_summary.md",
     ],
     "patcher": [
-        "execution/patcher_session_fix_summary.md",
+        "sessions/<NNN>/execution/patcher_overwrite_fix_summary.md",
         "knowledge/current/patcher_findings_snapshot.md",
         "knowledge/history/patcher_attempt_log.json",
         "src/",
@@ -292,6 +270,219 @@ STEP_ARTIFACT_WRITES: dict[str, list[str]] = {
         "knowledge/history/archivist_curation_log.json",
     ],
 }
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Core helpers
+# ════════════════════════════════════════════════════════════════════════════
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _die(msg: str) -> None:
+    print(f"[harness] ERROR: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def load_dotenv() -> None:
+    env_file = ROOT / ".env"
+    if not env_file.exists():
+        return
+
+    for line in env_file.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, _, value = line.partition("=")
+            os.environ.setdefault(key.strip(), value.strip())
+
+
+def check_env(keys: list[str]) -> bool:
+    missing = [key for key in keys if not os.environ.get(key)]
+    if missing:
+        print(f"[harness] Missing env vars: {', '.join(missing)}")
+        print("          Set them in .env or export them before running.")
+        return False
+    return True
+
+
+def _normalize_session_id(raw: str | int) -> str:
+    return f"{int(raw):03d}"
+
+
+def _pipeline_script(script: str) -> Path:
+    return ROOT / "pipeline" / script
+
+
+def run_step(label: str, script: str, extra_args: list[str] | None = None) -> bool:
+    cmd = [sys.executable, str(_pipeline_script(script))] + (extra_args or [])
+
+    print(f"\n{'=' * 60}")
+    print(f"  {label}")
+    print(f"{'=' * 60}")
+
+    t0 = time.time()
+    result = subprocess.run(cmd, cwd=ROOT)
+    elapsed = time.time() - t0
+
+    status = "✓ PASS" if result.returncode == 0 else "✗ FAIL"
+    print(f"  {status}  ({elapsed:.1f}s)")
+    return result.returncode == 0
+
+
+def skip_step(label: str, reason: str) -> None:
+    print(f"\n{'=' * 60}")
+    print(f"  {label}  [SKIPPED — {reason}]")
+    print(f"{'=' * 60}")
+
+
+def _scope_args_for_script(script: str, scope: str) -> list[str]:
+    if script in {"07_planner.py", "08_executor.py"}:
+        return ["--scope", scope]
+    return []
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Session selection + run metadata
+# ════════════════════════════════════════════════════════════════════════════
+
+def _existing_session_ids() -> list[str]:
+    from artifacts.paths import artifact_root
+
+    sessions_dir = artifact_root() / "sessions"
+    if not sessions_dir.exists():
+        return []
+
+    ids: list[str] = []
+    for path in sessions_dir.iterdir():
+        if path.is_dir() and path.name.isdigit():
+            ids.append(_normalize_session_id(path.name))
+    return sorted(set(ids))
+
+
+def _next_session_id() -> str:
+    ids = _existing_session_ids()
+    if not ids:
+        return "001"
+    return _normalize_session_id(int(ids[-1]) + 1)
+
+
+def _resolve_session_for_run(args: argparse.Namespace) -> str:
+    if args.session:
+        return _normalize_session_id(args.session)
+
+    if args.new_session:
+        return _next_session_id()
+
+    ids = _existing_session_ids()
+    if ids:
+        return ids[-1]
+
+    return "001"
+
+
+def _session_runs_path(session_id: str) -> Path:
+    from artifacts.paths import get_session_runs_path
+
+    return get_session_runs_path(session_id)
+
+
+def _atomic_write_json(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    tmp.replace(path)
+
+
+def _load_session_runs(session_id: str) -> dict[str, Any]:
+    path = _session_runs_path(session_id)
+
+    if path.exists():
+        try:
+            data = json.loads(path.read_text())
+            if isinstance(data, dict):
+                data.setdefault("session_id", session_id)
+                data.setdefault("created_at", _now_iso())
+                data.setdefault("runs", [])
+                return data
+        except Exception:
+            pass
+
+    return {
+        "session_id": session_id,
+        "created_at": _now_iso(),
+        "runs": [],
+    }
+
+
+def _start_run_record(
+    session_id: str,
+    args: argparse.Namespace,
+    from_step: str,
+    until_step: str,
+) -> str:
+    data = _load_session_runs(session_id)
+    run_id = f"run_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+
+    data["runs"].append(
+        {
+            "run_id": run_id,
+            "started_at": _now_iso(),
+            "completed_at": None,
+            "status": "RUNNING",
+            "scope": args.scope,
+            "from_step": from_step,
+            "until_step": until_step,
+            "stopped_at_step": None,
+            "resumed_from_run": data["runs"][-1]["run_id"] if data["runs"] else None,
+            "steps": [],
+            "spec_version": None,
+        }
+    )
+
+    _atomic_write_json(_session_runs_path(session_id), data)
+    return run_id
+
+
+def _update_run_record(
+    session_id: str,
+    run_id: str,
+    *,
+    status: str | None = None,
+    step: str | None = None,
+    step_status: str | None = None,
+    stopped_at_step: str | None = None,
+    spec_version: str | None = None,
+) -> None:
+    data = _load_session_runs(session_id)
+
+    for run in data.get("runs", []):
+        if run.get("run_id") != run_id:
+            continue
+
+        if status is not None:
+            run["status"] = status
+            if status in {"PASS", "FAIL", "STOPPED"}:
+                run["completed_at"] = _now_iso()
+
+        if stopped_at_step is not None:
+            run["stopped_at_step"] = stopped_at_step
+
+        if spec_version is not None:
+            run["spec_version"] = spec_version
+
+        if step is not None and step_status is not None:
+            run.setdefault("steps", []).append(
+                {
+                    "step": step,
+                    "status": step_status,
+                    "at": _now_iso(),
+                }
+            )
+
+        break
+
+    _atomic_write_json(_session_runs_path(session_id), data)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -314,14 +505,6 @@ def _hash_bytes(data: bytes) -> str:
 
 
 def _snapshot_artifacts() -> ArtifactSnapshot:
-    """
-    Snapshot files under artifacts_<slug>/.
-
-    Note:
-      - Traces pipeline artifacts only under artifacts_<slug>/.
-      - Excludes harness scratch state/prev_src/.
-      - Root-level src/ and tests/ are build outputs, not artifact files.
-    """
     from artifacts.paths import artifact_root
 
     root = artifact_root()
@@ -335,6 +518,8 @@ def _snapshot_artifacts() -> ArtifactSnapshot:
             continue
 
         rel = path.relative_to(root).as_posix()
+
+        # harness scratch space
         if rel.startswith("state/prev_src/"):
             continue
 
@@ -402,8 +587,9 @@ def _print_artifact_list(title: str, items: list[str], indent: str = "    ") -> 
         print(f"{indent}  - (none)")
         return
 
+    sid = os.environ.get("PIPELINE_SESSION", "<NNN>")
     for item in items:
-        print(f"{indent}  - {item}")
+        print(f"{indent}  - {item.replace('<NNN>', sid)}")
 
 
 def _print_artifact_trace(
@@ -449,88 +635,6 @@ def _run_step_with_trace(
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Core helpers
-# ════════════════════════════════════════════════════════════════════════════
-
-def _die(msg: str) -> None:
-    print(f"[harness] ERROR: {msg}", file=sys.stderr)
-    sys.exit(1)
-
-
-def load_dotenv() -> None:
-    env_file = ROOT / ".env"
-    if not env_file.exists():
-        return
-
-    for line in env_file.read_text().splitlines():
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            key, _, value = line.partition("=")
-            os.environ.setdefault(key.strip(), value.strip())
-
-
-def run_step(label: str, script: str, extra_args: list[str] | None = None) -> bool:
-    cmd = [sys.executable, str(ROOT / "pipeline" / script)] + (extra_args or [])
-
-    print(f"\n{'=' * 60}")
-    print(f"  {label}")
-    print(f"{'=' * 60}")
-
-    t0 = time.time()
-    result = subprocess.run(cmd, cwd=ROOT)
-    elapsed = time.time() - t0
-
-    status = "✓ PASS" if result.returncode == 0 else "✗ FAIL"
-    print(f"  {status}  ({elapsed:.1f}s)")
-    return result.returncode == 0
-
-
-def skip_step(label: str, reason: str) -> None:
-    print(f"\n{'=' * 60}")
-    print(f"  {label}  [SKIPPED — {reason}]")
-    print(f"{'=' * 60}")
-
-
-def check_env(keys: list[str]) -> bool:
-    missing = [key for key in keys if not os.environ.get(key)]
-    if missing:
-        print(f"[harness] Missing env vars: {', '.join(missing)}")
-        print("          Set them in .env or export them before running.")
-        return False
-
-    return True
-
-
-def _artifact_rel(path: Any) -> str:
-    try:
-        from artifacts.paths import artifact_root
-
-        return str(Path(path).relative_to(artifact_root()))
-    except Exception:
-        return str(path)
-
-
-def _canonical_step(step: str | None) -> str | None:
-    return step
-
-
-def _prev_src_dir() -> Path:
-    from artifacts.paths import artifact_root
-
-    return artifact_root() / "state" / "prev_src"
-
-
-def _canonical_spec_path() -> Path:
-    from artifacts.paths import get_spec_path
-
-    return get_spec_path()
-
-
-def _canonical_spec_exists() -> bool:
-    return _canonical_spec_path().exists()
-
-
-# ════════════════════════════════════════════════════════════════════════════
 # Project selection
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -571,10 +675,37 @@ def _interactive_project_select(root: Path) -> str:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Delta helpers
+# Artifact/path helpers
 # ════════════════════════════════════════════════════════════════════════════
 
+def _artifact_rel(path: Any) -> str:
+    try:
+        from artifacts.paths import artifact_root
+
+        return str(Path(path).relative_to(artifact_root()))
+    except Exception:
+        return str(path)
+
+
+def _prev_src_dir() -> Path:
+    from artifacts.paths import artifact_root
+
+    return artifact_root() / "state" / "prev_src"
+
+
+def _canonical_spec_path() -> Path:
+    from artifacts.paths import get_spec_path
+
+    return get_spec_path()
+
+
+def _canonical_spec_exists() -> bool:
+    return _canonical_spec_path().exists()
+
+
 def load_delta() -> dict | None:
+    from artifacts.paths import SPECTRACKER_VERSION_DELTA
+
     if not SPECTRACKER_VERSION_DELTA.exists():
         return None
 
@@ -585,9 +716,6 @@ def load_delta() -> dict | None:
 
 
 def delta_requires(delta: dict | None, step: str) -> bool:
-    """
-    True if spectracker delta says step must re-run, or delta unavailable.
-    """
     if delta is None:
         return True
 
@@ -640,7 +768,13 @@ def print_delta_summary(delta: dict) -> None:
 # ════════════════════════════════════════════════════════════════════════════
 
 def snapshot_src() -> None:
-    src = ROOT / "src"
+    from artifacts.paths import SRC_DIR
+
+    src = Path(SRC_DIR)
+    if not src.exists():
+        # backward compat if executor still writes root-level src/
+        src = ROOT / "src"
+
     if not src.exists():
         return
 
@@ -653,6 +787,8 @@ def snapshot_src() -> None:
 
 
 def restore_unaffected_files(delta: dict) -> int:
+    from artifacts.paths import SRC_DIR
+
     unaffected = [
         file
         for file in delta.get("unaffected_files", [])
@@ -664,9 +800,11 @@ def restore_unaffected_files(delta: dict) -> int:
         return 0
 
     restored = 0
+    src_root = Path(SRC_DIR)
+
     for rel in unaffected:
         prev = prev_src / rel[len("src/"):]
-        dest = ROOT / rel
+        dest = src_root / rel[len("src/"):]
 
         if prev.exists():
             dest.parent.mkdir(parents=True, exist_ok=True)
@@ -684,6 +822,8 @@ def restore_unaffected_files(delta: dict) -> int:
 # ════════════════════════════════════════════════════════════════════════════
 
 def _read_judge_verdict() -> str:
+    from artifacts.paths import JUDGE_SESSION_VERDICT_RAW
+
     raw_path = JUDGE_SESSION_VERDICT_RAW
     if not raw_path.exists():
         return ""
@@ -705,16 +845,10 @@ def _read_judge_verdict() -> str:
         return ""
 
 
-def _scope_args_for_script(script: str, scope: str) -> list[str]:
-    if script in {"07_planner.py", "08_executor.py"}:
-        return ["--scope", scope]
-
-    return []
-
-
 def _run_judge_fix_loop(args: argparse.Namespace, results: dict[str, bool]) -> None:
+    from artifacts.paths import ARCHIVIST_CURATION_LOG
+
     max_rounds = args.max_judge_rounds
-    skip_fix = args.skip_fix
 
     for round_num in range(1, max_rounds + 1):
         round_sfx = f" (round {round_num}/{max_rounds})" if max_rounds > 1 else ""
@@ -734,28 +868,25 @@ def _run_judge_fix_loop(args: argparse.Namespace, results: dict[str, bool]) -> N
         if verdict in ("APPROVED", "APPROVED_WITH_NOTES"):
             print(f"[harness] ✅ Judge {verdict} — pipeline complete.")
             results["judge"] = True
-            break
+            return
 
         if round_num == max_rounds:
-            print(
-                f"[harness] ⚠ Reached max_judge_rounds ({max_rounds}) "
-                f"with verdict {verdict or '(unknown)'}."
-            )
+            print(f"[harness] ⚠ Reached max_judge_rounds ({max_rounds}).")
             print("[harness] Run archivist when ready: python pipeline/13_archivist.py")
-            break
+            return
 
-        if skip_fix:
+        if args.skip_fix:
             skip_step(
                 f"patcher{round_sfx}",
                 "--skip-fix set — review judge_verdict_summary.md manually",
             )
-            break
+            return
 
         if verdict == "NEEDS_REVISION":
             patcher_args: list[str] = []
             if args.verbose:
                 patcher_args.append("--verbose")
-            if getattr(args, "fix_non_blocking", False):
+            if args.fix_non_blocking:
                 patcher_args.append("--fix-non-blocking")
 
             patch_ok = _run_step_with_trace(
@@ -770,9 +901,9 @@ def _run_judge_fix_loop(args: argparse.Namespace, results: dict[str, bool]) -> N
             if not patch_ok:
                 print("\n[harness] ⚠ Patcher failed; human review required.")
                 print(f"[harness] See {ARCHIVIST_CURATION_LOG}")
-                break
+                return
 
-            print("\n[harness] Patch applied successfully — re-running reporter + judge …")
+            print("\n[harness] Patch applied — re-running reporter + judge …")
             report_ok = _run_step_with_trace(
                 "reporter",
                 "reporter post-patch",
@@ -783,19 +914,20 @@ def _run_judge_fix_loop(args: argparse.Namespace, results: dict[str, bool]) -> N
 
             if not report_ok:
                 results["judge"] = False
-                break
+                return
 
             continue
 
-        print("[harness] Judge step failed or returned non-actionable verdict — stopping.")
-        break
+        print("[harness] Judge failed or returned non-actionable verdict — stopping.")
+        return
 
 
 def _run_fix_from_existing_judge(args: argparse.Namespace, results: dict[str, bool]) -> None:
+    from artifacts.paths import JUDGE_SESSION_VERDICT_RAW, ARCHIVIST_CURATION_LOG
+
     raw_path = JUDGE_SESSION_VERDICT_RAW
     if not raw_path.exists():
-        print("[harness] --repair-from-judge: execution/judge_session_verdict_raw.json not found.")
-        print("          Run the full pipeline first to generate a judge report.")
+        print("[harness] --repair-from-judge: judge_overwrite_verdict_raw.json not found.")
         results["patcher_from_judge"] = False
         return
 
@@ -823,7 +955,7 @@ def _run_fix_from_existing_judge(args: argparse.Namespace, results: dict[str, bo
     patcher_args: list[str] = []
     if args.verbose:
         patcher_args.append("--verbose")
-    if getattr(args, "fix_non_blocking", False):
+    if args.fix_non_blocking:
         patcher_args.append("--fix-non-blocking")
 
     patch_ok = _run_step_with_trace(
@@ -841,6 +973,7 @@ def _run_fix_from_existing_judge(args: argparse.Namespace, results: dict[str, bo
         return
 
     print("\n[harness] Patch applied — refreshing reporter + re-judging …")
+
     report_ok = _run_step_with_trace(
         "reporter",
         "reporter post-patch",
@@ -884,22 +1017,10 @@ def _selected_single_steps(args: argparse.Namespace) -> list[str]:
 
 
 def _has_range_selection(args: argparse.Namespace) -> bool:
-    return bool(
-        getattr(args, "from_step", None)
-        or getattr(args, "until_step", None)
-    )
+    return bool(args.from_step or args.until_step)
 
 
 def _validate_execution_mode_conflicts(args: argparse.Namespace) -> None:
-    """
-    Keep harness CLI semantics strict:
-
-      range mode       : --from-<step> [--until-<step>]
-      single-step mode : --<step>
-      repair flow      : --repair-from-judge
-
-    These modes must not be mixed.
-    """
     single_steps = _selected_single_steps(args)
 
     if len(single_steps) > 1:
@@ -916,7 +1037,7 @@ def _validate_execution_mode_conflicts(args: argparse.Namespace) -> None:
     if single_steps:
         active_modes.append(f"single-step mode (--{single_steps[0]})")
 
-    if getattr(args, "repair_from_judge", False):
+    if args.repair_from_judge:
         active_modes.append("repair flow (--repair-from-judge)")
 
     if len(active_modes) > 1:
@@ -924,33 +1045,31 @@ def _validate_execution_mode_conflicts(args: argparse.Namespace) -> None:
 
 
 def _resolve_run_range(args: argparse.Namespace) -> tuple[str, str]:
-    from_step = _canonical_step(getattr(args, "from_step", None))
-    until_step = _canonical_step(getattr(args, "until_step", None))
-
     shorthands = _selected_single_steps(args)
 
     if shorthands:
         return shorthands[0], shorthands[0]
 
-    if until_step and not from_step:
-        _die(f"--until-{until_step} requires --from-<step>.")
+    if args.until_step and not args.from_step:
+        _die(f"--until-{args.until_step} requires --from-<step>.")
 
-    if not from_step and not until_step:
+    if not args.from_step and not args.until_step:
         return STEPS[0], STEPS[-1]
 
-    if from_step not in STEPS:
-        _die(f"Unknown --from step: {from_step}")
+    if args.from_step not in STEPS:
+        _die(f"Unknown --from step: {args.from_step}")
 
-    if until_step and until_step not in STEPS:
-        _die(f"Unknown --until step: {until_step}")
+    if args.until_step and args.until_step not in STEPS:
+        _die(f"Unknown --until step: {args.until_step}")
 
-    from_idx = STEPS.index(from_step)
-    until_idx = STEPS.index(until_step) if until_step else len(STEPS) - 1
-    until_step = until_step or STEPS[-1]
+    from_step = args.from_step
+    until_step = args.until_step or STEPS[-1]
 
-    if from_idx > until_idx:
-        order = " → ".join(STEPS)
-        _die(f"--from-{from_step} comes after --until-{until_step}.\n  Order: {order}")
+    if STEPS.index(from_step) > STEPS.index(until_step):
+        _die(
+            f"--from-{from_step} comes after --until-{until_step}.\n"
+            f"  Order: {' → '.join(STEPS)}"
+        )
 
     return from_step, until_step
 
@@ -961,14 +1080,14 @@ def _print_dry_run(from_step: str, until_step: str, args: argparse.Namespace) ->
 
     print("\n[harness] DRY RUN — nothing will be executed.")
     print(f"  Project         : {os.environ.get('PIPELINE_PROJECT', '?')}")
+    print(f"  Session         : {os.environ.get('PIPELINE_SESSION', '?')}")
     print(f"  Scope           : {args.scope}")
     print(f"  Range           : {from_step} → {until_step}")
     print(f"  Artifact trace  : {'on' if args.trace_artifacts else 'off'}")
     print()
 
     for i, step in enumerate(STEPS):
-        in_range = from_idx <= i <= until_idx
-        if not in_range:
+        if not (from_idx <= i <= until_idx):
             print(f"  ⏭  {step:<14}  (skipped)")
             continue
 
@@ -983,18 +1102,53 @@ def _print_dry_run(from_step: str, until_step: str, args: argparse.Namespace) ->
 
     print()
 
-    if args.scope == "full" and args.force:
-        print("  --force: spectracker delta checks will be bypassed.")
 
-    if args.scope == "mini":
-        print("  mini scope: specwright/spectracker/scaffolder are skipped.")
+# ════════════════════════════════════════════════════════════════════════════
+# Executor retry helpers
+# ════════════════════════════════════════════════════════════════════════════
 
-    if args.trace_artifacts:
-        print("  artifact trace: will print after every executed step.")
-    else:
-        print("  artifact trace: disabled by --no-trace-artifacts.")
+def _retry_impl_args(executor_args: list[str]) -> list[str] | None:
+    from artifacts.paths import EXECUTOR_SESSION_MANIFEST
 
-    print()
+    if not EXECUTOR_SESSION_MANIFEST.exists():
+        print("[harness] --retry-impl: executor_overwrite_manifest.json not found.")
+        return None
+
+    try:
+        record = json.loads(EXECUTOR_SESSION_MANIFEST.read_text())
+        failed = record.get("failed_files", [])
+
+        if not failed:
+            print("[harness] --retry-impl: no failed_files — nothing to retry.")
+            return None
+
+        executor_args += ["--only-files", ",".join(failed)]
+        print(f"[harness] --retry-impl: retrying {len(failed)} failed file(s).")
+        return executor_args
+
+    except Exception:
+        print("[harness] --retry-impl: could not read executor_overwrite_manifest.json.")
+        return None
+
+
+def _print_impl_failed() -> None:
+    from artifacts.paths import EXECUTOR_SESSION_MANIFEST
+
+    if not EXECUTOR_SESSION_MANIFEST.exists():
+        return
+
+    try:
+        record = json.loads(EXECUTOR_SESSION_MANIFEST.read_text())
+        failed = record.get("failed_files", [])
+
+        if failed:
+            print(f"\n[harness] {len(failed)} file(s) failed to implement:")
+            for file in failed:
+                print(f"    {file}")
+            print("\n[harness] Retry: python harness.py --retry-impl")
+
+    except Exception:
+        pass
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1014,7 +1168,7 @@ def _run_step(
 
     if step == "clarificator":
         clarify_args: list[str] = []
-        if getattr(args, "clarify_input", None):
+        if args.clarify_input:
             clarify_args += ["--input", args.clarify_input]
 
         return _run_step_with_trace(
@@ -1057,19 +1211,14 @@ def _run_step(
         if delta and not delta.get("is_first_run") and not delta_requires(delta, "scaffolder"):
             skip_step(
                 "scaffolder",
-                "delta: scaffold-relevant spec sections unchanged — "
-                "reusing scaffolder_codebase_skeleton.json",
+                "delta: scaffold-relevant sections unchanged — reusing skeleton",
             )
             return True
 
         if not check_env(STEP_ENV_KEYS.get("scaffolder", [])):
             sys.exit(1)
 
-        ok = _run_step_with_trace(step, "scaffolder", STEP_SCRIPTS[step], args)
-        if not ok:
-            print("\n[harness] Scaffolder failed — stopping.")
-
-        return ok
+        return _run_step_with_trace(step, "scaffolder", STEP_SCRIPTS[step], args)
 
     if step == "planner":
         if args.only_qwen:
@@ -1112,6 +1261,7 @@ def _run_step(
 
         elif args.scope == "full" and delta and not delta.get("is_first_run"):
             restore_unaffected_files(delta)
+
             src_affected = [
                 file
                 for file in delta.get("affected_files", [])
@@ -1184,54 +1334,8 @@ def _run_step(
     return True
 
 
-def _retry_impl_args(executor_args: list[str]) -> list[str] | None:
-    if not EXECUTOR_SESSION_MANIFEST.exists():
-        print(
-            "[harness] --retry-impl: executor_session_manifest.json not found "
-            "— run executor first."
-        )
-        return None
-
-    try:
-        record = json.loads(EXECUTOR_SESSION_MANIFEST.read_text())
-        failed = record.get("failed_files", [])
-
-        if not failed:
-            print(
-                "[harness] --retry-impl: no failed_files in "
-                "executor_session_manifest.json — nothing to retry."
-            )
-            return None
-
-        executor_args += ["--only-files", ",".join(failed)]
-        print(f"[harness] --retry-impl: retrying {len(failed)} failed file(s).")
-        return executor_args
-
-    except Exception:
-        print("[harness] --retry-impl: could not read executor_session_manifest.json.")
-        return None
-
-
-def _print_impl_failed() -> None:
-    if not EXECUTOR_SESSION_MANIFEST.exists():
-        return
-
-    try:
-        record = json.loads(EXECUTOR_SESSION_MANIFEST.read_text())
-        failed = record.get("failed_files", [])
-
-        if failed:
-            print(f"\n[harness] {len(failed)} file(s) failed to implement:")
-            for file in failed:
-                print(f"    {file}")
-            print("\n[harness] Retry: python harness.py --retry-impl")
-
-    except Exception:
-        pass
-
-
 # ════════════════════════════════════════════════════════════════════════════
-# Summary + apply record
+# Summary + applied record
 # ════════════════════════════════════════════════════════════════════════════
 
 def _print_summary(
@@ -1240,10 +1344,18 @@ def _print_summary(
     args: argparse.Namespace,
     tests_passed: bool,
 ) -> None:
+    from artifacts.paths import (
+        CLARIFICATOR_SESSION_QUESTIONS,
+        JUDGE_VERDICT_SUMMARY,
+        REPORTER_EXECUTION_SUMMARY,
+    )
+
     print(f"\n{'=' * 60}")
     print("  PIPELINE SUMMARY")
     print(f"{'=' * 60}")
 
+    print(f"  Project        : {os.environ.get('PIPELINE_PROJECT', '?')}")
+    print(f"  Session        : {os.environ.get('PIPELINE_SESSION', '?')}")
     print(f"  Scope          : {args.scope}")
     print(f"  Artifact trace : {'on' if args.trace_artifacts else 'off'}")
 
@@ -1268,26 +1380,15 @@ def _print_summary(
 
     if results.get("judge") and tests_passed:
         print(f"    Judge        → {JUDGE_VERDICT_SUMMARY}")
-        judge_verdict = _read_judge_verdict()
-
-        if judge_verdict in ("APPROVED_WITH_NOTES", "NEEDS_REVISION"):
-            print(f"\n  Judge verdict: {judge_verdict}")
-
-        if judge_verdict in ("APPROVED_WITH_NOTES", "NEEDS_REVISION"):
+        verdict = _read_judge_verdict()
+        if verdict in ("APPROVED_WITH_NOTES", "NEEDS_REVISION"):
+            print(f"\n  Judge verdict: {verdict}")
             print("  Run archivist when ready:")
             print("    python pipeline/13_archivist.py")
 
 
 def _load_write_applied():
-    """
-    Load spectracker.write_applied() from the canonical spectracker script.
-
-    Important:
-      - The artifact remains owned by spectracker.
-      - Harness only orchestrates the finalization call after pipeline success.
-      - sys.modules insertion avoids dataclass/import edge cases during dynamic import.
-    """
-    path = ROOT / "pipeline" / STEP_SCRIPTS["spectracker"]
+    path = _pipeline_script(STEP_SCRIPTS["spectracker"])
 
     if not path.exists():
         return None
@@ -1306,14 +1407,9 @@ def _load_write_applied():
 
 
 def _write_apply_record(delta: dict, results: dict[str, bool]) -> None:
-    """
-    Mark the current spec version as applied.
+    from artifacts.paths import SPECTRACKER_APPLIED
 
-    This is intentionally called by harness only after downstream success.
-    The actual writer function is owned by spectracker.
-    """
     write_applied = _load_write_applied()
-
     if write_applied is None:
         print("[harness] WARNING: could not load spectracker.write_applied")
         return
@@ -1340,17 +1436,6 @@ def _should_mark_applied(
     tests_passed: bool,
     steps_to_run: list[str],
 ) -> bool:
-    """
-    Decide whether harness should finalize spectracker applied state.
-
-    Conservative policy:
-      - only full scope
-      - only when a spectracker delta exists
-      - only when all executed/handled steps passed
-      - only when executor participated
-      - if debugger ran, tests must pass
-      - if judge ran, verdict must be APPROVED or APPROVED_WITH_NOTES
-    """
     if args.scope != "full":
         return False
 
@@ -1370,25 +1455,14 @@ def _should_mark_applied(
         return False
 
     if "judge" in steps_to_run:
-        # Check that judge actually ran — not just skipped (e.g. because debugger
-        # failed). A skipped judge sets results["judge"] = True but never writes
-        # judge_r1 into results, so results.keys() won't contain any "judge_r"
-        # entry. Reading the verdict file in that case would pick up a stale
-        # verdict from a previous run, which could incorrectly satisfy the check.
         judge_actually_ran = any(k.startswith("judge_r") for k in results)
         if not judge_actually_ran:
-            print(
-                "[harness] Apply record skipped: judge was in run range but did "
-                "not execute (skipped due to test failure or missing env)."
-            )
+            print("[harness] Apply record skipped: judge was in range but did not execute.")
             return False
 
         verdict = _read_judge_verdict()
         if verdict not in ("APPROVED", "APPROVED_WITH_NOTES"):
-            print(
-                "[harness] Apply record skipped: judge verdict is "
-                f"{verdict or '(unknown)'}."
-            )
+            print(f"[harness] Apply record skipped: judge verdict is {verdict or '(unknown)'}.")
             return False
 
     return True
@@ -1405,11 +1479,9 @@ def _build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python harness.py
   python harness.py --project demo
-  python harness.py --project demo --scope full --from-clarificator
-  python harness.py --project demo --scope full --from-specwright --until-spectracker
-  python harness.py --project demo --scope full --from-executor --until-debugger
+  python harness.py --project demo --new-session
+  python harness.py --project demo --session 001 --from-executor --until-debugger
   python harness.py --project demo --scope mini --from-clarificator --until-executor
   python harness.py --project demo --dry-run
   python harness.py --project demo --no-trace-artifacts
@@ -1422,10 +1494,19 @@ Examples:
         type=str,
         default=None,
         metavar="NAME",
-        help=(
-            "Project name → artifacts_<slug>/. "
-            "If omitted, interactive prompt lists existing projects."
-        ),
+        help="Project name → artifacts_<slug>/. If omitted, interactive prompt lists projects.",
+    )
+    parser.add_argument(
+        "--session",
+        type=str,
+        default=None,
+        metavar="NNN",
+        help="Use/resume a specific session id. Example: --session 001",
+    )
+    parser.add_argument(
+        "--new-session",
+        action="store_true",
+        help="Create the next session id instead of resuming the latest session.",
     )
     parser.add_argument(
         "--scope",
@@ -1463,97 +1544,31 @@ Examples:
             help=f"Run only step '{step}'.",
         )
 
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Print steps that would run without executing anything.",
-    )
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Re-run all full-scope steps even if spectracker delta says nothing changed.",
-    )
-    parser.add_argument(
-        "--only-qwen",
-        action="store_true",
-        help="Skip planner step; executor runs in single-call mode.",
-    )
-    parser.add_argument(
-        "--retry-impl",
-        action="store_true",
-        help=(
-            "Re-implement only files listed as failed in "
-            "execution/executor_session_manifest.json."
-        ),
-    )
-    parser.add_argument(
-        "--max-judge-rounds",
-        type=int,
-        default=2,
-        metavar="N",
-        help="Max judge→patcher→re-judge iterations.",
-    )
-    parser.add_argument(
-        "--max-iter",
-        type=int,
-        default=3,
-        metavar="N",
-        help="Max vitest→repair outer loops.",
-    )
-    parser.add_argument(
-        "--max-cluster-attempts",
-        type=int,
-        default=2,
-        metavar="N",
-        help="Max LLM repair calls per failing cluster.",
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Print per-cluster debug output during debugger step.",
-    )
-    parser.add_argument(
-        "--skip-fix",
-        action="store_true",
-        help="Run judge but skip auto-patcher step.",
-    )
-    parser.add_argument(
-        "--fix-non-blocking",
-        dest="fix_non_blocking",
-        action="store_true",
-        help="Allow patcher to also attempt non-blocking judge findings.",
-    )
-    parser.add_argument(
-        "--repair-from-judge",
-        dest="repair_from_judge",
-        action="store_true",
-        help=(
-            "Consume existing execution/judge_session_verdict_raw.json, "
-            "then run patcher, refresh reporter, and run one post-patch judge."
-        ),
-    )
-    parser.add_argument(
-        "--clarify-input",
-        type=str,
-        default=None,
-        metavar="FILE",
-        help="Pass file path as input to clarificator step.",
-    )
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--only-qwen", action="store_true")
+    parser.add_argument("--retry-impl", action="store_true")
+    parser.add_argument("--max-judge-rounds", type=int, default=2, metavar="N")
+    parser.add_argument("--max-iter", type=int, default=3, metavar="N")
+    parser.add_argument("--max-cluster-attempts", type=int, default=2, metavar="N")
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--skip-fix", action="store_true")
+    parser.add_argument("--fix-non-blocking", dest="fix_non_blocking", action="store_true")
+    parser.add_argument("--repair-from-judge", dest="repair_from_judge", action="store_true")
+    parser.add_argument("--clarify-input", type=str, default=None, metavar="FILE")
+
     parser.add_argument(
         "--trace-artifacts",
         dest="trace_artifacts",
         action="store_true",
         default=True,
-        help=(
-            "Print artifact reads/writes and actual changes after each step. "
-            "Default: enabled."
-        ),
+        help="Print artifact reads/writes and actual changes after each step. Default: enabled.",
     )
     parser.add_argument(
         "--no-trace-artifacts",
         dest="trace_artifacts",
         action="store_false",
-        help="Disable default artifact tracing.",
+        help="Disable artifact tracing.",
     )
 
     # Legacy mini mode.
@@ -1562,10 +1577,7 @@ Examples:
         type=str,
         default=None,
         metavar="PROMPT",
-        help=(
-            "Legacy mini mode delegated to pipeline/mini_mode.py. "
-            "Prefer --scope mini."
-        ),
+        help="Legacy mini mode delegated to pipeline/mini_mode.py. Prefer --scope mini.",
     )
     parser.add_argument("--files", nargs="+", default=None)
     parser.add_argument("--context-file", type=str, default=None)
@@ -1588,17 +1600,35 @@ def main() -> None:
     _validate_scope(args.scope)
     _validate_execution_mode_conflicts(args)
 
+    if args.session and args.new_session:
+        _die("Cannot combine --session and --new-session.")
+
     if not args.project:
         args.project = _interactive_project_select(ROOT)
 
     os.environ["PIPELINE_PROJECT"] = args.project
 
-    from artifacts.paths import ensure_dirs, artifact_root
+    # Import after PIPELINE_PROJECT is set.
+    from artifacts.paths import (
+        PLANNER_FULL_PLAN,
+        PLANNER_MINI_PLAN,
+        artifact_root,
+        ensure_dirs,
+        get_project_slug,
+        session_root,
+    )
+
+    # Resolve and set session before ensure_dirs() so _SessLazyPath creates sessions/<NNN>/.
+    session_id = _resolve_session_for_run(args)
+    os.environ["PIPELINE_SESSION"] = session_id
 
     ensure_dirs()
 
     print(f"[harness] Project        : {args.project}")
+    print(f"[harness] Project slug   : {get_project_slug()}")
     print(f"[harness] Workspace      : {artifact_root()}")
+    print(f"[harness] Session        : {session_id}")
+    print(f"[harness] Session root   : {session_root()}")
     print(f"[harness] Scope          : {args.scope}")
     print(f"[harness] Artifact trace : {'on' if args.trace_artifacts else 'off'}")
 
@@ -1621,27 +1651,37 @@ def main() -> None:
         )
         return
 
-    # --repair-from-judge special flow.
+    # Repair flow.
     if args.repair_from_judge:
         results: dict[str, bool] = {}
 
         if args.dry_run:
             print(
                 "\n[harness] DRY RUN — would consume existing "
-                "execution/judge_session_verdict_raw.json, run patcher, "
+                "execution/judge_overwrite_verdict_raw.json, run patcher, "
                 "refresh reporter, and re-run judge."
             )
             return
 
-        _run_fix_from_existing_judge(args, results)
-        _print_summary(results, delta=None, args=args, tests_passed=True)
-        sys.exit(0 if all(results.values()) else 1)
+        run_id = _start_run_record(session_id, args, "patcher", "judge")
+
+        try:
+            _run_fix_from_existing_judge(args, results)
+            _print_summary(results, delta=None, args=args, tests_passed=True)
+            all_ok = all(results.values()) if results else False
+            _update_run_record(session_id, run_id, status="PASS" if all_ok else "FAIL")
+            sys.exit(0 if all_ok else 1)
+        except Exception:
+            _update_run_record(session_id, run_id, status="FAIL")
+            raise
 
     from_step, until_step = _resolve_run_range(args)
 
     if args.dry_run:
         _print_dry_run(from_step, until_step, args)
         return
+
+    run_id = _start_run_record(session_id, args, from_step, until_step)
 
     from_idx = STEPS.index(from_step)
     until_idx = STEPS.index(until_step)
@@ -1651,96 +1691,133 @@ def main() -> None:
 
     results: dict[str, bool] = {}
 
-    # Spectracker delta preflight when starting mid-pipeline after spectracker.
-    # Example: --from-scaffolder, --from-planner, --from-executor.
     delta: dict | None = None
     needs_delta = (
         args.scope == "full"
         and any(step in steps_to_run for step in ("scaffolder", "planner", "executor"))
     )
 
-    if needs_delta and "spectracker" not in steps_to_run:
-        if _canonical_spec_exists():
-            _run_step_with_trace(
-                "spectracker",
-                "spectracker preflight",
-                STEP_SCRIPTS["spectracker"],
-                args,
-            )
-            delta = load_delta()
+    try:
+        # Spectracker preflight for mid-pipeline full runs.
+        if needs_delta and "spectracker" not in steps_to_run:
+            if _canonical_spec_exists():
+                ok = _run_step_with_trace(
+                    "spectracker",
+                    "spectracker preflight",
+                    STEP_SCRIPTS["spectracker"],
+                    args,
+                )
+                _update_run_record(
+                    session_id,
+                    run_id,
+                    step="spectracker_preflight",
+                    step_status="PASS" if ok else "FAIL",
+                )
 
-            if delta:
-                print_delta_summary(delta)
+                delta = load_delta()
+
+                if delta:
+                    print_delta_summary(delta)
+                else:
+                    print("[harness] spectracker preflight produced no readable delta.")
+
+                if args.force:
+                    print("[harness] --force: delta ignored — all steps will re-run.")
+                    delta = None
             else:
-                print("[harness] spectracker preflight produced no readable delta.")
-
-            if args.force:
-                print("[harness] --force: delta ignored — all steps will re-run.")
+                skip_step(
+                    "spectracker preflight",
+                    f"canonical spec not found — no delta available: {_canonical_spec_path()}",
+                )
                 delta = None
+
+        elif args.scope == "mini":
+            print("[harness] mini scope: skipping specwright/spectracker/scaffolder contracts.")
+
+        tests_passed = True
+        plan_available = PLANNER_MINI_PLAN.exists() if args.scope == "mini" else PLANNER_FULL_PLAN.exists()
+
+        for step in steps_to_run:
+            ok = _run_step(step, args, delta, plan_available, results, tests_passed)
+            results[step] = ok
+
+            _update_run_record(
+                session_id,
+                run_id,
+                step=step,
+                step_status="PASS" if ok else "FAIL",
+            )
+
+            if step == "spectracker" and ok and args.scope == "full":
+                delta = load_delta()
+
+                if delta:
+                    print_delta_summary(delta)
+                    _update_run_record(
+                        session_id,
+                        run_id,
+                        spec_version=delta.get("to_version"),
+                    )
+                else:
+                    print("[harness] spectracker produced no readable delta.")
+
+                if args.force:
+                    print("[harness] --force: delta ignored — all steps will re-run.")
+                    delta = None
+
+            if step == "planner" and ok:
+                plan_available = True
+
+            if step == "debugger":
+                tests_passed = ok
+
+            if step == "executor" and ok:
+                snapshot_src()
+
+            if not ok and step in ("scaffolder", "planner", "executor", "debugger"):
+                print(f"\n[harness] {step} failed — stopping pipeline.")
+                _print_summary(results, delta, args, tests_passed)
+                _update_run_record(
+                    session_id,
+                    run_id,
+                    status="FAIL",
+                    stopped_at_step=step,
+                )
+                sys.exit(1)
+
+        _print_summary(results, delta, args, tests_passed)
+
+        all_ok = all(results.values()) if results else False
+
+        if _should_mark_applied(
+            args=args,
+            delta=delta,
+            results=results,
+            tests_passed=tests_passed,
+            steps_to_run=steps_to_run,
+        ):
+            _write_apply_record(delta, results)
         else:
-            skip_step(
-                "spectracker preflight",
-                f"canonical spec not found — no delta available: {_canonical_spec_path()}",
-            )
-            delta = None
+            if args.scope == "full" and delta:
+                print("[harness] Apply record skipped — finalization criteria not met.")
 
-    elif args.scope == "mini":
-        print("[harness] mini scope: skipping specwright/spectracker/scaffolder contracts.")
+        _update_run_record(
+            session_id,
+            run_id,
+            status="PASS" if all_ok else "FAIL",
+            spec_version=delta.get("to_version") if delta else None,
+        )
 
-    tests_passed = True
-    plan_available = (
-        PLANNER_MINI_PLAN.exists()
-        if args.scope == "mini"
-        else PLANNER_FULL_PLAN.exists()
-    )
+        sys.exit(0 if all_ok else 1)
 
-    for step in steps_to_run:
-        ok = _run_step(step, args, delta, plan_available, results, tests_passed)
-        results[step] = ok
+    except KeyboardInterrupt:
+        print("\n[harness] Interrupted.")
+        _update_run_record(session_id, run_id, status="STOPPED")
+        raise
 
-        if step == "spectracker" and ok and args.scope == "full":
-            delta = load_delta()
-
-            if delta:
-                print_delta_summary(delta)
-            else:
-                print("[harness] spectracker produced no readable delta.")
-
-            if args.force:
-                print("[harness] --force: delta ignored — all steps will re-run.")
-                delta = None
-
-        if step == "planner" and ok:
-            plan_available = True
-
-        if step == "debugger":
-            tests_passed = ok
-
-        if step == "executor" and ok:
-            snapshot_src()
-
-        if not ok and step in ("scaffolder", "planner", "executor", "debugger"):
-            print(f"\n[harness] {step} failed — stopping pipeline.")
-            _print_summary(results, delta, args, tests_passed)
-            sys.exit(1)
-
-    _print_summary(results, delta, args, tests_passed)
-
-    all_ok = all(results.values()) if results else False
-
-    if _should_mark_applied(
-        args=args,
-        delta=delta,
-        results=results,
-        tests_passed=tests_passed,
-        steps_to_run=steps_to_run,
-    ):
-        _write_apply_record(delta, results)
-    else:
-        if args.scope == "full" and delta:
-            print("[harness] Apply record skipped — finalization criteria not met.")
-
-    sys.exit(0 if all_ok else 1)
+    except Exception:
+        _update_run_record(session_id, run_id, status="FAIL")
+        raise
 
 
 if __name__ == "__main__":

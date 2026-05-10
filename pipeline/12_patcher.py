@@ -10,48 +10,41 @@ issues, but this script must still enforce scope safety.
 Supports:
   - FULL flow:
       Uses canonical spec / scaffolder_compressed_spec + judge finding +
-      affected src files.
-      Patch scope defaults to src/** only. Never patches tests.
-      Runs Vitest confirmation unless skipped.
+      affected src files. Patch scope defaults to src/** only. Never patches tests.
 
   - MINI targeted flow:
       Uses clarificator_requirement_synthesis.md +
       planner_mini_execution_plan.json + planner_mini_impact_analysis.json +
-      executor_session_manifest.json + judge finding.
+      executor_overwrite_manifest.json + judge finding.
       Patch scope is strictly limited to planner_mini_execution_plan.target_files.
-      If a judge finding requires a file outside target_files, this script
-      rejects auto-fix and escalates to human instead of broadening scope.
-      Confirmation uses lightweight verifier dispatch by file extension.
 
 Writes:
-  artifacts_<slug>/execution/patcher_session_fix_summary.md
+  artifacts_<slug>/sessions/<NNN>/execution/patcher_overwrite_fix_summary.md
   artifacts_<slug>/knowledge/current/patcher_findings_snapshot.md
   artifacts_<slug>/knowledge/history/patcher_attempt_log.json
   target source/config/query files when allowed
 
 Reads:
-  artifacts_<slug>/execution/judge_session_verdict_raw.json
-  artifacts_<slug>/execution/executor_session_manifest.json
-  artifacts_<slug>/execution/debugger_session_test_summary.json
-  artifacts_<slug>/state/planner_mini_execution_plan.json
-  artifacts_<slug>/state/planner_mini_impact_analysis.json
-  artifacts_<slug>/state/planner_full_execution_plan.json
-  artifacts_<slug>/state/clarificator_requirement_synthesis.md
-  artifacts_<slug>/execution/enricher_session_enriched_prompt.md
+  artifacts_<slug>/sessions/<NNN>/execution/judge_overwrite_verdict_raw.json
+  artifacts_<slug>/sessions/<NNN>/execution/executor_overwrite_manifest.json
+  artifacts_<slug>/sessions/<NNN>/execution/debugger_overwrite_test_summary.json
+  artifacts_<slug>/sessions/<NNN>/state/planner_mini_execution_plan.json
+  artifacts_<slug>/sessions/<NNN>/state/planner_mini_impact_analysis.json
+  artifacts_<slug>/sessions/<NNN>/state/planner_full_execution_plan.json
+  artifacts_<slug>/sessions/<NNN>/state/clarificator_requirement_synthesis.md
+  artifacts_<slug>/sessions/<NNN>/execution/enricher_overwrite_enriched_prompt.md
   artifacts_<slug>/knowledge/current/archivist_knowledge_log.md
-  artifacts_<slug>/cache/scaffolder_compressed_spec.md
+  artifacts_<slug>/sessions/<NNN>/cache/scaffolder_compressed_spec.md
   artifacts_<slug>/specwright_spec_<slug>.md
 
 Direct execution:
   python 12_patcher.py --project my-app
+  python 12_patcher.py --project my-app --session 1
   PIPELINE_PROJECT=my-app python 12_patcher.py
+  PIPELINE_PROJECT=my-app PIPELINE_SESSION=001 python 12_patcher.py
 
 Required environment:
   OPENROUTER_API_KEY=<your-key>
-
-At the end of each run, prints:
-  - artifacts/files read
-  - artifacts/files created/updated/overwritten/appended
 
 For taxonomy details see artifacts/TAXONOMY.md
 """
@@ -75,20 +68,20 @@ from typing import Any
 import httpx
 
 # === WRITE AUTHORITY: patcher ===
-# OWNS  : artifacts_<slug>/execution/patcher_session_fix_summary.md
+# OWNS  : artifacts_<slug>/sessions/<NNN>/execution/patcher_overwrite_fix_summary.md
 #         artifacts_<slug>/knowledge/current/patcher_findings_snapshot.md
 #         artifacts_<slug>/knowledge/history/patcher_attempt_log.json
 #         allowed source/target files only
-# READS : artifacts_<slug>/execution/judge_session_verdict_raw.json
-#         artifacts_<slug>/execution/executor_session_manifest.json
-#         artifacts_<slug>/execution/debugger_session_test_summary.json
-#         artifacts_<slug>/state/planner_mini_execution_plan.json
-#         artifacts_<slug>/state/planner_mini_impact_analysis.json
-#         artifacts_<slug>/state/planner_full_execution_plan.json
-#         artifacts_<slug>/state/clarificator_requirement_synthesis.md
-#         artifacts_<slug>/execution/enricher_session_enriched_prompt.md
+# READS : artifacts_<slug>/sessions/<NNN>/execution/judge_overwrite_verdict_raw.json
+#         artifacts_<slug>/sessions/<NNN>/execution/executor_overwrite_manifest.json
+#         artifacts_<slug>/sessions/<NNN>/execution/debugger_overwrite_test_summary.json
+#         artifacts_<slug>/sessions/<NNN>/state/planner_mini_execution_plan.json
+#         artifacts_<slug>/sessions/<NNN>/state/planner_mini_impact_analysis.json
+#         artifacts_<slug>/sessions/<NNN>/state/planner_full_execution_plan.json
+#         artifacts_<slug>/sessions/<NNN>/state/clarificator_requirement_synthesis.md
+#         artifacts_<slug>/sessions/<NNN>/execution/enricher_overwrite_enriched_prompt.md
 #         artifacts_<slug>/knowledge/current/archivist_knowledge_log.md
-#         artifacts_<slug>/cache/scaffolder_compressed_spec.md
+#         artifacts_<slug>/sessions/<NNN>/cache/scaffolder_compressed_spec.md
 #         artifacts_<slug>/specwright_spec_<slug>.md
 #         artifacts_<slug>/src/**
 
@@ -96,13 +89,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from artifacts.paths import (  # noqa: E402
     ARCHIVIST_KNOWLEDGE_LOG,
     CLARIFIED_REQ,
-    DEBUGGER_SESSION_TEST_SUMMARY,
-    ENRICHER_SESSION_PROMPT,
-    EXECUTOR_SESSION_MANIFEST,
-    JUDGE_SESSION_VERDICT_RAW,
+    DEBUGGER_OVERWRITE_TEST_SUMMARY,
+    ENRICHER_OVERWRITE_PROMPT,
+    EXECUTOR_OVERWRITE_MANIFEST,
+    JUDGE_OVERWRITE_VERDICT_RAW,
     PATCHER_ATTEMPT_LOG,
     PATCHER_FINDINGS_SNAPSHOT,
-    PATCHER_SESSION_FIX_SUMMARY,
+    PATCHER_OVERWRITE_FIX_SUMMARY,
     PLANNER_FULL_PLAN,
     PLANNER_MINI_IMPACT,
     PLANNER_MINI_PLAN,
@@ -110,20 +103,16 @@ from artifacts.paths import (  # noqa: E402
     SRC_DIR,
     artifact_root,
     ensure_dirs,
+    get_project_name,
+    get_project_slug,
+    get_session_id,
     get_spec_path,
 )
-
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_MINIMAX_MODEL = "minimax/minimax-m2.7"
 DEFAULT_QWEN_MODEL = "qwen/qwen3.6-plus"
-
 MAX_FILE_CHARS = 80_000
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# Artifact/file access tracking
-# ════════════════════════════════════════════════════════════════════════════
 
 _ARTIFACTS_READ: set[str] = set()
 _ARTIFACTS_WRITTEN: set[str] = set()
@@ -153,10 +142,6 @@ def _print_artifact_access_summary() -> None:
         print("[12]   WRITE (none)")
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# Data structures
-# ════════════════════════════════════════════════════════════════════════════
-
 @dataclass
 class JudgeFinding:
     description: str
@@ -177,10 +162,6 @@ class FixRecord:
     rejected_files: list[str] | None = None
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# CLI / project setup
-# ════════════════════════════════════════════════════════════════════════════
-
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="12_patcher.py",
@@ -189,17 +170,20 @@ def _build_parser() -> argparse.ArgumentParser:
         epilog=textwrap.dedent("""
             Examples:
               python 12_patcher.py --project my-app
+              python 12_patcher.py --project my-app --session 1
               PIPELINE_PROJECT=my-app python 12_patcher.py
+              PIPELINE_PROJECT=my-app PIPELINE_SESSION=001 python 12_patcher.py
 
               python 12_patcher.py --project my-app --verbose
               python 12_patcher.py --project my-app --skip-confirm
               python 12_patcher.py --project my-app --fix-non-blocking
         """),
     )
+    parser.add_argument("--project", default=None, help="Project name. Sets PIPELINE_PROJECT.")
     parser.add_argument(
-        "--project",
+        "--session",
         default=None,
-        help="Project name for direct execution. Sets PIPELINE_PROJECT.",
+        help="Optional session id. Sets PIPELINE_SESSION. Example: --session 1 → sessions/001.",
     )
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument(
@@ -232,13 +216,18 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _configure_project(
-    project: str | None,
-    parser: argparse.ArgumentParser,
-) -> None:
+def _configure_project(project: str | None, session: str | None, parser: argparse.ArgumentParser) -> None:
     if project:
         os.environ["PIPELINE_PROJECT"] = project
-        return
+
+    if session is not None:
+        raw = str(session).strip()
+        if not raw:
+            parser.error("--session cannot be empty.")
+        try:
+            os.environ["PIPELINE_SESSION"] = f"{int(raw):03d}"
+        except ValueError:
+            parser.error("--session must be an integer, e.g. --session 1.")
 
     if os.environ.get("PIPELINE_PROJECT"):
         return
@@ -252,15 +241,9 @@ def _configure_project(
 def _require_openrouter_key(parser: argparse.ArgumentParser) -> str:
     api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
     if not api_key:
-        parser.error(
-            "OPENROUTER_API_KEY is not set. Export OPENROUTER_API_KEY=<your-key> and retry."
-        )
+        parser.error("OPENROUTER_API_KEY is not set. Export OPENROUTER_API_KEY=<your-key>.")
     return api_key
 
-
-# ════════════════════════════════════════════════════════════════════════════
-# Safe loaders / scope detection
-# ════════════════════════════════════════════════════════════════════════════
 
 def _read_json(path: Any, default: Any) -> Any:
     if not path.exists():
@@ -285,7 +268,7 @@ def _read_text(path: Any) -> str:
 
 
 def _load_impl_record() -> dict[str, Any]:
-    rec = _read_json(EXECUTOR_SESSION_MANIFEST, {})
+    rec = _read_json(EXECUTOR_OVERWRITE_MANIFEST, {})
     return rec if isinstance(rec, dict) else {}
 
 
@@ -300,7 +283,7 @@ def _load_analysis_mini() -> dict[str, Any]:
 
 
 def _load_test_report() -> dict[str, Any]:
-    report = _read_json(DEBUGGER_SESSION_TEST_SUMMARY, {})
+    report = _read_json(DEBUGGER_OVERWRITE_TEST_SUMMARY, {})
     return report if isinstance(report, dict) else {}
 
 
@@ -323,7 +306,6 @@ def _current_scope() -> str:
 
 def _extract_file_list(value: Any) -> list[str]:
     files: list[str] = []
-
     if not isinstance(value, list):
         return files
 
@@ -339,18 +321,12 @@ def _extract_file_list(value: Any) -> list[str]:
 
 
 def _mini_allowed_files() -> set[str]:
-    plan = _load_plan_mini()
-    return set(_extract_file_list(plan.get("target_files", [])))
+    return set(_extract_file_list(_load_plan_mini().get("target_files", [])))
 
 
 def _implemented_files() -> set[str]:
-    rec = _load_impl_record()
-    return set(_extract_file_list(rec.get("files", [])))
+    return set(_extract_file_list(_load_impl_record().get("files", [])))
 
-
-# ════════════════════════════════════════════════════════════════════════════
-# Path helpers
-# ════════════════════════════════════════════════════════════════════════════
 
 def _safe_rel(raw: str) -> Path:
     normalized = raw.replace("\\", "/").strip().lstrip("/")
@@ -358,10 +334,8 @@ def _safe_rel(raw: str) -> Path:
 
     if not normalized:
         raise ValueError("empty path")
-
     if rel.is_absolute():
         raise ValueError(f"absolute path not allowed: {raw}")
-
     if any(part == ".." for part in rel.parts):
         raise ValueError(f"path traversal not allowed: {raw}")
 
@@ -382,10 +356,8 @@ def _is_disallowed_pipeline_path(rel: str) -> bool:
     normalized = rel.replace("\\", "/").strip().lstrip("/")
     if not normalized:
         return True
-
     if normalized == "spec.md":
         return True
-
     if normalized.startswith("specwright_spec_") and normalized.endswith(".md"):
         return True
 
@@ -394,9 +366,11 @@ def _is_disallowed_pipeline_path(rel: str) -> bool:
         "state/",
         "cache/",
         "execution/",
-        "run/",       # legacy artifact dir, still blocked
+        "run/",
         "knowledge/",
         "reports/",
+        "sessions/",
+        "session_runs/",
     )
     return normalized.startswith(blocked_prefixes)
 
@@ -426,7 +400,7 @@ def _read_file_for_prompt(rel: str) -> str:
 
 def _lang_for_path(rel: str) -> str:
     ext = Path(rel).suffix.lower()
-    mapping = {
+    return {
         ".ts": "typescript",
         ".tsx": "tsx",
         ".js": "javascript",
@@ -443,8 +417,7 @@ def _lang_for_path(rel: str) -> str:
         ".cfg": "ini",
         ".conf": "text",
         ".sh": "bash",
-    }
-    return mapping.get(ext, "")
+    }.get(ext, "")
 
 
 def _format_file_block(rel: str) -> str:
@@ -457,10 +430,6 @@ def _is_test_path(rel: str) -> bool:
     lowered = rel.lower()
     return rel.startswith("tests/") or ".test." in lowered or ".spec." in lowered
 
-
-# ════════════════════════════════════════════════════════════════════════════
-# API
-# ════════════════════════════════════════════════════════════════════════════
 
 def _openrouter_call(
     model_id: str,
@@ -499,18 +468,11 @@ def _openrouter_call(
             return content.strip()
 
         if attempt == 0:
-            print(
-                f"    [warn] empty response from {model_id}, retrying in 3s …",
-                file=sys.stderr,
-            )
+            print(f"    [warn] empty response from {model_id}, retrying in 3s …", file=sys.stderr)
             time.sleep(3)
 
     return ""
 
-
-# ════════════════════════════════════════════════════════════════════════════
-# Judge response parsing
-# ════════════════════════════════════════════════════════════════════════════
 
 def _strip_json_fences(raw: str) -> str:
     text = raw.strip()
@@ -537,23 +499,19 @@ def _parse_json_object(raw: str) -> dict[str, Any]:
 
 
 def load_judge_verdict() -> dict[str, Any]:
-    if not JUDGE_SESSION_VERDICT_RAW.exists():
-        print(f"[12] ERROR: {JUDGE_SESSION_VERDICT_RAW} not found.", file=sys.stderr)
+    if not JUDGE_OVERWRITE_VERDICT_RAW.exists():
+        print(f"[12] ERROR: {JUDGE_OVERWRITE_VERDICT_RAW} not found.", file=sys.stderr)
         print("[12] Run 11_judge.py first.", file=sys.stderr)
         sys.exit(1)
 
-    raw_data = _read_json(JUDGE_SESSION_VERDICT_RAW, {})
+    raw_data = _read_json(JUDGE_OVERWRITE_VERDICT_RAW, {})
     if not isinstance(raw_data, dict):
-        print(
-            f"[12] ERROR: invalid judge_session_verdict_raw.json shape: "
-            f"{JUDGE_SESSION_VERDICT_RAW}",
-            file=sys.stderr,
-        )
+        print(f"[12] ERROR: invalid judge_overwrite_verdict_raw.json shape.", file=sys.stderr)
         sys.exit(1)
 
     raw_resp = raw_data.get("response", "")
     if not isinstance(raw_resp, str) or not raw_resp.strip():
-        print("[12] ERROR: judge_session_verdict_raw.json has empty response.", file=sys.stderr)
+        print("[12] ERROR: judge_overwrite_verdict_raw.json has empty response.", file=sys.stderr)
         sys.exit(1)
 
     try:
@@ -564,18 +522,12 @@ def load_judge_verdict() -> dict[str, Any]:
         sys.exit(1)
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# Finding → file mapping
-# ════════════════════════════════════════════════════════════════════════════
-
 _RE_ANY_REL_PATH = re.compile(
     r"(?:src|queries|dags|config|configs|sql|scripts|app|lib|tests)/"
     r"[\w.\-/]+\."
     r"(?:ts|tsx|js|jsx|py|sql|json|ya?ml|toml|md|txt|ini|cfg|conf|sh)"
 )
-
 _RE_SRC_PATH = re.compile(r"src/[\w.\-/]+\.(?:ts|tsx|js|jsx)")
-
 
 _KEYWORD_FILES: dict[str, list[str]] = {
     "useSensorData": ["src/hooks/useSensorData.ts", "src/data/demoConstants.ts"],
@@ -629,20 +581,10 @@ def _infer_full_files(text: str) -> list[str]:
 
 
 def _infer_mini_files(text: str) -> tuple[list[str], list[str]]:
-    """
-    Return:
-      (allowed_mapped_files, rejected_out_of_scope_files)
-    """
     allowed = _mini_allowed_files()
     implemented = _implemented_files()
 
-    candidates: set[str] = set()
-
-    for match in _RE_ANY_REL_PATH.findall(text):
-        candidates.add(match)
-
-    # If judge did not mention concrete files, fall back to implemented/target
-    # files, but still within mini allowed set.
+    candidates: set[str] = set(_RE_ANY_REL_PATH.findall(text))
     if not candidates:
         candidates.update(implemented)
         candidates.update(allowed)
@@ -677,7 +619,6 @@ def extract_findings(
     scope: str,
 ) -> tuple[list[JudgeFinding], list[JudgeFinding], list[str]]:
     section_notes = _section_notes(verdict)
-
     scope_rejections: list[str] = []
 
     def map_files(description: str, section_hint: str = "") -> list[str]:
@@ -696,8 +637,8 @@ def extract_findings(
 
     blocking: list[JudgeFinding] = []
     for desc in verdict.get("blocking_issues", []):
-        section_hint = ""
         desc_text = str(desc)
+        section_hint = ""
 
         for sec_name, notes in section_notes.items():
             first_words = desc_text.lower().split()[:4]
@@ -722,27 +663,18 @@ def extract_findings(
                 description=desc_text,
                 severity="non_blocking",
                 files=map_files(desc_text),
-                section="",
             )
         )
 
     return blocking, non_blocking, scope_rejections
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# Context builders
-# ════════════════════════════════════════════════════════════════════════════
-
 def _load_full_context() -> str:
     spec = _read_text(SCAFFOLDER_COMPRESSED_SPEC)
     if not spec:
-        spec_path = get_spec_path()
-        spec = _read_text(spec_path)
+        spec = _read_text(get_spec_path())
 
-    if not spec:
-        return "[canonical spec missing]"
-
-    parts = ["## Canonical spec\n\n" + spec]
+    parts = ["## Canonical spec\n\n" + (spec or "[canonical spec missing]")]
 
     plan = _read_json(PLANNER_FULL_PLAN, None)
     if isinstance(plan, dict):
@@ -763,14 +695,11 @@ def _load_mini_context() -> str:
     parts: list[str] = []
 
     clarified = _read_text(CLARIFIED_REQ)
-    if clarified:
-        parts.append("## clarificator_requirement_synthesis.md\n\n" + clarified)
-    else:
-        parts.append("## clarificator_requirement_synthesis.md\n\n[missing]")
+    parts.append("## clarificator_requirement_synthesis.md\n\n" + (clarified or "[missing]"))
 
-    enriched = _read_text(ENRICHER_SESSION_PROMPT)
+    enriched = _read_text(ENRICHER_OVERWRITE_PROMPT)
     if enriched:
-        parts.append("## enricher_session_enriched_prompt.md\n\n" + enriched)
+        parts.append("## enricher_overwrite_enriched_prompt.md\n\n" + enriched)
 
     plan = _load_plan_mini()
     if plan:
@@ -793,7 +722,7 @@ def _load_mini_context() -> str:
     impl = _load_impl_record()
     if impl:
         parts.append(
-            "## executor_session_manifest.json\n\n```json\n"
+            "## executor_overwrite_manifest.json\n\n```json\n"
             + json.dumps(impl, indent=2, ensure_ascii=False)
             + "\n```"
         )
@@ -809,14 +738,8 @@ def _load_run_context() -> str:
     return _load_mini_context() if _current_scope() == "mini" else _load_full_context()
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# Fix prompts
-# ════════════════════════════════════════════════════════════════════════════
-
 JUDGE_FIX_SYSTEM_FULL_MINIMAX = """\
 You are a senior TypeScript engineer fixing issues identified by a code reviewer.
-
-The judge has already diagnosed the problem. Your job is to implement the fix precisely.
 
 Rules:
 - Fix ONLY what the judge finding describes.
@@ -824,7 +747,7 @@ Rules:
 - Patch source files only.
 - Never modify tests.
 - TypeScript strict; avoid `any`.
-- Preserve public interfaces unless the judge finding explicitly requires a change.
+- Preserve public interfaces unless explicitly required.
 - Output raw JSON only, no markdown fences.
 
 Return:
@@ -839,8 +762,6 @@ Return:
   "root_cause": "one sentence",
   "fix_summary": "one sentence"
 }
-
-IMPORTANT: Return all affected files in the files array.
 """
 
 JUDGE_FIX_SYSTEM_FULL_QWEN = """\
@@ -874,19 +795,14 @@ You are fixing a blocking issue from a judge in a MINI targeted run.
 Critical scope rule:
 - You may ONLY write files explicitly listed in planner_mini_execution_plan.target_files.
 - Do NOT add new files.
-- Do NOT modify tests unless tests are explicitly listed in planner_mini_execution_plan.target_files.
-- If the fix requires a file outside target_files, return:
-  {
-    "files": [],
-    "root_cause": "...",
-    "fix_summary": "Cannot safely auto-fix because required file is outside mini target scope."
-  }
+- Do NOT modify tests unless tests are explicitly listed in target_files.
+- If the fix requires a file outside target_files, return files=[].
 
-Context you receive:
-- clarificator requirement synthesis
+Context:
+- clarificator_requirement_synthesis.md
 - planner_mini_execution_plan.json
 - planner_mini_impact_analysis.json
-- executor_session_manifest.json
+- executor_overwrite_manifest.json
 - judge finding
 - allowed affected files
 
@@ -911,7 +827,6 @@ Return:
 }
 """
 
-
 _SURFACE_KEYWORDS = {
     "theme",
     "tailwind",
@@ -928,18 +843,11 @@ _SURFACE_KEYWORDS = {
 }
 
 
-def _choose_agent_and_prompt(
-    finding: JudgeFinding,
-    *,
-    scope: str,
-) -> tuple[str, str]:
+def _choose_agent_and_prompt(finding: JudgeFinding, *, scope: str) -> tuple[str, str]:
     if scope == "mini":
         return "minimax", JUDGE_FIX_SYSTEM_MINI
 
     text_lower = finding.description.lower()
-    if finding.severity == "non_blocking" and any(kw in text_lower for kw in _SURFACE_KEYWORDS):
-        return "qwen", JUDGE_FIX_SYSTEM_FULL_QWEN
-
     if any(kw in text_lower for kw in _SURFACE_KEYWORDS):
         return "qwen", JUDGE_FIX_SYSTEM_FULL_QWEN
 
@@ -949,7 +857,6 @@ def _choose_agent_and_prompt(
 def _parse_fix_response(raw: str, label: str) -> dict[str, Any] | None:
     if not raw.strip():
         return None
-
     try:
         return _parse_json_object(raw)
     except Exception as exc:
@@ -958,14 +865,9 @@ def _parse_fix_response(raw: str, label: str) -> dict[str, Any] | None:
         return None
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# Scope guards / patch executor
-# ════════════════════════════════════════════════════════════════════════════
-
 def _allowed_to_write(rel: str, *, scope: str) -> tuple[bool, str]:
     try:
-        safe = _safe_rel(rel)
-        rel = safe.as_posix()
+        rel = _safe_rel(rel).as_posix()
     except Exception as exc:
         return False, str(exc)
 
@@ -976,8 +878,7 @@ def _allowed_to_write(rel: str, *, scope: str) -> tuple[bool, str]:
         return False, "test file writes are rejected by judge-fix step"
 
     if scope == "mini":
-        allowed = _mini_allowed_files()
-        if rel not in allowed:
+        if rel not in _mini_allowed_files():
             return False, f"`{rel}` is outside planner_mini_execution_plan.target_files"
         return True, ""
 
@@ -1001,7 +902,7 @@ def fix_finding(
     if not finding.files:
         note = "no files mapped"
         if scope == "mini":
-            note += " — judge finding did not map to any planner_mini_execution_plan.target_files"
+            note += " — finding did not map to planner_mini_execution_plan.target_files"
         else:
             note += " — check heuristics or add explicit path in judge finding"
 
@@ -1016,7 +917,6 @@ def fix_finding(
             escalated_to="human",
         )
 
-    # Preflight: do not call model if mapped files violate write scope.
     rejected: list[str] = []
     allowed_files: list[str] = []
 
@@ -1052,17 +952,13 @@ def fix_finding(
     if finding.section:
         sec = verdict.get("sections", {}).get(finding.section, {})
         if isinstance(sec, dict) and sec.get("notes"):
-            sections_block = (
-                f"\n### Judge section notes ({finding.section})\n"
-                f"{sec['notes']}\n"
-            )
+            sections_block = f"\n### Judge section notes ({finding.section})\n{sec['notes']}\n"
 
     allowed_block = ""
     if scope == "mini":
-        allowed = sorted(_mini_allowed_files())
         allowed_block = (
             "\n### Mini allowed write set — STRICT\n"
-            + "\n".join(f"- `{rel}`" for rel in allowed)
+            + "\n".join(f"- `{rel}`" for rel in sorted(_mini_allowed_files()))
             + "\n"
         )
 
@@ -1074,35 +970,26 @@ def fix_finding(
         f"### Affected files you may edit\n\n{files_block}"
     )
 
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user_content},
-    ]
-
     print(f"  [12] → {agent_label.upper()} fixing: {finding.description[:90]}…")
     if verbose:
         print(f"  [12]   scope: {scope}")
         print(f"  [12]   files: {allowed_files}")
 
-    raw = _openrouter_call(model_id, messages, api_key=api_key).strip()
+    raw = _openrouter_call(
+        model_id,
+        [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_content},
+        ],
+        api_key=api_key,
+    ).strip()
+
     if not raw:
-        return FixRecord(
-            finding=finding.description,
-            files=finding.files,
-            patched=False,
-            files_written=[],
-            note="model returned empty response",
-        )
+        return FixRecord(finding.description, finding.files, False, [], "model returned empty response")
 
     patch = _parse_fix_response(raw, finding.description[:40])
     if not patch:
-        return FixRecord(
-            finding=finding.description,
-            files=finding.files,
-            patched=False,
-            files_written=[],
-            note="JSON parse failed",
-        )
+        return FixRecord(finding.description, finding.files, False, [], "JSON parse failed")
 
     written: list[str] = []
     rejected_after_model: list[str] = []
@@ -1168,10 +1055,6 @@ def fix_finding(
     )
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# Confirmation / verifier dispatch
-# ════════════════════════════════════════════════════════════════════════════
-
 def run_vitest_confirm() -> tuple[bool, str]:
     print("\n[12] Running Vitest to confirm fixes …")
     result = subprocess.run(
@@ -1190,8 +1073,7 @@ def run_vitest_confirm() -> tuple[bool, str]:
         ),
         "no summary line found",
     )
-    icon = "✓" if passed else "✗"
-    print(f"[12] Vitest {icon} {summary}")
+    print(f"[12] Vitest {'✓' if passed else '✗'} {summary}")
     return passed, output
 
 
@@ -1225,7 +1107,6 @@ def _verify_toml(path: Path) -> tuple[bool, str]:
 
 def _verify_yaml(path: Path) -> tuple[bool, str]:
     _track_read(path)
-
     try:
         import yaml  # type: ignore
     except Exception:
@@ -1290,12 +1171,7 @@ def run_mini_confirm(files_written: list[str]) -> tuple[bool, str]:
     return all_ok, "\n".join(checks)
 
 
-def run_confirm(
-    *,
-    scope: str,
-    files_written: list[str],
-    skip_confirm: bool,
-) -> tuple[bool, str]:
+def run_confirm(*, scope: str, files_written: list[str], skip_confirm: bool) -> tuple[bool, str]:
     if skip_confirm:
         print("\n[12] Skipping confirmation (--skip-confirm)")
         return True, "skipped"
@@ -1305,10 +1181,6 @@ def run_confirm(
 
     return run_vitest_confirm()
 
-
-# ════════════════════════════════════════════════════════════════════════════
-# Findings snapshot — per-run snapshot
-# ════════════════════════════════════════════════════════════════════════════
 
 def write_patcher_findings_snapshot(
     blocking: list[JudgeFinding],
@@ -1329,6 +1201,8 @@ def write_patcher_findings_snapshot(
 
     lines = [
         f"# Patcher findings snapshot — {now}",
+        f"_Project: {get_project_name()} ({get_project_slug()})_",
+        f"_Session: {get_session_id() or 'legacy/no-session'}_",
         f"_Scope: {scope} | Verdict: {verdict.get('verdict')} | "
         f"Scores: {', '.join(f'{k}={v}/5' for k, v in scores.items())}_",
         "",
@@ -1351,22 +1225,14 @@ def write_patcher_findings_snapshot(
         if finding.files:
             lines.append(f"  → files: {', '.join(finding.files)}")
 
-    lines += [
-        "",
-        "## Non-blocking notes",
-        "",
-    ]
+    lines += ["", "## Non-blocking notes", ""]
 
     for finding in non_blocking:
         lines.append(f"- {finding.description}")
         if finding.files:
             lines.append(f"  → files: {', '.join(finding.files)}")
 
-    lines += [
-        "",
-        "## Patterns to avoid",
-        "",
-    ]
+    lines += ["", "## Patterns to avoid", ""]
 
     if isinstance(sections, dict):
         for section_name in (
@@ -1379,11 +1245,7 @@ def write_patcher_findings_snapshot(
         ):
             section = sections.get(section_name, {})
             if isinstance(section, dict) and section.get("notes"):
-                lines += [
-                    f"### {section_name}",
-                    str(section.get("notes")),
-                    "",
-                ]
+                lines += [f"### {section_name}", str(section.get("notes")), ""]
 
     lines += [
         "---",
@@ -1397,11 +1259,7 @@ def write_patcher_findings_snapshot(
     print(f"\n[12] Findings snapshot written → {PATCHER_FINDINGS_SNAPSHOT}")
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# Session fix summary
-# ════════════════════════════════════════════════════════════════════════════
-
-def write_session_fix_summary(
+def write_overwrite_fix_summary(
     *,
     scope: str,
     verdict: dict[str, Any],
@@ -1417,9 +1275,12 @@ def write_session_fix_summary(
     n_escalated = sum(1 for record in fix_records if record.escalated)
 
     lines = [
-        "# Patcher Session Fix Summary",
+        "# Patcher Overwrite Fix Summary",
         f"_Generated: {now}_",
         "",
+        f"- Project: `{get_project_name()}`",
+        f"- Project slug: `{get_project_slug()}`",
+        f"- Session: `{get_session_id() or 'legacy/no-session'}`",
         f"- Scope: `{scope}`",
         f"- Judge verdict: `{verdict.get('verdict')}`",
         f"- Blocking issues: {len(blocking)}",
@@ -1466,16 +1327,12 @@ def write_session_fix_summary(
         "",
     ]
 
-    PATCHER_SESSION_FIX_SUMMARY.parent.mkdir(parents=True, exist_ok=True)
-    PATCHER_SESSION_FIX_SUMMARY.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
-    _track_write(PATCHER_SESSION_FIX_SUMMARY)
+    PATCHER_OVERWRITE_FIX_SUMMARY.parent.mkdir(parents=True, exist_ok=True)
+    PATCHER_OVERWRITE_FIX_SUMMARY.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    _track_write(PATCHER_OVERWRITE_FIX_SUMMARY)
 
-    print(f"[12] Session fix summary written → {PATCHER_SESSION_FIX_SUMMARY}")
+    print(f"[12] Overwrite fix summary written → {PATCHER_OVERWRITE_FIX_SUMMARY}")
 
-
-# ════════════════════════════════════════════════════════════════════════════
-# Attempt log
-# ════════════════════════════════════════════════════════════════════════════
 
 def append_attempt_log(report: dict[str, Any]) -> None:
     PATCHER_ATTEMPT_LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -1500,17 +1357,13 @@ def append_attempt_log(report: dict[str, Any]) -> None:
     print(f"\n[12] Attempt log appended → {PATCHER_ATTEMPT_LOG}")
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# Main
-# ════════════════════════════════════════════════════════════════════════════
-
 def main() -> None:
     parser = _build_parser()
     args = parser.parse_args()
 
-    _configure_project(args.project, parser)
+    _configure_project(args.project, args.session, parser)
 
-    # Important: project env must be configured before ensure_dirs().
+    # Important: project/session env must be configured before ensure_dirs().
     ensure_dirs()
 
     exit_code = 0
@@ -1519,6 +1372,8 @@ def main() -> None:
         api_key = _require_openrouter_key(parser)
 
         scope = _current_scope()
+        print(f"[12] Project: {get_project_name()} ({get_project_slug()})")
+        print(f"[12] Session: {get_session_id() or 'legacy/no-session'}")
         print(f"[12] Scope detected: {scope}")
 
         verdict = load_judge_verdict()
@@ -1528,6 +1383,9 @@ def main() -> None:
 
             report = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
+                "project": get_project_name(),
+                "project_slug": get_project_slug(),
+                "session_id": get_session_id(),
                 "scope": scope,
                 "judge_verdict": verdict.get("verdict"),
                 "blocking_count": 0,
@@ -1541,7 +1399,7 @@ def main() -> None:
                 "records": [],
             }
             append_attempt_log(report)
-            write_session_fix_summary(
+            write_overwrite_fix_summary(
                 scope=scope,
                 verdict=verdict,
                 blocking=[],
@@ -1565,16 +1423,14 @@ def main() -> None:
 
         print(f"\n[12] Blocking issues ({len(blocking)}):")
         for finding in blocking:
-            mapped = finding.files or ["(no files mapped)"]
             print(f"  • {finding.description[:100]}")
-            print(f"    files: {mapped}")
+            print(f"    files: {finding.files or ['(no files mapped)']}")
 
         print(f"\n[12] Non-blocking notes ({len(non_blocking)}):")
         for finding in non_blocking:
-            mapped = finding.files or ["(no files mapped)"]
             agent, _ = _choose_agent_and_prompt(finding, scope=scope)
             print(f"  • {finding.description[:100]}")
-            print(f"    files: {mapped}, agent: {agent}")
+            print(f"    files: {finding.files or ['(no files mapped)']}, agent: {agent}")
 
         to_fix: list[JudgeFinding] = []
         if args.fix_blocking:
@@ -1589,24 +1445,18 @@ def main() -> None:
         else:
             print(f"\n[12] Fixing {len(to_fix)} finding(s) …")
             for finding in to_fix:
-                record = fix_finding(
-                    finding,
-                    verdict,
-                    api_key=api_key,
-                    minimax_model=args.minimax_model,
-                    qwen_model=args.qwen_model,
-                    verbose=args.verbose,
+                fix_records.append(
+                    fix_finding(
+                        finding,
+                        verdict,
+                        api_key=api_key,
+                        minimax_model=args.minimax_model,
+                        qwen_model=args.qwen_model,
+                        verbose=args.verbose,
+                    )
                 )
-                fix_records.append(record)
 
-        files_written = sorted({
-            rel
-            for record in fix_records
-            for rel in record.files_written
-        })
-
-        confirm_passed = False
-        confirm_summary = "not run"
+        files_written = sorted({rel for record in fix_records for rel in record.files_written})
 
         if fix_records:
             confirm_passed, confirm_summary = run_confirm(
@@ -1615,11 +1465,9 @@ def main() -> None:
                 skip_confirm=args.skip_confirm,
             )
         elif args.skip_confirm:
-            confirm_passed = True
-            confirm_summary = "skipped"
+            confirm_passed, confirm_summary = True, "skipped"
         else:
-            confirm_passed = False
-            confirm_summary = "no fixes attempted"
+            confirm_passed, confirm_summary = False, "no fixes attempted"
 
         write_patcher_findings_snapshot(
             blocking,
@@ -1634,6 +1482,9 @@ def main() -> None:
 
         report = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
+            "project": get_project_name(),
+            "project_slug": get_project_slug(),
+            "session_id": get_session_id(),
             "scope": scope,
             "judge_verdict": verdict.get("verdict"),
             "blocking_count": len(blocking),
@@ -1648,7 +1499,7 @@ def main() -> None:
         }
         append_attempt_log(report)
 
-        write_session_fix_summary(
+        write_overwrite_fix_summary(
             scope=scope,
             verdict=verdict,
             blocking=blocking,
@@ -1662,6 +1513,8 @@ def main() -> None:
         print(f"\n{'=' * 50}")
         print("  STEP 12 SUMMARY")
         print(f"{'=' * 50}")
+        print(f"  Project:            {get_project_name()} ({get_project_slug()})")
+        print(f"  Session:            {get_session_id() or 'legacy/no-session'}")
         print(f"  Scope:              {scope}")
         print(f"  Blocking issues:    {len(blocking)}")
         print(f"  Fixes applied:      {n_patched}/{len(fix_records)}")

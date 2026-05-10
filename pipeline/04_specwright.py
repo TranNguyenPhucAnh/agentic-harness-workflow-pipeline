@@ -9,9 +9,9 @@ Vị trí trong luồng:
     03_enricher → [04_specwright] → 05_spectracker → artifacts_<slug>/specwright_spec_<slug>.md → (optional) harness
 
 Inputs:
-    execution/enricher_session_enriched_prompt.md      — output của 03_enricher (bắt buộc)
+    execution/enricher_overwrite_enriched_prompt.md    — output của 03_enricher (bắt buộc)
     state/clarificator_requirement_synthesis.md        — fallback nếu enriched_prompt thiếu
-    execution/clarificator_session_raw.json            — để lấy project metadata
+    execution/clarificator_overwrite_raw.json          — để lấy project metadata
 
 Output:
     artifacts_<slug>/specwright_spec_<slug>.md         — technical spec tại get_spec_path()
@@ -52,22 +52,22 @@ import httpx
 # ── paths ─────────────────────────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from artifacts.paths import (  # type: ignore
-    CLARIFICATOR_SESSION_RAW,
+    CLARIFICATOR_OVERWRITE_RAW,
     CLARIFIED_REQ,
-    ENRICHER_SESSION_PROMPT,
+    ENRICHER_OVERWRITE_PROMPT,
     ensure_dirs,
     get_spec_path,
 )
 
 # Local aliases — map canonical constants to the short names used internally
-CLARIFICATION_REPORT = CLARIFICATOR_SESSION_RAW
-ENRICHED_PROMPT      = ENRICHER_SESSION_PROMPT
+CLARIFICATION_REPORT = CLARIFICATOR_OVERWRITE_RAW
+ENRICHED_PROMPT      = ENRICHER_OVERWRITE_PROMPT
 
 # === WRITE AUTHORITY: specwright ===
 # OWNS  : artifacts_<slug>/specwright_spec_<slug>.md   (dynamic path via get_spec_path())
-# READS : artifacts_<slug>/execution/enricher_session_enriched_prompt.md
+# READS : artifacts_<slug>/execution/enricher_overwrite_enriched_prompt.md
 #         artifacts_<slug>/state/clarificator_requirement_synthesis.md (fallback)
-#         artifacts_<slug>/execution/clarificator_session_raw.json
+#         artifacts_<slug>/execution/clarificator_overwrite_raw.json
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -87,19 +87,19 @@ def _track_write(path: Any) -> None:
 
 
 def _print_artifact_access_summary() -> None:
-    print("[05] Artifacts read:")
+    print("[04] Artifacts read:")
     if _ARTIFACTS_READ:
         for item in sorted(_ARTIFACTS_READ):
-            print(f"[05]   READ  {item}")
+            print(f"[04]   READ  {item}")
     else:
-        print("[05]   READ  (none)")
+        print("[04]   READ  (none)")
 
-    print("[05] Artifacts created/updated/overwritten/appended:")
+    print("[04] Artifacts created/updated/overwritten/appended:")
     if _ARTIFACTS_WRITTEN:
         for item in sorted(_ARTIFACTS_WRITTEN):
-            print(f"[05]   WRITE {item}")
+            print(f"[04]   WRITE {item}")
     else:
-        print("[05]   WRITE (none)")
+        print("[04]   WRITE (none)")
 
 
 # ── Model config ──────────────────────────────────────────────────────────────
@@ -508,14 +508,14 @@ def main() -> None:
         # ── Load enriched prompt ──────────────────────────────────────────────────
         enriched_prompt = _load_enriched_prompt()
         if enriched_prompt.strip():
-            print(f"[specwright] Loaded enricher_session_enriched_prompt.md ({len(enriched_prompt)} chars)")
+            print(f"[specwright] Loaded enricher_overwrite_enriched_prompt.md ({len(enriched_prompt)} chars)")
         else:
             # Fallback: use clarified_req directly (less optimal but functional)
-            print("[specwright][warn] enricher_session_enriched_prompt.md not found — falling back to clarificator_requirement_synthesis.md")
+            print("[specwright][warn] enricher_overwrite_enriched_prompt.md not found — falling back to clarificator_requirement_synthesis.md")
             enriched_prompt = _load_clarified_req()
             if not enriched_prompt.strip():
                 print(
-                    "[specwright][error] Neither enricher_session_enriched_prompt.md nor clarificator_requirement_synthesis.md found.\n"
+                    "[specwright][error] Neither enricher_overwrite_enriched_prompt.md nor clarificator_requirement_synthesis.md found.\n"
                     "            Run 03_clarificator.py → 03_enricher.py first."
                 )
                 sys.exit(1)
@@ -525,7 +525,7 @@ def main() -> None:
         # future prompt expansion and makes the declared READS contract observable.
         clarification_report = _load_clarification_report()
         if clarification_report:
-            print("[specwright] Loaded clarificator_session_raw.json metadata")
+            print("[specwright] Loaded clarificator_overwrite_raw.json metadata")
 
         # ── Check if spec already exists — warn user ──────────────────────────────
         if spec_file.exists():
