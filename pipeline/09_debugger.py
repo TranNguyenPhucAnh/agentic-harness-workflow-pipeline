@@ -10,15 +10,15 @@ FULL mode:
     - Apply static fixes.
     - Use Qwen for surface/component bugs.
     - Use Minimax for hook/data/type/util logic bugs.
-    - Write debugger_session_test_summary.json.
+    - Write debugger_overwrite_test_summary.json.
 
 MINI mode:
   Safe targeted verification:
-    - Detect scope from execution/executor_session_manifest.json.
+    - Detect scope from execution/executor_overwrite_manifest.json.
     - Do not require the canonical spec.
     - Build context from clarificator_requirement_synthesis.md,
       planner_mini_execution_plan.json, planner_mini_impact_analysis.json,
-      executor_session_manifest.json.
+      executor_overwrite_manifest.json.
     - Dispatch lightweight verifiers by target file extension:
         .py                  → py_compile
         .json                → json parse
@@ -28,7 +28,7 @@ MINI mode:
     - For TS/Vitest projects, can still run the full Vitest repair loop.
 
 Writes:
-  artifacts_<slug>/execution/debugger_session_test_summary.json
+  artifacts_<slug>/execution/debugger_overwrite_test_summary.json
   artifacts_<slug>/src/**    repair loop patches, if needed
   artifacts_<slug>/tests/**  fragile-test repair, if auditor allows
 
@@ -39,8 +39,8 @@ Reads:
   artifacts_<slug>/state/planner_mini_execution_plan.json
   artifacts_<slug>/state/planner_mini_impact_analysis.json
   artifacts_<slug>/state/clarificator_requirement_synthesis.md
-  artifacts_<slug>/execution/enricher_session_enriched_prompt.md
-  artifacts_<slug>/execution/executor_session_manifest.json
+  artifacts_<slug>/execution/enricher_overwrite_enriched_prompt.md
+  artifacts_<slug>/execution/executor_overwrite_manifest.json
   artifacts_<slug>/knowledge/current/patcher_findings_snapshot.md
   artifacts_<slug>/knowledge/current/archivist_knowledge_log.md
   artifacts_<slug>/src/**
@@ -77,7 +77,7 @@ from typing import Any, Callable
 import httpx
 
 # === WRITE AUTHORITY: debugger ===
-# OWNS  : artifacts_<slug>/execution/debugger_session_test_summary.json
+# OWNS  : artifacts_<slug>/execution/debugger_overwrite_test_summary.json
 #         artifacts_<slug>/src/**    repair patches, if needed
 #         artifacts_<slug>/tests/**  fragile-test patches, if auditor allows
 # READS : artifacts_<slug>/specwright_spec_<slug>.md
@@ -86,8 +86,8 @@ import httpx
 #         artifacts_<slug>/state/planner_mini_execution_plan.json
 #         artifacts_<slug>/state/planner_mini_impact_analysis.json
 #         artifacts_<slug>/state/clarificator_requirement_synthesis.md
-#         artifacts_<slug>/execution/enricher_session_enriched_prompt.md
-#         artifacts_<slug>/execution/executor_session_manifest.json
+#         artifacts_<slug>/execution/enricher_overwrite_enriched_prompt.md
+#         artifacts_<slug>/execution/executor_overwrite_manifest.json
 #         artifacts_<slug>/knowledge/current/patcher_findings_snapshot.md
 #         artifacts_<slug>/knowledge/current/archivist_knowledge_log.md
 #         artifacts_<slug>/src/**
@@ -97,9 +97,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from artifacts.paths import (  # noqa: E402
     ARCHIVIST_KNOWLEDGE_LOG,
     CLARIFIED_REQ,
-    DEBUGGER_SESSION_TEST_SUMMARY,
-    ENRICHER_SESSION_PROMPT,
-    EXECUTOR_SESSION_MANIFEST,
+    DEBUGGER_OVERWRITE_TEST_SUMMARY,
+    ENRICHER_OVERWRITE_PROMPT,
+    EXECUTOR_OVERWRITE_MANIFEST,
     PATCHER_FINDINGS_SNAPSHOT,
     PLANNER_FULL_PLAN,
     PLANNER_MINI_IMPACT,
@@ -290,7 +290,7 @@ def _read_text_if_exists(path: Any, *, errors: str = "replace") -> str:
 
 
 def _load_impl_record() -> dict[str, Any]:
-    data = _read_json(EXECUTOR_SESSION_MANIFEST, {})
+    data = _read_json(EXECUTOR_OVERWRITE_MANIFEST, {})
     return data if isinstance(data, dict) else {}
 
 
@@ -321,10 +321,10 @@ def _load_mini_context() -> str:
             + _read_text_if_exists(CLARIFIED_REQ).strip()
         )
 
-    if ENRICHER_SESSION_PROMPT.exists():
+    if ENRICHER_OVERWRITE_PROMPT.exists():
         parts.append(
-            "## enricher_session_enriched_prompt.md\n\n"
-            + _read_text_if_exists(ENRICHER_SESSION_PROMPT).strip()
+            "## enricher_overwrite_enriched_prompt.md\n\n"
+            + _read_text_if_exists(ENRICHER_OVERWRITE_PROMPT).strip()
         )
 
     if PLANNER_MINI_PLAN.exists():
@@ -341,10 +341,10 @@ def _load_mini_context() -> str:
             + "\n```"
         )
 
-    if EXECUTOR_SESSION_MANIFEST.exists():
+    if EXECUTOR_OVERWRITE_MANIFEST.exists():
         parts.append(
-            "## executor_session_manifest.json\n\n```json\n"
-            + _read_text_if_exists(EXECUTOR_SESSION_MANIFEST).strip()
+            "## executor_overwrite_manifest.json\n\n```json\n"
+            + _read_text_if_exists(EXECUTOR_OVERWRITE_MANIFEST).strip()
             + "\n```"
         )
 
@@ -1473,13 +1473,13 @@ def repair_cluster(
 # ════════════════════════════════════════════════════════════════════════════
 
 def _write_report(report: dict[str, Any]) -> None:
-    DEBUGGER_SESSION_TEST_SUMMARY.parent.mkdir(parents=True, exist_ok=True)
-    DEBUGGER_SESSION_TEST_SUMMARY.write_text(
+    DEBUGGER_OVERWRITE_TEST_SUMMARY.parent.mkdir(parents=True, exist_ok=True)
+    DEBUGGER_OVERWRITE_TEST_SUMMARY.write_text(
         json.dumps(report, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
-    _track_write(DEBUGGER_SESSION_TEST_SUMMARY)
-    print(f"\n[09] Debugger session test summary → {DEBUGGER_SESSION_TEST_SUMMARY}")
+    _track_write(DEBUGGER_OVERWRITE_TEST_SUMMARY)
+    print(f"\n[09] Debugger test summary → {DEBUGGER_OVERWRITE_TEST_SUMMARY}")
 
 
 def _write_mini_report(passed: bool, details: dict[str, Any]) -> None:
