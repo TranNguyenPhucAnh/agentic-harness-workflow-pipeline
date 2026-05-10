@@ -116,7 +116,7 @@ def _print_artifact_access_summary() -> None:
 
 # ── Model config ──────────────────────────────────────────────────────────────
 # Prompt agent chạy model nhanh/rẻ — nhiệm vụ là enrich context, không cần Opus.
-_ENRICH_MODEL      = "deepseek/deepseek-chat"
+_ENRICH_MODEL      = "deepseek/deepseek-v4-pro"
 _MAX_TOKENS_ENRICH = 4096
 
 
