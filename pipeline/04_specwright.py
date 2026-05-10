@@ -105,7 +105,7 @@ def _print_artifact_access_summary() -> None:
 # ── Model config ──────────────────────────────────────────────────────────────
 # Spec agent dùng model xịn — spec phải đủ chất lượng để harness chạy được.
 # Default: claude-sonnet (cân bằng chất/giá). Override bằng --model.
-_SPEC_MODEL_DEFAULT = "anthropic/claude-sonnet-4-5"
+_SPEC_MODEL_DEFAULT = "~anthropic/claude-opus-latest"
 _MAX_TOKENS_SPEC    = 8192
 
 
