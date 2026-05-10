@@ -1,7 +1,7 @@
 """
 pipeline/08_executor.py
 =======================
-Step 8 — Qwen 3.6 Plus as EXECUTOR.
+Step 8 — claude-opus-latest as EXECUTOR.
 
 This script supports two scopes:
 
@@ -82,7 +82,7 @@ import httpx
 
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL = "qwen/qwen3.6-plus"
+MODEL = "~anthropic/claude-opus-latest"
 
 
 # === WRITE AUTHORITY: executor ===
@@ -1021,7 +1021,7 @@ def implement_all_single_call(
         f"{json.dumps(stub_files, indent=2, ensure_ascii=False)}"
     )
 
-    print("[08] Calling Qwen 3.6 Plus, single-call mode …")
+    print("[08] Calling claude-opus-latest, single-call mode …")
 
     raw = _call_qwen(
         build_system_prompt_single(instructions=instructions, stack=stack),
