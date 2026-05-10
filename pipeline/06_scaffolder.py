@@ -20,10 +20,10 @@ Direct execution:
   PIPELINE_PROJECT=my-app python 06_scaffolder.py
 
 Required environment:
-  GEMINI_API_KEY=<your-key>
+  OPENROUTER_API_KEY=<your-key>
 
 Optional environment:
-  GEMINI_MODEL=gemini-2.5-flash
+  MODEL=~moonshotai/kimi-latest
 
 At the end of each run, prints:
   - artifacts/files read
@@ -65,7 +65,7 @@ from artifacts.paths import (  # noqa: E402
 )
 
 
-DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = "~moonshotai/kimi-latest"
 MAX_OUTPUT_TOKENS = 32768
 
 
@@ -150,7 +150,7 @@ def _build_parser() -> argparse.ArgumentParser:
               python 06_scaffolder.py --project my-app
               PIPELINE_PROJECT=my-app python 06_scaffolder.py
 
-              python 06_scaffolder.py --project my-app --model gemini-2.5-flash
+              python 06_scaffolder.py --project my-app --model ~moonshotai/kimi-latest
               python 06_scaffolder.py --project my-app --dry-run
         """),
     )
@@ -164,8 +164,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--model",
-        default=os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
-        help=f"Gemini model name. Default: env GEMINI_MODEL or {DEFAULT_GEMINI_MODEL}.",
+        default=os.environ.get("MODEL", DEFAULT_MODEL),
+        help=f"Gemini model name. Default: env MODEL or {DEFAULT_MODEL}.",
     )
     parser.add_argument(
         "--dry-run",
@@ -205,10 +205,10 @@ def _configure_project(
 
 
 def _require_api_key(parser: argparse.ArgumentParser) -> str:
-    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
     if not api_key:
         parser.error(
-            "GEMINI_API_KEY is not set. Export GEMINI_API_KEY=<your-key> and retry."
+            "OPENROUTER_API_KEY is not set. Export OPENROUTER_API_KEY=<your-key> and retry."
         )
     return api_key
 
