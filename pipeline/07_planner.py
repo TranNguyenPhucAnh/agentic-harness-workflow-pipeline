@@ -1,7 +1,7 @@
 """
 pipeline/07_planner.py
 ======================
-Step 7 — GLM 5.1 as PLANNER (reasoning-heavy, no code output).
+Step 7 — Planner (reasoning-heavy, no code output).
 
 This script supports two scopes:
 
@@ -18,7 +18,7 @@ Writes:
     artifacts_<slug>/state/planner_full_execution_plan.json
 
 Consumed by:
-    pipeline/08_executor.py --scope full --use-glm-plan
+    pipeline/08_executor.py --scope full --use-planner-plan
 
 
 MINI SCOPE
@@ -41,7 +41,7 @@ Writes:
     artifacts_<slug>/state/planner_mini_impact_analysis.json
 
 Consumed by:
-    pipeline/08_executor.py --scope mini --use-glm-plan
+    pipeline/08_executor.py --scope mini --use-planner-plan
 
 Does NOT write any src/ files. 08_executor.py is the sole executor.
 
@@ -63,12 +63,6 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
-
-import httpx
-
-
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL = "z-ai/glm-5.1"
 
 
 # === WRITE AUTHORITY: planner ===
@@ -97,6 +91,7 @@ MODEL = "z-ai/glm-5.1"
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from artifacts.models import call_model, get_model, get_provider  # noqa: E402
 from artifacts.paths import (  # noqa: E402
     ABSORBER_BLAME_MAP,
     ABSORBER_CODEBASE_MAP,
@@ -115,6 +110,9 @@ from artifacts.paths import (  # noqa: E402
     ensure_dirs,
     get_spec_path,
 )
+
+
+ROLE = "planner"
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -400,7 +398,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="07_planner.py",
         description=(
-            "GLM planner step. Writes planner_full_execution_plan.json "
+            "Planner step. Writes planner_full_execution_plan.json "
             "or planner_mini_execution_plan.json + planner_mini_impact_analysis.json."
         ),
     )
@@ -451,13 +449,6 @@ def _configure_project(
 # ════════════════════════════════════════════════════════════════════════════
 # Generic helpers
 # ════════════════════════════════════════════════════════════════════════════
-
-def _api_key() -> str:
-    key = os.environ.get("OPENROUTER_API_KEY", "").strip()
-    if not key:
-        raise RuntimeError("OPENROUTER_API_KEY is not set.")
-    return key
-
 
 def _utc_now_iso() -> str:
     return _dt.datetime.now(_dt.timezone.utc).isoformat()
@@ -535,26 +526,11 @@ def _parse_json(raw: str, label: str) -> dict:
     raise RuntimeError(f"No JSON object found in {label}")
 
 
-def _extract_chat_json_response(data: dict, label: str) -> dict:
-    choice = data["choices"][0]
-    message = choice["message"]
+# ════════════════════════════════════════════════════════════════════════════
+# Core model call
+# ════════════════════════════════════════════════════════════════════════════
 
-    content = message.get("content")
-    tool_calls = message.get("tool_calls")
-    finish_reason = choice.get("finish_reason")
-
-    if tool_calls:
-        raise RuntimeError(f"Model returned tool_calls instead of text: {tool_calls}")
-
-    if not content or not content.strip():
-        raise RuntimeError(
-            f"Model returned empty content. finish_reason={finish_reason}, message={message}"
-        )
-
-    return _parse_json(content.strip(), label=label)
-
-
-def _call_glm_json(
+def _call_planner_json(
     *,
     system_prompt: str,
     user_message: str,
@@ -562,46 +538,62 @@ def _call_glm_json(
     temperature: float = 0.2,
     max_tokens: int = 32768,
 ) -> dict:
-    payload = {
-        "model": MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
-        ],
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    }
+    """
+    Call the planner role (config in artifacts/models.py) and return parsed JSON.
 
-    headers = {
-        "Authorization": f"Bearer {_api_key()}",
-        "Content-Type": "application/json",
-    }
+    Retries once on transient failures.
+    """
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_message},
+    ]
 
-    print(f"[07] Calling GLM 5.1 ({label}) …")
+    model    = get_model(ROLE)
+    provider = get_provider(ROLE)
+    print(f"[07] Calling model: {model} (provider: {provider}) — {label} …")
 
     last_error: Exception | None = None
 
-    with httpx.Client(timeout=240) as client:
-        for attempt in range(2):
-            try:
-                response = client.post(OPENROUTER_URL, headers=headers, json=payload)
-                response.raise_for_status()
-                data = response.json()
+    for attempt in range(2):
+        try:
+            resp = call_model(
+                ROLE,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
 
-                usage = data.get("usage", {})
-                prompt_t = usage.get("prompt_tokens", "?")
-                completion_t = usage.get("completion_tokens", "?")
-                print(f"[07] Tokens: prompt={prompt_t}, completion={completion_t}")
+            usage = getattr(resp, "usage", None)
+            if usage:
+                print(
+                    f"[07] Tokens: prompt={getattr(usage, 'prompt_tokens', '?')}, "
+                    f"completion={getattr(usage, 'completion_tokens', '?')}"
+                )
 
-                return _extract_chat_json_response(data, label=label)
+            choice  = resp.choices[0]
+            message = choice.message
+            content = message.content
+            tool_calls = getattr(message, "tool_calls", None)
+            finish_reason = getattr(choice, "finish_reason", None)
 
-            except Exception as exc:
-                last_error = exc
-                print(f"[07] {label} failed: {exc}", file=sys.stderr)
+            if tool_calls:
+                raise RuntimeError(f"Model returned tool_calls instead of text: {tool_calls}")
 
-                if attempt == 0:
-                    print("[07] Retrying in 3s …", file=sys.stderr)
-                    time.sleep(3)
+            if not content or not content.strip():
+                raise RuntimeError(
+                    f"Model returned empty content. finish_reason={finish_reason}, "
+                    f"message={message}"
+                )
+
+            return _parse_json(content.strip(), label=label)
+
+        except Exception as exc:
+            last_error = exc
+            print(f"[07] {label} failed: {exc}", file=sys.stderr)
+
+            if attempt == 0:
+                print("[07] Retrying in 3s …", file=sys.stderr)
+                time.sleep(3)
 
     raise RuntimeError(f"{label} failed after retries: {last_error}")
 
@@ -642,14 +634,14 @@ def _load_scaffold() -> dict:
     return json.loads(SCAFFOLD_JSON.read_text(encoding="utf-8"))
 
 
-def call_glm_full_planner(spec: str, stub_files: list[dict]) -> dict:
+def call_full_planner(spec: str, stub_files: list[dict]) -> dict:
     user_message = (
         f"### canonical spec\n\n{spec}\n\n"
         f"### scaffold stub files\n\n"
         f"{json.dumps(stub_files, indent=2, ensure_ascii=False)}"
     )
 
-    return _call_glm_json(
+    return _call_planner_json(
         system_prompt=FULL_SYSTEM_PROMPT,
         user_message=user_message,
         label="full planner response",
@@ -712,7 +704,7 @@ def run_full_scope() -> None:
     print("[07] Scope: full")
     print(f"[07] Planning {len(stub_files)} non-test stub file(s) …")
 
-    plan = call_glm_full_planner(spec, stub_files)
+    plan = call_full_planner(spec, stub_files)
     validate_full_plan(plan, stub_files)
 
     PLANNER_FULL_PLAN.parent.mkdir(parents=True, exist_ok=True)
@@ -725,7 +717,7 @@ def run_full_scope() -> None:
     print(f"[07] Full plan written → {PLANNER_FULL_PLAN}")
     print(f"[07] Tasks in plan: {len(plan.get('tasks', []))}")
     print(f"[07] Implementation order: {plan.get('implementation_order', [])}")
-    print("[07] Done. Pass --use-glm-plan to 08_executor.py to use this plan.")
+    print("[07] Done. Pass --use-planner-plan to 08_executor.py to use this plan.")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -836,7 +828,7 @@ def _load_mini_context_bundle() -> str:
     return "\n\n".join(sections)
 
 
-def call_glm_mini_planner(request: str, context_bundle: str) -> dict:
+def call_mini_planner(request: str, context_bundle: str) -> dict:
     context_block = (
         f"\n\n## Project context bundle\n\n{context_bundle}"
         if context_bundle
@@ -849,7 +841,7 @@ def call_glm_mini_planner(request: str, context_bundle: str) -> dict:
         f"{context_block}"
     )
 
-    return _call_glm_json(
+    return _call_planner_json(
         system_prompt=MINI_SYSTEM_PROMPT,
         user_message=user_message,
         label="mini planner response",
@@ -1007,7 +999,7 @@ def run_mini_scope() -> None:
     else:
         print("[07] Knowledge context: none")
 
-    result = call_glm_mini_planner(request, context_bundle)
+    result = call_mini_planner(request, context_bundle)
     plan_mini, impact_analysis = validate_and_normalize_mini_result(result)
 
     PLANNER_MINI_PLAN.parent.mkdir(parents=True, exist_ok=True)
@@ -1033,7 +1025,7 @@ def run_mini_scope() -> None:
             f"  - {entry.get('action', 'MODIFY'):<6} "
             f"{entry.get('path')}  risk={entry.get('risk')}"
         )
-    print("[07] Done. Pass --scope mini --use-glm-plan to 08_executor.py.")
+    print("[07] Done. Pass --scope mini --use-planner-plan to 08_executor.py.")
 
 
 # ════════════════════════════════════════════════════════════════════════════
