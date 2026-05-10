@@ -1,7 +1,7 @@
 """
 pipeline/08_executor.py
 =======================
-Step 8 — Qwen 3.6 Plus as EXECUTOR.
+Step 8 — EXECUTOR.
 
 This script supports two scopes:
 
@@ -10,10 +10,10 @@ FULL SCOPE
 Spec/scaffold-driven implementation.
 
 Modes:
-    Default, no GLM plan:
+    Default, no planner plan:
         Single API call for all requested non-test stub files.
 
-    With planner plan (--use-glm-plan):
+    With planner plan (--use-planner-plan):
         Reads artifacts_<slug>/state/planner_full_execution_plan.json produced
         by 07_planner.py.
         For each file, injects the matching planner task:
@@ -32,7 +32,7 @@ Delta mode:
 Reads:
     artifacts_<slug>/specwright_spec_<slug>.md or cache/scaffolder_compressed_spec.md
     artifacts_<slug>/state/scaffolder_codebase_skeleton.json
-    artifacts_<slug>/state/planner_full_execution_plan.json         optional, with --use-glm-plan
+    artifacts_<slug>/state/planner_full_execution_plan.json         optional, with --use-planner-plan
 
 Writes:
     artifacts_<slug>/src/**                                        non-test files only
@@ -78,12 +78,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-import httpx
-
-
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL = "qwen/qwen3.6-plus"
-
 
 # === WRITE AUTHORITY: executor ===
 # OWNS full:
@@ -107,6 +101,7 @@ MODEL = "qwen/qwen3.6-plus"
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from artifacts.models import call_model, get_model, get_provider  # noqa: E402
 from artifacts.paths import (  # noqa: E402
     EXECUTOR_OVERWRITE_MANIFEST,
     PLANNER_FULL_PLAN,
@@ -119,6 +114,9 @@ from artifacts.paths import (  # noqa: E402
     ensure_dirs,
     get_spec_path,
 )
+
+
+ROLE = "executor"
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -240,13 +238,6 @@ FENCE_LANGUAGE_BY_EXT = {
     ".fish": "fish",
     ".md": "markdown",
 }
-
-
-def _api_key() -> str:
-    key = os.environ.get("OPENROUTER_API_KEY", "").strip()
-    if not key:
-        raise RuntimeError("OPENROUTER_API_KEY is not set.")
-    return key
 
 
 def _utc_now_iso() -> str:
@@ -648,90 +639,67 @@ def _build_mini_user_message(
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# API call
+# Core model call
 # ════════════════════════════════════════════════════════════════════════════
 
-def _extract_chat_text_response(data: dict[str, Any], label: str) -> str:
-    choice = data["choices"][0]
-    msg = choice["message"]
+def _call_executor(system: str, user_message: str) -> str:
+    """
+    Call the executor role (config in artifacts/models.py).
 
-    content = msg.get("content")
-    tool_calls = msg.get("tool_calls")
-    finish_reason = choice.get("finish_reason")
+    Retries once on transient failures. Returns raw text content.
+    """
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user_message},
+    ]
 
-    if tool_calls:
-        raise RuntimeError(f"{label} returned tool_calls instead of text: {tool_calls}")
-
-    if not content or not content.strip():
-        raise RuntimeError(
-            f"{label} returned empty content. "
-            f"finish_reason={finish_reason}, message={msg}"
-        )
-
-    return content.strip()
-
-
-def _call_qwen(system: str, user_message: str) -> str:
-    headers = {
-        "Authorization": f"Bearer {_api_key()}",
-        "Content-Type": "application/json",
-    }
-
-    payload = {
-        "model": MODEL,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user_message},
-        ],
-        "temperature": 0.15,
-        "max_tokens": 32768,
-    }
+    model    = get_model(ROLE)
+    provider = get_provider(ROLE)
 
     last_error: Exception | None = None
 
-    with httpx.Client(timeout=180) as client:
-        for attempt in range(2):
-            try:
-                response = client.post(OPENROUTER_URL, headers=headers, json=payload)
-                response.raise_for_status()
+    for attempt in range(2):
+        try:
+            resp = call_model(
+                ROLE,
+                messages=messages,
+                temperature=0.15,
+                max_tokens=32768,
+            )
 
-                try:
-                    data = response.json()
-                except json.JSONDecodeError as exc:
-                    body_preview = response.text[:1000] if response.text else "<empty body>"
-                    raise RuntimeError(
-                        f"OpenRouter returned non-JSON response: {exc}\n"
-                        f"Response body, first 1000 chars:\n{body_preview}"
-                    ) from exc
-
-                usage = data.get("usage", {})
-                prompt_t = usage.get("prompt_tokens", "?")
-                completion_t = usage.get("completion_tokens", "?")
-                print(f"[qwen] Tokens: prompt={prompt_t}, completion={completion_t}")
-
-                return _extract_chat_text_response(data, label="Qwen")
-
-            except httpx.HTTPStatusError as exc:
-                body_preview = (
-                    exc.response.text[:1000]
-                    if exc.response is not None and exc.response.text
-                    else "<empty body>"
+            usage = getattr(resp, "usage", None)
+            if usage:
+                print(
+                    f"[08] Tokens: prompt={getattr(usage, 'prompt_tokens', '?')}, "
+                    f"completion={getattr(usage, 'completion_tokens', '?')}"
                 )
-                last_error = RuntimeError(
-                    f"HTTP error from OpenRouter: {exc}\n"
-                    f"Response body, first 1000 chars:\n{body_preview}"
-                )
-                print(f"[qwen] {last_error}", file=sys.stderr)
 
-            except (httpx.HTTPError, RuntimeError) as exc:
-                last_error = exc
-                print(f"[qwen] {exc}", file=sys.stderr)
+            choice     = resp.choices[0]
+            message    = choice.message
+            content    = message.content
+            tool_calls = getattr(message, "tool_calls", None)
+            finish_reason = getattr(choice, "finish_reason", None)
+
+            if tool_calls:
+                raise RuntimeError(f"Model returned tool_calls instead of text: {tool_calls}")
+
+            if not content or not content.strip():
+                raise RuntimeError(
+                    f"Model returned empty content. "
+                    f"finish_reason={finish_reason}, message={message}"
+                )
+
+            return content.strip()
+
+        except Exception as exc:
+            last_error = exc
+            print(f"[08] [{model}] {exc}", file=sys.stderr)
 
             if attempt == 0:
-                print("[qwen] Retrying in 3s …", file=sys.stderr)
+                print("[08] Retrying in 3s …", file=sys.stderr)
                 time.sleep(3)
 
-    raise RuntimeError(f"Qwen call failed after retries: {last_error}")
+    raise RuntimeError(f"Executor call failed after retries: {last_error}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -740,7 +708,7 @@ def _call_qwen(system: str, user_message: str) -> str:
 
 def _parse_json(raw: str, label: str) -> dict[str, Any]:
     """
-    Parse JSON from LLM response.
+    Parse JSON from model response.
 
     Handles accidental markdown fences and accidental surrounding prose.
     Raises RuntimeError on failure.
@@ -967,7 +935,7 @@ def implement_file(
         )
 
     print(f"[08]   → Implementing {file_path} …")
-    raw = _call_qwen(build_system_prompt_per_file(stack=stack), user_msg)
+    raw = _call_executor(build_system_prompt_per_file(stack=stack), user_msg)
     result = _parse_json(raw, file_path)
 
     # Be tolerant if model accidentally returns the single-call shape.
@@ -1021,9 +989,11 @@ def implement_all_single_call(
         f"{json.dumps(stub_files, indent=2, ensure_ascii=False)}"
     )
 
-    print("[08] Calling Qwen 3.6 Plus, single-call mode …")
+    model    = get_model(ROLE)
+    provider = get_provider(ROLE)
+    print(f"[08] Calling model: {model} (provider: {provider}), single-call mode …")
 
-    raw = _call_qwen(
+    raw = _call_executor(
         build_system_prompt_single(instructions=instructions, stack=stack),
         user_msg,
     )
@@ -1043,7 +1013,7 @@ def implement_all_single_call(
 def _load_restored_files(only_set: set[str]) -> dict[str, str]:
     """
     Read already-restored src/ files into memory so they can be used as
-    import/reference context for Qwen in delta mode.
+    import/reference context for the executor in delta mode.
 
     These are build outputs, not pipeline artifacts, so they are not included
     in the artifact access summary.
@@ -1235,7 +1205,7 @@ def _implement_mini_target(
         )
 
     print(f"[08]   → Mini patch {action:<6} {path} …")
-    raw = _call_qwen(build_system_prompt_mini_file(), user_msg)
+    raw = _call_executor(build_system_prompt_mini_file(), user_msg)
     result = _parse_json(raw, f"mini target {path}")
 
     # Tolerate full-scope key names.
@@ -1390,7 +1360,7 @@ def run_full_scope(args: argparse.Namespace) -> tuple[list[str], list[str], dict
     spec = _load_spec()
     scaffold = _read_json_file(SCAFFOLD_JSON, "scaffolder_codebase_skeleton.json")
 
-    instrs = scaffold.get("implementation_instructions", {}).get("for_qwen", "")
+    instrs = scaffold.get("implementation_instructions", {}).get("for_executor", "")
     scaffold_stack = scaffold.get("stack")
 
     files = scaffold.get("files", [])
@@ -1447,10 +1417,10 @@ def run_full_scope(args: argparse.Namespace) -> tuple[list[str], list[str], dict
     task_index: dict[str, dict[str, Any]] = {}
     stack: dict[str, Any] | None = scaffold_stack if isinstance(scaffold_stack, dict) else None
 
-    if args.use_glm_plan:
+    if args.use_planner_plan:
         if not PLANNER_FULL_PLAN.exists():
             raise FileNotFoundError(
-                f"ERROR: --use-glm-plan set but full planner plan not found: {PLANNER_FULL_PLAN}\n"
+                f"ERROR: --use-planner-plan set but full planner plan not found: {PLANNER_FULL_PLAN}\n"
                 "Run 07_planner.py --scope full first."
             )
 
@@ -1580,7 +1550,8 @@ def _write_impl_record(
     extra: dict[str, Any],
 ) -> None:
     record = {
-        "model": "qwen",
+        "executor_role": ROLE,
+        "executor_model": get_model(ROLE),
         "scope": scope,
         "mode": mode,
         "generated_at": _utc_now_iso(),
@@ -1606,7 +1577,7 @@ def _write_impl_record(
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="08_executor.py",
-        description="Qwen executor. Implements full scaffold plan or mini targeted plan.",
+        description="Executor. Implements full scaffold plan or mini targeted plan.",
     )
 
     parser.add_argument(
@@ -1626,7 +1597,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
-        "--use-glm-plan",
+        "--use-planner-plan",
         action="store_true",
         help=(
             "Full scope: inject state/planner_full_execution_plan.json as per-file "
