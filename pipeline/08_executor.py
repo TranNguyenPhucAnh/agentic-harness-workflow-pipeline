@@ -671,7 +671,7 @@ def _extract_chat_text_response(data: dict[str, Any], label: str) -> str:
     return content.strip()
 
 
-def _call_qwen(system: str, user_message: str) -> str:
+def _call_executor(system: str, user_message: str) -> str:
     headers = {
         "Authorization": f"Bearer {_api_key()}",
         "Content-Type": "application/json",
@@ -707,9 +707,9 @@ def _call_qwen(system: str, user_message: str) -> str:
                 usage = data.get("usage", {})
                 prompt_t = usage.get("prompt_tokens", "?")
                 completion_t = usage.get("completion_tokens", "?")
-                print(f"[qwen] Tokens: prompt={prompt_t}, completion={completion_t}")
+                print(f"[executor] Tokens: prompt={prompt_t}, completion={completion_t}")
 
-                return _extract_chat_text_response(data, label="Qwen")
+                return _extract_chat_text_response(data, label="Executor")
 
             except httpx.HTTPStatusError as exc:
                 body_preview = (
@@ -721,17 +721,17 @@ def _call_qwen(system: str, user_message: str) -> str:
                     f"HTTP error from OpenRouter: {exc}\n"
                     f"Response body, first 1000 chars:\n{body_preview}"
                 )
-                print(f"[qwen] {last_error}", file=sys.stderr)
+                print(f"[executor] {last_error}", file=sys.stderr)
 
             except (httpx.HTTPError, RuntimeError) as exc:
                 last_error = exc
-                print(f"[qwen] {exc}", file=sys.stderr)
+                print(f"[executor] {exc}", file=sys.stderr)
 
             if attempt == 0:
-                print("[qwen] Retrying in 3s …", file=sys.stderr)
+                print("[executor] Retrying in 3s …", file=sys.stderr)
                 time.sleep(3)
 
-    raise RuntimeError(f"Qwen call failed after retries: {last_error}")
+    raise RuntimeError(f"Executor model call failed after retries: {last_error}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -967,7 +967,7 @@ def implement_file(
         )
 
     print(f"[08]   → Implementing {file_path} …")
-    raw = _call_qwen(build_system_prompt_per_file(stack=stack), user_msg)
+    raw = _call_executor(build_system_prompt_per_file(stack=stack), user_msg)
     result = _parse_json(raw, file_path)
 
     # Be tolerant if model accidentally returns the single-call shape.
@@ -1023,7 +1023,7 @@ def implement_all_single_call(
 
     print("[08] Calling claude-opus-latest, single-call mode …")
 
-    raw = _call_qwen(
+    raw = _call_executor(
         build_system_prompt_single(instructions=instructions, stack=stack),
         user_msg,
     )
@@ -1043,7 +1043,7 @@ def implement_all_single_call(
 def _load_restored_files(only_set: set[str]) -> dict[str, str]:
     """
     Read already-restored src/ files into memory so they can be used as
-    import/reference context for Qwen in delta mode.
+    import/reference context for executor model in delta mode.
 
     These are build outputs, not pipeline artifacts, so they are not included
     in the artifact access summary.
@@ -1235,7 +1235,7 @@ def _implement_mini_target(
         )
 
     print(f"[08]   → Mini patch {action:<6} {path} …")
-    raw = _call_qwen(build_system_prompt_mini_file(), user_msg)
+    raw = _call_executor(build_system_prompt_mini_file(), user_msg)
     result = _parse_json(raw, f"mini target {path}")
 
     # Tolerate full-scope key names.
@@ -1580,7 +1580,7 @@ def _write_impl_record(
     extra: dict[str, Any],
 ) -> None:
     record = {
-        "model": "qwen",
+        "model": "executor",
         "scope": scope,
         "mode": mode,
         "generated_at": _utc_now_iso(),
@@ -1606,7 +1606,7 @@ def _write_impl_record(
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="08_executor.py",
-        description="Qwen executor. Implements full scaffold plan or mini targeted plan.",
+        description="Executor. Implements full scaffold plan or mini targeted plan.",
     )
 
     parser.add_argument(
