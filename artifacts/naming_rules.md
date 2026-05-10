@@ -68,18 +68,23 @@ Không dùng `.txt`, `.yaml`, `.csv` cho pipeline artifacts.
 
 ## Rule 4 — Lifecycle suffixes (bắt buộc nếu applicable)
 
-### `_session_` — overwrite mỗi pipeline run
+### `_overwrite_` — overwrite mỗi khi module chạy trong cùng session
 
-Dùng khi artifact bị overwrite hoàn toàn mỗi lần module chạy trong một pipeline session.
+Dùng khi artifact bị overwrite hoàn toàn mỗi lần module chạy. Không tích lũy.
 
 ```
-clarificator_session_raw.json
-enricher_session_enriched_prompt.md
-judge_session_verdict_raw.json
-spectracker_session_version_delta.json
+clarificator_overwrite_raw.json
+enricher_overwrite_enriched_prompt.md
+judge_overwrite_verdict_raw.json
+spectracker_overwrite_version_delta.json
 ```
 
-**Test:** nếu chạy pipeline 2 lần liên tiếp, file có nội dung run trước không? Nếu không → dùng `_session_`.
+**Test:** nếu module chạy 2 lần liên tiếp trong cùng session, file có nội dung run trước không? Nếu không → dùng `_overwrite_`.
+
+> **Lưu ý naming:** suffix cũ `_session_` đã được đổi sang `_overwrite_` để tránh trùng semantic
+> với khái niệm **Session** trong session isolation model (Rule 11).
+> `_session_` trong tên artifact cũ ám chỉ "per-run overwrite" — nhưng một Session nay
+> chứa nhiều runs, gây nhầm lẫn. `_overwrite_` encode đúng behavior hơn.
 
 ### `_log` — append-only, tích lũy across sessions
 
@@ -104,7 +109,7 @@ judge_session_verdict_raw.json
 clarificator_session_raw.json
 ```
 
-**Invariant:** `_raw` luôn đi kèm `_session_` vì model output là per-run.
+**Invariant:** `_raw` luôn đi kèm `_overwrite_` vì model output là per-run.
 
 ---
 
@@ -165,7 +170,7 @@ Tránh những từ không encode semantic cụ thể:
 | `_info` | tên cụ thể theo content |
 | `_output` | `_synthesis`, `_summary`, `_raw` |
 | `_report` (cho human-readable) | `_summary`, `_synthesis` |
-| `_record` (khi là snapshot session) | `_session_manifest`, `_session_snapshot` |
+| `_record` (khi là snapshot session) | `_session_manifest` → `_overwrite_manifest`, `_session_snapshot` → `_overwrite_snapshot` |
 
 ---
 
@@ -192,9 +197,37 @@ SPEC_PATH = _LazyPath("specwright_spec_myapp.md")
 
 Mọi artifact mới phải được đăng ký đủ 3 nơi trước khi merge:
 
-- [ ] `artifacts/paths.py` — `_LazyPath` constant với đầy đủ comments: owner, consumers, lifecycle, purpose
+- [ ] `artifacts/paths.py` — `_LazyPath` hoặc `_SessLazyPath` constant với đầy đủ comments: owner, consumers, lifecycle, purpose, scope
 - [ ] `artifacts/OWNERSHIP.md` — thêm vào ownership table đúng section
 - [ ] `artifacts/TAXONOMY.md` — thêm vào directory overview, ownership table, và Special Notes nếu có hybrid lifecycle hoặc exception
+
+---
+
+## Rule 11 — Session-scoped locations
+
+Session isolation được encode trong **directory path**, bukan filename.
+
+Không thêm session id hay run id vào tên artifact thông thường của pipeline.
+
+```
+# ✅
+sessions/001/execution/judge_overwrite_verdict_raw.json
+
+# ❌
+execution/judge_overwrite_001_verdict_raw.json
+execution/judge_run_003_verdict_raw.json
+```
+
+`session_NNN_runs.json` là ngoại lệ — đây là orchestrator metadata thuộc `harness`, không phải pipeline step artifact.
+
+**Scope được khai báo trong `paths.py`:**
+
+| Class | Scope | Resolves to |
+|---|---|---|
+| `_LazyPath` | project-global | `artifacts_<slug>/` |
+| `_SessLazyPath` | session-local | `artifacts_<slug>/sessions/<NNN>/` |
+
+Mọi constant mới phải dùng đúng class theo scope, và khai báo `# scope:` trong comment.
 
 ---
 
@@ -202,7 +235,7 @@ Mọi artifact mới phải được đăng ký đủ 3 nơi trước khi merge:
 
 Khi một file có mixed write behavior (ví dụ: top-level fields overwrite, embedded array append-only), đây là **documented exception**. Phải:
 
-1. Không dùng `_session_` hay `_log` suffix — cả hai đều sai một phần
+1. Không dùng `_overwrite_` hay `_log` suffix — cả hai đều sai một phần
 2. Comment `# lifecycle: hybrid` trong `paths.py`
 3. Giải thích rõ trong TAXONOMY.md Special Notes tại sao hybrid thay vì tách thành 2 artifacts
 
@@ -217,7 +250,7 @@ artifact mới → hỏi:
 
 1. Module nào ghi?           → owner prefix
 2. Machine hay human?        → .json hay .md
-3. Overwrite mỗi run?        → thêm _session_
+3. Overwrite mỗi run?        → thêm _overwrite_
 4. Append-only log?          → thêm _log
 5. Unprocessed model output? → thêm _raw (+ _session_)
 6. Full hay mini scope?      → thêm _full_ hay _mini_ infix
