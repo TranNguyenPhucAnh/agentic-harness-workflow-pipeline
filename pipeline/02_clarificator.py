@@ -111,8 +111,8 @@ def _print_artifact_access_summary() -> None:
 
 # ── Model config ──────────────────────────────────────────────────────────────
 
-_ANALYZE_MODEL = "~moonshotai/kimi-latest"
-_SUGGEST_MODEL = "~moonshotai/kimi-latest"
+_ANALYZE_MODEL = "~anthropic/claude-sonnet-latest"
+_SUGGEST_MODEL = "~anthropic/claude-sonnet-latest"
 _TIER3_MIN_CONF = 0.75
 
 _MAX_TOKENS_ANALYZE = 8192
