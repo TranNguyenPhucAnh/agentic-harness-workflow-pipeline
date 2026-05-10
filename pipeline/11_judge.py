@@ -40,9 +40,6 @@ Direct execution:
   PIPELINE_PROJECT=my-app python 11_judge.py
   PIPELINE_PROJECT=my-app PIPELINE_SESSION=001 python 11_judge.py
 
-Required environment:
-  OPENROUTER_API_KEY=<your-key>
-
 At the end of each run, prints:
   - artifacts/files read
   - artifacts/files created/updated/overwritten/appended
@@ -63,7 +60,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import httpx
 
 # === WRITE AUTHORITY: judge ===
 # OWNS  : artifacts_<slug>/sessions/<NNN>/execution/judge_overwrite_verdict_raw.json
@@ -107,10 +103,11 @@ from artifacts.paths import (  # noqa: E402
     get_session_id,
     get_spec_path,
 )
+from artifacts.models import call_model, get_model  # noqa: E402
 
 
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-DEFAULT_MODEL = "deepseek/deepseek-v3.2"
+# Model identity resolved from artifacts/models.py role "judge".
+# Reasoning is enabled by default for judge via REASONING_OVERRIDES in models.py.
 MAX_BRIEFING_CHARS = 900_000
 MAX_FILE_CHARS = 80_000
 
@@ -238,7 +235,8 @@ def _build_parser() -> argparse.ArgumentParser:
               PIPELINE_PROJECT=my-app python 11_judge.py
               PIPELINE_PROJECT=my-app PIPELINE_SESSION=001 python 11_judge.py
 
-              python 11_judge.py --project my-app --model deepseek/deepseek-v3.2
+              # Model is resolved from artifacts/models.py role "judge".
+              # To change: edit ROLES["judge"] in models.py.
         """),
     )
     parser.add_argument(
@@ -253,11 +251,6 @@ def _build_parser() -> argparse.ArgumentParser:
             "Optional session id for direct execution. Sets PIPELINE_SESSION. "
             "Example: --session 1 resolves to sessions/001."
         ),
-    )
-    parser.add_argument(
-        "--model",
-        default=os.environ.get("JUDGE_MODEL", DEFAULT_MODEL),
-        help=f"Judge model id. Default: env JUDGE_MODEL or {DEFAULT_MODEL}.",
     )
     parser.add_argument(
         "--max-briefing-chars",
@@ -292,15 +285,6 @@ def _configure_project(
         "PIPELINE_PROJECT is not set. Use --project <name> or export "
         "PIPELINE_PROJECT=<name> before running 11_judge.py directly."
     )
-
-
-def _require_openrouter_key(parser: argparse.ArgumentParser) -> str:
-    api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
-    if not api_key:
-        parser.error(
-            "OPENROUTER_API_KEY is not set. Export OPENROUTER_API_KEY=<your-key> and retry."
-        )
-    return api_key
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -900,64 +884,57 @@ def build_briefing(max_chars: int = MAX_BRIEFING_CHARS) -> str:
 # API call
 # ─────────────────────────────────────────────────────────────────────────────
 
-def call_deepseek_judge(
+def call_judge(
     briefing: str,
-    *,
-    api_key: str,
-    model: str,
 ) -> tuple[str, list[Any] | None, dict[str, Any]]:
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": JUDGE_SYSTEM},
-            {"role": "user", "content": briefing},
-        ],
-        "reasoning": {"enabled": True},
-        "temperature": 0.1,
-        "max_tokens": 16000,
-    }
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-
-    print(f"[11] Calling judge model: {model} …")
+    """
+    Call the judge model via the central model registry.
+    Model identity, provider, and reasoning flag are resolved from
+    artifacts/models.py role "judge". Reasoning is ON by default for judge.
+    """
+    model_id = get_model("judge")
+    print(f"[11] Calling judge model: {model_id} …")
 
     last_error = None
 
-    with httpx.Client(timeout=300) as client:
-        for attempt in range(2):
-            response = client.post(OPENROUTER_URL, headers=headers, json=payload)
-            response.raise_for_status()
+    for attempt in range(2):
+        resp = call_model(
+            "judge",
+            messages=[
+                {"role": "system", "content": JUDGE_SYSTEM},
+                {"role": "user",   "content": briefing},
+            ],
+            temperature=0.1,
+            max_tokens=16000,
+        )
 
-            data = response.json()
+        usage = resp.usage
+        prompt_t = getattr(usage, "prompt_tokens", "?") if usage else "?"
+        completion_t = getattr(usage, "completion_tokens", "?") if usage else "?"
+        print(f"[11] Tokens: prompt={prompt_t}, completion={completion_t}")
 
-            usage = data.get("usage", {})
-            prompt_t = usage.get("prompt_tokens", "?")
-            completion_t = usage.get("completion_tokens", "?")
-            print(f"[11] Tokens: prompt={prompt_t}, completion={completion_t}")
+        choice = resp.choices[0]
+        msg = choice.message
+        content = getattr(msg, "content", None)
+        tool_calls = getattr(msg, "tool_calls", None)
+        finish_reason = getattr(choice, "finish_reason", None)
+        reasoning_details = getattr(msg, "reasoning_details", None)
 
-            choice = data["choices"][0]
-            msg = choice["message"]
-            content = msg.get("content")
-            tool_calls = msg.get("tool_calls")
-            finish_reason = choice.get("finish_reason")
-            reasoning_details = msg.get("reasoning_details")
+        if tool_calls:
+            raise RuntimeError(
+                f"Judge returned tool_calls instead of text: {tool_calls}"
+            )
 
-            if tool_calls:
-                raise RuntimeError(
-                    f"Judge returned tool_calls instead of text: {tool_calls}"
-                )
+        if content and content.strip():
+            usage_dict = dict(usage) if usage else {}
+            return content.strip(), reasoning_details, usage_dict
 
-            if content and content.strip():
-                return content.strip(), reasoning_details, usage
+        last_error = f"Empty content. finish_reason={finish_reason}, message={msg}"
+        print(f"[11][warn] {last_error}", file=sys.stderr)
 
-            last_error = f"Empty content. finish_reason={finish_reason}, message={msg}"
-            print(f"[11][warn] {last_error}", file=sys.stderr)
-
-            if attempt == 0:
-                print("[11] Retrying in 3s …", file=sys.stderr)
-                time.sleep(3)
+        if attempt == 0:
+            print("[11] Retrying in 3s …", file=sys.stderr)
+            time.sleep(3)
 
     raise RuntimeError(f"Judge failed after retries: {last_error}")
 
@@ -998,7 +975,8 @@ def _parse_json(raw: str) -> dict[str, Any]:
 # Report renderer
 # ─────────────────────────────────────────────────────────────────────────────
 
-def render_report(review: dict[str, Any], *, model: str) -> str:
+def render_report(review: dict[str, Any]) -> str:
+    model = get_model("judge")
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     verdict = review.get("verdict", "UNKNOWN")
     run_type = review.get("run_type", _detect_scope())
@@ -1097,13 +1075,13 @@ def render_report(review: dict[str, Any], *, model: str) -> str:
 
 def _write_raw_verdict(
     *,
-    model: str,
     scope: str,
     briefing_chars: int,
     usage: dict[str, Any],
     raw_response: str,
     reasoning_details: list[Any] | None,
 ) -> None:
+    model = get_model("judge")
     JUDGE_OVERWRITE_VERDICT_RAW.parent.mkdir(parents=True, exist_ok=True)
     JUDGE_OVERWRITE_VERDICT_RAW.write_text(
         json.dumps(
@@ -1151,8 +1129,6 @@ def main() -> None:
     exit_code = 0
 
     try:
-        api_key = _require_openrouter_key(parser)
-
         scope = _detect_scope()
         print(f"[11] Project: {get_project_name()} ({get_project_slug()})")
         print(f"[11] Session: {get_session_id() or 'legacy/no-session'}")
@@ -1162,14 +1138,9 @@ def main() -> None:
         briefing = build_briefing(max_chars=args.max_briefing_chars)
         print(f"[11] Briefing size: {len(briefing):,} chars")
 
-        raw_response, reasoning_details, usage = call_deepseek_judge(
-            briefing,
-            api_key=api_key,
-            model=args.model,
-        )
+        raw_response, reasoning_details, usage = call_judge(briefing)
 
         _write_raw_verdict(
-            model=args.model,
             scope=scope,
             briefing_chars=len(briefing),
             usage=usage,
@@ -1182,7 +1153,7 @@ def main() -> None:
         if "run_type" not in review:
             review["run_type"] = "mini" if scope == "mini" else "full"
 
-        report_md = render_report(review, model=args.model)
+        report_md = render_report(review)
         _write_report(report_md)
 
         print(f"\n{'=' * 60}")
