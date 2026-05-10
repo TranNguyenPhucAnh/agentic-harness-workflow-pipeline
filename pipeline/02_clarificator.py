@@ -111,8 +111,8 @@ def _print_artifact_access_summary() -> None:
 
 # ── Model config ──────────────────────────────────────────────────────────────
 
-_ANALYZE_MODEL = "moonshotai/kimi-k2.6"
-_SUGGEST_MODEL = "moonshotai/kimi-k2.6"
+_ANALYZE_MODEL = "~moonshotai/kimi-latest"
+_SUGGEST_MODEL = "~moonshotai/kimi-latest"
 _TIER3_MIN_CONF = 0.75
 
 _MAX_TOKENS_ANALYZE = 8192
