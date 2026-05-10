@@ -20,11 +20,11 @@ Output:
 
 Usage:
     python 04_specwright.py --project my-app
-    python 04_specwright.py --project my-app --model anthropic/claude-opus-4-5
     python 04_specwright.py --project my-app --dry-run
     python 04_specwright.py --project my-app --no-review
 
-    # Thường được gọi tự động từ 03_enricher.py.
+    # Model được resolve từ artifacts/models.py role "specwright".
+    # Để đổi model: sửa ROLES["specwright"] trong models.py.
 
 Artifacts produced (owner: specwright):
     artifacts_<slug>/specwright_spec_<slug>.md         — get_spec_path(), input cho harness.py
@@ -47,8 +47,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import httpx
-
 # ── paths ─────────────────────────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from artifacts.paths import (  # type: ignore
@@ -58,6 +56,7 @@ from artifacts.paths import (  # type: ignore
     ensure_dirs,
     get_spec_path,
 )
+from artifacts.models import call_model, get_model  # type: ignore
 
 # Local aliases — map canonical constants to the short names used internally
 CLARIFICATION_REPORT = CLARIFICATOR_OVERWRITE_RAW
@@ -103,10 +102,9 @@ def _print_artifact_access_summary() -> None:
 
 
 # ── Model config ──────────────────────────────────────────────────────────────
-# Spec agent dùng model xịn — spec phải đủ chất lượng để harness chạy được.
-# Default: claude-sonnet (cân bằng chất/giá). Override bằng --model.
-_SPEC_MODEL_DEFAULT = "anthropic/claude-sonnet-4-5"
-_MAX_TOKENS_SPEC    = 8192
+# Model identity resolved from artifacts/models.py role "specwright".
+# Để đổi model: sửa ROLES["specwright"] trong models.py — không sửa file này.
+_MAX_TOKENS_SPEC = 8192
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -136,41 +134,32 @@ def _wrap(text: str, indent: int = 0) -> str:
 def _call_llm(
     system: str,
     user: str,
-    model: str = _SPEC_MODEL_DEFAULT,
     max_tokens: int = _MAX_TOKENS_SPEC,
 ) -> str:
-    if "/" in model:
-        api_key  = os.environ.get("OPENROUTER_API_KEY", "")
-        base_url = "https://openrouter.ai/api/v1"
-        model_id = model
-    else:
-        api_key  = os.environ.get("OPENAI_API_KEY", "")
-        base_url = "https://api.openai.com/v1"
-        model_id = model
-
-    if not api_key:
-        print("\n[specwright][offline] No API key found. Paste LLM response then EOF (Ctrl-D):")
-        return sys.stdin.read()
-
+    """
+    Call the specwright model via the central model registry.
+    Model identity and provider are resolved from artifacts/models.py role "specwright".
+    Falls back to stdin mock when API key is missing (offline dev).
+    """
     try:
-        payload = {
-            "model":      model_id,
-            "max_tokens": max_tokens,
-            "messages": [
+        print(f"[specwright] Using model: {get_model('specwright')}")
+        resp = call_model(
+            "specwright",
+            messages=[
                 {"role": "system", "content": system},
                 {"role": "user",   "content": user},
             ],
-        }
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type":  "application/json",
-        }
-        print(f"[specwright] Using model: {model_id}")
-        with httpx.Client(timeout=180) as client:
-            resp = client.post(f"{base_url}/chat/completions", headers=headers, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-        return data["choices"][0]["message"]["content"]
+            max_tokens=max_tokens,
+        )
+        content = resp.choices[0].message.content
+        if not content or not content.strip():
+            raise RuntimeError("Model returned empty content.")
+        return content
+    except RuntimeError as exc:
+        if "not set" in str(exc):
+            print("\n[specwright][offline] No API key found. Paste LLM response then EOF (Ctrl-D):")
+            return sys.stdin.read()
+        raise
     except Exception as exc:
         print(f"[specwright][error] LLM call failed: {exc}")
         raise
@@ -284,8 +273,8 @@ QUALITY RULES (strictly enforced):
 """.strip()
 
 
-def _generate_spec(enriched_prompt: str, model: str) -> str:
-    """Call spec model with enriched prompt, return raw spec markdown."""
+def _generate_spec(enriched_prompt: str) -> str:
+    """Call specwright model with enriched prompt, return raw spec markdown."""
     user_msg = f"""Use the enriched prompt below to write the technical specification.
 Follow all instructions in the prompt exactly.
 
@@ -293,7 +282,7 @@ Follow all instructions in the prompt exactly.
 
 Write the specification now."""
 
-    return _call_llm(_SPEC_SYSTEM, user_msg, model=model)
+    return _call_llm(_SPEC_SYSTEM, user_msg)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -482,8 +471,6 @@ def main() -> None:
         )
         parser.add_argument("--project",   metavar="NAME",
                             help="Project workspace name. Prompted if omitted.")
-        parser.add_argument("--model",     metavar="MODEL", default=_SPEC_MODEL_DEFAULT,
-                            help=f"Model to use for spec generation. Default: {_SPEC_MODEL_DEFAULT}")
         parser.add_argument("--dry-run",   action="store_true",
                             help="Generate spec, print to stdout, do not write file or launch harness.")
         parser.add_argument("--no-review", action="store_true",
@@ -503,7 +490,7 @@ def main() -> None:
 
         print(f"[specwright] Workspace:  {project_name!r}")
         print(f"[specwright] Spec target: {spec_file}")
-        print(f"[specwright] Model:       {args.model}")
+        print(f"[specwright] Model:       {get_model('specwright')}")
 
         # ── Load enriched prompt ──────────────────────────────────────────────────
         enriched_prompt = _load_enriched_prompt()
@@ -542,7 +529,7 @@ def main() -> None:
         print("[specwright] Calling spec model (this may take 30–60s for complex specs) ...")
 
         try:
-            raw_spec = _generate_spec(enriched_prompt, model=args.model)
+            raw_spec = _generate_spec(enriched_prompt)
         except Exception as exc:
             print(f"[specwright][error] Spec generation failed: {exc}")
             sys.exit(1)
@@ -569,7 +556,7 @@ def main() -> None:
         # ── Write spec file ───────────────────────────────────────────────────────
         header = (
             f"<!-- specwright_spec_{os.environ.get('PIPELINE_PROJECT', 'unknown')} — generated by 04_specwright on {_now_iso()} -->\n"
-            f"<!-- project: {project_name} | model: {args.model} -->\n\n"
+            f"<!-- project: {project_name} | model: {get_model('specwright')} -->\n\n"
         )
         final_spec = header + spec.strip() + "\n"
         spec_file.write_text(final_spec, encoding="utf-8")
