@@ -20,10 +20,7 @@ Direct execution:
   PIPELINE_PROJECT=my-app python 06_scaffolder.py
 
 Required environment:
-  GEMINI_API_KEY=<your-key>
-
-Optional environment:
-  GEMINI_MODEL=gemini-2.5-flash
+  Xem artifacts/models.py — API key được lấy tự động theo role "scaffolder".
 
 At the end of each run, prints:
   - artifacts/files read
@@ -37,15 +34,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import random
 import re
 import sys
 import textwrap
-import time
 from pathlib import Path
 from typing import Any
-
-import httpx
 
 # === WRITE AUTHORITY: scaffolder ===
 # OWNS  : artifacts_<slug>/state/scaffolder_codebase_skeleton.json
@@ -55,6 +48,7 @@ import httpx
 # READS : artifacts_<slug>/specwright_spec_<slug>.md
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+from artifacts.models import call_model, get_model, get_provider  # noqa: E402
 from artifacts.paths import (  # noqa: E402
     SCAFFOLD_JSON,
     SCAFFOLDER_COMPRESSED_SPEC,
@@ -65,7 +59,7 @@ from artifacts.paths import (  # noqa: E402
 )
 
 
-DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+ROLE = "scaffolder"
 MAX_OUTPUT_TOKENS = 32768
 
 
@@ -150,8 +144,9 @@ def _build_parser() -> argparse.ArgumentParser:
               python 06_scaffolder.py --project my-app
               PIPELINE_PROJECT=my-app python 06_scaffolder.py
 
-              python 06_scaffolder.py --project my-app --model gemini-2.5-flash
               python 06_scaffolder.py --project my-app --dry-run
+
+            Model/provider config: xem artifacts/models.py, role "scaffolder".
         """),
     )
     parser.add_argument(
@@ -161,11 +156,6 @@ def _build_parser() -> argparse.ArgumentParser:
             "Project name for direct execution. Sets PIPELINE_PROJECT before "
             "resolving artifact paths."
         ),
-    )
-    parser.add_argument(
-        "--model",
-        default=os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
-        help=f"Gemini model name. Default: env GEMINI_MODEL or {DEFAULT_GEMINI_MODEL}.",
     )
     parser.add_argument(
         "--dry-run",
@@ -204,109 +194,62 @@ def _configure_project(
     )
 
 
-def _require_api_key(parser: argparse.ArgumentParser) -> str:
-    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
-    if not api_key:
-        parser.error(
-            "GEMINI_API_KEY is not set. Export GEMINI_API_KEY=<your-key> and retry."
-        )
-    return api_key
-
-
 # ─────────────────────────────────────────────────────────────────────────────
-# API call
+# Model call
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _gemini_url(model: str, api_key: str) -> str:
-    return (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{model}:generateContent?key={api_key}"
-    )
-
-
-def _extract_gemini_text(raw: dict[str, Any]) -> str:
-    try:
-        parts = raw["candidates"][0]["content"]["parts"]
-    except (KeyError, IndexError, TypeError) as exc:
-        raise ValueError(f"Unexpected Gemini response shape: {raw}") from exc
-
-    texts = [p.get("text", "") for p in parts if isinstance(p, dict)]
-    text = "\n".join(t for t in texts if t).strip()
-
-    if not text:
-        raise ValueError(f"Gemini returned no text parts: {raw}")
-
-    return text
-
-
-def call_gemini(
+def call_scaffolder(
     spec_content: str,
     *,
-    api_key: str,
-    model: str,
     max_retries: int = 5,
 ) -> dict[str, Any]:
-    payload = {
-        "system_instruction": {
-            "parts": [{"text": SYSTEM_PROMPT}],
+    """
+    Call the scaffolder role (config in artifacts/models.py) with the canonical spec.
+
+    Retries on transient failures with exponential backoff.
+    Returns the parsed scaffold as a dict.
+    """
+    import random
+    import time
+
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": f"Here is the canonical spec:\n\n{spec_content}",
         },
-        "contents": [
-            {
-                "role": "user",
-                "parts": [{"text": f"Here is the canonical spec:\n\n{spec_content}"}],
-            }
-        ],
-        "generationConfig": {
-            "temperature": 0.2,
-            "maxOutputTokens": MAX_OUTPUT_TOKENS,
-            "responseMimeType": "application/json",
-        },
-    }
+    ]
 
-    print(f"[06] Calling Gemini model: {model} …")
+    model    = get_model(ROLE)
+    provider = get_provider(ROLE)
+    print(f"[06] Calling model: {model} (provider: {provider}) …")
 
-    timeout = httpx.Timeout(120.0, connect=30.0)
-    url = _gemini_url(model, api_key)
+    last_exc: Exception | None = None
 
-    with httpx.Client(timeout=timeout) as client:
-        for attempt in range(1, max_retries + 1):
-            try:
-                resp = client.post(url, json=payload)
-                resp.raise_for_status()
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = call_model(
+                ROLE,
+                messages=messages,
+                max_tokens=MAX_OUTPUT_TOKENS,
+                temperature=0.2,
+            )
+            text = resp.choices[0].message.content or ""
+            return _parse_json(text)
 
-                raw = resp.json()
-                text = _extract_gemini_text(raw)
-                return _parse_json(text)
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if attempt < max_retries:
+                wait = (2 ** (attempt - 1)) + random.uniform(0, 1)
+                print(
+                    f"[06][warn] Call failed (attempt {attempt}/{max_retries}), "
+                    f"retry in {wait:.1f}s: {exc}"
+                )
+                time.sleep(wait)
+            else:
+                print(f"[06][error] Model call failed: {exc}", file=sys.stderr)
 
-            except httpx.HTTPStatusError as exc:
-                status = exc.response.status_code if exc.response else None
-
-                if status in {429, 500, 502, 503, 504} and attempt < max_retries:
-                    wait = (2 ** (attempt - 1)) + random.uniform(0, 1)
-                    print(
-                        f"[06][warn] API status {status}, retry "
-                        f"{attempt}/{max_retries} in {wait:.1f}s …"
-                    )
-                    time.sleep(wait)
-                    continue
-
-                print(f"[06][error] API call failed: {exc}", file=sys.stderr)
-                raise
-
-            except httpx.TransportError as exc:
-                if attempt < max_retries:
-                    wait = (2 ** (attempt - 1)) + random.uniform(0, 1)
-                    print(
-                        f"[06][warn] Transport error, retry "
-                        f"{attempt}/{max_retries} in {wait:.1f}s: {exc}"
-                    )
-                    time.sleep(wait)
-                    continue
-
-                print(f"[06][error] Transport error: {exc}", file=sys.stderr)
-                raise
-
-    raise RuntimeError("Gemini call failed after retries")
+    raise RuntimeError(f"Scaffolder call failed after {max_retries} retries") from last_exc
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -525,8 +468,6 @@ def main() -> None:
         # PIPELINE_PROJECT must be available before artifact paths are resolved.
         ensure_dirs()
 
-        api_key = _require_api_key(parser)
-
         spec_path = get_spec_path()
         if not spec_path.exists():
             print(f"[06][error] canonical spec not found: {spec_path}", file=sys.stderr)
@@ -540,10 +481,8 @@ def main() -> None:
         _track_read(spec_path)
         spec = spec_path.read_text(errors="replace")
 
-        scaffold = call_gemini(
+        scaffold = call_scaffolder(
             spec,
-            api_key=api_key,
-            model=args.model,
             max_retries=args.max_retries,
         )
 
