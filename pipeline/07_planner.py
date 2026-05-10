@@ -1,7 +1,7 @@
 """
 pipeline/07_planner.py
 ======================
-Step 7 — GLM 5.1 as PLANNER (reasoning-heavy, no code output).
+Step 7 — kimi-k2.6 as PLANNER (reasoning-heavy, no code output).
 
 This script supports two scopes:
 
@@ -68,7 +68,7 @@ import httpx
 
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL = "z-ai/glm-5.1"
+MODEL = "~moonshotai/kimi-latest"
 
 
 # === WRITE AUTHORITY: planner ===
@@ -400,7 +400,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="07_planner.py",
         description=(
-            "GLM planner step. Writes planner_full_execution_plan.json "
+            "Planner step. Writes planner_full_execution_plan.json "
             "or planner_mini_execution_plan.json + planner_mini_impact_analysis.json."
         ),
     )
@@ -577,7 +577,7 @@ def _call_glm_json(
         "Content-Type": "application/json",
     }
 
-    print(f"[07] Calling GLM 5.1 ({label}) …")
+    print(f"[07] Calling Kimi K2.6 ({label}) …")
 
     last_error: Exception | None = None
 
