@@ -25,7 +25,7 @@ Reads:
     artifacts_<slug>/knowledge/history/spectracker_version_log.md
 
 Writes:
-    artifacts_<slug>/cache/spectracker_session_version_delta.json
+    artifacts_<slug>/cache/spectracker_overwrite_version_delta.json
     artifacts_<slug>/knowledge/history/<version>.md                    ← write-once
     artifacts_<slug>/knowledge/history/<version>.changelog.md          ← write-once
     artifacts_<slug>/knowledge/history/spectracker_version_log.md      ← append-only
@@ -73,7 +73,7 @@ from pathlib import Path
 from typing import Any
 
 # === WRITE AUTHORITY: spectracker ===
-# OWNS  : artifacts_<slug>/cache/spectracker_session_version_delta.json
+# OWNS  : artifacts_<slug>/cache/spectracker_overwrite_version_delta.json
 #         artifacts_<slug>/state/spectracker_applied_version.json
 #         artifacts_<slug>/knowledge/history/spectracker_version_log.md
 #         artifacts_<slug>/knowledge/history/<version>.md            (dynamic, write-once)
