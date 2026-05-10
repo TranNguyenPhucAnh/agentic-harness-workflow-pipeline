@@ -19,10 +19,10 @@ When run directly, --project or interactive project prompt is used and
 PIPELINE_PROJECT is set before any artifact path is resolved.
 
 Artifacts produced (owner: clarificator):
-    artifacts_<slug>/execution/clarificator_session_raw.json        (session)
-    artifacts_<slug>/execution/clarificator_session_questions.md    (session)
-    artifacts_<slug>/knowledge/current/clarificator_decision_log.md (append-only log)
-    artifacts_<slug>/state/clarificator_requirement_synthesis.md    (persistent)
+    artifacts_<slug>/execution/clarificator_overwrite_raw.json        (overwrite per run)
+    artifacts_<slug>/execution/clarificator_overwrite_questions.md    (overwrite per run)
+    artifacts_<slug>/knowledge/current/clarificator_decision_log.md   (append-only log)
+    artifacts_<slug>/state/clarificator_requirement_synthesis.md      (persistent)
 
 At the end of each run, prints:
     - artifacts/files read
@@ -54,8 +54,8 @@ sys.path.insert(0, str(_REPO_ROOT))
 from artifacts.paths import (  # type: ignore  # noqa: E402
     ARCHIVIST_KNOWLEDGE_LOG,
     CLARIFICATOR_DECISION_LOG,
-    CLARIFICATOR_SESSION_QUESTIONS,
-    CLARIFICATOR_SESSION_RAW,
+    CLARIFICATOR_OVERWRITE_QUESTIONS,
+    CLARIFICATOR_OVERWRITE_RAW,
     CLARIFIED_REQ,
     ensure_dirs,
     get_project_name,
@@ -63,13 +63,13 @@ from artifacts.paths import (  # type: ignore  # noqa: E402
 
 # Local aliases — map canonical constants to the short names used internally
 KNOWLEDGE_BASE          = ARCHIVIST_KNOWLEDGE_LOG
-CLARIFICATION_REPORT    = CLARIFICATOR_SESSION_RAW
-CLARIFICATION_QUESTIONS = CLARIFICATOR_SESSION_QUESTIONS
+CLARIFICATION_REPORT    = CLARIFICATOR_OVERWRITE_RAW
+CLARIFICATION_QUESTIONS = CLARIFICATOR_OVERWRITE_QUESTIONS
 CLARIFICATION_LOG       = CLARIFICATOR_DECISION_LOG
 
 # === WRITE AUTHORITY: clarificator ===
-# OWNS  : artifacts_<slug>/execution/clarificator_session_raw.json
-#         artifacts_<slug>/execution/clarificator_session_questions.md
+# OWNS  : artifacts_<slug>/execution/clarificator_overwrite_raw.json
+#         artifacts_<slug>/execution/clarificator_overwrite_questions.md
 #         artifacts_<slug>/knowledge/current/clarificator_decision_log.md
 #         artifacts_<slug>/state/clarificator_requirement_synthesis.md
 # READS : artifacts_<slug>/knowledge/current/archivist_knowledge_log.md
@@ -94,19 +94,19 @@ def _track_write(path: Any) -> None:
 
 
 def _print_artifact_access_summary() -> None:
-    print("[03] Artifacts/files read:")
+    print("[02] Artifacts/files read:")
     if _ARTIFACTS_READ:
         for item in sorted(_ARTIFACTS_READ):
-            print(f"[03]   READ  {item}")
+            print(f"[02]   READ  {item}")
     else:
-        print("[03]   READ  (none)")
+        print("[02]   READ  (none)")
 
-    print("[03] Artifacts/files created/updated/overwritten/appended:")
+    print("[02] Artifacts/files created/updated/overwritten/appended:")
     if _ARTIFACTS_WRITTEN:
         for item in sorted(_ARTIFACTS_WRITTEN):
-            print(f"[03]   WRITE {item}")
+            print(f"[02]   WRITE {item}")
     else:
-        print("[03]   WRITE (none)")
+        print("[02]   WRITE (none)")
 
 
 # ── Model config ──────────────────────────────────────────────────────────────
