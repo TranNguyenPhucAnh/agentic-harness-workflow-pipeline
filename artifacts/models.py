@@ -89,6 +89,7 @@ ROLES: dict[str, str] = {
     "planner":            "moonshotai/kimi-latest",
     "executor":           "anthropic/claude-opus-latest",
     "debugger":           "deepseek/deepseek-v4-pro",
+    "debugger_secondary": "moonshotai/kimi-latest",  # logic/hook/data/type repair
     "reporter":           "minimax/minimax-m2.7",
     "judge":              "z-ai/glm-5.1",
     "patcher":            "deepseek/deepseek-v4-pro",
