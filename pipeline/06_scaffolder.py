@@ -23,7 +23,7 @@ Required environment:
   OPENROUTER_API_KEY=<your-key>
 
 Optional environment:
-  MODEL=~moonshotai/kimi-latest
+  MODEL=deepseek/deepseek-v4-pro
 
 At the end of each run, prints:
   - artifacts/files read
@@ -65,7 +65,7 @@ from artifacts.paths import (  # noqa: E402
 )
 
 
-DEFAULT_MODEL = "~moonshotai/kimi-latest"
+DEFAULT_MODEL = "deepseek/deepseek-v4-pro"
 MAX_OUTPUT_TOKENS = 32768
 
 
@@ -150,7 +150,7 @@ def _build_parser() -> argparse.ArgumentParser:
               python 06_scaffolder.py --project my-app
               PIPELINE_PROJECT=my-app python 06_scaffolder.py
 
-              python 06_scaffolder.py --project my-app --model ~moonshotai/kimi-latest
+              python 06_scaffolder.py --project my-app --model deepseek/deepseek-v4-pro
               python 06_scaffolder.py --project my-app --dry-run
         """),
     )
