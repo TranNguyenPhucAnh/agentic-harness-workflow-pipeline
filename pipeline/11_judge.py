@@ -1,12 +1,17 @@
 """
 pipeline/11_judge.py
 ====================
-Step 11 — DeepSeek V3.2 as Judge / Validator.
+Step 11 — Judge / Validator.
 
 Runs after verification/tests have passed. Aggregates pipeline artifacts into a
 single briefing, sends it to the judge model for final review, and writes:
 
-  artifacts_<slug>/execution/judge_session_verdict_raw.json
+  artifacts_<slug>/sessions/<NNN>/execution/judge_overwrite_verdict_raw.json
+  artifacts_<slug>/sessions/<NNN>/reports/judge_verdict_summary.md
+
+When PIPELINE_SESSION is not set, paths.py falls back to the legacy layout:
+
+  artifacts_<slug>/execution/judge_overwrite_verdict_raw.json
   artifacts_<slug>/reports/judge_verdict_summary.md
 
 Supports both:
@@ -14,23 +19,26 @@ Supports both:
       specwright_spec_<slug>.md / scaffolder_compressed_spec.md,
       planner_full_execution_plan.json,
       scaffolder_codebase_skeleton.json,
-      debugger_session_test_summary.json,
-      executor_session_manifest.json,
+      debugger_overwrite_test_summary.json,
+      executor_overwrite_manifest.json,
       source files,
       test files,
-      spectracker_session_version_delta.json.
+      spectracker_overwrite_version_delta.json.
+
   - MINI targeted flow:
       clarificator_requirement_synthesis.md,
-      enricher_session_enriched_prompt.md,
+      enricher_overwrite_enriched_prompt.md,
       planner_mini_execution_plan.json,
       planner_mini_impact_analysis.json,
-      executor_session_manifest.json,
-      debugger_session_test_summary.json,
+      executor_overwrite_manifest.json,
+      debugger_overwrite_test_summary.json,
       and only the target/implemented files.
 
 Direct execution:
   python 11_judge.py --project my-app
+  python 11_judge.py --project my-app --session 1
   PIPELINE_PROJECT=my-app python 11_judge.py
+  PIPELINE_PROJECT=my-app PIPELINE_SESSION=001 python 11_judge.py
 
 Required environment:
   OPENROUTER_API_KEY=<your-key>
@@ -58,19 +66,19 @@ from typing import Any
 import httpx
 
 # === WRITE AUTHORITY: judge ===
-# OWNS  : artifacts_<slug>/execution/judge_session_verdict_raw.json
-#         artifacts_<slug>/reports/judge_verdict_summary.md
+# OWNS  : artifacts_<slug>/sessions/<NNN>/execution/judge_overwrite_verdict_raw.json
+#         artifacts_<slug>/sessions/<NNN>/reports/judge_verdict_summary.md
 # READS : artifacts_<slug>/specwright_spec_<slug>.md
-#         artifacts_<slug>/cache/scaffolder_compressed_spec.md
-#         artifacts_<slug>/state/planner_full_execution_plan.json
-#         artifacts_<slug>/state/planner_mini_execution_plan.json
-#         artifacts_<slug>/state/planner_mini_impact_analysis.json
-#         artifacts_<slug>/state/scaffolder_codebase_skeleton.json
-#         artifacts_<slug>/state/clarificator_requirement_synthesis.md
-#         artifacts_<slug>/cache/spectracker_session_version_delta.json
-#         artifacts_<slug>/execution/enricher_session_enriched_prompt.md
-#         artifacts_<slug>/execution/executor_session_manifest.json
-#         artifacts_<slug>/execution/debugger_session_test_summary.json
+#         artifacts_<slug>/sessions/<NNN>/cache/scaffolder_compressed_spec.md
+#         artifacts_<slug>/sessions/<NNN>/state/planner_full_execution_plan.json
+#         artifacts_<slug>/sessions/<NNN>/state/planner_mini_execution_plan.json
+#         artifacts_<slug>/sessions/<NNN>/state/planner_mini_impact_analysis.json
+#         artifacts_<slug>/sessions/<NNN>/state/scaffolder_codebase_skeleton.json
+#         artifacts_<slug>/sessions/<NNN>/state/clarificator_requirement_synthesis.md
+#         artifacts_<slug>/sessions/<NNN>/cache/spectracker_overwrite_version_delta.json
+#         artifacts_<slug>/sessions/<NNN>/execution/enricher_overwrite_enriched_prompt.md
+#         artifacts_<slug>/sessions/<NNN>/execution/executor_overwrite_manifest.json
+#         artifacts_<slug>/sessions/<NNN>/execution/debugger_overwrite_test_summary.json
 #         artifacts_<slug>/knowledge/current/archivist_spec_gaps.md
 #         artifacts_<slug>/src/**
 #         artifacts_<slug>/tests/**
@@ -79,10 +87,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from artifacts.paths import (  # noqa: E402
     ARCHIVIST_SPEC_GAPS,
     CLARIFIED_REQ,
-    DEBUGGER_SESSION_TEST_SUMMARY,
-    ENRICHER_SESSION_PROMPT,
-    EXECUTOR_SESSION_MANIFEST,
-    JUDGE_SESSION_VERDICT_RAW,
+    DEBUGGER_OVERWRITE_TEST_SUMMARY,
+    ENRICHER_OVERWRITE_PROMPT,
+    EXECUTOR_OVERWRITE_MANIFEST,
+    JUDGE_OVERWRITE_VERDICT_RAW,
     JUDGE_VERDICT_SUMMARY,
     PLANNER_FULL_PLAN,
     PLANNER_MINI_IMPACT,
@@ -94,6 +102,9 @@ from artifacts.paths import (  # noqa: E402
     TESTS_DIR,
     artifact_root,
     ensure_dirs,
+    get_project_name,
+    get_project_slug,
+    get_session_id,
     get_spec_path,
 )
 
@@ -158,7 +169,7 @@ For PARTIAL runs:
 
 For MINI targeted runs:
 - Review ONLY the target files listed in planner_mini_execution_plan.target_files and files written
-  in executor_session_manifest.files.
+  in executor_overwrite_manifest.files.
 - Do NOT block approval for unrelated pre-existing issues outside the mini target scope.
 - If you notice a problem outside the target scope, mention it as a non-blocking
   note or as "requires broader follow-up", unless it directly breaks the targeted task.
@@ -194,7 +205,7 @@ Return a structured JSON object — raw JSON only, no markdown fences:
   "non_blocking_notes": [ "note 1" ],
   "partial_run_notes": "observations about reused files for partial runs, else null",
   "mini_run_notes": "observations about target scope for mini runs, else null",
-  "sign_off": "DeepSeek V3.2 + timestamp placeholder"
+  "sign_off": "judge model + timestamp placeholder"
 }
 
 Scoring:
@@ -212,7 +223,7 @@ Verdict rules:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CLI / project setup
+# CLI / project/session setup
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -223,7 +234,9 @@ def _build_parser() -> argparse.ArgumentParser:
         epilog=textwrap.dedent("""
             Examples:
               python 11_judge.py --project my-app
+              python 11_judge.py --project my-app --session 1
               PIPELINE_PROJECT=my-app python 11_judge.py
+              PIPELINE_PROJECT=my-app PIPELINE_SESSION=001 python 11_judge.py
 
               python 11_judge.py --project my-app --model deepseek/deepseek-v3.2
         """),
@@ -232,6 +245,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "--project",
         default=None,
         help="Project name for direct execution. Sets PIPELINE_PROJECT.",
+    )
+    parser.add_argument(
+        "--session",
+        default=None,
+        help=(
+            "Optional session id for direct execution. Sets PIPELINE_SESSION. "
+            "Example: --session 1 resolves to sessions/001."
+        ),
     )
     parser.add_argument(
         "--model",
@@ -249,11 +270,20 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _configure_project(
     project: str | None,
+    session: str | None,
     parser: argparse.ArgumentParser,
 ) -> None:
     if project:
         os.environ["PIPELINE_PROJECT"] = project
-        return
+
+    if session is not None:
+        raw = str(session).strip()
+        if not raw:
+            parser.error("--session cannot be empty.")
+        try:
+            os.environ["PIPELINE_SESSION"] = f"{int(raw):03d}"
+        except ValueError:
+            parser.error("--session must be an integer, e.g. --session 1.")
 
     if os.environ.get("PIPELINE_PROJECT"):
         return
@@ -300,7 +330,7 @@ def _read_text(path: Any) -> str:
 
 
 def _load_impl_record() -> dict[str, Any]:
-    rec = _read_json(EXECUTOR_SESSION_MANIFEST, {})
+    rec = _read_json(EXECUTOR_OVERWRITE_MANIFEST, {})
     return rec if isinstance(rec, dict) else {}
 
 
@@ -328,7 +358,7 @@ def _load_spec_optional() -> str:
 
 
 def _load_test_report() -> dict[str, Any]:
-    report = _read_json(DEBUGGER_SESSION_TEST_SUMMARY, {})
+    report = _read_json(DEBUGGER_OVERWRITE_TEST_SUMMARY, {})
     return report if isinstance(report, dict) else {}
 
 
@@ -382,6 +412,16 @@ def _resolve_artifact_path(rel: str) -> Path:
 
 
 def _extract_file_list(value: Any) -> list[str]:
+    """
+    Normalize file list from either:
+      ["src/a.ts"]
+    or:
+      [{"path": "src/a.ts", ...}]
+    or:
+      [{"file_path": "src/a.ts", ...}]
+    or:
+      [{"file": "src/a.ts", ...}]
+    """
     files: list[str] = []
 
     if not isinstance(value, list):
@@ -460,7 +500,7 @@ def _collect_files_by_rel_paths(paths: list[str]) -> dict[str, str]:
     return files
 
 
-def _collect_ts_files(root: Path, prefix: str) -> dict[str, str]:
+def _collect_ts_files(root: Any, prefix: str) -> dict[str, str]:
     files: dict[str, str] = {}
 
     if not root.exists():
@@ -620,7 +660,7 @@ def _build_mini_context(
         "",
         "**Primary review focus:**",
         "- Files listed in `planner_mini_execution_plan.target_files`",
-        "- Files written in `executor_session_manifest.files`",
+        "- Files written in `executor_overwrite_manifest.files`",
         "",
         "**Scope rule:**",
         "- Do NOT block approval for unrelated pre-existing issues outside target scope.",
@@ -684,7 +724,7 @@ def _append_full_sections(parts: list[str], is_partial: bool, affected_set: set[
     impl_record = _load_impl_record()
     if impl_record:
         parts.append(
-            "## 3. Executor Session Manifest\n\n"
+            "## 3. Executor Overwrite Manifest\n\n"
             f"```json\n{json.dumps(impl_record, indent=2, ensure_ascii=False)}\n```"
         )
 
@@ -692,7 +732,7 @@ def _append_full_sections(parts: list[str], is_partial: bool, affected_set: set[
     test_report = _load_test_report()
     if test_report:
         parts.append(
-            "## 4. Debugger Session Test Summary\n\n"
+            "## 4. Debugger Overwrite Test Summary\n\n"
             f"```json\n{json.dumps(test_report, indent=2, ensure_ascii=False)}\n```"
         )
 
@@ -744,7 +784,7 @@ def _append_mini_sections(
     impl_record: dict[str, Any],
 ) -> None:
     clarified = _read_text(CLARIFIED_REQ)
-    enriched = _read_text(ENRICHER_SESSION_PROMPT)
+    enriched = _read_text(ENRICHER_OVERWRITE_PROMPT)
     test_report = _load_test_report()
 
     if clarified:
@@ -753,7 +793,7 @@ def _append_mini_sections(
         parts.append("## 1. Clarificator Requirement Synthesis\n\n_[missing]_")
 
     if enriched:
-        parts.append("## 1b. Enricher Session Enriched Prompt\n\n" + enriched)
+        parts.append("## 1b. Enricher Overwrite Enriched Prompt\n\n" + enriched)
 
     if plan_mini:
         parts.append(
@@ -773,13 +813,13 @@ def _append_mini_sections(
 
     if impl_record:
         parts.append(
-            "## 4. Executor Session Manifest\n\n"
+            "## 4. Executor Overwrite Manifest\n\n"
             f"```json\n{json.dumps(impl_record, indent=2, ensure_ascii=False)}\n```"
         )
 
     if test_report:
         parts.append(
-            "## 5. Debugger Session Test Summary\n\n"
+            "## 5. Debugger Overwrite Test Summary\n\n"
             f"```json\n{json.dumps(test_report, indent=2, ensure_ascii=False)}\n```"
         )
 
@@ -973,6 +1013,9 @@ def render_report(review: dict[str, Any], *, model: str) -> str:
         "# Judge Verdict Summary — Final Review",
         f"_Generated: {now}_",
         f"_Model: {model}_",
+        f"_Project: **{get_project_name()}**_",
+        f"_Project slug: **{get_project_slug()}**_",
+        f"_Session: **{get_session_id() or 'legacy/no-session'}**_",
         f"_Run type: **{run_type}**_",
         "",
         f"## Verdict: {verdict_icon} {verdict}",
@@ -1061,12 +1104,15 @@ def _write_raw_verdict(
     raw_response: str,
     reasoning_details: list[Any] | None,
 ) -> None:
-    JUDGE_SESSION_VERDICT_RAW.parent.mkdir(parents=True, exist_ok=True)
-    JUDGE_SESSION_VERDICT_RAW.write_text(
+    JUDGE_OVERWRITE_VERDICT_RAW.parent.mkdir(parents=True, exist_ok=True)
+    JUDGE_OVERWRITE_VERDICT_RAW.write_text(
         json.dumps(
             {
                 "model": model,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
+                "project": get_project_name(),
+                "project_slug": get_project_slug(),
+                "session_id": get_session_id(),
                 "scope_detected": scope,
                 "briefing_chars": briefing_chars,
                 "usage": usage,
@@ -1078,8 +1124,8 @@ def _write_raw_verdict(
         ),
         encoding="utf-8",
     )
-    _track_write(JUDGE_SESSION_VERDICT_RAW)
-    print(f"[11] Raw response + reasoning saved → {JUDGE_SESSION_VERDICT_RAW}")
+    _track_write(JUDGE_OVERWRITE_VERDICT_RAW)
+    print(f"[11] Raw response + reasoning saved → {JUDGE_OVERWRITE_VERDICT_RAW}")
 
 
 def _write_report(report_md: str) -> None:
@@ -1097,9 +1143,9 @@ def main() -> None:
     parser = _build_parser()
     args = parser.parse_args()
 
-    _configure_project(args.project, parser)
+    _configure_project(args.project, args.session, parser)
 
-    # Important: project env must be configured before ensure_dirs().
+    # Important: project/session env must be configured before ensure_dirs().
     ensure_dirs()
 
     exit_code = 0
@@ -1108,6 +1154,8 @@ def main() -> None:
         api_key = _require_openrouter_key(parser)
 
         scope = _detect_scope()
+        print(f"[11] Project: {get_project_name()} ({get_project_slug()})")
+        print(f"[11] Session: {get_session_id() or 'legacy/no-session'}")
         print(f"[11] Scope detected: {scope}")
         print("[11] Building pipeline briefing …")
 
