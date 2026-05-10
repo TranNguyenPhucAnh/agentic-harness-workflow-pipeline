@@ -46,8 +46,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import httpx
-
 # ── paths ─────────────────────────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from artifacts.paths import (  # type: ignore
@@ -60,6 +58,7 @@ from artifacts.paths import (  # type: ignore
     ENRICHER_OVERWRITE_PROMPT,
     ensure_dirs,
 )
+from artifacts.models import call_model  # type: ignore
 
 # Local aliases — map canonical constants to the short names used internally
 CLARIFICATION_REPORT = CLARIFICATOR_OVERWRITE_RAW
@@ -115,8 +114,7 @@ def _print_artifact_access_summary() -> None:
 
 
 # ── Model config ──────────────────────────────────────────────────────────────
-# Prompt agent chạy model nhanh/rẻ — nhiệm vụ là enrich context, không cần Opus.
-_ENRICH_MODEL      = "deepseek/deepseek-chat"
+# Model identity resolved from artifacts/models.py role "enricher".
 _MAX_TOKENS_ENRICH = 4096
 
 
@@ -141,46 +139,37 @@ def _wrap(text: str, indent: int = 0) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LLM call — same thin wrapper pattern as clarificator
+# LLM call — thin wrapper delegating to central model registry
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _call_llm(
     system: str,
     user: str,
-    model: str = _ENRICH_MODEL,
     max_tokens: int = _MAX_TOKENS_ENRICH,
 ) -> str:
-    if "/" in model:
-        api_key  = os.environ.get("OPENROUTER_API_KEY", "")
-        base_url = "https://openrouter.ai/api/v1"
-        model_id = model
-    else:
-        api_key  = os.environ.get("OPENAI_API_KEY", "")
-        base_url = "https://api.openai.com/v1"
-        model_id = model
-
-    if not api_key:
-        print("\n[enricher][offline] No API key found. Paste LLM response then EOF (Ctrl-D):")
-        return sys.stdin.read()
-
+    """
+    Call the enricher model via the central model registry.
+    Model identity and provider are resolved from artifacts/models.py role "enricher".
+    Falls back to stdin mock when API key is missing (offline dev).
+    """
     try:
-        payload = {
-            "model":      model_id,
-            "max_tokens": max_tokens,
-            "messages": [
+        resp = call_model(
+            "enricher",
+            messages=[
                 {"role": "system", "content": system},
                 {"role": "user",   "content": user},
             ],
-        }
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type":  "application/json",
-        }
-        with httpx.Client(timeout=120) as client:
-            resp = client.post(f"{base_url}/chat/completions", headers=headers, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-        return data["choices"][0]["message"]["content"]
+            max_tokens=max_tokens,
+        )
+        content = resp.choices[0].message.content
+        if not content or not content.strip():
+            raise RuntimeError("Model returned empty content.")
+        return content
+    except RuntimeError as exc:
+        if "not set" in str(exc):
+            print("\n[enricher][offline] No API key found. Paste LLM response then EOF (Ctrl-D):")
+            return sys.stdin.read()
+        raise
     except Exception as exc:
         print(f"[enricher][error] LLM call failed: {exc}")
         raise
