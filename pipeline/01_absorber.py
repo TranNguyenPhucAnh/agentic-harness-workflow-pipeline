@@ -70,8 +70,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import httpx
-
 # === WRITE AUTHORITY: absorber ===
 # OWNS  : artifacts_<slug>/knowledge/current/absorber_codebase_map.md
 #         artifacts_<slug>/knowledge/current/absorber_config_map.json
@@ -91,6 +89,7 @@ from artifacts.paths import (  # noqa: E402
     artifact_root,
     ensure_dirs,
 )
+from artifacts.models import call_model  # noqa: E402
 
 # Local aliases — map canonical constants to the short names used internally
 ABSORBER_CACHE = ABSORBER_CODEBASE_SNAPSHOT
@@ -137,8 +136,6 @@ def _print_artifact_access_summary() -> None:
 _MAX_TOKENS_MAP = 16384
 _MAX_FILE_BYTES = 256 * 1024
 _IGNORED_FILE = "absorber.ignored"
-
-_MODEL = os.environ.get("ABSORBER_MODEL", "gemini/gemini-2.5-flash")
 
 _BUILTIN_SKIP_DIRS: frozenset[str] = frozenset({
     "node_modules",
@@ -901,98 +898,42 @@ _MAP_SYSTEM = textwrap.dedent("""
 def call_llm_for_map(
     context: str,
     target_name: str,
-    model: str = _MODEL,
 ) -> str:
-    api_key, base_url, model_id = _resolve_model(model)
-
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     system = _MAP_SYSTEM.replace("{date}", date_str)
     user = f"Codebase: {target_name}\n\nExtracted content:\n\n{context}"
 
     tokens_est = len(context) // 4
-    print(f"[absorber] LLM call: {model_id} | ~{tokens_est:,} input tokens")
-
-    if not api_key or not api_key.strip():
-        env_var = (
-            "GEMINI_API_KEY" if model.startswith(("gemini/", "gemini-")) else
-            "DEEPSEEK_API_KEY" if model.startswith("deepseek") else
-            "OPENROUTER_API_KEY" if "/" in model else
-            "OPENAI_API_KEY"
-        )
-        raise ValueError(
-            f"API key not set. Export {env_var} and retry.\n"
-            f"  e.g. export {env_var}=<your-key>\n"
-            f"  or pass --skip-llm to skip LLM synthesis."
-        )
+    print(f"[absorber] LLM call: absorber | ~{tokens_est:,} input tokens")
 
     try:
-        with httpx.Client(timeout=300) as client:
-            resp = client.post(
-                f"{base_url}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": model_id,
-                    "max_tokens": _MAX_TOKENS_MAP,
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user},
-                    ],
-                    "temperature": 0.2,
-                },
+        resp = call_model(
+            "absorber",
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user",   "content": user},
+            ],
+            max_tokens=_MAX_TOKENS_MAP,
+            temperature=0.2,
+        )
+        choice = resp.choices[0]
+        content = choice.message.content
+        finish_reason = getattr(choice, "finish_reason", "unknown")
+
+        if finish_reason == "length":
+            print(
+                f"[absorber][warn] LLM output was truncated. "
+                f"Consider increasing _MAX_TOKENS_MAP={_MAX_TOKENS_MAP} "
+                f"or reducing codebase context."
             )
-            resp.raise_for_status()
-            data = resp.json()
-            choice = data["choices"][0]
-            content = choice["message"]["content"]
-            finish_reason = choice.get("finish_reason", "unknown")
+        else:
+            print(f"[absorber] LLM finish_reason: {finish_reason}")
 
-            if finish_reason == "length":
-                print(
-                    f"[absorber][warn] LLM output was truncated. "
-                    f"Consider increasing _MAX_TOKENS_MAP={_MAX_TOKENS_MAP} "
-                    f"or reducing codebase context."
-                )
-            else:
-                print(f"[absorber] LLM finish_reason: {finish_reason}")
-
-            return content
+        return content
 
     except Exception as e:
         print(f"[absorber][error] LLM call failed: {e}", file=sys.stderr)
         raise
-
-
-def _resolve_model(model: str) -> tuple[str, str, str]:
-    if model.startswith("gemini/") or model.startswith("gemini-"):
-        model_id = model.split("/")[-1]
-        return (
-            os.environ.get("GEMINI_API_KEY", ""),
-            "https://generativelanguage.googleapis.com/v1beta/openai",
-            model_id,
-        )
-
-    if model.startswith("deepseek"):
-        return (
-            os.environ.get("DEEPSEEK_API_KEY", os.environ.get("OPENAI_API_KEY", "")),
-            "https://api.deepseek.com/v1",
-            model.split("/")[-1],
-        )
-
-    if "/" in model:
-        return (
-            os.environ.get("OPENROUTER_API_KEY", ""),
-            "https://openrouter.ai/api/v1",
-            model,
-        )
-
-    return (
-        os.environ.get("OPENAI_API_KEY", ""),
-        "https://api.openai.com/v1",
-        model,
-    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
