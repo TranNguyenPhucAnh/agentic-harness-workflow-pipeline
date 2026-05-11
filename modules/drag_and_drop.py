@@ -11,8 +11,8 @@ Normalize user input from multiple UX paths into one text bundle:
     - CLI inline text
     - CLI file paths
     - piped stdin
-    - interactive pasted text
-    - drag-and-drop file paths in terminal
+    - interactive pasted text (multiline, terminated by /done or blank-line sentinel)
+    - drag-and-drop file paths in terminal (single line, auto-detected)
     - attachment-only input
 
 This module is intentionally model-agnostic. It does NOT produce provider-native
@@ -42,6 +42,24 @@ Expected usage
     requirement_text = bundle.text
     source_metadata = bundle.sources
     attachment_only = bundle.attachment_only
+
+Input UX — interactive mode
+----------------------------
+The prompt supports three natural entry patterns without requiring Ctrl-D/Ctrl-Z:
+
+  1. **Single-line drag-drop path(s)**
+     Drag one or more files into the terminal → a single line of shell-quoted
+     paths appears.  The moment you press Enter, the module detects all tokens
+     are valid file paths and treats it as attachment-only input.
+
+  2. **Multiline text requirement**
+     Type (or paste) multiple lines of text.  Finish with an empty line followed
+     by `/done`, OR just `/done` on its own line.  Everything before the sentinel
+     is collected as the requirement text.
+
+  3. **Single-line shortcut**
+     If you type a single non-empty line and immediately press Enter twice (blank
+     line acts as implicit sentinel), the module accepts it.
 
 Notes
 -----
@@ -313,10 +331,12 @@ def _print_input_box(title: str, body: str) -> None:
         for line in _wrap_for_box(body, width=58):
             print(f"║  {line.ljust(58)}  ║")
 
-    print("║  Paste multiple lines if needed.                           ║")
-    print("║  Or drag-drop one or more files into the terminal.          ║")
-    print("║  Press Ctrl-D (Mac/Linux) or Ctrl-Z Enter (Windows) to end. ║")
+    print("║                                                              ║")
+    print("║  • Drag-drop file(s) → paste path(s), press Enter           ║")
+    print("║  • Multiline text    → type/paste, then type /done + Enter  ║")
+    print("║  • Single line       → type text, press Enter twice         ║")
     print("╚" + "═" * 62 + "╝")
+    print()
 
 
 def _wrap_for_box(text: str, width: int = 58) -> list[str]:
@@ -342,6 +362,9 @@ def _wrap_for_box(text: str, width: int = 58) -> list[str]:
     return lines
 
 
+_DONE_SENTINEL = "/done"
+
+
 def prompt_for_text_or_paths(
     *,
     prompt_title: str = "Enter input",
@@ -350,16 +373,64 @@ def prompt_for_text_or_paths(
     """
     Prompt user for freeform text or drag/drop path list.
 
-    Uses EOF to finish because requirement text can be multiline.
+    Supports three termination patterns without requiring Ctrl-D/Ctrl-Z:
+
+    1. **Single-line drag-drop** — user drags file(s); one line of path tokens
+       appears. After Enter, the line is immediately tested with
+       detect_attachment_only_input(). If every token is a valid file path,
+       collection ends immediately and the raw line is returned (attachment-only
+       detection will happen in the caller).
+
+    2. **`/done` sentinel** — user types multiline text and finishes with
+       `/done` on its own line (with or without surrounding whitespace). Everything
+       accumulated before the sentinel is returned.
+
+    3. **Blank-line shortcut** — if the accumulated buffer is non-empty and the
+       user submits an empty line, the buffer is returned. This provides a natural
+       single-Enter termination for single-line text without requiring /done.
+
+    Ctrl-C raises RuntimeError("Input aborted by user.").
     """
     _print_input_box(prompt_title, prompt_body)
-    print("▶ ", end="", flush=True)
+
+    lines: list[str] = []
 
     try:
-        return sys.stdin.read().strip()
+        while True:
+            # Show a continuation prompt: "▶ " on first line, "  " afterwards.
+            prompt_char = "▶ " if not lines else "  "
+            try:
+                line = input(prompt_char)
+            except EOFError:
+                # Ctrl-D / Ctrl-Z+Enter: treat as /done for graceful compat.
+                break
+
+            # ── /done sentinel ────────────────────────────────────────────
+            if line.strip().lower() == _DONE_SENTINEL:
+                break
+
+            # ── Blank-line shortcut ───────────────────────────────────────
+            # An empty line after at least one non-empty line ends input.
+            if line.strip() == "" and lines:
+                break
+
+            lines.append(line)
+
+            # ── Single-line drag-drop fast-path ───────────────────────────
+            # After the very first line, check immediately whether all tokens
+            # are valid existing file paths. If so, stop collecting — we don't
+            # want to force the user to type /done just for a path drop.
+            if len(lines) == 1:
+                candidate = lines[0].strip()
+                if candidate and detect_attachment_only_input(candidate) is not None:
+                    # Looks like a path drop — return immediately.
+                    break
+
     except KeyboardInterrupt:
         print()
         raise RuntimeError("Input aborted by user.")
+
+    return "\n".join(lines).strip()
 
 
 def prompt_for_attachments(
