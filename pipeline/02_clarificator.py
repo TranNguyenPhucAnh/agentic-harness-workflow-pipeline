@@ -3,13 +3,20 @@
 ==================
 Clarificator agent — upstream nhất trong pipeline.
 
-Nhận raw requirement (file hoặc text), phân tích holes/conflicts/assumptions,
-tổ chức Q&A với user theo 3-tier system, và output clarificator_requirement_synthesis.md
-cùng với structured report cho downstream steps.
+Nhận raw requirement dưới nhiều dạng:
+    - inline text
+    - một hoặc nhiều file
+    - drag-drop path trong terminal
+    - piped stdin
+    - attachment-only input
+
+Sau đó phân tích holes/conflicts/assumptions, tổ chức Q&A với user theo
+3-tier system, và output clarificator_requirement_synthesis.md cùng structured
+report cho downstream steps.
 
 Usage:
     python pipeline/02_clarificator.py --project my-app --input requirement.pdf
-    python pipeline/02_clarificator.py --project my-app --input spec_draft.md
+    python pipeline/02_clarificator.py --project my-app --input spec.md notes.md
     python pipeline/02_clarificator.py --project my-app --text "Build a dashboard..."
     python pipeline/02_clarificator.py --project my-app
     python pipeline/02_clarificator.py
@@ -19,10 +26,10 @@ When run directly, --project or interactive project prompt is used and
 PIPELINE_PROJECT is set before any artifact path is resolved.
 
 Artifacts produced (owner: clarificator):
-    artifacts_<slug>/execution/clarificator_overwrite_raw.json        (overwrite per run)
-    artifacts_<slug>/execution/clarificator_overwrite_questions.md    (overwrite per run)
-    artifacts_<slug>/knowledge/current/clarificator_decision_log.md   (append-only log)
-    artifacts_<slug>/state/clarificator_requirement_synthesis.md      (persistent)
+    artifacts_<slug>/sessions/<NNN>/execution/clarificator_overwrite_raw.json
+    artifacts_<slug>/sessions/<NNN>/execution/clarificator_overwrite_questions.md
+    artifacts_<slug>/knowledge/current/clarificator_decision_log.md
+    artifacts_<slug>/sessions/<NNN>/state/clarificator_requirement_synthesis.md
 
 At the end of each run, prints:
     - artifacts/files read
@@ -44,8 +51,7 @@ from pathlib import Path
 from typing import Any
 
 
-
-# ── Import from artifacts.paths (source of truth cho tất cả paths) ────────────
+# ── Import from artifacts.paths ──────────────────────────────────────────────
 
 _REPO_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
@@ -61,20 +67,26 @@ from artifacts.paths import (  # type: ignore  # noqa: E402
 )
 from artifacts.models import call_model  # noqa: E402
 
-# Local aliases — map canonical constants to the short names used internally
-KNOWLEDGE_BASE          = ARCHIVIST_KNOWLEDGE_LOG
-CLARIFICATION_REPORT    = CLARIFICATOR_OVERWRITE_RAW
+# New shared interactive/drag-drop abstraction.
+# File will be implemented separately: modules/drag_and_drop.py
+from modules.drag_and_drop import gather_text_file_bundle  # type: ignore  # noqa: E402
+
+
+# Local aliases
+KNOWLEDGE_BASE = ARCHIVIST_KNOWLEDGE_LOG
+CLARIFICATION_REPORT = CLARIFICATOR_OVERWRITE_RAW
 CLARIFICATION_QUESTIONS = CLARIFICATOR_OVERWRITE_QUESTIONS
-CLARIFICATION_LOG       = CLARIFICATOR_DECISION_LOG
+CLARIFICATION_LOG = CLARIFICATOR_DECISION_LOG
+
 
 # === WRITE AUTHORITY: clarificator ===
-# OWNS  : artifacts_<slug>/execution/clarificator_overwrite_raw.json
-#         artifacts_<slug>/execution/clarificator_overwrite_questions.md
-#         artifacts_<slug>/knowledge/current/clarificator_decision_log.md
-#         artifacts_<slug>/state/clarificator_requirement_synthesis.md
-# READS : artifacts_<slug>/knowledge/current/archivist_knowledge_log.md
-#         artifacts_<slug>/knowledge/current/clarificator_decision_log.md (self, prior sessions)
-#         optional user-provided requirement file
+# OWNS  : execution/clarificator_overwrite_raw.json
+#         execution/clarificator_overwrite_questions.md
+#         knowledge/current/clarificator_decision_log.md
+#         state/clarificator_requirement_synthesis.md
+# READS : knowledge/current/archivist_knowledge_log.md
+#         knowledge/current/clarificator_decision_log.md
+#         optional user-provided requirement file(s)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -109,7 +121,7 @@ def _print_artifact_access_summary() -> None:
         print("[02]   WRITE (none)")
 
 
-# ── Model config ──────────────────────────────────────────────────────────────
+# ── Model config ─────────────────────────────────────────────────────────────
 
 _TIER3_MIN_CONF = 0.75
 
@@ -144,7 +156,7 @@ def _wrap(text: str, indent: int = 0) -> str:
 
 
 def _read_pdf(path: Path) -> str:
-    """Extract text from PDF via pdftotext (poppler) or pypdf fallback."""
+    """Extract text from PDF via pdftotext or pypdf fallback."""
     _track_read(path)
 
     try:
@@ -169,7 +181,15 @@ def _read_pdf(path: Path) -> str:
 
 
 def _read_input_file(path: Path) -> str:
+    """
+    Read user-provided requirement source.
+
+    This function intentionally converts files to text before model call.
+    Clarificator stays model-agnostic and does not rely on provider-native
+    file/image attachments.
+    """
     suffix = path.suffix.lower()
+
     if suffix == ".pdf":
         text = _read_pdf(path)
         if not text.strip():
@@ -177,6 +197,12 @@ def _read_input_file(path: Path) -> str:
         return text
 
     _track_read(path)
+
+    if suffix in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff"}:
+        raise RuntimeError(
+            f"Image input is not supported by clarificator yet: {path}\n"
+            "Add OCR support first, or provide a text/PDF requirement file."
+        )
 
     try:
         return path.read_text(encoding="utf-8")
@@ -218,7 +244,6 @@ def _parse_json_response(raw: str, label: str) -> dict[str, Any]:
 
 
 def _load_clarification_log() -> str:
-    """Load project clarification log. Requires PIPELINE_PROJECT to be set."""
     if CLARIFICATION_LOG.exists():
         _track_read(CLARIFICATION_LOG)
         return CLARIFICATION_LOG.read_text(encoding="utf-8")
@@ -226,10 +251,6 @@ def _load_clarification_log() -> str:
 
 
 def _extract_answered_qa_pairs(log_text: str) -> list[dict[str, str]]:
-    """
-    Extract structured Q/A pairs from the log for semantic dedup.
-    Returns list of {id, question, answer} dicts.
-    """
     pairs: list[dict[str, str]] = []
     blocks = re.split(r"\n(?=###\s+CLR-)", log_text)
 
@@ -269,14 +290,6 @@ def _load_knowledge_context() -> str:
 # ════════════════════════════════════════════════════════════════════════════
 
 def _resolve_project(arg_project: str | None) -> str:
-    """
-    Resolve project name without touching artifact paths prematurely.
-
-    Priority:
-      1. --project
-      2. PIPELINE_PROJECT
-      3. interactive prompt
-    """
     if arg_project and arg_project.strip():
         return arg_project.strip()
 
@@ -284,6 +297,13 @@ def _resolve_project(arg_project: str | None) -> str:
         return get_project_name()
     except RuntimeError:
         pass
+
+    if not sys.stdin.isatty():
+        print(
+            "[clarificator][error] No --project specified and PIPELINE_PROJECT not set.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     print()
     print("[clarificator] No --project specified and PIPELINE_PROJECT not set.")
@@ -295,13 +315,7 @@ def _resolve_project(arg_project: str | None) -> str:
 
 
 def _list_projects() -> None:
-    """
-    List artifact workspaces without requiring PIPELINE_PROJECT.
-    """
-    projects = sorted(
-        p for p in _REPO_ROOT.glob("artifacts_*")
-        if p.is_dir()
-    )
+    projects = sorted(p for p in _REPO_ROOT.glob("artifacts_*") if p.is_dir())
 
     if not projects:
         print("[clarificator] No artifacts_* project workspaces found.")
@@ -330,26 +344,20 @@ def _call_llm(
     user: str,
     max_tokens: int = _MAX_TOKENS_ANALYZE,
 ) -> str:
-    """
-    Call the clarificator model via the central model registry.
-    Model identity and provider are resolved from artifacts/models.py.
-    Falls back to stdin mock when API key is missing (offline dev).
-    """
     try:
         resp = call_model(
             "clarificator",
             messages=[
                 {"role": "system", "content": system},
-                {"role": "user",   "content": user},
+                {"role": "user", "content": user},
             ],
             max_tokens=max_tokens,
         )
         content = resp.choices[0].message.content
         if not content or not content.strip():
-            raise RuntimeError(f"Model returned empty content.")
+            raise RuntimeError("Model returned empty content.")
         return content
     except RuntimeError as exc:
-        # API key missing — fall back to offline stdin mock
         if "not set" in str(exc):
             print("\n[clarificator][offline] No API key found. Paste LLM response then EOF:")
             return sys.stdin.read()
@@ -409,10 +417,7 @@ TONE RULES:
 - Write as a natural, collaborative question — NOT a judgment or critique.
 - NEVER start with: "The requirement does not specify", "It is unclear",
   "There is no mention of", or similar.
-- Ask directly and warmly:
-  "Which customer segments should be available as filter options?"
-  "How should the mobile layout differ from desktop?"
-  "Should the dashboard support real-time updates or manual refresh?"
+- Ask directly and warmly.
 
 TIER RULES:
 - Tier 1: subjective/business/product decision. Include 2–4 representative scenarios.
@@ -452,7 +457,6 @@ def _analyze(
     knowledge_context: str,
     answered_qa_pairs: list[dict[str, str]],
 ) -> dict[str, Any]:
-    """Run Phase 1+2: call LLM, parse JSON, enforce invariants."""
     if answered_qa_pairs:
         qa_lines: list[str] = []
         for pair in answered_qa_pairs:
@@ -507,10 +511,6 @@ def _finding_hash(text: str) -> str:
     normalized = re.sub(r"\s+", " ", text.strip().lower())
     return hashlib.sha256(normalized.encode()).hexdigest()[:8]
 
-
-# ════════════════════════════════════════════════════════════════════════════
-# Deterministic tier rule engine
-# ════════════════════════════════════════════════════════════════════════════
 
 def _enforce_tiers(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for finding in findings:
@@ -586,9 +586,7 @@ Rules:
 - Do not regenerate existing questions.
 - If nothing changes, return {"new_findings": [], "invalidated_ids": []}.
 - MAXIMUM 3 new findings.
-- Only policy-shaping follow-ups: architecture, access control, workflow design,
-  compliance posture. Do NOT ask about labels, copy, exact thresholds, retry counts,
-  scheduling intervals, or developer-decidable details.
+- Only policy-shaping follow-ups.
 """
 
 
@@ -962,6 +960,42 @@ Produce the clarified requirement document now."""
 # Output writers
 # ════════════════════════════════════════════════════════════════════════════
 
+def _normalize_input_sources_for_report(sources: Any) -> list[dict[str, Any]]:
+    """
+    Normalize source metadata returned from modules.drag_and_drop into JSON-safe dicts.
+
+    The abstraction module may return dataclasses, dicts, or simple objects.
+    Clarificator only persists conservative metadata, not full source text.
+    """
+    normalized: list[dict[str, Any]] = []
+
+    if not sources:
+        return normalized
+
+    for src in sources:
+        if isinstance(src, dict):
+            item = dict(src)
+        else:
+            item = {
+                "kind": getattr(src, "kind", ""),
+                "label": getattr(src, "label", ""),
+                "path": str(getattr(src, "path", "") or ""),
+                "chars": getattr(src, "chars", None),
+                "sha256": getattr(src, "sha256", ""),
+            }
+
+        # Avoid accidentally storing entire source content in report.
+        item.pop("text", None)
+        item.pop("content", None)
+
+        if item.get("path") is not None:
+            item["path"] = str(item.get("path"))
+
+        normalized.append(item)
+
+    return normalized
+
+
 def _write_report(
     session_id: str,
     req_hash: str,
@@ -970,6 +1004,8 @@ def _write_report(
     unresolved: list[dict[str, Any]],
     conflicts: list[dict[str, Any]],
     findings: list[dict[str, Any]],
+    input_sources: list[dict[str, Any]] | None = None,
+    attachment_only: bool = False,
 ) -> None:
     tier_counts = {1: 0, 2: 0, 3: 0}
     tier3_accepted = 0
@@ -987,6 +1023,8 @@ def _write_report(
         "requirement_hash": req_hash,
         "session_id": session_id,
         "project_name": project_name,
+        "input_sources": input_sources or [],
+        "attachment_only_input": attachment_only,
         "initial_findings": len(findings),
         "delta_injected": sum(1 for d in decisions if d["id"].startswith("NEW-")),
         "total_decisions": len(decisions),
@@ -1150,42 +1188,45 @@ def _write_clarified_req(content: str) -> None:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Input gathering
+# Input gathering — delegated to modules/drag_and_drop.py
 # ════════════════════════════════════════════════════════════════════════════
 
-def _gather_requirement(args: argparse.Namespace) -> str:
-    if args.input:
-        path = Path(args.input)
-        if not path.exists():
-            print(f"[clarificator][error] File not found: {path}", file=sys.stderr)
-            sys.exit(1)
+def _gather_requirement_bundle(args: argparse.Namespace) -> Any:
+    """
+    Gather requirement text and source metadata.
 
-        print(f"[clarificator] Reading requirement from {path.name} ...")
-        text = _read_input_file(path)
+    This function intentionally delegates interactive UX, drag-drop parsing,
+    attachment-only detection, stdin handling, and multi-file composition to
+    modules.drag_and_drop.
 
-        if not text.strip():
-            print(f"[clarificator][error] Could not extract text from {path.name}.", file=sys.stderr)
-            sys.exit(1)
+    Clarificator only provides:
+      - CLI values
+      - file reader callback
+      - prompt copy
+      - policy around interactivity
+    """
+    allow_interactive = not args.no_interactive
 
-        return text
+    bundle = gather_text_file_bundle(
+        cli_text=args.text,
+        cli_files=args.input or [],
+        read_file_fn=_read_input_file,
+        prompt_title="Enter requirement",
+        prompt_body=(
+            "Describe the feature/change you want to build, paste requirement text, "
+            "or drag-drop one or more requirement files."
+        ),
+        attachment_prompt="Attach requirement files if any",
+        default_attachment_only_prompt="Please analyze the attached requirement source files.",
+        allow_interactive=allow_interactive,
+    )
 
-    if args.text:
-        return args.text
+    text = getattr(bundle, "text", "")
+    if not text or not str(text).strip():
+        print("[clarificator][error] Empty requirement input.", file=sys.stderr)
+        sys.exit(1)
 
-    print("╔══════════════════════════════════════════════════════╗")
-    print("║  Enter requirement                                   ║")
-    print("╠══════════════════════════════════════════════════════╣")
-    print("║  Describe the feature or change you want to make.    ║")
-    print("║  You can paste multiple lines.                       ║")
-    print("║  Press Ctrl-D (Mac) or Ctrl-Z Enter (Win) to finish. ║")
-    print("╚══════════════════════════════════════════════════════╝")
-    print("▶ ", end="", flush=True)
-
-    try:
-        return sys.stdin.read().strip()
-    except KeyboardInterrupt:
-        print("\n[clarificator] Aborted.")
-        sys.exit(0)
+    return bundle
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1204,27 +1245,42 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--input",
         metavar="FILE",
-        help="Path to requirement file (.md, .txt, .pdf)",
+        nargs="+",
+        help=(
+            "Requirement file(s). Supports text-like files and PDF. "
+            "Can be repeated as space-separated paths."
+        ),
     )
     parser.add_argument(
         "--text",
         metavar="TEXT",
-        help="Requirement as inline text string",
+        help=(
+            "Requirement as inline text. If it contains only valid file paths, "
+            "the drag/drop layer may treat it as attachment-only input."
+        ),
     )
     parser.add_argument(
         "--no-synth",
         action="store_true",
-        help="Skip synthesis step; do not generate clarificator_requirement_synthesis.md",
+        help="Skip synthesis step; do not generate clarificator_requirement_synthesis.md.",
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Run analysis only, print findings, no Q&A and no file writes",
+        help="Run analysis only, print findings, no Q&A and no file writes.",
     )
     parser.add_argument(
         "--list-projects",
         action="store_true",
-        help="List all known artifacts_* project workspaces and exit",
+        help="List all known artifacts_* project workspaces and exit.",
+    )
+    parser.add_argument(
+        "--no-interactive",
+        action="store_true",
+        help=(
+            "Disable terminal prompts. Intended for CI/harness usage. "
+            "Fails if no --input/--text/piped stdin is available."
+        ),
     )
     return parser
 
@@ -1234,12 +1290,10 @@ def main() -> None:
         parser = _build_parser()
         args = parser.parse_args()
 
-        # --list-projects must work without PIPELINE_PROJECT.
         if args.list_projects and not args.project and not os.environ.get("PIPELINE_PROJECT"):
             _list_projects()
             return
 
-        # Resolve and set project BEFORE ensure_dirs() or any LazyPath operation.
         project_name = _resolve_project(args.project)
         os.environ["PIPELINE_PROJECT"] = project_name
         ensure_dirs()
@@ -1250,15 +1304,28 @@ def main() -> None:
 
         print(f"[clarificator] Workspace: {project_name!r}")
 
-        requirement_text = _gather_requirement(args)
-        if not requirement_text.strip():
-            print("[clarificator][error] Empty requirement input.", file=sys.stderr)
-            sys.exit(1)
+        # ── Requirement intake via drag/drop abstraction ─────────────────────
+        bundle = _gather_requirement_bundle(args)
+        requirement_text = str(getattr(bundle, "text", "")).strip()
+        input_sources = _normalize_input_sources_for_report(getattr(bundle, "sources", []))
+        attachment_only = bool(getattr(bundle, "attachment_only", False))
+
+        if input_sources:
+            print("[clarificator] Requirement sources:")
+            for src in input_sources:
+                kind = src.get("kind") or "source"
+                label = src.get("label") or src.get("path") or "(unknown)"
+                chars = src.get("chars")
+                suffix = f" ({chars} chars)" if isinstance(chars, int) else ""
+                print(f"  - {kind}: {label}{suffix}")
+
+        if attachment_only:
+            print("[clarificator] Attachment-only requirement input detected.")
 
         req_hash = _sha256(requirement_text)
         session_id = _now_iso()
 
-        # ── Load knowledge context ────────────────────────────────────────────────
+        # ── Load knowledge context ──────────────────────────────────────────
         log_text = _load_clarification_log()
         standalone = not (KNOWLEDGE_BASE.exists() or bool(log_text))
 
@@ -1273,7 +1340,7 @@ def main() -> None:
             if answered_qa_pairs:
                 print(f"[clarificator] Loaded {len(answered_qa_pairs)} past Q/A pairs for semantic dedup")
 
-        # ── Phase 1+2: Analyze ────────────────────────────────────────────────────
+        # ── Phase 1+2: Analyze ──────────────────────────────────────────────
         print("[clarificator] Analyzing requirement ...")
         analysis = _analyze(requirement_text, knowledge_context, answered_qa_pairs)
 
@@ -1341,14 +1408,17 @@ def main() -> None:
         _batch_derive_impacts(decisions)
 
         _write_report(
-            session_id,
-            req_hash,
-            project_name,
-            decisions,
-            unresolved,
-            conflicts,
-            findings,
+            session_id=session_id,
+            req_hash=req_hash,
+            project_name=project_name,
+            decisions=decisions,
+            unresolved=unresolved,
+            conflicts=conflicts,
+            findings=findings,
+            input_sources=input_sources,
+            attachment_only=attachment_only,
         )
+
         _append_to_log(session_id, project_name, decisions, conflicts)
 
         if not args.no_synth:
