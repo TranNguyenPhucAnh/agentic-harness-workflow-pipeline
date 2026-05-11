@@ -648,6 +648,68 @@ def _run_step_with_trace(
 
     return ok
 
+# ════════════════════════════════════════════════════════════════════════════
+# Project directory cache  (.harness_projects.json)
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Harness metadata — not a pipeline artifact. Same exception class as
+# session_NNN_runs.json: owned by harness, lives outside artifacts_<slug>/.
+
+_PROJECT_DIR_CACHE = ROOT / ".harness_projects.json"
+
+
+def _load_project_dir_cache() -> dict[str, str]:
+    if not _PROJECT_DIR_CACHE.exists():
+        return {}
+    try:
+        data = json.loads(_PROJECT_DIR_CACHE.read_text())
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_project_dir_cache(cache: dict[str, str]) -> None:
+    try:
+        tmp = _PROJECT_DIR_CACHE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(cache, indent=2, ensure_ascii=False) + "\n")
+        tmp.replace(_PROJECT_DIR_CACHE)
+    except Exception as exc:
+        print(f"[harness] WARNING: could not save project dir cache: {exc}")
+
+
+def _resolve_project_target_dir(slug: str) -> str | None:
+    """
+    Return the cached or user-supplied target directory for a project slug.
+    Prompts the user if no cache entry exists or they choose to update.
+    Returns None if the user skips (absorber falls back to artifact_root()).
+    """
+    cache = _load_project_dir_cache()
+    cached = cache.get(slug)
+
+    if cached:
+        print(f"\n[harness] Absorber target directory (cached): {cached}")
+        choice = input("  [1] Use this path  [2] Update path  [Enter=1]: ").strip()
+        if choice != "2":
+            return cached
+
+    raw = input("  Target directory for absorber (Enter to use artifact workspace): ").strip()
+    if not raw:
+        # Clear stale cache entry if user explicitly skips
+        if slug in cache:
+            del cache[slug]
+            _save_project_dir_cache(cache)
+        return None
+
+    path = Path(raw).expanduser().resolve()
+    if not path.exists():
+        print(f"[harness] WARNING: path does not exist: {path} — skipping cache.")
+        return str(path)  # still return; absorber will error with a cleaner message
+
+    cache[slug] = str(path)
+    _save_project_dir_cache(cache)
+    print(f"[harness] Saved target directory → {_PROJECT_DIR_CACHE.name}")
+    return str(path)
+    
 
 # ════════════════════════════════════════════════════════════════════════════
 # Project selection
@@ -1609,6 +1671,34 @@ Examples:
 
     return parser
 
+def _maybe_resolve_absorber_target(args: argparse.Namespace) -> None:
+    """
+    Prompt for / recall the absorber target directory when absorber will run.
+    Sets PIPELINE_TARGET_DIR so 01_absorber.py can pick it up without
+    knowing about the cache mechanism.
+    """
+    # Only relevant when absorber is in the execution range.
+    # At this point from_step/until_step haven't been resolved yet,
+    # so we check args directly: if --from-absorber or no --from-* flag
+    # (default full run), absorber will run.
+    will_run_absorber = (
+        not args.from_step                          # full run from start
+        or args.from_step == "absorber"             # explicit --from-absorber
+        or getattr(args, "absorber", False)         # --absorber single-step
+    )
+
+    if not will_run_absorber:
+        return
+
+    if args.dry_run:
+        return
+
+    from artifacts.paths import get_project_slug
+    slug = get_project_slug()
+
+    target = _resolve_project_target_dir(slug)
+    if target:
+        os.environ["PIPELINE_TARGET_DIR"] = target
 
 # ════════════════════════════════════════════════════════════════════════════
 # Main
@@ -1631,6 +1721,11 @@ def main() -> None:
 
     os.environ["PIPELINE_PROJECT"] = args.project
 
+    # Resolve absorber target directory (cached per project slug).
+    # Only prompt when absorber is in the steps to run.
+    # Set PIPELINE_TARGET_DIR so 01_absorber.py picks it up.
+    _maybe_resolve_absorber_target(args)
+    
     # Import after PIPELINE_PROJECT is set.
     from artifacts.paths import (
         PLANNER_FULL_PLAN,
