@@ -43,9 +43,6 @@ Direct execution:
   PIPELINE_PROJECT=my-app python 12_patcher.py
   PIPELINE_PROJECT=my-app PIPELINE_SESSION=001 python 12_patcher.py
 
-Required environment:
-  OPENROUTER_API_KEY=<your-key>
-
 For taxonomy details see artifacts/TAXONOMY.md
 """
 
@@ -65,7 +62,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import httpx
 
 # === WRITE AUTHORITY: patcher ===
 # OWNS  : artifacts_<slug>/sessions/<NNN>/execution/patcher_overwrite_fix_summary.md
@@ -108,10 +104,14 @@ from artifacts.paths import (  # noqa: E402
     get_session_id,
     get_spec_path,
 )
+from artifacts.models import call_model, get_model  # noqa: E402
 
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-DEFAULT_MINIMAX_MODEL = "minimax/minimax-m2.7"
-DEFAULT_QWEN_MODEL = "qwen/qwen3.6-plus"
+_PATCHER_MODEL           = get_model("patcher")            # surface fixes
+_PATCHER_SECONDARY_MODEL = get_model("patcher_secondary")  # logic/hook/data + mini scope
+
+# Model roles resolved from artifacts/models.py:
+#   "patcher"           — surface/component fixes (qwen)
+#   "patcher_secondary" — logic/hook/data fixes + mini scope (minimax)
 MAX_FILE_CHARS = 80_000
 
 _ARTIFACTS_READ: set[str] = set()
@@ -205,14 +205,6 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip post-fix verification/confirmation.",
     )
-    parser.add_argument(
-        "--minimax-model",
-        default=os.environ.get("FIX_MINIMAX_MODEL", DEFAULT_MINIMAX_MODEL),
-    )
-    parser.add_argument(
-        "--qwen-model",
-        default=os.environ.get("FIX_QWEN_MODEL", DEFAULT_QWEN_MODEL),
-    )
     return parser
 
 
@@ -237,12 +229,6 @@ def _configure_project(project: str | None, session: str | None, parser: argpars
         "PIPELINE_PROJECT=<name> before running 12_patcher.py directly."
     )
 
-
-def _require_openrouter_key(parser: argparse.ArgumentParser) -> str:
-    api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
-    if not api_key:
-        parser.error("OPENROUTER_API_KEY is not set. Export OPENROUTER_API_KEY=<your-key>.")
-    return api_key
 
 
 def _read_json(path: Any, default: Any) -> Any:
@@ -431,39 +417,27 @@ def _is_test_path(rel: str) -> bool:
     return rel.startswith("tests/") or ".test." in lowered or ".spec." in lowered
 
 
-def _openrouter_call(
-    model_id: str,
+def _model_call(
+    role: str,
     messages: list[dict[str, str]],
-    *,
-    api_key: str,
     max_tokens: int = 32768,
 ) -> str:
+    """
+    Thin wrapper around call_model() with retry and token logging.
+    role must be registered in artifacts/models.py ROLES.
+    """
+    model_id = get_model(role)
     for attempt in range(2):
-        response = httpx.post(
-            OPENROUTER_URL,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": model_id,
-                "messages": messages,
-                "temperature": 0.1,
-                "max_tokens": max_tokens,
-            },
-            timeout=300,
-        )
-        response.raise_for_status()
-
-        data = response.json()
-        usage = data.get("usage", {})
+        resp = call_model(role, messages, temperature=0.1, max_tokens=max_tokens)
+        usage = getattr(resp, "usage", None)
+        prompt_t = getattr(usage, "prompt_tokens", "?") if usage else "?"
+        completion_t = getattr(usage, "completion_tokens", "?") if usage else "?"
         print(
             f"    [tokens] {model_id}: "
-            f"prompt={usage.get('prompt_tokens', '?')}, "
-            f"completion={usage.get('completion_tokens', '?')}"
+            f"prompt={prompt_t}, completion={completion_t}"
         )
 
-        content = data["choices"][0]["message"].get("content", "")
+        content = resp.choices[0].message.content
         if content and content.strip():
             return content.strip()
 
@@ -845,13 +819,13 @@ _SURFACE_KEYWORDS = {
 
 def _choose_agent_and_prompt(finding: JudgeFinding, *, scope: str) -> tuple[str, str]:
     if scope == "mini":
-        return "minimax", JUDGE_FIX_SYSTEM_MINI
+        return "patcher_secondary", JUDGE_FIX_SYSTEM_MINI
 
     text_lower = finding.description.lower()
     if any(kw in text_lower for kw in _SURFACE_KEYWORDS):
-        return "qwen", JUDGE_FIX_SYSTEM_FULL_QWEN
+        return "patcher", JUDGE_FIX_SYSTEM_FULL_QWEN
 
-    return "minimax", JUDGE_FIX_SYSTEM_FULL_MINIMAX
+    return "patcher_secondary", JUDGE_FIX_SYSTEM_FULL_MINIMAX
 
 
 def _parse_fix_response(raw: str, label: str) -> dict[str, Any] | None:
@@ -892,9 +866,6 @@ def fix_finding(
     finding: JudgeFinding,
     verdict: dict[str, Any],
     *,
-    api_key: str,
-    minimax_model: str,
-    qwen_model: str,
     verbose: bool,
 ) -> FixRecord:
     scope = _current_scope()
@@ -943,8 +914,7 @@ def fix_finding(
             rejected_files=rejected,
         )
 
-    agent_label, system = _choose_agent_and_prompt(finding, scope=scope)
-    model_id = minimax_model if agent_label == "minimax" else qwen_model
+    role, system = _choose_agent_and_prompt(finding, scope=scope)
 
     files_block = "\n\n".join(_format_file_block(rel) for rel in allowed_files)
 
@@ -970,18 +940,17 @@ def fix_finding(
         f"### Affected files you may edit\n\n{files_block}"
     )
 
-    print(f"  [12] → {agent_label.upper()} fixing: {finding.description[:90]}…")
+    print(f"  [12] → {get_model(role)} fixing: {finding.description[:90]}…")
     if verbose:
         print(f"  [12]   scope: {scope}")
         print(f"  [12]   files: {allowed_files}")
 
-    raw = _openrouter_call(
-        model_id,
+    raw = _model_call(
+        role,
         [
             {"role": "system", "content": system},
             {"role": "user", "content": user_content},
         ],
-        api_key=api_key,
     ).strip()
 
     if not raw:
@@ -1369,8 +1338,6 @@ def main() -> None:
     exit_code = 0
 
     try:
-        api_key = _require_openrouter_key(parser)
-
         scope = _current_scope()
         print(f"[12] Project: {get_project_name()} ({get_project_slug()})")
         print(f"[12] Session: {get_session_id() or 'legacy/no-session'}")
@@ -1428,9 +1395,9 @@ def main() -> None:
 
         print(f"\n[12] Non-blocking notes ({len(non_blocking)}):")
         for finding in non_blocking:
-            agent, _ = _choose_agent_and_prompt(finding, scope=scope)
+            role, _ = _choose_agent_and_prompt(finding, scope=scope)
             print(f"  • {finding.description[:100]}")
-            print(f"    files: {finding.files or ['(no files mapped)']}, agent: {agent}")
+            print(f"    files: {finding.files or ['(no files mapped)']}, model: {get_model(role)}")
 
         to_fix: list[JudgeFinding] = []
         if args.fix_blocking:
@@ -1449,9 +1416,6 @@ def main() -> None:
                     fix_finding(
                         finding,
                         verdict,
-                        api_key=api_key,
-                        minimax_model=args.minimax_model,
-                        qwen_model=args.qwen_model,
                         verbose=args.verbose,
                     )
                 )
