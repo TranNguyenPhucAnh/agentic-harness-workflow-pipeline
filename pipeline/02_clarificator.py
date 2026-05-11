@@ -1213,8 +1213,8 @@ def _gather_requirement_bundle(args: argparse.Namespace) -> Any:
         read_file_fn=_read_input_file,
         prompt_title="Enter requirement",
         prompt_body=(
-            "Describe the feature/change you want to build, paste requirement text, "
-            "or drag-drop one or more requirement files."
+            "Describe the feature/change, paste requirement text, or drag-drop files. "
+            "End with /done (multiline) or press Enter twice (single line)."
         ),
         attachment_prompt="Attach requirement files if any",
         default_attachment_only_prompt="Please analyze the attached requirement source files.",
