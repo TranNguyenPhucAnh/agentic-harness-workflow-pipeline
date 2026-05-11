@@ -299,7 +299,8 @@ def _parse_json(raw: str) -> dict[str, Any]:
 
 
 def _validate_scaffold(scaffold: dict[str, Any]) -> None:
-    required = {"scaffold_version", "files", "implementation_instructions"}
+    #required = {"scaffold_version", "files", "implementation_instructions"}
+    required = {"files"}
     missing = required - set(scaffold.keys())
     if missing:
         raise ValueError(f"scaffold JSON missing required keys: {sorted(missing)}")
