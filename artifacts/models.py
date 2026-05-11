@@ -87,7 +87,7 @@ ROLES: dict[str, str] = {
     #"spectracker":        "gemini/gemini-2.5-flash",
     "scaffolder":         "openrouter/deepseek/deepseek-v4-pro",
     "planner":            "openrouter/~moonshotai/kimi-latest",
-    "executor":           "openrouter/anthropic/claude-sonnet-latest",
+    "executor":           "openrouter/~anthropic/claude-sonnet-latest",
     "debugger":           "openrouter/deepseek/deepseek-v4-pro",
     "debugger_secondary": "openrouter/~moonshotai/kimi-latest",  # logic/hook/data/type repair
     "reporter":           "openrouter/minimax/minimax-m2.7",
