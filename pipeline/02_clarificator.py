@@ -43,7 +43,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import httpx
 
 
 # ── Import from artifacts.paths (source of truth cho tất cả paths) ────────────
@@ -60,6 +59,7 @@ from artifacts.paths import (  # type: ignore  # noqa: E402
     ensure_dirs,
     get_project_name,
 )
+from artifacts.models import call_model  # noqa: E402
 
 # Local aliases — map canonical constants to the short names used internally
 KNOWLEDGE_BASE          = ARCHIVIST_KNOWLEDGE_LOG
@@ -111,8 +111,6 @@ def _print_artifact_access_summary() -> None:
 
 # ── Model config ──────────────────────────────────────────────────────────────
 
-_ANALYZE_MODEL = "deepseek/deepseek-chat"
-_SUGGEST_MODEL = "deepseek/deepseek-chat"
 _TIER3_MIN_CONF = 0.75
 
 _MAX_TOKENS_ANALYZE = 8192
@@ -330,56 +328,32 @@ def _list_projects() -> None:
 def _call_llm(
     system: str,
     user: str,
-    model: str = _ANALYZE_MODEL,
     max_tokens: int = _MAX_TOKENS_ANALYZE,
 ) -> str:
     """
-    Call an OpenAI-compatible chat completion API.
-
-    OpenRouter model IDs contain '/', e.g. deepseek/deepseek-chat.
-    If no API key is present, falls back to stdin mock for offline development.
+    Call the clarificator model via the central model registry.
+    Model identity and provider are resolved from artifacts/models.py.
+    Falls back to stdin mock when API key is missing (offline dev).
     """
-    if "/" in model:
-        api_key = os.environ.get("OPENROUTER_API_KEY", "")
-        base_url = "https://openrouter.ai/api/v1"
-        model_id = model
-    else:
-        api_key = os.environ.get("OPENAI_API_KEY", "")
-        base_url = "https://api.openai.com/v1"
-        model_id = model
-
-    if not api_key:
-        print("\n[clarificator][offline] No API key found. Paste LLM response then EOF:")
-        return sys.stdin.read()
-
-    payload = {
-        "model": model_id,
-        "max_tokens": max_tokens,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-    }
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-
     try:
-        with httpx.Client(timeout=120) as client:
-            resp = client.post(
-                f"{base_url}/chat/completions",
-                headers=headers,
-                json=payload,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-
-        content = data["choices"][0]["message"].get("content", "")
+        resp = call_model(
+            "clarificator",
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user",   "content": user},
+            ],
+            max_tokens=max_tokens,
+        )
+        content = resp.choices[0].message.content
         if not content or not content.strip():
-            raise RuntimeError(f"LLM returned empty content: {data}")
+            raise RuntimeError(f"Model returned empty content.")
         return content
-
+    except RuntimeError as exc:
+        # API key missing — fall back to offline stdin mock
+        if "not set" in str(exc):
+            print("\n[clarificator][offline] No API key found. Paste LLM response then EOF:")
+            return sys.stdin.read()
+        raise
     except Exception as exc:
         print(f"[clarificator][error] LLM call failed: {exc}", file=sys.stderr)
         raise

@@ -8,8 +8,8 @@ FULL mode:
     - Run Vitest.
     - Parse failing clusters.
     - Apply static fixes.
-    - Use Qwen for surface/component bugs.
-    - Use Minimax for hook/data/type/util logic bugs.
+    - Dispatch surface/component bugs to primary repair model (role: debugger).
+    - Dispatch hook/data/type/util logic bugs to secondary repair model (role: debugger_secondary).
     - Write debugger_overwrite_test_summary.json.
 
 MINI mode:
@@ -50,9 +50,6 @@ Direct execution:
   python 09_debugger.py --project my-app
   PIPELINE_PROJECT=my-app python 09_debugger.py
 
-Required for repair loop:
-  OPENROUTER_API_KEY=<your-key>
-
 At the end of each run, prints:
   - artifacts/files read
   - artifacts/files created/updated/overwritten/appended
@@ -74,24 +71,11 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-import httpx
-
 # === WRITE AUTHORITY: debugger ===
 # OWNS  : artifacts_<slug>/execution/debugger_overwrite_test_summary.json
 #         artifacts_<slug>/src/**    repair patches, if needed
 #         artifacts_<slug>/tests/**  fragile-test patches, if auditor allows
-# READS : artifacts_<slug>/specwright_spec_<slug>.md
-#         artifacts_<slug>/cache/scaffolder_compressed_spec.md
-#         artifacts_<slug>/state/planner_full_execution_plan.json
-#         artifacts_<slug>/state/planner_mini_execution_plan.json
-#         artifacts_<slug>/state/planner_mini_impact_analysis.json
-#         artifacts_<slug>/state/clarificator_requirement_synthesis.md
-#         artifacts_<slug>/execution/enricher_overwrite_enriched_prompt.md
-#         artifacts_<slug>/execution/executor_overwrite_manifest.json
-#         artifacts_<slug>/knowledge/current/patcher_findings_snapshot.md
-#         artifacts_<slug>/knowledge/current/archivist_knowledge_log.md
-#         artifacts_<slug>/src/**
-#         artifacts_<slug>/tests/**
+# READS : see module docstring
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from artifacts.paths import (  # noqa: E402
@@ -111,6 +95,13 @@ from artifacts.paths import (  # noqa: E402
     ensure_dirs,
     get_spec_path,
 )
+from artifacts.models import call_model, get_model  # noqa: E402
+
+# Module-level model label constants — derived from models.py at import time.
+# Used as owner labels in FailureCluster / ClusterRepairRecord so logs always
+# show the actual model name, not an abstract role string.
+_DEBUGGER_MODEL           = get_model("debugger")            # surface/component repair
+_DEBUGGER_SECONDARY_MODEL = get_model("debugger_secondary")  # logic/hook/data repair
 
 
 _SRC_PREFIX = "src"
@@ -176,7 +167,7 @@ class FailureCluster:
     last_fingerprint: str = ""
     escalated: bool = False
     is_transform_error: bool = False
-    owner: str = "qwen"
+    owner: str = ""  # set at runtime to get_model("debugger"); see _DEBUGGER_MODEL / _DEBUGGER_SECONDARY_MODEL
 
     @property
     def key(self) -> str:
@@ -239,9 +230,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument(
         "--impl",
-        default="qwen",
-        choices=["qwen"],
-        help="Kept for harness.py compatibility — internally uses qwen+minimax.",
+        default="primary",
+        choices=["primary"],
+        help="Kept for harness.py compatibility — internally dispatches via model roles debugger + debugger_secondary.",
     )
     parser.add_argument(
         "--no-repair",
@@ -428,16 +419,6 @@ def _load_knowledge_base() -> str:
 # API helpers
 # ════════════════════════════════════════════════════════════════════════════
 
-def _require_openrouter_key() -> str:
-    api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError(
-            "OPENROUTER_API_KEY is not set. Export OPENROUTER_API_KEY=<your-key> "
-            "or run with --no-repair."
-        )
-    return api_key
-
-
 def _strip_json_fences(raw: str) -> str:
     text = raw.strip()
     text = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", text)
@@ -461,37 +442,24 @@ def _parse_model_json(raw: str) -> dict[str, Any]:
     return parsed
 
 
-def _openrouter_call(
-    model_id: str,
+def _model_call(
+    role: str,
     messages: list[dict[str, str]],
     max_tokens: int = 32768,
 ) -> str:
-    api_key = _require_openrouter_key()
-
+    """
+    Thin wrapper around call_model() with retry, token logging, and empty-response guard.
+    role must be registered in artifacts/models.py ROLES.
+    """
+    model_id = get_model(role)
     for attempt in range(2):
-        response = httpx.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": model_id,
-                "messages": messages,
-                "temperature": 0.1,
-                "max_tokens": max_tokens,
-            },
-            timeout=300,
-        )
-        response.raise_for_status()
-
-        data = response.json()
-        usage = data.get("usage", {})
-        prompt_t = usage.get("prompt_tokens", "?")
-        completion_t = usage.get("completion_tokens", "?")
+        resp = call_model(role, messages, max_tokens=max_tokens, temperature=0.1)
+        usage = getattr(resp, "usage", None)
+        prompt_t = getattr(usage, "prompt_tokens", "?") if usage else "?"
+        completion_t = getattr(usage, "completion_tokens", "?") if usage else "?"
         print(f"    [tokens] {model_id}: prompt={prompt_t}, completion={completion_t}")
 
-        content = data["choices"][0]["message"]["content"]
+        content = resp.choices[0].message.content
         if content and content.strip():
             return content
 
@@ -506,11 +474,13 @@ def _openrouter_call(
 
 
 def call_qwen(messages: list[dict[str, str]]) -> str:
-    return _openrouter_call("qwen/qwen3.6-plus", messages)
+    """Surface/component repair — role: debugger. Owner label: _DEBUGGER_MODEL."""
+    return _model_call("debugger", messages)
 
 
 def call_minimax(messages: list[dict[str, str]]) -> str:
-    return _openrouter_call("minimax/minimax-m2.7", messages)
+    """Logic/hook/data repair — role: debugger_secondary. Owner label: _DEBUGGER_SECONDARY_MODEL."""
+    return _model_call("debugger_secondary", messages)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -819,7 +789,7 @@ def parse_failures(output: str) -> list[FailureCluster]:
         src_file = _infer_src_file(test_file)
         cluster = clusters.setdefault(
             test_file,
-            FailureCluster(test_file=test_file, src_file=src_file),
+            FailureCluster(test_file=test_file, src_file=src_file, owner=_DEBUGGER_MODEL),
         )
 
         if _RE_TRANSFORM_ERR.search(section):
@@ -1109,7 +1079,7 @@ def check_consistency(
     ]
 
     if verbose:
-        print(f"    [P0] Consistency check → Qwen ({cluster.test_file}) …")
+        print(f"    [P0] Consistency check → {_DEBUGGER_MODEL} ({cluster.test_file}) …")
 
     try:
         raw = call_qwen(messages)
@@ -1226,7 +1196,7 @@ def _call_repair(
         {"role": "user", "content": user_content},
     ]
 
-    model_label = "Qwen" if layer_name == "L1" else "Minimax"
+    model_label = _DEBUGGER_MODEL if layer_name == "L1" else _DEBUGGER_SECONDARY_MODEL
     if verbose:
         print(
             f"    [{layer_name}] → {model_label} "
@@ -1243,7 +1213,7 @@ def _call_repair(
     explanation = str(patch.get("explanation", ""))
 
     if layer_name == "L1" and "LOGIC_BUG" in explanation.upper():
-        print("    [L1] Qwen signalled LOGIC_BUG — deferring to Minimax.")
+        print(f"    [L1] {_DEBUGGER_MODEL} signalled LOGIC_BUG — deferring to {_DEBUGGER_SECONDARY_MODEL}.")
         return False, "LOGIC_BUG"
 
     out_rel = str(patch.get("file_path", cluster.src_file))
@@ -1386,7 +1356,7 @@ def repair_cluster(
     is_stale = cluster.attempt_count > 0 and cluster.last_fingerprint == current_fp
 
     skip_qwen = (
-        cluster.owner == "minimax"
+        cluster.owner == _DEBUGGER_SECONDARY_MODEL
         or cluster.is_minimax_scope()
         or is_stale
     )
@@ -1413,13 +1383,13 @@ def repair_cluster(
                 layer_used="qwen_targeted",
                 escalated=False,
                 escalated_to="",
-                owner="qwen",
+                owner=_DEBUGGER_MODEL,
                 consistency_verdict=consistency_verdict_label,
             )
 
         if cluster.is_minimax_scope():
-            print(f"    [L1→L2] Transferring {cluster.test_file} to Minimax.")
-            cluster.owner = "minimax"
+            print(f"    [L1→L2] Transferring {cluster.test_file} to {_DEBUGGER_SECONDARY_MODEL}.")
+            cluster.owner = _DEBUGGER_SECONDARY_MODEL
         else:
             cluster.escalated = True
             return ClusterRepairRecord(
@@ -1430,12 +1400,12 @@ def repair_cluster(
                 layer_used="qwen_targeted",
                 escalated=True,
                 escalated_to="human",
-                owner="qwen",
-                note=f"Qwen failed on component outside Minimax scope: {note}",
+                owner=_DEBUGGER_MODEL,
+                note=f"{_DEBUGGER_MODEL} failed on component outside {_DEBUGGER_SECONDARY_MODEL} scope: {note}",
                 consistency_verdict=consistency_verdict_label,
             )
 
-    cluster.owner = "minimax"
+    cluster.owner = _DEBUGGER_SECONDARY_MODEL
     test_code = _read_file_safe(_resolve_artifact_path(cluster.test_file))
     timeline = _build_state_timeline(test_code)
     minimax_system = _build_minimax_system(global_notes, judge_findings)
@@ -1462,7 +1432,7 @@ def repair_cluster(
         layer_used="minimax_logic",
         escalated=False,
         escalated_to="",
-        owner="minimax",
+        owner=_DEBUGGER_SECONDARY_MODEL,
         note=note,
         consistency_verdict=consistency_verdict_label,
     )
@@ -1520,7 +1490,7 @@ def _run_full_vitest_loop(
     if global_notes:
         print(
             f"[09] Planner/global knowledge loaded ({len(global_notes)} chars) "
-            "— will be injected into Minimax prompts"
+            f"— will be injected into {_DEBUGGER_SECONDARY_MODEL} prompts"
         )
 
     judge_findings = _load_judge_findings()
@@ -1567,10 +1537,10 @@ def _run_full_vitest_loop(
                 markers.append("STALE")
             if cluster.escalated:
                 markers.append("ESCALATED")
-            if cluster.owner == "minimax":
-                markers.append("MINIMAX")
+            if cluster.owner == _DEBUGGER_SECONDARY_MODEL:
+                markers.append(_DEBUGGER_SECONDARY_MODEL.upper()[:12])
 
-            scope_label = "[hook/data]" if cluster.is_minimax_scope() else "[component]"
+            scope_label = "[hook/data/logic]" if cluster.is_minimax_scope() else "[component]"
             marker_str = f"  [{', '.join(markers)}]" if markers else ""
             print(
                 f"  * {scope_label} {cluster.test_file} "
@@ -1694,7 +1664,7 @@ def _run_full_vitest_loop(
     final_passed = bool(iteration_records and iteration_records[-1].passed)
 
     report = {
-        "impl": "qwen+minimax",
+        "impl": f"primary:{get_model('debugger')}+secondary:{get_model('debugger_secondary')}",
         "scope": _current_scope(),
         "max_iter": max_iter,
         "max_cluster_attempts": max_cluster_attempts,
@@ -1775,7 +1745,7 @@ def main() -> None:
         try:
             _write_report(
                 {
-                    "impl": "qwen+minimax",
+                    "impl": f"primary:{get_model('debugger')}+secondary:{get_model('debugger_secondary')}",
                     "scope": "unknown",
                     "final_status": "FAIL",
                     "total_iterations": 0,

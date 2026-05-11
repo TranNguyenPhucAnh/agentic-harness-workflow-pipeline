@@ -530,7 +530,7 @@ def append_test_results_section(
 
     final = test_report.get("final_status") == "PASS"
     scope = test_report.get("scope", "full")
-    impl_label = test_report.get("impl", "qwen+minimax")
+    impl_label = test_report.get("impl", "unknown")
     iterations = test_report.get("iterations", [])
     iters = test_report.get(
         "total_iterations",
@@ -652,7 +652,7 @@ def append_iteration_details(
 
         lines.append("")
 
-    impl_label = test_report.get("impl", "qwen+minimax")
+    impl_label = test_report.get("impl", "unknown")
     max_i = test_report.get("max_iter", 3)
     max_ca = test_report.get("max_cluster_attempts", 2)
 

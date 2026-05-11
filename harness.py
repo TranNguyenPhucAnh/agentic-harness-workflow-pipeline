@@ -94,13 +94,28 @@ STEP_SCRIPTS: dict[str, str] = {
     "archivist": "13_archivist.py",
 }
 
+from artifacts.models import PROVIDERS, get_provider  # noqa: E402
+
+# STEP_ENV_KEYS is derived from models.py at import time — do not hard-code.
+# Each step's required env var is the api_key_env of its provider.
+# Steps without a model role (absorber, clarificator, enricher, specwright,
+# spectracker, reporter, archivist) run LLM calls through scripts that resolve
+# their own keys; harness only pre-checks steps it dispatches directly.
+_LLM_STEPS = {
+    "scaffolder", "planner", "executor", "debugger", "judge", "patcher",
+    "clarificator", "enricher", "specwright",
+}
+
+def _env_key_for_step(step: str) -> list[str]:
+    try:
+        provider = get_provider(step)
+        env_var = PROVIDERS[provider]["api_key_env"]
+        return [env_var]
+    except (ValueError, KeyError):
+        return []
+
 STEP_ENV_KEYS: dict[str, list[str]] = {
-    "scaffolder": ["GEMINI_API_KEY"],
-    "planner": ["OPENROUTER_API_KEY"],
-    "executor": ["OPENROUTER_API_KEY"],
-    "debugger": ["OPENROUTER_API_KEY"],
-    "judge": ["OPENROUTER_API_KEY"],
-    "patcher": ["OPENROUTER_API_KEY"],
+    step: _env_key_for_step(step) for step in _LLM_STEPS
 }
 
 SCOPE_CHOICES = ("full", "mini")
@@ -986,8 +1001,8 @@ def _run_fix_from_existing_judge(args: argparse.Namespace, results: dict[str, bo
         results["patcher_from_judge"] = False
         return
 
-    if not check_env(["OPENROUTER_API_KEY"]):
-        print("[harness] WARNING: cannot re-judge without OPENROUTER_API_KEY.")
+    if not check_env(STEP_ENV_KEYS.get("judge", [])):
+        print("[harness] WARNING: cannot re-judge without required API key.")
         return
 
     judge_ok = _run_step_with_trace(
@@ -1221,8 +1236,8 @@ def _run_step(
         return _run_step_with_trace(step, "scaffolder", STEP_SCRIPTS[step], args)
 
     if step == "planner":
-        if args.only_qwen:
-            skip_step("planner", "--only-qwen")
+        if args.skip_planner:
+            skip_step("planner", "--skip-planner")
             return True
 
         if args.scope == "full":
@@ -1240,7 +1255,7 @@ def _run_step(
         ok = _run_step_with_trace(step, "planner", STEP_SCRIPTS[step], args, planner_args)
 
         if not ok:
-            print("\n[harness] Planner failed.\n  Tip: --only-qwen to skip planning.")
+            print("\n[harness] Planner failed.\n  Tip: --skip-planner to skip planning.")
 
         return ok
 
@@ -1249,9 +1264,6 @@ def _run_step(
             sys.exit(1)
 
         executor_args = _scope_args_for_script(STEP_SCRIPTS[step], args.scope)
-
-        if plan_available:
-            executor_args.append("--use-glm-plan")
 
         if args.retry_impl:
             retry_args = _retry_impl_args(executor_args)
@@ -1293,7 +1305,7 @@ def _run_step(
     if step == "debugger":
         test_args = [
             "--impl",
-            "qwen",
+            "primary",
             "--max-iter",
             str(args.max_iter),
             "--max-cluster-attempts",
@@ -1314,7 +1326,7 @@ def _run_step(
             return True
 
         if not check_env(STEP_ENV_KEYS.get("judge", [])):
-            print("[harness] WARNING: cannot run judge without OPENROUTER_API_KEY.")
+            print("[harness] WARNING: cannot run judge without required API key.")
             return False
 
         _run_judge_fix_loop(args, results)
@@ -1546,7 +1558,18 @@ Examples:
 
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--force", action="store_true")
-    parser.add_argument("--only-qwen", action="store_true")
+    parser.add_argument(
+        "--skip-planner",
+        dest="skip_planner",
+        action="store_true",
+        help="Skip the planner step entirely (use when planner fails or plan already exists).",
+    )
+    parser.add_argument(
+        "--only-qwen",
+        dest="skip_planner",
+        action="store_true",
+        help=argparse.SUPPRESS,  # backward-compat alias for --skip-planner
+    )
     parser.add_argument("--retry-impl", action="store_true")
     parser.add_argument("--max-judge-rounds", type=int, default=2, metavar="N")
     parser.add_argument("--max-iter", type=int, default=3, metavar="N")
