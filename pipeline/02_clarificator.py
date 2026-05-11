@@ -1172,8 +1172,14 @@ def _gather_requirement(args: argparse.Namespace) -> str:
     if args.text:
         return args.text
 
-    print("[clarificator] Paste / type requirement below.")
-    print("     Press Ctrl-D (Unix) or Ctrl-Z Enter (Windows) to finish.\n")
+    print("╔══════════════════════════════════════════════════════╗")
+    print("║  Enter requirement                                   ║")
+    print("╠══════════════════════════════════════════════════════╣")
+    print("║  Describe the feature or change you want to make.    ║")
+    print("║  You can paste multiple lines.                       ║")
+    print("║  Press Ctrl-D (Mac) or Ctrl-Z Enter (Win) to finish. ║")
+    print("╚══════════════════════════════════════════════════════╝")
+    print("▶ ", end="", flush=True)
 
     try:
         return sys.stdin.read().strip()
