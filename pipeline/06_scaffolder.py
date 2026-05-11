@@ -127,6 +127,13 @@ SYSTEM_PROMPT = textwrap.dedent("""
       specified by the spec.
     - Preserve file paths exactly as specified by the spec unless the output
       schema explicitly says otherwise.
+      
+    Output schema for each file entry (STRICT — no other key names allowed):
+    {
+      "file_path": "relative/path/to/file.py",   // NOT "path", NOT "filepath"
+      "code": "...",
+      "is_test": false
+    }
 """).strip()
 
 
@@ -298,8 +305,19 @@ def _parse_json(raw: str) -> dict[str, Any]:
     raise SystemExit(1)
 
 
+_FILE_PATH_ALIASES = ("path", "filepath", "filename", "file", "name")
+
+def _normalize_scaffold_entry(entry: dict[str, Any], idx: int) -> dict[str, Any]:
+    if "file_path" not in entry:
+        for alias in _FILE_PATH_ALIASES:
+            if alias in entry:
+                print(f"[06][warn] files[{idx}]: aliased '{alias}' → 'file_path'")
+                entry = {**entry, "file_path": entry[alias]}
+                break
+    return entry
+
+
 def _validate_scaffold(scaffold: dict[str, Any]) -> None:
-    #required = {"scaffold_version", "files", "implementation_instructions"}
     required = {"files"}
     missing = required - set(scaffold.keys())
     if missing:
@@ -309,9 +327,12 @@ def _validate_scaffold(scaffold: dict[str, Any]) -> None:
     if not isinstance(files, list):
         raise ValueError('scaffold["files"] must be a list')
 
+    normalized: list[dict] = []
     for idx, entry in enumerate(files):
         if not isinstance(entry, dict):
             raise ValueError(f"scaffold files[{idx}] must be an object")
+
+        entry = _normalize_scaffold_entry(entry, idx)
 
         file_path = entry.get("file_path")
         if not isinstance(file_path, str) or not file_path.strip():
@@ -325,6 +346,9 @@ def _validate_scaffold(scaffold: dict[str, Any]) -> None:
         if not isinstance(is_test, bool):
             raise ValueError(f"scaffold files[{idx}].is_test must be boolean when present")
 
+        normalized.append(entry)
+
+    scaffold["files"] = normalized  # write_files sẽ thấy đúng key
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Spec compression
