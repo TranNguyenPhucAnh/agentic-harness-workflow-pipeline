@@ -486,6 +486,10 @@ def main() -> None:
             spec,
             max_retries=args.max_retries,
         )
+      
+        # DEBUG
+        if scaffold.get("files"):
+          print(f"[06][debug] files[0] keys: {list(scaffold['files'][0].keys())}", file=sys.stderr)
 
         try:
             _validate_scaffold(scaffold)
