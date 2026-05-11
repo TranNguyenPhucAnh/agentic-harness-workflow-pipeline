@@ -83,13 +83,13 @@ ROLES: dict[str, str] = {
     "absorber":           "gemini/gemini-2.5-flash",
     "clarificator":       "openrouter/z-ai/glm-5.1",
     "enricher":           "openrouter/qwen/qwen3.6-plus",
-    "specwright":         "openrouter/moonshotai/kimi-latest",
+    "specwright":         "openrouter/~moonshotai/kimi-latest",
     #"spectracker":        "gemini/gemini-2.5-flash",
     "scaffolder":         "openrouter/deepseek/deepseek-v4-pro",
-    "planner":            "openrouter/moonshotai/kimi-latest",
+    "planner":            "openrouter/~moonshotai/kimi-latest",
     "executor":           "openrouter/anthropic/claude-sonnet-latest",
     "debugger":           "openrouter/deepseek/deepseek-v4-pro",
-    "debugger_secondary": "openrouter/moonshotai/kimi-latest",  # logic/hook/data/type repair
+    "debugger_secondary": "openrouter/~moonshotai/kimi-latest",  # logic/hook/data/type repair
     "reporter":           "openrouter/minimax/minimax-m2.7",
     "judge":              "openrouter/z-ai/glm-5.1",
     "patcher":            "openrouter/deepseek/deepseek-v4-pro",
