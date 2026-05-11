@@ -425,11 +425,11 @@ def _open_in_editor(content: str) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _launch_spec_agent(project_name: str) -> None:
-    script = Path(__file__).parent / "05_specwright.py"
+    script = Path(__file__).parent / "04_specwright.py"
     if not script.exists():
-        print(f"\n[enricher][warn] 05_specwright.py not found at {script}")
+        print(f"\n[enricher][warn] 04_specwright.py not found at {script}")
         print(f"[enricher]       Create it first, then run:")
-        print(f"           python 05_specwright.py --project {project_name!r}")
+        print(f"           python 04_specwright.py --project {project_name!r}")
         return
 
     print(f"\n[enricher] Launching specwright → {script.name}")
@@ -562,7 +562,7 @@ def main() -> None:
         if not should_continue:
             _print_banner("Stopped — enricher_overwrite_enriched_prompt.md saved for manual review")
             print(f"  Review:   {ENRICHED_PROMPT}")
-            print(f"  Continue: python 05_specwright.py --project {project_name!r}\n")
+            print(f"  Continue: python 04_specwright.py --project {project_name!r}\n")
             return
 
         # ── Launch spec agent ─────────────────────────────────────────────────────
