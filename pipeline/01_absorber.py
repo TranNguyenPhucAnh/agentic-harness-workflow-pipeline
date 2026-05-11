@@ -1470,8 +1470,9 @@ def main() -> None:
         # PIPELINE_PROJECT must be available before artifact paths are resolved.
         ensure_dirs()
 
-        using_default_target = args.target is None
-        target: Path = (args.target or artifact_root()).resolve()
+        _env_target = os.environ.get("PIPELINE_TARGET_DIR")
+        using_default_target = args.target is None and not _env_target
+        target: Path = (args.target or (_env_target and Path(_env_target)) or artifact_root()).resolve()
 
         if not target.exists():
             print(f"[absorber][error] Target path does not exist: {target}", file=sys.stderr)
