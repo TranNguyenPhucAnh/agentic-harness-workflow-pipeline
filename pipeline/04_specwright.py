@@ -104,7 +104,7 @@ def _print_artifact_access_summary() -> None:
 # ── Model config ──────────────────────────────────────────────────────────────
 # Model identity resolved from artifacts/models.py role "specwright".
 # Để đổi model: sửa ROLES["specwright"] trong models.py — không sửa file này.
-_MAX_TOKENS_SPEC = 8192
+_MAX_TOKENS_SPEC = 32768
 
 
 # ─────────────────────────────────────────────────────────────────────────────
