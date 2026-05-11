@@ -81,13 +81,13 @@ PROVIDERS: dict[str, dict[str, Any]] = {
 ROLES: dict[str, str] = {
     # ── Pipeline steps ─────────────────────────────────────────────────────
     "absorber":           "gemini/gemini-2.5-flash",
-    "clarificator":       "anthropic/claude-sonnet-latest",
+    "clarificator":       "z-ai/glm-5.1",
     "enricher":           "deepseek/deepseek-v4-flash",
-    "specwright":         "anthropic/claude-sonnet-latest",
+    "specwright":         "moonshotai/kimi-latest",
     "spectracker":        "gemini/gemini-2.5-flash",
     "scaffolder":         "deepseek/deepseek-v4-pro",
     "planner":            "moonshotai/kimi-latest",
-    "executor":           "anthropic/claude-opus-latest",
+    "executor":           "openrouter/anthropic/claude-opus-latest",
     "debugger":           "deepseek/deepseek-v4-pro",
     "debugger_secondary": "moonshotai/kimi-latest",  # logic/hook/data/type repair
     "reporter":           "minimax/minimax-m2.7",
