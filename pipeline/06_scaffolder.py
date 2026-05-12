@@ -57,10 +57,7 @@ from artifacts.paths import (  # noqa: E402
 
 
 ROLE = "scaffolder"
-MAX_OUTPUT_TOKENS = 16384   # glm-5.1 / most providers cap around 16k output tokens
-# Each batch asks the model for this many files at a time.
-# At ~400 chars/file average, 12 files ≈ ~5k chars of code → well under 16k limit.
-BATCH_SIZE = 12
+MAX_OUTPUT_TOKENS = 32768
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -136,53 +133,6 @@ SYSTEM_PROMPT = textwrap.dedent("""
     }
 """).strip()
 
-# Used in pass-1: ask model only for the list of files (no code).
-SYSTEM_PROMPT_FILE_LIST = textwrap.dedent("""
-    You are a senior software architect reading a technical spec.
-
-    Your ONLY task: return a JSON array of file paths that should be scaffolded,
-    exactly as listed in the spec's file tree. No code, no explanations.
-
-    Output format — a raw JSON array of strings, nothing else:
-    ["src/foo.py", "src/bar.py", "tests/test_foo.py"]
-
-    Rules:
-    - Output raw JSON only, no markdown fences, no comments.
-    - Preserve the exact paths from the spec.
-    - Include ALL files from the spec's file tree.
-""").strip()
-
-# Used in pass-2 batches: generate code only for a given subset of files.
-SYSTEM_PROMPT_BATCH = textwrap.dedent("""
-    You are a senior software architect generating a scaffold from a technical spec.
-
-    You will receive the canonical spec AND a list of files to generate THIS BATCH.
-    Generate ONLY the files listed in "files_to_generate". Ignore all other files.
-
-    JSON requirements:
-    - Use double quotes " for all JSON strings.
-    - Escape any internal " characters as \\".
-    - Code in "code" fields MUST be a single JSON string with \\n for newlines.
-    - Do NOT use single quotes ' as JSON string delimiters.
-    - Do NOT include comments or trailing commas.
-    - Do NOT wrap the response in markdown fences.
-    - Output raw JSON only.
-
-    Output a single JSON object:
-    {
-      "files": [
-        {"file_path": "relative/path/to/file.py", "code": "...", "is_test": false},
-        ...
-      ]
-    }
-
-    Scaffold requirements:
-    - For non-test files: interfaces/types/function signatures/stubs with
-      explicit "not implemented" placeholders where the spec asks for stubs.
-    - For test files: complete runnable tests using the framework in the spec.
-    - file_path keys MUST match exactly what was given in files_to_generate.
-""").strip()
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI / project setup
@@ -252,20 +202,34 @@ def _configure_project(
 # Model call
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _call_with_retry(
-    messages: list[dict],
+def call_scaffolder(
+    spec_content: str,
     *,
-    max_retries: int,
-    label: str,
-) -> str:
+    max_retries: int = 5,
+) -> dict[str, Any]:
     """
-    Call the model with exponential-backoff retry.
-    Returns the raw text response. Raises RuntimeError after max_retries.
+    Call the scaffolder role (config in artifacts/models.py) with the canonical spec.
+
+    Retries on transient failures with exponential backoff.
+    Returns the parsed scaffold as a dict.
     """
     import random
     import time
 
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": f"Here is the canonical spec:\n\n{spec_content}",
+        },
+    ]
+
+    model    = get_model(ROLE)
+    provider = get_provider(ROLE)
+    print(f"[06] Calling model: {model} (provider: {provider}) …")
+
     last_exc: Exception | None = None
+
     for attempt in range(1, max_retries + 1):
         try:
             resp = call_model(
@@ -275,119 +239,21 @@ def _call_with_retry(
                 temperature=0.2,
             )
             text = resp.choices[0].message.content or ""
-            finish_reason = getattr(resp.choices[0], "finish_reason", None)
-            if finish_reason == "max_tokens":
-                raise ValueError(
-                    f"{label}: model hit max_tokens={MAX_OUTPUT_TOKENS} — "
-                    "response truncated. Reduce BATCH_SIZE or check model limits."
-                )
-            return text
+            return _parse_json(text)
+
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
             if attempt < max_retries:
                 wait = (2 ** (attempt - 1)) + random.uniform(0, 1)
                 print(
-                    f"[06][warn] {label} failed (attempt {attempt}/{max_retries}), "
-                    f"retry in {wait:.1f}s: {exc}",
-                    file=sys.stderr,
+                    f"[06][warn] Call failed (attempt {attempt}/{max_retries}), "
+                    f"retry in {wait:.1f}s: {exc}"
                 )
                 time.sleep(wait)
             else:
-                print(f"[06][error] {label} failed: {exc}", file=sys.stderr)
+                print(f"[06][error] Model call failed: {exc}", file=sys.stderr)
 
-    raise RuntimeError(f"{label} failed after {max_retries} retries") from last_exc
-
-
-def _fetch_file_list(spec_content: str, *, max_retries: int) -> list[str]:
-    """
-    Pass 1: ask the model for the list of file paths only (no code).
-    Returns a list of file path strings.
-    """
-    print("[06] Pass 1 — fetching file list from spec …")
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT_FILE_LIST},
-        {"role": "user", "content": f"Here is the canonical spec:\n\n{spec_content}"},
-    ]
-    raw = _call_with_retry(messages, max_retries=max_retries, label="pass-1 file-list")
-    cleaned = raw.strip()
-    cleaned = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", cleaned)
-    cleaned = re.sub(r"\n?```$", "", cleaned.strip())
-    try:
-        file_list = json.loads(cleaned)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Pass 1 file-list JSON parse failed: {exc}\nRaw: {cleaned[:500]}") from exc
-    if not isinstance(file_list, list) or not all(isinstance(p, str) for p in file_list):
-        raise ValueError(f"Pass 1 returned unexpected structure: {type(file_list)}")
-    print(f"[06] Pass 1 — {len(file_list)} files identified.")
-    return file_list
-
-
-def _fetch_batch(
-    spec_content: str,
-    batch: list[str],
-    batch_idx: int,
-    total_batches: int,
-    *,
-    max_retries: int,
-) -> list[dict[str, Any]]:
-    """
-    Pass 2: generate code for one batch of files.
-    Returns list of file entry dicts.
-    """
-    label = f"pass-2 batch {batch_idx}/{total_batches}"
-    print(f"[06] {label} — generating {len(batch)} files: {batch}")
-    user_content = (
-        f"Here is the canonical spec:\n\n{spec_content}\n\n"
-        f"files_to_generate: {json.dumps(batch)}"
-    )
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT_BATCH},
-        {"role": "user", "content": user_content},
-    ]
-    raw = _call_with_retry(messages, max_retries=max_retries, label=label)
-    batch_scaffold = _parse_json(raw)
-    entries = batch_scaffold.get("files", [])
-    if not isinstance(entries, list):
-        raise ValueError(f"{label}: 'files' key missing or not a list")
-    return entries
-
-
-def call_scaffolder(
-    spec_content: str,
-    *,
-    max_retries: int = 5,
-) -> dict[str, Any]:
-    """
-    Two-pass batched scaffold generation.
-
-    Pass 1 — get the full file list from the model (tiny response, no truncation risk).
-    Pass 2 — generate code in batches of BATCH_SIZE files each.
-
-    This sidesteps output-token limits on models like glm-5.1 that cap around 16k tokens
-    (~60k chars), which is insufficient for a full scaffold in one shot.
-    """
-    model    = get_model(ROLE)
-    provider = get_provider(ROLE)
-    print(f"[06] Calling model: {model} (provider: {provider}), batch_size={BATCH_SIZE} …")
-
-    # Pass 1: file list
-    file_list = _fetch_file_list(spec_content, max_retries=max_retries)
-
-    # Pass 2: batched code generation
-    batches = [file_list[i:i + BATCH_SIZE] for i in range(0, len(file_list), BATCH_SIZE)]
-    total_batches = len(batches)
-    print(f"[06] Pass 2 — {total_batches} batch(es) of up to {BATCH_SIZE} files each.")
-
-    all_entries: list[dict[str, Any]] = []
-    for idx, batch in enumerate(batches, start=1):
-        entries = _fetch_batch(
-            spec_content, batch, idx, total_batches, max_retries=max_retries
-        )
-        all_entries.extend(entries)
-
-    print(f"[06] Pass 2 — {len(all_entries)} file entries collected.")
-    return {"files": all_entries}
-
+    raise RuntimeError(f"Scaffolder call failed after {max_retries} retries") from last_exc
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -408,19 +274,7 @@ def _parse_json(raw: str) -> dict[str, Any]:
     try:
         parsed = json.loads(cleaned)
     except json.JSONDecodeError as exc:
-        if "Unterminated string" in str(exc) or cleaned.rstrip()[-1:] not in ("}", "]"):
-            print(
-                f"[06][warn] Primary JSON parse failed (TRUNCATED RESPONSE — model likely "
-                f"hit max_tokens={MAX_OUTPUT_TOKENS} limit): {exc}",
-                file=sys.stderr,
-            )
-            print(
-                f"[06][warn] Response is {len(cleaned)} chars. Reduce scaffold scope or "
-                f"verify your model supports {MAX_OUTPUT_TOKENS} output tokens.",
-                file=sys.stderr,
-            )
-        else:
-            print(f"[06][warn] Primary JSON parse failed: {exc}", file=sys.stderr)
+        print(f"[06][warn] Primary JSON parse failed: {exc}", file=sys.stderr)
     else:
         if not isinstance(parsed, dict):
             raise ValueError("Model returned JSON, but top-level value is not an object.")
