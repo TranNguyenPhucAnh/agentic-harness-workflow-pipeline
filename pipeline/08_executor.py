@@ -101,6 +101,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from artifacts.models import call_model, get_model, get_provider  # noqa: E402
+from modules.cost import print_call, print_summary, record_usage, summary as cost_summary  # noqa: E402
 from artifacts.paths import (  # noqa: E402
     EXECUTOR_OVERWRITE_MANIFEST,
     PLANNER_FULL_PLAN,
@@ -660,10 +661,10 @@ def _call_executor(system: str, user_message: str) -> str:
 
             usage = getattr(resp, "usage", None)
             if usage:
-                print(
-                    f"[08] Tokens: prompt={getattr(usage, 'prompt_tokens', '?')}, "
-                    f"completion={getattr(usage, 'completion_tokens', '?')}"
-                )
+                pt        = getattr(usage, "prompt_tokens",     0) or 0
+                ct        = getattr(usage, "completion_tokens", 0) or 0
+                call_cost = record_usage(usage, model=model, provider=provider)
+                print_call(__file__, pt, ct, call_cost)
 
             choice     = resp.choices[0]
             message    = choice.message
@@ -1548,6 +1549,7 @@ def _write_impl_record(
         "generated_at": _utc_now_iso(),
         "files": written,
         "failed_files": failed_files,
+        "token_summary": cost_summary(),
     }
     record.update(extra)
 
@@ -1677,6 +1679,7 @@ def main() -> None:
             print(f"[08] Done — {len(written)} file(s) written.")
 
     finally:
+        print_summary("[08]")
         _print_artifact_access_summary()
 
     sys.exit(exit_code)
