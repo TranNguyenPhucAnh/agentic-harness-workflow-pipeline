@@ -80,18 +80,24 @@ PROVIDERS: dict[str, dict[str, Any]] = {
 
 ROLES: dict[str, str] = {
     # ── Pipeline steps ─────────────────────────────────────────────────────
+    # NOTE: ~ prefix trên OpenRouter = "route directly via provider đó".
+    # Khi dùng ~, model string PHẢI là exact model ID của provider
+    # (vd ~anthropic/claude-sonnet-4-5-20251001).
+    # "claude-sonnet-latest" không phải valid Anthropic model ID → OpenRouter
+    # trả về HTML 404 thay vì JSON → JSONDecodeError trong openai SDK.
+    # Drop ~ để dùng load-balanced routing (resilient hơn, auto-failover).
     "absorber":           "gemini/gemini-2.5-flash",
     "clarificator":       "openrouter/z-ai/glm-5.1",
     "enricher":           "openrouter/qwen/qwen3.6-plus",
-    "specwright":         "openrouter/~anthropic/claude-sonnet-latest",
+    "specwright":         "openrouter/anthropic/claude-sonnet-4.6",
     #"spectracker":        "gemini/gemini-2.5-flash",
     "scaffolder":         "openrouter/z-ai/glm-5.1",
-    "planner":            "openrouter/~moonshotai/kimi-latest",
-    "executor":           "openrouter/~anthropic/claude-sonnet-latest",
+    "planner":            "openrouter/moonshotai/kimi-latest",
+    "executor":           "openrouter/anthropic/claude-sonnet-4.6",
     "debugger":           "openrouter/minimax/minimax-m2.7",
     "debugger_secondary": "openrouter/qwen/qwen3.6-plus",
     "reporter":           "openrouter/deepseek/deepseek-v4-pro",
-    "judge":              "openrouter/~moonshotai/kimi-latest",
+    "judge":              "openrouter/moonshotai/kimi-latest",
     "patcher":            "openrouter/minimax/minimax-m2.7",
     #"archivist":         "openrouter/deepseek/deepseek-v4-pro",
 
@@ -251,15 +257,38 @@ def call_model(
         # Force reasoning on for this call only:
         resp = call_model("judge", messages=[...], reasoning=True)
     """
+    import json as _json
     client = get_client(role)
     model  = get_model(role)
     extra  = reasoning_params(role, reasoning)
-    return client.chat.completions.create(
-        model=model,
-        messages=messages,
-        **extra,
-        **kwargs,
-    )
+    try:
+        return client.chat.completions.create(
+            model=model,
+            messages=messages,
+            **extra,
+            **kwargs,
+        )
+    except _json.JSONDecodeError as exc:
+        # OpenRouter (and other proxies) return HTML error pages or malformed JSON
+        # when the model string is invalid, quota is exceeded, or upstream times out.
+        # The openai SDK then fails trying to parse the HTTP response body as JSON.
+        #
+        # Common causes:
+        #   - Invalid model string (e.g. "~anthropic/claude-sonnet-latest" — the
+        #     ~ prefix requires an exact provider model ID, not an alias)
+        #   - Model not available on this provider
+        #   - Rate limit / quota exceeded (some providers return HTML for these)
+        #   - Upstream timeout returning a partial/empty body
+        provider_key, _ = _parse_role(role)
+        cfg = PROVIDERS[provider_key]
+        raise RuntimeError(
+            f"[models] call_model({role!r}) received a non-JSON response from "
+            f"{cfg['base_url']} — provider likely returned an HTML error page.\n"
+            f"  model string : {model!r}\n"
+            f"  Check: (1) model ID is valid on {provider_key!r}, "
+            f"(2) API key is correct, (3) quota not exceeded.\n"
+            f"  Original parse error: {exc}"
+        ) from exc
 
 
 def model_info(role: str | None = None) -> dict | list[dict]:
