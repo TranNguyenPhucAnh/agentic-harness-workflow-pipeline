@@ -57,7 +57,7 @@ from artifacts.paths import (  # noqa: E402
 
 
 ROLE = "scaffolder"
-MAX_OUTPUT_TOKENS = 32768
+MAX_OUTPUT_TOKENS = 32768  # Reduced from 16384 — most providers cap at 16k output tokens
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -239,6 +239,15 @@ def call_scaffolder(
                 temperature=0.2,
             )
             text = resp.choices[0].message.content or ""
+
+            # Detect likely token-limit truncation before attempting JSON parse
+            finish_reason = getattr(resp.choices[0], "finish_reason", None)
+            if finish_reason == "max_tokens":
+                raise ValueError(
+                    f"Model hit max_tokens={MAX_OUTPUT_TOKENS} limit — response truncated. "
+                    "Reduce scaffold scope or split into smaller requests."
+                )
+
             return _parse_json(text)
 
         except Exception as exc:  # noqa: BLE001
@@ -274,7 +283,19 @@ def _parse_json(raw: str) -> dict[str, Any]:
     try:
         parsed = json.loads(cleaned)
     except json.JSONDecodeError as exc:
-        print(f"[06][warn] Primary JSON parse failed: {exc}", file=sys.stderr)
+        if "Unterminated string" in str(exc) or cleaned.rstrip()[-1:] not in ("}", "]"):
+            print(
+                f"[06][warn] Primary JSON parse failed (TRUNCATED RESPONSE — model likely "
+                f"hit max_tokens={MAX_OUTPUT_TOKENS} limit): {exc}",
+                file=sys.stderr,
+            )
+            print(
+                f"[06][warn] Response is {len(cleaned)} chars. Reduce scaffold scope or "
+                f"verify your model supports {MAX_OUTPUT_TOKENS} output tokens.",
+                file=sys.stderr,
+            )
+        else:
+            print(f"[06][warn] Primary JSON parse failed: {exc}", file=sys.stderr)
     else:
         if not isinstance(parsed, dict):
             raise ValueError("Model returned JSON, but top-level value is not an object.")
