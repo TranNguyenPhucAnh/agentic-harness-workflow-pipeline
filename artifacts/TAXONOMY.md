@@ -28,7 +28,6 @@ artifacts_<slug>/
 │       │   └── planner_mini_impact_analysis.json
 │       │
 │       ├── cache/
-│       │   ├── scaffolder_compressed_spec.md
 │       │   ├── spectracker_overwrite_version_delta.json
 │       │   ├── absorber_overwrite_codebase_snapshot.json
 │       │   └── absorber_overwrite_git_snapshot.json
@@ -89,7 +88,6 @@ artifacts_<slug>/
 | `sessions/<N>/state/planner_full_execution_plan.json` | S | `planner` | overwrite | executor, debugger, reporter, judge, patcher, harness |
 | `sessions/<N>/state/planner_mini_execution_plan.json` | S | `planner` | overwrite | executor, debugger, reporter, judge, patcher, harness |
 | `sessions/<N>/state/planner_mini_impact_analysis.json` | S | `planner` | overwrite | executor |
-| `sessions/<N>/cache/scaffolder_compressed_spec.md` | S | `scaffolder` | overwrite | planner, executor, patcher |
 | `sessions/<N>/cache/spectracker_overwrite_version_delta.json` | S | `spectracker` | overwrite | harness |
 | `sessions/<N>/cache/absorber_overwrite_codebase_snapshot.json` | S | `absorber` | overwrite | clarificator, enricher, planner |
 | `sessions/<N>/cache/absorber_overwrite_git_snapshot.json` | S | `absorber` | overwrite | clarificator, enricher |
@@ -145,7 +143,6 @@ artifacts_<slug>/
                               │                     <version>.md, <version>.changelog.md
                               │
                               └─[scaffolder]─────► scaffolder_codebase_skeleton.json
-                                                    scaffolder_compressed_spec.md
 
 [planner]────────────────► planner_full_execution_plan.json
                             planner_mini_execution_plan.json
@@ -225,9 +222,6 @@ Deliberate hybrid lifecycle: top-level fields (current version, last run metadat
 **Project-global exception:** this file lives at project root `state/`, not inside `sessions/<NNN>/state/`. Rationale: spectracker must know the last successfully applied version across all sessions to compute deltas correctly. If session-local, each new session would lose the applied baseline and force a full rerun. All other `state/` artifacts are session-local.
 
 In full harness runs, `write_applied()` is called by harness **at finalization time** only after the downstream pipeline succeeds — not during spectracker's normal run. This prevents a spec version from being marked applied before executor/debugger/judge completion. Ownership remains spectracker. A manual CLI fallback (`--mark-applied`) is available for recovery.
-
-### `cache/scaffolder_compressed_spec.md`
-Token-optimised spec with §0 (pipeline meta) and §8 (output schema) stripped — ~35% token saving on downstream API calls. Pure cache: fully derivable from spec. Falls back to `get_spec_path()` if absent. No data here that isn't in source.
 
 ### `cache/spectracker_overwrite_version_delta.json`
 Computed by spectracker from diff between current spec and last applied snapshot. Describes changed sections, affected files, steps to skip. Documented exception: placed in cache/ because derivable from spec + applied_version, but drives harness control flow rather than being a passive cache.
