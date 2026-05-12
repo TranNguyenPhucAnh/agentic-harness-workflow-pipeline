@@ -1249,6 +1249,9 @@ def _run_step(
 
         executor_args = _scope_args_for_script(STEP_SCRIPTS[step], args.scope)
 
+        if plan_available:
+            executor_args.append("--use-planner-plan")
+
         if args.retry_impl:
             retry_args = _retry_impl_args(executor_args)
             if retry_args is None:
