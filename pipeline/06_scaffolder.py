@@ -57,7 +57,7 @@ from artifacts.paths import (  # noqa: E402
 
 
 ROLE = "scaffolder"
-MAX_OUTPUT_TOKENS = 32768
+MAX_OUTPUT_TOKENS = 65536
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -264,8 +264,11 @@ def _parse_json(raw: str) -> dict[str, Any]:
     """
     Robust JSON extraction.
 
-    Handles accidental markdown fences and, as a fallback, extracts the outermost
-    JSON object.
+    Handles:
+      - Accidental markdown fences (```json ... ```)
+      - Top-level array → auto-wrapped into {"files": [...]}
+        (some models like GLM return array of file entries directly)
+      - Fallback: extract outermost JSON object via regex
     """
     cleaned = raw.strip()
     cleaned = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", cleaned)
@@ -276,10 +279,21 @@ def _parse_json(raw: str) -> dict[str, Any]:
     except json.JSONDecodeError as exc:
         print(f"[06][warn] Primary JSON parse failed: {exc}", file=sys.stderr)
     else:
+        if isinstance(parsed, list):
+            print(
+                "[06][warn] Model returned top-level array — auto-wrapping into "
+                '{"files": [...]}',
+                file=sys.stderr,
+            )
+            return {"files": parsed}
         if not isinstance(parsed, dict):
-            raise ValueError("Model returned JSON, but top-level value is not an object.")
+            raise ValueError(
+                f"Model returned JSON, but top-level value is not an object or array "
+                f"(got {type(parsed).__name__})."
+            )
         return parsed
 
+    # Fallback: extract outermost { ... }
     match = re.search(r"\{.*\}", cleaned, re.DOTALL)
     if match:
         candidate = match.group()
@@ -293,8 +307,18 @@ def _parse_json(raw: str) -> dict[str, Any]:
             print(f"[06][error] Raw output first 1000 chars:\n{cleaned[:1000]}", file=sys.stderr)
             raise SystemExit(1) from exc
 
+        if isinstance(parsed, list):
+            print(
+                "[06][warn] Extracted JSON is top-level array — auto-wrapping into "
+                '{"files": [...]}',
+                file=sys.stderr,
+            )
+            return {"files": parsed}
         if not isinstance(parsed, dict):
-            raise ValueError("Extracted JSON top-level value is not an object.")
+            raise ValueError(
+                f"Extracted JSON top-level value is not an object or array "
+                f"(got {type(parsed).__name__})."
+            )
         return parsed
 
     print("[06][error] No JSON object found in model response.", file=sys.stderr)
