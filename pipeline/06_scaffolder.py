@@ -47,6 +47,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from artifacts.models import call_model, get_model, get_provider  # noqa: E402
+from modules.cost import print_call, print_summary, record_usage  # noqa: E402
 from artifacts.paths import (  # noqa: E402
     SCAFFOLD_JSON,
     SRC_DIR,
@@ -251,6 +252,12 @@ def call_scaffolder(
                 temperature=0.2,
             )
             text = resp.choices[0].message.content or ""
+            usage = getattr(resp, "usage", None)
+            if usage:
+                pt        = getattr(usage, "prompt_tokens",     0) or 0
+                ct        = getattr(usage, "completion_tokens", 0) or 0
+                call_cost = record_usage(usage, model=model, provider=provider)
+                print_call(__file__, pt, ct, call_cost)
             return _parse_json(text)
 
         except Exception as exc:  # noqa: BLE001
@@ -523,6 +530,7 @@ def main() -> None:
         exit_code = 1
 
     finally:
+        print_summary("[06]")
         _print_artifact_access_summary()
 
     sys.exit(exit_code)
