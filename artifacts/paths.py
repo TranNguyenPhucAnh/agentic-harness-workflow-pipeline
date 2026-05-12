@@ -409,14 +409,6 @@ CLARIFIED_REQUEST = CLARIFIED_REQ
 
 # ── cache/ (session-local) ───────────────────────────────────────────────────
 
-# owner:     scaffolder (06_scaffolder.py)
-# consumers: planner, executor, patcher
-# lifecycle: persistent within session — overwrite when spec changes
-# purpose:   token-optimised spec with §0 and §8 stripped (~35% token saving).
-#            Pure cache — fully derivable from spec. Falls back to get_spec_path() if absent.
-# scope:     session-local
-SCAFFOLDER_COMPRESSED_SPEC = _SessLazyPath("cache/scaffolder_compressed_spec.md")
-
 # owner:     spectracker (05_spectracker.py)
 # consumers: harness (decides which steps to rerun)
 # lifecycle: overwrite — replaced each time spectracker runs within the session
@@ -440,7 +432,6 @@ ABSORBER_CODEBASE_SNAPSHOT = _SessLazyPath("cache/absorber_overwrite_codebase_sn
 ABSORBER_GIT_SNAPSHOT = _SessLazyPath("cache/absorber_overwrite_git_snapshot.json")
 
 # ── Backward-compatible aliases (cache/) ─────────────────────────────────────
-SPEC_COMPRESSED = SCAFFOLDER_COMPRESSED_SPEC
 SPEC_DELTA      = SPECTRACKER_VERSION_DELTA
 ABSORBER_CACHE  = ABSORBER_CODEBASE_SNAPSHOT
 # REMOVED: cache/absorber_cache.json → now ABSORBER_CODEBASE_SNAPSHOT
