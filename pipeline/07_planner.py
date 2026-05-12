@@ -90,6 +90,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from artifacts.models import call_model, get_model, get_provider  # noqa: E402
+from modules.cost import print_call, print_summary, record_usage  # noqa: E402
 from artifacts.paths import (  # noqa: E402
     ABSORBER_BLAME_MAP,
     ABSORBER_CODEBASE_MAP,
@@ -562,10 +563,10 @@ def _call_planner_json(
 
             usage = getattr(resp, "usage", None)
             if usage:
-                print(
-                    f"[07] Tokens: prompt={getattr(usage, 'prompt_tokens', '?')}, "
-                    f"completion={getattr(usage, 'completion_tokens', '?')}"
-                )
+                pt        = getattr(usage, "prompt_tokens",     0) or 0
+                ct        = getattr(usage, "completion_tokens", 0) or 0
+                call_cost = record_usage(usage, model=model, provider=provider)
+                print_call(__file__, pt, ct, call_cost)
 
             choice  = resp.choices[0]
             message = choice.message
@@ -1049,6 +1050,7 @@ def main() -> None:
         exit_code = 1
 
     finally:
+        print_summary("[07]")
         _print_artifact_access_summary()
 
     sys.exit(exit_code)
