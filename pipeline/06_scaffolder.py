@@ -57,7 +57,7 @@ from artifacts.paths import (  # noqa: E402
 
 
 ROLE = "scaffolder"
-MAX_OUTPUT_TOKENS = 65536
+MAX_OUTPUT_TOKENS = 32768
 
 
 # ─────────────────────────────────────────────────────────────────────────────
