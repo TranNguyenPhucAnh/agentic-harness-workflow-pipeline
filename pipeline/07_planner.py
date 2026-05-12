@@ -11,7 +11,6 @@ Spec-driven planner for the full pipeline.
 
 Reads:
     artifacts_<slug>/specwright_spec_<slug>.md
-    artifacts_<slug>/cache/scaffolder_compressed_spec.md          optional preferred spec source
     artifacts_<slug>/state/scaffolder_codebase_skeleton.json
 
 Writes:
@@ -75,7 +74,6 @@ from typing import Any
 #
 # READS full:
 #   artifacts_<slug>/specwright_spec_<slug>.md
-#   artifacts_<slug>/cache/scaffolder_compressed_spec.md
 #   artifacts_<slug>/state/scaffolder_codebase_skeleton.json
 #
 # READS mini:
@@ -106,7 +104,6 @@ from artifacts.paths import (  # noqa: E402
     PLANNER_MINI_IMPACT,
     PLANNER_MINI_PLAN,
     SCAFFOLD_JSON,
-    SCAFFOLDER_COMPRESSED_SPEC,
     ensure_dirs,
     get_spec_path,
 )
@@ -603,13 +600,6 @@ def _call_planner_json(
 # ════════════════════════════════════════════════════════════════════════════
 
 def _load_full_spec() -> str:
-    """
-    Use scaffolder compressed spec if available, fallback to canonical spec.
-    """
-    if SCAFFOLDER_COMPRESSED_SPEC.exists():
-        _track_read(SCAFFOLDER_COMPRESSED_SPEC)
-        return SCAFFOLDER_COMPRESSED_SPEC.read_text(encoding="utf-8")
-
     spec_path = get_spec_path()
     if not spec_path.exists():
         raise FileNotFoundError(
