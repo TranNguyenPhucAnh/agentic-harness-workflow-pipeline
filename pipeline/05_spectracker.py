@@ -360,7 +360,13 @@ def _print_delta_summary(delta: SpecDelta) -> None:
 # ════════════════════════════════════════════════════════════════════════════
 
 def _snapshot_path(version: str) -> Path:
-    return KNOWLEDGE_HISTORY_DIR / f"{_safe_version_filename(version)}.md"
+    # Naming: spectracker_spec_snapshot_<version>.md
+    #   owner prefix : spectracker (naming_rules Rule 1+2)
+    #   semantic     : spec_snapshot — write-once raw spec content at this version
+    #   lifecycle    : write-once exception — NOT _overwrite_ (not per-run), NOT _log (not append)
+    #                  documented in TAXONOMY.md + OWNERSHIP.md Special Notes
+    #   extension    : .md — human-readable spec content (Rule 3)
+    return KNOWLEDGE_HISTORY_DIR / f"spectracker_spec_snapshot_{_safe_version_filename(version)}.md"
 
 
 def _save_snapshot_write_once(version: str, text: str) -> tuple[Path, bool]:
@@ -387,21 +393,19 @@ def _load_latest_snapshot(exclude_version: str) -> tuple[str | None, str | None]
     if not KNOWLEDGE_HISTORY_DIR.exists():
         return None, None
 
-    exclude_stem = _safe_version_filename(exclude_version)
+    exclude_stem = f"spectracker_spec_snapshot_{_safe_version_filename(exclude_version)}"
 
+    # Only match files following the new naming: spectracker_spec_snapshot_<version>.md
+    # This avoids accidentally picking up spectracker_version_log.md or other .md files.
     snapshots = sorted(
-        [
-            p
-            for p in KNOWLEDGE_HISTORY_DIR.glob("*.md")
-            if p.name != "spectracker_version_log.md"
-        ],
+        KNOWLEDGE_HISTORY_DIR.glob("spectracker_spec_snapshot_*.md"),
         key=lambda p: p.stem,
     )
 
     for snap in reversed(snapshots):
         if snap.stem != exclude_stem:
             _track_read(snap)
-            return snap.stem, snap.read_text()
+            return snap.stem.removeprefix("spectracker_spec_snapshot_"), snap.read_text()
 
     return None, None
 
