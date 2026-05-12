@@ -58,7 +58,8 @@ from artifacts.paths import (  # type: ignore
     ENRICHER_OVERWRITE_PROMPT,
     ensure_dirs,
 )
-from artifacts.models import call_model  # type: ignore
+from artifacts.models import call_model, get_model, get_provider  # type: ignore
+from modules.cost import print_call, print_summary, record_usage  # noqa: E402
 
 # Local aliases — map canonical constants to the short names used internally
 CLARIFICATION_REPORT = CLARIFICATOR_OVERWRITE_RAW
@@ -161,6 +162,12 @@ def _call_llm(
             ],
             max_tokens=max_tokens,
         )
+        usage = getattr(resp, "usage", None)
+        if usage:
+            pt        = getattr(usage, "prompt_tokens",     0) or 0
+            ct        = getattr(usage, "completion_tokens", 0) or 0
+            call_cost = record_usage(usage, model=get_model("enricher"), provider=get_provider("enricher"))
+            print_call(__file__, pt, ct, call_cost)
         content = resp.choices[0].message.content
         if not content or not content.strip():
             raise RuntimeError("Model returned empty content.")
@@ -569,8 +576,5 @@ def main() -> None:
         _launch_spec_agent(project_name)
 
     finally:
+        print_summary("[03]")
         _print_artifact_access_summary()
-
-
-if __name__ == "__main__":
-    main()
