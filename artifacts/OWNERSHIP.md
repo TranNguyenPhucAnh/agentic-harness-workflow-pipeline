@@ -79,12 +79,10 @@ In full harness runs, `write_applied()` is called by harness **at finalization t
 
 | Artifact | Owner | Consumers | Lifecycle |
 |---|---|---|---|
-| `scaffolder_compressed_spec.md` | `scaffolder` | planner, executor, patcher | persistent |
 | `spectracker_session_version_delta.json` | `spectracker` | harness | session |
 | `absorber_session_codebase_snapshot.json` | `absorber` | clarificator, enricher, planner | session |
 | `absorber_session_git_snapshot.json` | `absorber` | clarificator, enricher | session |
 
-> `scaffolder_compressed_spec.md`: pure cache — fully derivable from spec. Falls back to `get_spec_path()` if absent.
 > `spectracker_session_version_delta.json`: exception — in cache/ but drives harness control flow.
 
 ---
@@ -184,7 +182,6 @@ In full harness runs, `write_applied()` is called by harness **at finalization t
                               │                     <version>.md, <version>.changelog.md   (knowledge/history)
                               │
                               └─[scaffolder]─────► scaffolder_codebase_skeleton.json       (state)
-                                                    scaffolder_compressed_spec.md           (cache)
 
 [planner]────────────────► planner_full_execution_plan.json        (state)
                             planner_mini_execution_plan.json       (state)
