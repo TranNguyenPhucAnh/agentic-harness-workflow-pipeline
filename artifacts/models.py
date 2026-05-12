@@ -120,14 +120,9 @@ ROLES: dict[str, str] = {
 #   2. REASONING_OVERRIDES[role]
 #   3. REASONING_DEFAULT
 #
-# REASONING_EXPLICIT_DISABLE_PROVIDERS:
-#   Các provider có một số model dùng reasoning mặc định (default-on), ví dụ
-#   kimi-k2 và glm-5.1 trên OpenRouter. Nếu không gửi param gì, model tự bật
-#   thinking tokens dù config là OFF → stop_reason = "length" do tốn token.
-#   Provider trong set này sẽ luôn nhận explicit {"reasoning": {"enabled": False}}
-#   khi reasoning OFF, thay vì không gửi gì.
-#   Google (gemini qua OpenAI-compat endpoint) không hỗ trợ param này → không có
-#   trong set, tránh API error.
+# NOTE: {"reasoning": {"enabled": false}} là best-effort — provider/model có thể
+# tự kích hoạt reasoning khi input phức tạp. Không có client-side hard guarantee.
+# Để tắt cứng: dùng model không có reasoning mode (vd deepseek-v4-pro, qwen3.6-plus).
 
 REASONING_DEFAULT: bool = False
 
@@ -136,10 +131,6 @@ REASONING_OVERRIDES: dict[str, bool] = {
     "judge":     True,
     "planner":   True,
     # "executor":  True,
-}
-
-REASONING_EXPLICIT_DISABLE_PROVIDERS: set[str] = {
-    "openrouter",
 }
 
 
@@ -234,29 +225,17 @@ def reasoning_params(role: str, override: bool | None = None) -> dict[str, Any]:
     """
     Return extra kwargs to pass to chat.completions.create() for reasoning.
 
-    Behavior:
-      - reasoning ON  → {"extra_body": {"reasoning": {"enabled": True}}}
-                        (áp dụng mọi provider)
-      - reasoning OFF + provider trong REASONING_EXPLICIT_DISABLE_PROVIDERS
-                      → {"extra_body": {"reasoning": {"enabled": False}}}
-                        (explicit disable — tránh default-on của kimi, glm, ...)
-      - reasoning OFF + provider KHÔNG trong set
-                      → {} (không gửi param — vd google không hỗ trợ field này)
+    reasoning ON  → {"extra_body": {"reasoning": {"enabled": True}}}
+    reasoning OFF → {} (không gửi param — best-effort, không hard guarantee)
 
     Example:
         extra = reasoning_params("judge")
         client.chat.completions.create(model=model, messages=msgs, **extra)
     """
     enabled = _resolve_reasoning(role, override)
-
-    if enabled:
-        return {"extra_body": {"reasoning": {"enabled": True}}}
-
-    provider_key, _ = _parse_role(role)
-    if provider_key in REASONING_EXPLICIT_DISABLE_PROVIDERS:
-        return {"extra_body": {"reasoning": {"enabled": False}}}
-
-    return {}
+    if not enabled:
+        return {}
+    return {"extra_body": {"reasoning": {"enabled": True}}}
 
 
 def call_model(
