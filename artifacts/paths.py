@@ -603,7 +603,6 @@ SPECTRACKER_VERSION_LOG = _LazyPath("knowledge/history/spectracker_version_log.m
 
 # NOTE: spectracker also writes dynamic per-version files at runtime:
 #   knowledge/history/<version>.md           — raw spec snapshot at version apply time
-#   knowledge/history/<version>.changelog.md — per-version changelog entry
 # These are write-once, constructed by spectracker using the version string.
 # Cannot be static LazyPath constants — spectracker builds paths at runtime.
 # Consumed internally by spectracker._load_latest_snapshot() for future delta computation.
