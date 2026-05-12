@@ -905,7 +905,7 @@ def call_judge(
                 {"role": "user",   "content": briefing},
             ],
             temperature=0.1,
-            max_tokens=16000,
+            max_tokens=32768,
         )
 
         usage = resp.usage
