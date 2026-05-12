@@ -601,11 +601,14 @@ PATCHER_ATTEMPT_LOG = _LazyPath("knowledge/history/patcher_attempt_log.json")
 #            Distinct from spectracker_overwrite_version_delta.json (per-run machine diff).
 SPECTRACKER_VERSION_LOG = _LazyPath("knowledge/history/spectracker_version_log.md")
 
-# NOTE: spectracker also writes dynamic per-version files at runtime:
-#   knowledge/history/<version>.md           — raw spec snapshot at version apply time
-# These are write-once, constructed by spectracker using the version string.
-# Cannot be static LazyPath constants — spectracker builds paths at runtime.
-# Consumed internally by spectracker._load_latest_snapshot() for future delta computation.
+# NOTE: spectracker also writes dynamic per-version snapshot files at runtime:
+#   knowledge/history/spectracker_spec_snapshot_<version>.md
+#     owner prefix : spectracker (naming_rules Rule 1+2)
+#     lifecycle    : write-once exception — not _overwrite_ (not per-run), not _log (not append)
+#                    documented in TAXONOMY.md + OWNERSHIP.md Special Notes
+#     purpose      : preserved spec content at each version for future delta baseline computation
+# Cannot be static LazyPath constants — spectracker builds paths at runtime via _snapshot_path().
+# Consumed internally by spectracker._load_latest_snapshot().
 
 # ── Backward-compatible aliases (knowledge/history/) ─────────────────────────
 UPDATE_LOG     = ARCHIVIST_CURATION_LOG
