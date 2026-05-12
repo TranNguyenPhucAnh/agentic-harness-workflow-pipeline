@@ -59,7 +59,6 @@ artifacts_<slug>/
 │       ├── patcher_attempt_log.json
 │       ├── spectracker_version_log.md
 │       ├── <version>.md               ← write-once spec snapshots (spectracker)
-│       └── <version>.changelog.md     ← write-once per-version changelog (spectracker)
 │
 ├── session_runs/                          ← project-global run history (harness)
 │   ├── session_001_runs.json
@@ -111,7 +110,6 @@ artifacts_<slug>/
 | `knowledge/history/patcher_attempt_log.json` | P | `patcher` | append | human review, archivist |
 | `knowledge/history/spectracker_version_log.md` | P | `spectracker` | append | human review |
 | `knowledge/history/<version>.md` | P | `spectracker` | write-once | spectracker (delta computation) |
-| `knowledge/history/<version>.changelog.md` | P | `spectracker` | write-once | human review |
 | `session_runs/session_<N>_runs.json` | P | `harness` | append‡ | harness, human review |
 
 † `spectracker_applied_version.json`: top-level fields overwrite each run; embedded `run_history[]` is append-only.
@@ -140,7 +138,7 @@ artifacts_<slug>/
                               ├─[spectracker]────► spectracker_overwrite_version_delta.json → harness
                               │                     spectracker_applied_version.json
                               │                     spectracker_version_log.md (append)
-                              │                     <version>.md, <version>.changelog.md
+                              │                     <version>.md
                               │
                               └─[scaffolder]─────► scaffolder_codebase_skeleton.json
 
@@ -244,8 +242,8 @@ Core persistent knowledge base. Consolidates three retired artifacts: `base.md`,
 ### `knowledge/current/archivist_spec_gaps.md`
 Edge cases and spec gaps surfaced by judge, human-approved via archivist interactive flow. Injected into judge briefing so future runs are aware of known gaps. Also feeds specwright on next spec revision. Human-editable.
 
-### `knowledge/history/<version>.md` and `<version>.changelog.md`
-Write-once files created by spectracker each time a new spec version is applied. `<version>.md` is the raw spec snapshot used internally by spectracker for future delta computation (`_load_latest_snapshot`). `<version>.changelog.md` is the human-readable per-version changelog. Both are dynamic paths constructed at runtime — not static constants in paths.py.
+### `knowledge/history/<version>.md`
+Write-once files created by spectracker each time a new spec version is applied. `<version>.md` is the raw spec snapshot used internally by spectracker for future delta computation (`_load_latest_snapshot`). Dynamic path constructed at runtime — not static constants in paths.py.
 
 ### `knowledge/history/archivist_curation_log.json`
 Audit trail of human decisions when reviewing judge findings: which findings were applied to knowledge base, skipped, or escalated to spec bump. Distinct from `patcher_attempt_log.json` — archivist modifies knowledge artifacts while patcher modifies src/ directly.
