@@ -327,10 +327,10 @@ def _safe_src_output_path(file_path: str) -> Path | None:
     out_path = SRC_DIR / rel
 
     try:
-        src_root = SRC_DIR.resolve()
+        src_root = Path(SRC_DIR).resolve()
         resolved = out_path.resolve()
     except FileNotFoundError:
-        src_root = SRC_DIR.absolute()
+        src_root = Path(SRC_DIR).absolute()
         resolved = out_path.absolute()
 
     if resolved != src_root and src_root not in resolved.parents:
