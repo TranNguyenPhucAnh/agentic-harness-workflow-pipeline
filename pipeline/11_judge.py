@@ -16,7 +16,7 @@ When PIPELINE_SESSION is not set, paths.py falls back to the legacy layout:
 
 Supports both:
   - FULL/PARTIAL flow:
-      specwright_spec_<slug>.md / scaffolder_compressed_spec.md,
+      specwright_spec_<slug>.md,
       planner_full_execution_plan.json,
       scaffolder_codebase_skeleton.json,
       debugger_overwrite_test_summary.json,
@@ -65,7 +65,6 @@ from typing import Any
 # OWNS  : artifacts_<slug>/sessions/<NNN>/execution/judge_overwrite_verdict_raw.json
 #         artifacts_<slug>/sessions/<NNN>/reports/judge_verdict_summary.md
 # READS : artifacts_<slug>/specwright_spec_<slug>.md
-#         artifacts_<slug>/sessions/<NNN>/cache/scaffolder_compressed_spec.md
 #         artifacts_<slug>/sessions/<NNN>/state/planner_full_execution_plan.json
 #         artifacts_<slug>/sessions/<NNN>/state/planner_mini_execution_plan.json
 #         artifacts_<slug>/sessions/<NNN>/state/planner_mini_impact_analysis.json
@@ -92,7 +91,6 @@ from artifacts.paths import (  # noqa: E402
     PLANNER_MINI_IMPACT,
     PLANNER_MINI_PLAN,
     SCAFFOLD_JSON,
-    SCAFFOLDER_COMPRESSED_SPEC,
     SPECTRACKER_VERSION_DELTA,
     SRC_DIR,
     TESTS_DIR,
@@ -334,9 +332,6 @@ def _load_delta() -> dict[str, Any] | None:
 
 
 def _load_spec_optional() -> str:
-    if SCAFFOLDER_COMPRESSED_SPEC.exists():
-        return _read_text(SCAFFOLDER_COMPRESSED_SPEC)
-
     spec_path = get_spec_path()
     return _read_text(spec_path)
 
