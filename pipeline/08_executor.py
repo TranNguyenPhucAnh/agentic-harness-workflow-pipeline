@@ -30,7 +30,7 @@ Delta mode:
         Other restored files in src/ are used as import/context references.
 
 Reads:
-    artifacts_<slug>/specwright_spec_<slug>.md or cache/scaffolder_compressed_spec.md
+    artifacts_<slug>/specwright_spec_<slug>.md
     artifacts_<slug>/state/scaffolder_codebase_skeleton.json
     artifacts_<slug>/state/planner_full_execution_plan.json         optional, with --use-planner-plan
 
@@ -90,7 +90,6 @@ from typing import Any
 #
 # READS full:
 #   artifacts_<slug>/specwright_spec_<slug>.md
-#   artifacts_<slug>/cache/scaffolder_compressed_spec.md
 #   artifacts_<slug>/state/scaffolder_codebase_skeleton.json
 #   artifacts_<slug>/state/planner_full_execution_plan.json
 #
@@ -108,7 +107,6 @@ from artifacts.paths import (  # noqa: E402
     PLANNER_MINI_IMPACT,
     PLANNER_MINI_PLAN,
     SCAFFOLD_JSON,
-    SCAFFOLDER_COMPRESSED_SPEC,
     SRC_DIR,
     artifact_root,
     ensure_dirs,
@@ -425,13 +423,6 @@ def _safe_artifact_output_path(rel_path: str) -> Path | None:
 # ════════════════════════════════════════════════════════════════════════════
 
 def _load_spec() -> str:
-    """
-    Use scaffolder compressed spec if available, fallback to canonical spec.
-    """
-    if SCAFFOLDER_COMPRESSED_SPEC.exists():
-        _track_read(SCAFFOLDER_COMPRESSED_SPEC)
-        return SCAFFOLDER_COMPRESSED_SPEC.read_text(encoding="utf-8")
-
     spec_path = get_spec_path()
     if not spec_path.exists():
         raise FileNotFoundError(
