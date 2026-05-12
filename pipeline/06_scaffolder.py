@@ -125,6 +125,18 @@ SYSTEM_PROMPT = textwrap.dedent("""
     - Preserve file paths exactly as specified by the spec unless the output
       schema explicitly says otherwise.
       
+    STRICT SKELETON RULES — NO EXCEPTIONS:
+    - Do NOT write any business logic, algorithm, or implementation body.
+    - Do NOT write SQL queries, API calls, data transformations, or computation.
+    - Every function/method body MUST be exactly one placeholder line, for examples:
+        Python : raise NotImplementedError
+        TS/JS  : throw new Error("not implemented")
+        Go     : panic("not implemented")
+        Java   : throw new UnsupportedOperationException("not implemented")
+    - Class attributes, fields, constructor params: declare types only, no default values beyond None/null/zero.
+    - Config files (JSON/YAML/TOML): include all keys from spec, values are empty string "", [], or {}.
+    - No helper utilities, no inline logic, no conditional branches.
+    
     Output schema for each file entry (STRICT — no other key names allowed):
     {
       "file_path": "relative/path/to/file.py",   // NOT "path", NOT "filepath"
