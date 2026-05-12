@@ -8,7 +8,6 @@ step and use the mini planner/implementer flow instead.
 
 Writes, owner: scaffolder:
   artifacts_<slug>/state/scaffolder_codebase_skeleton.json
-  artifacts_<slug>/cache/scaffolder_compressed_spec.md
   artifacts_<slug>/src/**
   artifacts_<slug>/tests/**
 
@@ -42,7 +41,6 @@ from typing import Any
 
 # === WRITE AUTHORITY: scaffolder ===
 # OWNS  : artifacts_<slug>/state/scaffolder_codebase_skeleton.json
-#         artifacts_<slug>/cache/scaffolder_compressed_spec.md
 #         artifacts_<slug>/src/**
 #         artifacts_<slug>/tests/**
 # READS : artifacts_<slug>/specwright_spec_<slug>.md
@@ -51,7 +49,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from artifacts.models import call_model, get_model, get_provider  # noqa: E402
 from artifacts.paths import (  # noqa: E402
     SCAFFOLD_JSON,
-    SCAFFOLDER_COMPRESSED_SPEC,
     SRC_DIR,
     TESTS_DIR,
     ensure_dirs,
@@ -348,43 +345,7 @@ def _validate_scaffold(scaffold: dict[str, Any]) -> None:
 
         normalized.append(entry)
 
-    scaffold["files"] = normalized  # write_files sẽ thấy đúng key
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Spec compression
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _compress_spec(spec: str) -> str:
-    """
-    Create compressed version of the canonical spec for downstream models.
-
-    Removes sections commonly useful only for scaffold-generation instructions:
-      - ## 0.
-      - ## 8.
-
-    Keeps the rest of the spec intact.
-    """
-    lines = spec.splitlines()
-    out: list[str] = []
-
-    skip = False
-    skip_headers = ("## 0.", "## 8.")
-    resume_prefix = "## "
-
-    for line in lines:
-        if any(line.startswith(h) for h in skip_headers):
-            skip = True
-        elif (
-            skip
-            and line.startswith(resume_prefix)
-            and not any(line.startswith(h) for h in skip_headers)
-        ):
-            skip = False
-
-        if not skip:
-            out.append(line)
-
-    return "\n".join(out)
+    scaffold["files"] = normalized
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -433,7 +394,7 @@ def _destination_for_entry(entry: dict[str, Any]) -> Path:
     return SRC_DIR / rel
 
 
-def write_files(scaffold: dict[str, Any], spec: str) -> None:
+def write_files(scaffold: dict[str, Any]) -> None:
     SCAFFOLD_JSON.parent.mkdir(parents=True, exist_ok=True)
     SCAFFOLD_JSON.write_text(json.dumps(scaffold, indent=2))
     _track_write(SCAFFOLD_JSON)
@@ -441,7 +402,6 @@ def write_files(scaffold: dict[str, Any], spec: str) -> None:
 
     for entry in scaffold["files"]:
         dest = _destination_for_entry(entry)
-
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(entry["code"])
         _track_write(dest)
@@ -449,20 +409,10 @@ def write_files(scaffold: dict[str, Any], spec: str) -> None:
         tag = "TEST" if entry.get("is_test", False) else "SRC "
         print(f"[06] [{tag}] {dest}")
 
-    compressed = _compress_spec(spec)
-    SCAFFOLDER_COMPRESSED_SPEC.parent.mkdir(parents=True, exist_ok=True)
-    SCAFFOLDER_COMPRESSED_SPEC.write_text(compressed)
-    _track_write(SCAFFOLDER_COMPRESSED_SPEC)
-
-    savings = 0
-    if spec:
-        savings = round((1 - len(compressed) / len(spec)) * 100)
-
-    print(f"[06] Compressed spec → {SCAFFOLDER_COMPRESSED_SPEC} ({savings}% smaller)")
     print("[06] Done.")
 
 
-def preview_files(scaffold: dict[str, Any], spec: str) -> None:
+def preview_files(scaffold: dict[str, Any]) -> None:
     print("[06] --dry-run: scaffold validated. No files written.")
     print(f"[06] Would write scaffold JSON → {SCAFFOLD_JSON}")
 
@@ -470,10 +420,6 @@ def preview_files(scaffold: dict[str, Any], spec: str) -> None:
         dest = _destination_for_entry(entry)
         tag = "TEST" if entry.get("is_test", False) else "SRC "
         print(f"[06] Would write [{tag}] {dest}")
-
-    compressed = _compress_spec(spec)
-    savings = round((1 - len(compressed) / len(spec)) * 100) if spec else 0
-    print(f"[06] Would write compressed spec → {SCAFFOLDER_COMPRESSED_SPEC} ({savings}% smaller)")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -510,10 +456,10 @@ def main() -> None:
             spec,
             max_retries=args.max_retries,
         )
-      
+
         # DEBUG
         if scaffold.get("files"):
-          print(f"[06][debug] files[0] keys: {list(scaffold['files'][0].keys())}", file=sys.stderr)
+            print(f"[06][debug] files[0] keys: {list(scaffold['files'][0].keys())}", file=sys.stderr)
 
         try:
             _validate_scaffold(scaffold)
@@ -527,10 +473,10 @@ def main() -> None:
             sys.exit(1)
 
         if args.dry_run:
-            preview_files(scaffold, spec)
+            preview_files(scaffold)
             return
 
-        write_files(scaffold, spec)
+        write_files(scaffold)
 
     except SystemExit as exc:
         code = exc.code
