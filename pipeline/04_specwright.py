@@ -56,7 +56,8 @@ from artifacts.paths import (  # type: ignore
     ensure_dirs,
     get_spec_path,
 )
-from artifacts.models import call_model, get_model  # type: ignore
+from artifacts.models import call_model, get_model, get_provider  # type: ignore
+from modules.cost import print_call, print_summary, record_usage  # noqa: E402
 
 # Local aliases — map canonical constants to the short names used internally
 CLARIFICATION_REPORT = CLARIFICATOR_OVERWRITE_RAW
@@ -229,6 +230,12 @@ def _call_llm(
             ],
             max_tokens=max_tokens,
         )
+        usage = getattr(resp, "usage", None)
+        if usage:
+            pt        = getattr(usage, "prompt_tokens",     0) or 0
+            ct        = getattr(usage, "completion_tokens", 0) or 0
+            call_cost = record_usage(usage, model=get_model("specwright"), provider=get_provider("specwright"))
+            print_call(__file__, pt, ct, call_cost)
         content = resp.choices[0].message.content
         if not content or not content.strip():
             raise RuntimeError("Model returned empty content.")
@@ -689,6 +696,7 @@ def main() -> None:
             _print_harness_instructions(project_name, spec_file)
 
     finally:
+        print_summary("[04]")
         _print_artifact_access_summary()
 
 
