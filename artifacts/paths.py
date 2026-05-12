@@ -312,6 +312,12 @@ class _LazyPath:
     def iterdir(self):
         return self._resolve().iterdir()
 
+    def resolve(self, **kwargs) -> Path:
+        return self._resolve().resolve(**kwargs)
+    
+    def absolute(self) -> Path:
+        return self._resolve().absolute()
+
 
 # ── Scoped LazyPath ───────────────────────────────────────────────────────────
 
