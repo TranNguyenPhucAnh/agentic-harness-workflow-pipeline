@@ -34,7 +34,6 @@ Writes:
 
 Reads:
   artifacts_<slug>/specwright_spec_<slug>.md
-  artifacts_<slug>/cache/scaffolder_compressed_spec.md
   artifacts_<slug>/state/planner_full_execution_plan.json
   artifacts_<slug>/state/planner_mini_execution_plan.json
   artifacts_<slug>/state/planner_mini_impact_analysis.json
@@ -88,7 +87,6 @@ from artifacts.paths import (  # noqa: E402
     PLANNER_FULL_PLAN,
     PLANNER_MINI_IMPACT,
     PLANNER_MINI_PLAN,
-    SCAFFOLDER_COMPRESSED_SPEC,
     SRC_DIR,
     TESTS_DIR,
     artifact_root,
@@ -292,9 +290,6 @@ def _current_scope() -> str:
 
 
 def _load_spec_or_full_context() -> str:
-    if SCAFFOLDER_COMPRESSED_SPEC.exists():
-        return _read_text_if_exists(SCAFFOLDER_COMPRESSED_SPEC).strip()
-
     spec_path = get_spec_path()
     if spec_path.exists():
         _track_read(spec_path)
