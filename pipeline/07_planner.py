@@ -190,14 +190,28 @@ If the project is a monorepo or mixed stack, represent that explicitly, for exam
   }
 }
 
-## Step 1 — Plan each non-test stub file
+## Step 1 — Plan EVERY file in the scaffold
 
-For each non-test stub file, output a task object describing:
-- What the file does and its role in the system
-- Ordered list of implementation sub-tasks, in dependency-aware order
-- Key types / interfaces / schemas / models this file depends on, with source file
-- Gotchas or edge cases the implementer must handle
-- Styling hints for visual/UI components if applicable
+RULE — FULL COVERAGE:
+Every file listed in implementation_order MUST have a task entry with sub_tasks.
+No file may appear only as a depends_on reference without its own task entry.
+This includes: types files, error/exception definitions, config files, entry points,
+constants files, and any other file that appears in the scaffold.
+
+For each file, output a task object with:
+- behavior_summary: 1-2 sentences describing what this file does in the context of
+  the overall system — written so the implementer understands the file's role WITHOUT
+  needing to read the spec. Be concrete: name the callers, the data it produces, the
+  invariants it maintains.
+- role: one-sentence functional label (same as before)
+- depends_on: list of files this file imports from
+- sub_tasks: ordered implementation steps, specific enough that the implementer does
+  not need the spec. For types/interfaces files: list every type, interface, enum, and
+  constant to define with their fields and value constraints.
+- gotchas: edge cases and framework quirks the implementer must handle
+- notes: cross-cutting concerns from global context that apply ONLY to this file
+  (see Rule — Notes Distribution below)
+- tailwind_hints: styling hints for visual components, or null
 
 ## Step 2 — Stack-specific gotchas
 
@@ -233,8 +247,27 @@ Return a single JSON object — NO markdown fences, raw JSON only:
   },
   "tasks": [
     {
+      "file_path": "src/types/sensor.ts",
+      "behavior_summary": "Defines all shared TypeScript types used across the app. Every other file imports from here — it has no runtime logic, only type declarations.",
+      "role": "Shared type definitions for sensor data, anomaly records, and replay state.",
+      "depends_on": [],
+      "sub_tasks": [
+        "1. Define SensorPoint interface with fields: timestamp (number), temperature (number), humidity (number), pressure (number), decisionScore (number).",
+        "2. Define AnomalyCluster interface with fields: startIndex (number), endIndex (number), severity ('low'|'medium'|'high').",
+        "3. Define ReplayState type as union: 'idle' | 'playing' | 'paused' | 'done'.",
+        "4. Export all types — no default export."
+      ],
+      "gotchas": [
+        "TypeScript strict mode: every field must be explicitly typed; avoid implicit any.",
+        "Do not add runtime values (classes, constants) here — types only."
+      ],
+      "notes": [],
+      "tailwind_hints": null
+    },
+    {
       "file_path": "src/hooks/useSensorData.ts",
-      "role": "one-sentence role description",
+      "behavior_summary": "Generates and manages the sensor dataset for the dashboard. Called once by App.tsx on mount. Consumers (AnomalyFeed, ReplayControls) read data from this hook via context or props.",
+      "role": "React hook producing the demo sensor dataset with injected anomaly clusters.",
       "depends_on": ["src/types/sensor.ts", "src/data/demoConstants.ts"],
       "sub_tasks": [
         "1. Generate base SensorPoint array using POINTS_PER_DAY constant ...",
@@ -245,6 +278,7 @@ Return a single JSON object — NO markdown fences, raw JSON only:
         "decisionScore must be negative for anomaly points (-0.05 to -0.45)",
         "React state updates derived from timers must be cleaned up in useEffect cleanup"
       ],
+      "notes": [],
       "tailwind_hints": null
     }
   ],
@@ -259,14 +293,25 @@ Return a single JSON object — NO markdown fences, raw JSON only:
     "src/components/ModelGates.tsx",
     "src/App.tsx",
     "src/main.tsx"
-  ],
-  "global_notes": "any cross-cutting concerns the implementer should know"
+  ]
 }
+
+RULE — NOTES DISTRIBUTION:
+Do NOT output a global_notes string. Instead, for each cross-cutting concern,
+inject it into the notes[] array of ONLY the task(s) it directly applies to.
+A note that applies to 3 files goes into those 3 tasks, not into a global field.
+notes[] for a task should contain only concerns directly relevant to that file.
+If a task has no relevant cross-cutting notes, set notes to [].
 
 Rules:
 - Reason as deeply as needed — this is your reasoning budget well spent.
 - Be specific: reference exact constant names, prop names, type names, schema names, and file paths from the spec/scaffold.
+- Every file in implementation_order must have a task entry — no exceptions.
 - implementation_order must respect dependency order.
+- behavior_summary must be self-contained: the implementer should understand the
+  file's role without reading the spec. Name callers, consumers, and invariants.
+- sub_tasks for types/interfaces/errors files must enumerate every type/class to
+  define with their fields and value constraints — not just "define types".
 - tailwind_hints: include for visual components if the detected stack uses Tailwind; otherwise provide relevant styling hints or null.
 - Do not assume TypeScript, React, Vite, Tailwind, or Vitest unless the spec/scaffold actually indicates them.
 - Do not use implementation patterns from a different stack than the one detected.
