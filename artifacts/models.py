@@ -16,6 +16,9 @@ Usage
 Reasoning toggle
 ────────────────
     # Default: reasoning OFF toàn bộ (xem REASONING_OVERRIDES bên dưới)
+    # Với các provider trong REASONING_EXPLICIT_DISABLE_PROVIDERS (vd openrouter),
+    # reasoning OFF sẽ được gửi EXPLICIT {"reasoning": {"enabled": False}} thay vì
+    # không gửi gì — tránh model dùng default-on reasoning của provider (kimi, glm, ...).
 
     # Bật cho một call cụ thể:
     extra = reasoning_params("judge")
@@ -116,6 +119,15 @@ ROLES: dict[str, str] = {
 #   1. per-call argument trong call_model(..., reasoning=True/False)
 #   2. REASONING_OVERRIDES[role]
 #   3. REASONING_DEFAULT
+#
+# REASONING_EXPLICIT_DISABLE_PROVIDERS:
+#   Các provider có một số model dùng reasoning mặc định (default-on), ví dụ
+#   kimi-k2 và glm-5.1 trên OpenRouter. Nếu không gửi param gì, model tự bật
+#   thinking tokens dù config là OFF → stop_reason = "length" do tốn token.
+#   Provider trong set này sẽ luôn nhận explicit {"reasoning": {"enabled": False}}
+#   khi reasoning OFF, thay vì không gửi gì.
+#   Google (gemini qua OpenAI-compat endpoint) không hỗ trợ param này → không có
+#   trong set, tránh API error.
 
 REASONING_DEFAULT: bool = False
 
@@ -124,6 +136,10 @@ REASONING_OVERRIDES: dict[str, bool] = {
     "judge":     True,
     "planner":   True,
     # "executor":  True,
+}
+
+REASONING_EXPLICIT_DISABLE_PROVIDERS: set[str] = {
+    "openrouter",
 }
 
 
@@ -218,18 +234,29 @@ def reasoning_params(role: str, override: bool | None = None) -> dict[str, Any]:
     """
     Return extra kwargs to pass to chat.completions.create() for reasoning.
 
-    If reasoning is OFF → returns {} (no extra params).
-    If reasoning is ON  → returns {"extra_body": {"reasoning": {"enabled": True}}}
-    using extra_body so the openai SDK passes it through to the provider.
+    Behavior:
+      - reasoning ON  → {"extra_body": {"reasoning": {"enabled": True}}}
+                        (áp dụng mọi provider)
+      - reasoning OFF + provider trong REASONING_EXPLICIT_DISABLE_PROVIDERS
+                      → {"extra_body": {"reasoning": {"enabled": False}}}
+                        (explicit disable — tránh default-on của kimi, glm, ...)
+      - reasoning OFF + provider KHÔNG trong set
+                      → {} (không gửi param — vd google không hỗ trợ field này)
 
     Example:
         extra = reasoning_params("judge")
         client.chat.completions.create(model=model, messages=msgs, **extra)
     """
     enabled = _resolve_reasoning(role, override)
-    if not enabled:
-        return {}
-    return {"extra_body": {"reasoning": {"enabled": True}}}
+
+    if enabled:
+        return {"extra_body": {"reasoning": {"enabled": True}}}
+
+    provider_key, _ = _parse_role(role)
+    if provider_key in REASONING_EXPLICIT_DISABLE_PROVIDERS:
+        return {"extra_body": {"reasoning": {"enabled": False}}}
+
+    return {}
 
 
 def call_model(
@@ -299,7 +326,7 @@ def model_info(role: str | None = None) -> dict | list[dict]:
     Example:
         print(model_info("executor"))
         # {'role': 'executor', 'provider': 'openrouter',
-        #   'model': 'deepseek/deepseek-v4-pro', 'reasoning': False}
+        #   'model': 'anthropic/claude-sonnet-4.6', 'reasoning': False}
     """
     def _info(r: str) -> dict:
         pk, ms = _parse_role(r)
