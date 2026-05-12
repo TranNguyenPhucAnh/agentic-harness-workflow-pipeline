@@ -9,7 +9,7 @@ issues, but this script must still enforce scope safety.
 
 Supports:
   - FULL flow:
-      Uses canonical spec / scaffolder_compressed_spec + judge finding +
+      Uses canonical spec + judge finding +
       affected src files. Patch scope defaults to src/** only. Never patches tests.
 
   - MINI targeted flow:
@@ -34,7 +34,6 @@ Reads:
   artifacts_<slug>/sessions/<NNN>/state/clarificator_requirement_synthesis.md
   artifacts_<slug>/sessions/<NNN>/execution/enricher_overwrite_enriched_prompt.md
   artifacts_<slug>/knowledge/current/archivist_knowledge_log.md
-  artifacts_<slug>/sessions/<NNN>/cache/scaffolder_compressed_spec.md
   artifacts_<slug>/specwright_spec_<slug>.md
 
 Direct execution:
@@ -77,7 +76,6 @@ from typing import Any
 #         artifacts_<slug>/sessions/<NNN>/state/clarificator_requirement_synthesis.md
 #         artifacts_<slug>/sessions/<NNN>/execution/enricher_overwrite_enriched_prompt.md
 #         artifacts_<slug>/knowledge/current/archivist_knowledge_log.md
-#         artifacts_<slug>/sessions/<NNN>/cache/scaffolder_compressed_spec.md
 #         artifacts_<slug>/specwright_spec_<slug>.md
 #         artifacts_<slug>/src/**
 
@@ -95,7 +93,6 @@ from artifacts.paths import (  # noqa: E402
     PLANNER_FULL_PLAN,
     PLANNER_MINI_IMPACT,
     PLANNER_MINI_PLAN,
-    SCAFFOLDER_COMPRESSED_SPEC,
     SRC_DIR,
     artifact_root,
     ensure_dirs,
@@ -644,9 +641,7 @@ def extract_findings(
 
 
 def _load_full_context() -> str:
-    spec = _read_text(SCAFFOLDER_COMPRESSED_SPEC)
-    if not spec:
-        spec = _read_text(get_spec_path())
+    spec = _read_text(get_spec_path())
 
     parts = ["## Canonical spec\n\n" + (spec or "[canonical spec missing]")]
 
