@@ -126,7 +126,6 @@ In full harness runs, `write_applied()` is called by harness **at finalization t
 | `patcher_attempt_log.json` | `patcher` | human review, archivist | append-only log |
 | `spectracker_version_log.md` | `spectracker` | human review | append-only log |
 | `<version>.md` *(dynamic)* | `spectracker` | spectracker (delta computation) | write-once |
-| `<version>.changelog.md` *(dynamic)* | `spectracker` | human review | write-once |
 
 > Dynamic paths are constructed by spectracker at runtime using the version string.
 > Cannot be static constants in paths.py.
@@ -176,12 +175,11 @@ In full harness runs, `write_applied()` is called by harness **at finalization t
 
 [specwright]─────────────► specwright_spec_<slug>.md               (root)
                               │
-                              ├─[spectracker]────► spectracker_session_version_delta.json  (cache, session)
-                              │                     spectracker_applied_version.json        (state, hybrid)
-                              │                     spectracker_version_log.md (append)    (knowledge/history)
-                              │                     <version>.md, <version>.changelog.md   (knowledge/history)
+                              ├─[spectracker]────► spectracker_session_version_delta.json (cache, session)
+                              │                    spectracker_applied_version.json       (state, hybrid)
+                              │                    spectracker_version_log.md (append)    (knowledge/history)
                               │
-                              └─[scaffolder]─────► scaffolder_codebase_skeleton.json       (state)
+                              └─[scaffolder]─────► scaffolder_codebase_skeleton.json      (state)
 
 [planner]────────────────► planner_full_execution_plan.json        (state)
                             planner_mini_execution_plan.json       (state)
