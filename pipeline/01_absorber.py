@@ -89,7 +89,11 @@ from artifacts.paths import (  # noqa: E402
     artifact_root,
     ensure_dirs,
 )
-from artifacts.models import call_model  # noqa: E402
+from artifacts.models import call_model, get_model, get_provider  # noqa: E402
+from modules.artifact_tracking import track_read, track_write, print_summary as print_artifact_summary  # noqa: E402
+from modules.cost import print_call, print_summary, record_usage  # noqa: E402
+from modules.md_header import apply_header as apply_md_header  # noqa: E402
+from modules.post_interactive import prompt_next_step  # noqa: E402
 
 # Local aliases — map canonical constants to the short names used internally
 ABSORBER_CACHE = ABSORBER_CODEBASE_SNAPSHOT
@@ -100,40 +104,12 @@ GIT_HISTORY    = ABSORBER_GIT_SNAPSHOT
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Artifact/source access tracking
-# ─────────────────────────────────────────────────────────────────────────────
-
-_ARTIFACTS_READ: set[str] = set()
-_ARTIFACTS_WRITTEN: set[str] = set()
-
-
-def _track_read(path: Any) -> None:
-    _ARTIFACTS_READ.add(str(path))
-
-
-def _track_write(path: Any) -> None:
-    _ARTIFACTS_WRITTEN.add(str(path))
-
-
-def _print_artifact_access_summary() -> None:
-    print("[01] Artifacts/files read:")
-    if _ARTIFACTS_READ:
-        for item in sorted(_ARTIFACTS_READ):
-            print(f"[01]   READ  {item}")
-    else:
-        print("[01]   READ  (none)")
-
-    print("[01] Artifacts/files created/updated/overwritten/appended:")
-    if _ARTIFACTS_WRITTEN:
-        for item in sorted(_ARTIFACTS_WRITTEN):
-            print(f"[01]   WRITE {item}")
-    else:
-        print("[01]   WRITE (none)")
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-_MAX_TOKENS_MAP = 16384
+ROLE             = "absorber"
+_MAX_TOKENS_MAP  = 16384
 _MAX_FILE_BYTES = 256 * 1024
 _IGNORED_FILE = "absorber.ignored"
 
@@ -234,7 +210,7 @@ class AbsorberIgnoreRules:
         if not path.exists():
             return
 
-        _track_read(path)
+        track_read(path)
 
         mode = "skip"
         for raw in path.read_text(errors="replace").splitlines():
@@ -306,7 +282,7 @@ class AbsorberIgnoreRules:
 def _load_cache() -> dict[str, Any]:
     if ABSORBER_CACHE.exists():
         try:
-            _track_read(ABSORBER_CACHE)
+            track_read(ABSORBER_CACHE)
             return json.loads(ABSORBER_CACHE.read_text())
         except Exception:
             pass
@@ -316,12 +292,12 @@ def _load_cache() -> dict[str, Any]:
 def _save_cache(cache: dict[str, Any]) -> None:
     ABSORBER_CACHE.parent.mkdir(parents=True, exist_ok=True)
     ABSORBER_CACHE.write_text(json.dumps(cache, indent=2))
-    _track_write(ABSORBER_CACHE)
+    track_write(ABSORBER_CACHE)
 
 
 def _file_hash(path: Path) -> str:
     try:
-        _track_read(path)
+        track_read(path)
         return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
     except Exception:
         return ""
@@ -605,7 +581,7 @@ def extract_content(
 
 def _extract_full(path: Path) -> str:
     try:
-        _track_read(path)
+        track_read(path)
         return path.read_text(errors="replace")
     except Exception as e:
         return f"[read error: {e}]"
@@ -758,7 +734,7 @@ def _extract_signature(path: Path, ext: str, lang: str | None) -> str:
         return _extract_ts_signatures(path)
 
     try:
-        _track_read(path)
+        track_read(path)
         lines = path.read_text(errors="replace").splitlines()
         preview = "\n".join(lines[:50])
         if len(lines) > 50:
@@ -770,7 +746,7 @@ def _extract_signature(path: Path, ext: str, lang: str | None) -> str:
 
 def _extract_python_signatures(path: Path) -> str:
     try:
-        _track_read(path)
+        track_read(path)
         source = path.read_text(errors="replace")
         tree = ast.parse(source)
     except SyntaxError:
@@ -817,7 +793,7 @@ def _extract_python_signatures(path: Path) -> str:
         return "\n".join(lines)
 
     try:
-        _track_read(path)
+        track_read(path)
         return path.read_text(errors="replace")[:500]
     except Exception:
         return "[signature extraction failed]"
@@ -825,7 +801,7 @@ def _extract_python_signatures(path: Path) -> str:
 
 def _extract_ts_signatures(path: Path) -> str:
     try:
-        _track_read(path)
+        track_read(path)
         source = path.read_text(errors="replace")
     except Exception:
         return "[read error]"
@@ -904,11 +880,11 @@ def call_llm_for_map(
     user = f"Codebase: {target_name}\n\nExtracted content:\n\n{context}"
 
     tokens_est = len(context) // 4
-    print(f"[absorber] LLM call: absorber | ~{tokens_est:,} input tokens")
+    print(f"[absorber] LLM call: {ROLE} | ~{tokens_est:,} input tokens")
 
     try:
         resp = call_model(
-            "absorber",
+            ROLE,
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user",   "content": user},
@@ -917,6 +893,12 @@ def call_llm_for_map(
             temperature=0.2,
         )
         choice = resp.choices[0]
+        usage  = getattr(resp, "usage", None)
+        if usage:
+            pt        = getattr(usage, "prompt_tokens",     0) or 0
+            ct        = getattr(usage, "completion_tokens", 0) or 0
+            call_cost = record_usage(usage, model=get_model(ROLE), provider=get_provider(ROLE))
+            print_call(__file__, pt, ct, call_cost)
         content = choice.message.content
         finish_reason = getattr(choice, "finish_reason", "unknown")
 
@@ -980,7 +962,7 @@ def _extract_env_vars_from_raw(path: Path, ext: str) -> set[str]:
     """
     _ = ext
     try:
-        _track_read(path)
+        track_read(path)
         raw = path.read_text(errors="replace")
     except Exception:
         return set()
@@ -1057,7 +1039,7 @@ def build_config_map(
         raw = ""
         if abs_path.exists():
             try:
-                _track_read(abs_path)
+                track_read(abs_path)
                 raw = abs_path.read_text(errors="replace")
             except Exception:
                 raw = ""
@@ -1553,19 +1535,20 @@ def main() -> None:
             try:
                 codebase_map = call_llm_for_map(context, target.name)
                 CODEBASE_MAP.parent.mkdir(parents=True, exist_ok=True)
-                CODEBASE_MAP.write_text(codebase_map)
-                _track_write(CODEBASE_MAP)
+                CODEBASE_MAP.write_text(apply_md_header(codebase_map, CODEBASE_MAP, owner="01_absorber.py", model=get_model(ROLE)))
+                track_write(CODEBASE_MAP)
                 print(f"[absorber] ✓ Codebase map → {CODEBASE_MAP}")
             except Exception as e:
                 print(f"[absorber][warn] LLM synthesis failed: {e} — skipping codebase_map.md")
         else:
             raw_context = _build_extraction_context(inventory, cache)
             CODEBASE_MAP.parent.mkdir(parents=True, exist_ok=True)
-            CODEBASE_MAP.write_text(
-                "# Codebase Map (raw extraction — no LLM synthesis)\n\n"
-                + raw_context
-            )
-            _track_write(CODEBASE_MAP)
+            CODEBASE_MAP.write_text(apply_md_header(
+                "# Codebase Map (raw extraction — no LLM synthesis)\n\n" + raw_context,
+                CODEBASE_MAP,
+                owner="01_absorber.py",
+            ))
+            track_write(CODEBASE_MAP)
             print(f"[absorber] ✓ Raw extraction → {CODEBASE_MAP} (--skip-llm)")
 
         # ── Phase 4: Config inventory ─────────────────────────────────────────────
@@ -1575,7 +1558,7 @@ def main() -> None:
 
         CONFIG_MAP.parent.mkdir(parents=True, exist_ok=True)
         CONFIG_MAP.write_text(json.dumps(config_map, indent=2))
-        _track_write(CONFIG_MAP)
+        track_write(CONFIG_MAP)
 
         print(f"[absorber] ✓ Config map → {CONFIG_MAP}")
         print(f"     Services detected: {', '.join(config_map['services_detected']) or 'none'}")
@@ -1592,7 +1575,7 @@ def main() -> None:
             if git_data:
                 GIT_HISTORY.parent.mkdir(parents=True, exist_ok=True)
                 GIT_HISTORY.write_text(json.dumps(git_data, indent=2))
-                _track_write(GIT_HISTORY)
+                track_write(GIT_HISTORY)
 
                 print(f"[absorber] ✓ Git history → {GIT_HISTORY}")
                 print(
@@ -1603,8 +1586,8 @@ def main() -> None:
 
                 blame_md = build_blame_map(git_data)
                 BLAME_MAP.parent.mkdir(parents=True, exist_ok=True)
-                BLAME_MAP.write_text(blame_md)
-                _track_write(BLAME_MAP)
+                BLAME_MAP.write_text(apply_md_header(blame_md, BLAME_MAP, owner="01_absorber.py"))
+                track_write(BLAME_MAP)
 
                 print(f"[absorber] ✓ Blame map → {BLAME_MAP}")
             else:
@@ -1634,7 +1617,9 @@ def main() -> None:
         exit_code = 1
 
     finally:
-        _print_artifact_access_summary()
+        print_summary("[01]")
+        print_artifact_summary("[01]")
+        prompt_next_step(ROLE, prefix="[01]")
 
     sys.exit(exit_code)
 
