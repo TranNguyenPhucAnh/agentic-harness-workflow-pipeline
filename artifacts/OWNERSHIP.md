@@ -125,7 +125,7 @@ In full harness runs, `write_applied()` is called by harness **at finalization t
 | `archivist_curation_log.json` | `archivist` | human review | append-only log |
 | `patcher_attempt_log.json` | `patcher` | human review, archivist | append-only log |
 | `spectracker_version_log.md` | `spectracker` | human review | append-only log |
-| `<version>.md` *(dynamic)* | `spectracker` | spectracker (delta computation) | write-once |
+| `spectracker_spec_snapshot_<version>.md` *(dynamic)* | `spectracker` | spectracker (delta computation) | write-once |
 
 > Dynamic paths are constructed by spectracker at runtime using the version string.
 > Cannot be static constants in paths.py.
