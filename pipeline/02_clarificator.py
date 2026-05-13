@@ -65,11 +65,15 @@ from artifacts.paths import (  # type: ignore  # noqa: E402
     ensure_dirs,
     get_project_name,
 )
-from artifacts.models import call_model  # noqa: E402
+from artifacts.models import call_model, get_model, get_provider  # noqa: E402
 
 # New shared interactive/drag-drop abstraction.
 # File will be implemented separately: modules/drag_and_drop.py
 from modules.drag_and_drop import gather_text_file_bundle  # type: ignore  # noqa: E402
+from modules.artifact_tracking import track_read, track_write, print_summary as print_artifact_summary  # noqa: E402
+from modules.cost import print_call, print_summary, record_usage  # noqa: E402
+from modules.md_header import apply_header as apply_md_header  # noqa: E402
+from modules.post_interactive import prompt_next_step  # noqa: E402
 
 
 # Local aliases
@@ -89,39 +93,9 @@ CLARIFICATION_LOG = CLARIFICATOR_DECISION_LOG
 #         optional user-provided requirement file(s)
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# Artifact/file access tracking
-# ════════════════════════════════════════════════════════════════════════════
-
-_ARTIFACTS_READ: set[str] = set()
-_ARTIFACTS_WRITTEN: set[str] = set()
-
-
-def _track_read(path: Any) -> None:
-    _ARTIFACTS_READ.add(str(path))
-
-
-def _track_write(path: Any) -> None:
-    _ARTIFACTS_WRITTEN.add(str(path))
-
-
-def _print_artifact_access_summary() -> None:
-    print("[02] Artifacts/files read:")
-    if _ARTIFACTS_READ:
-        for item in sorted(_ARTIFACTS_READ):
-            print(f"[02]   READ  {item}")
-    else:
-        print("[02]   READ  (none)")
-
-    print("[02] Artifacts/files created/updated/overwritten/appended:")
-    if _ARTIFACTS_WRITTEN:
-        for item in sorted(_ARTIFACTS_WRITTEN):
-            print(f"[02]   WRITE {item}")
-    else:
-        print("[02]   WRITE (none)")
-
-
 # ── Model config ─────────────────────────────────────────────────────────────
+
+ROLE = "clarificator"
 
 _TIER3_MIN_CONF = 0.75
 
@@ -157,7 +131,7 @@ def _wrap(text: str, indent: int = 0) -> str:
 
 def _read_pdf(path: Path) -> str:
     """Extract text from PDF via pdftotext or pypdf fallback."""
-    _track_read(path)
+    track_read(path)
 
     try:
         result = subprocess.run(
@@ -196,7 +170,7 @@ def _read_input_file(path: Path) -> str:
             print(f"[clarificator][warn] PDF extraction returned empty text from {path.name}.")
         return text
 
-    _track_read(path)
+    track_read(path)
 
     if suffix in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff"}:
         raise RuntimeError(
@@ -245,7 +219,7 @@ def _parse_json_response(raw: str, label: str) -> dict[str, Any]:
 
 def _load_clarification_log() -> str:
     if CLARIFICATION_LOG.exists():
-        _track_read(CLARIFICATION_LOG)
+        track_read(CLARIFICATION_LOG)
         return CLARIFICATION_LOG.read_text(encoding="utf-8")
     return ""
 
@@ -275,7 +249,7 @@ def _load_knowledge_context() -> str:
     parts: list[str] = []
 
     if KNOWLEDGE_BASE.exists():
-        _track_read(KNOWLEDGE_BASE)
+        track_read(KNOWLEDGE_BASE)
         parts.append(f"=== archivist_knowledge_log.md ===\n{KNOWLEDGE_BASE.read_text(encoding='utf-8')}")
 
     log_text = _load_clarification_log()
@@ -328,7 +302,7 @@ def _list_projects() -> None:
         sessions = 0
         if log.exists():
             try:
-                _track_read(log)
+                track_read(log)
                 sessions = len(re.findall(r"^## \d{4}-", log.read_text(encoding="utf-8"), re.MULTILINE))
             except Exception:
                 sessions = 0
@@ -346,13 +320,19 @@ def _call_llm(
 ) -> str:
     try:
         resp = call_model(
-            "clarificator",
+            ROLE,
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
             max_tokens=max_tokens,
         )
+        usage = getattr(resp, "usage", None)
+        if usage:
+            pt        = getattr(usage, "prompt_tokens",     0) or 0
+            ct        = getattr(usage, "completion_tokens", 0) or 0
+            call_cost = record_usage(usage, model=get_model(ROLE), provider=get_provider(ROLE))
+            print_call(__file__, pt, ct, call_cost)
         content = resp.choices[0].message.content
         if not content or not content.strip():
             raise RuntimeError("Model returned empty content.")
@@ -1043,7 +1023,7 @@ def _write_report(
         json.dumps(report, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
-    _track_write(CLARIFICATION_REPORT)
+    track_write(CLARIFICATION_REPORT)
 
     print(f"\n[clarificator] ✓ Report → {CLARIFICATION_REPORT}")
 
@@ -1128,8 +1108,8 @@ def _write_questions_md(
             lines.append("")
 
     CLARIFICATION_QUESTIONS.parent.mkdir(parents=True, exist_ok=True)
-    CLARIFICATION_QUESTIONS.write_text("\n".join(lines), encoding="utf-8")
-    _track_write(CLARIFICATION_QUESTIONS)
+    CLARIFICATION_QUESTIONS.write_text(apply_md_header("\n".join(lines), CLARIFICATION_QUESTIONS, owner="02_clarificator.py"), encoding="utf-8")
+    track_write(CLARIFICATION_QUESTIONS)
 
     print(f"[clarificator] ✓ Questions → {CLARIFICATION_QUESTIONS}")
 
@@ -1174,15 +1154,15 @@ def _append_to_log(
     CLARIFICATION_LOG.parent.mkdir(parents=True, exist_ok=True)
     with CLARIFICATION_LOG.open("a", encoding="utf-8") as fh:
         fh.write(content)
-    _track_write(CLARIFICATION_LOG)
+    track_write(CLARIFICATION_LOG)
 
     print(f"[clarificator] ✓ Log appended → {CLARIFICATION_LOG}")
 
 
 def _write_clarified_req(content: str) -> None:
     CLARIFIED_REQ.parent.mkdir(parents=True, exist_ok=True)
-    CLARIFIED_REQ.write_text(content, encoding="utf-8")
-    _track_write(CLARIFIED_REQ)
+    CLARIFIED_REQ.write_text(apply_md_header(content, CLARIFIED_REQ, owner="02_clarificator.py"), encoding="utf-8")
+    track_write(CLARIFIED_REQ)
 
     print(f"[clarificator] ✓ Clarified requirement → {CLARIFIED_REQ}")
 
@@ -1436,7 +1416,9 @@ def main() -> None:
         print(f"  Artifacts     → {CLARIFIED_REQ}")
 
     finally:
-        _print_artifact_access_summary()
+        print_summary("[02]")
+        print_artifact_summary("[02]")
+        prompt_next_step(ROLE, prefix="[02]")
 
 
 if __name__ == "__main__":
