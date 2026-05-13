@@ -59,7 +59,10 @@ from artifacts.paths import (  # type: ignore
     ensure_dirs,
 )
 from artifacts.models import call_model, get_model, get_provider  # type: ignore
+from modules.artifact_tracking import track_read, track_write, print_summary as print_artifact_summary  # noqa: E402
 from modules.cost import print_call, print_summary, record_usage  # noqa: E402
+from modules.md_header import apply_header as apply_md_header  # noqa: E402
+from modules.post_interactive import prompt_next_step  # noqa: E402
 
 # Local aliases — map canonical constants to the short names used internally
 CLARIFICATION_REPORT = CLARIFICATOR_OVERWRITE_RAW
@@ -82,40 +85,9 @@ ENRICHED_PROMPT      = ENRICHER_OVERWRITE_PROMPT
 #         artifacts_<slug>/knowledge/current/absorber_blame_map.md
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Artifact access tracking
-# ─────────────────────────────────────────────────────────────────────────────
-
-_ARTIFACTS_READ: set[str] = set()
-_ARTIFACTS_WRITTEN: set[str] = set()
-
-
-def _track_read(path: Any) -> None:
-    _ARTIFACTS_READ.add(str(path))
-
-
-def _track_write(path: Any) -> None:
-    _ARTIFACTS_WRITTEN.add(str(path))
-
-
-def _print_artifact_access_summary() -> None:
-    print("[03] Artifacts read:")
-    if _ARTIFACTS_READ:
-        for item in sorted(_ARTIFACTS_READ):
-            print(f"[03]   READ  {item}")
-    else:
-        print("[03]   READ  (none)")
-
-    print("[03] Artifacts created/updated/overwritten/appended:")
-    if _ARTIFACTS_WRITTEN:
-        for item in sorted(_ARTIFACTS_WRITTEN):
-            print(f"[03]   WRITE {item}")
-    else:
-        print("[03]   WRITE (none)")
-
-
 # ── Model config ──────────────────────────────────────────────────────────────
 # Model identity resolved from artifacts/models.py role "enricher".
+ROLE               = "enricher"
 _MAX_TOKENS_ENRICH = 4096
 
 
@@ -155,7 +127,7 @@ def _call_llm(
     """
     try:
         resp = call_model(
-            "enricher",
+            ROLE,
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user",   "content": user},
@@ -166,7 +138,7 @@ def _call_llm(
         if usage:
             pt        = getattr(usage, "prompt_tokens",     0) or 0
             ct        = getattr(usage, "completion_tokens", 0) or 0
-            call_cost = record_usage(usage, model=get_model("enricher"), provider=get_provider("enricher"))
+            call_cost = record_usage(usage, model=get_model(ROLE), provider=get_provider(ROLE))
             print_call(__file__, pt, ct, call_cost)
         content = resp.choices[0].message.content
         if not content or not content.strip():
@@ -188,14 +160,14 @@ def _call_llm(
 
 def _load_clarified_req() -> str:
     if CLARIFIED_REQ.exists():
-        _track_read(CLARIFIED_REQ)
+        track_read(CLARIFIED_REQ)
         return CLARIFIED_REQ.read_text(encoding="utf-8")
     return ""
 
 
 def _load_clarification_report() -> dict:
     if CLARIFICATION_REPORT.exists():
-        _track_read(CLARIFICATION_REPORT)
+        track_read(CLARIFICATION_REPORT)
         try:
             return json.loads(CLARIFICATION_REPORT.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
@@ -208,19 +180,19 @@ def _load_knowledge_layer() -> str:
     parts: list[str] = []
 
     if CODEBASE_MAP.exists():
-        _track_read(CODEBASE_MAP)
+        track_read(CODEBASE_MAP)
         parts.append(f"=== absorber_codebase_map.md ===\n{CODEBASE_MAP.read_text(encoding='utf-8')}")
 
     if CONFIG_MAP.exists():
-        _track_read(CONFIG_MAP)
+        track_read(CONFIG_MAP)
         parts.append(f"=== absorber_config_map.json ===\n{CONFIG_MAP.read_text(encoding='utf-8')}")
 
     if BLAME_MAP.exists():
-        _track_read(BLAME_MAP)
+        track_read(BLAME_MAP)
         parts.append(f"=== absorber_blame_map.md ===\n{BLAME_MAP.read_text(encoding='utf-8')}")
 
     if KNOWLEDGE_BASE.exists():
-        _track_read(KNOWLEDGE_BASE)
+        track_read(KNOWLEDGE_BASE)
         parts.append(f"=== archivist_knowledge_log.md ===\n{KNOWLEDGE_BASE.read_text(encoding='utf-8')}")
 
     return "\n\n".join(parts)
@@ -548,9 +520,9 @@ def main() -> None:
             f"Generated: {_now_iso()}\n\n"
             f"---\n\n"
         )
-        final_content = header + enriched.strip() + "\n"
+        final_content = apply_md_header(header + enriched.strip() + "\n", ENRICHED_PROMPT, owner="03_enricher.py", model=get_model(ROLE))
         ENRICHED_PROMPT.write_text(final_content, encoding="utf-8")
-        _track_write(ENRICHED_PROMPT)
+        track_write(ENRICHED_PROMPT)
         print(f"[enricher] ✓ Enriched prompt → {ENRICHED_PROMPT}")
 
         # ── Review ────────────────────────────────────────────────────────────────
@@ -561,9 +533,9 @@ def main() -> None:
             final_prompt, should_continue = _review_prompt(enriched)
             # If user edited, overwrite the written file with updated content
             if final_prompt != enriched:
-                updated = header + final_prompt.strip() + "\n"
+                updated = apply_md_header(header + final_prompt.strip() + "\n", ENRICHED_PROMPT, owner="03_enricher.py", model=get_model(ROLE))
                 ENRICHED_PROMPT.write_text(updated, encoding="utf-8")
-                _track_write(ENRICHED_PROMPT)
+                track_write(ENRICHED_PROMPT)
                 print(f"[enricher] ✓ Enriched prompt updated → {ENRICHED_PROMPT}")
 
         if not should_continue:
@@ -577,4 +549,5 @@ def main() -> None:
 
     finally:
         print_summary("[03]")
-        _print_artifact_access_summary()
+        print_artifact_summary("[03]")
+        prompt_next_step(ROLE, prefix="[03]")
