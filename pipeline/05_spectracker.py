@@ -96,6 +96,9 @@ from artifacts.paths import (  # noqa: E402
     ensure_dirs,
     get_spec_path,
 )
+from modules.artifact_tracking import track_read, track_write, print_summary as print_artifact_summary  # noqa: E402
+from modules.md_header import apply_header as apply_md_header  # noqa: E402
+from modules.post_interactive import prompt_next_step  # noqa: E402
 
 KNOWLEDGE_HISTORY_DIR = HISTORY_DIR
 CHANGELOG            = SPECTRACKER_VERSION_LOG
@@ -106,38 +109,10 @@ APPLIED_PATH         = SPECTRACKER_APPLIED
 # ════════════════════════════════════════════════════════════════════════════
 # Artifact access tracking
 # ════════════════════════════════════════════════════════════════════════════
-
-_ARTIFACTS_READ: set[str] = set()
-_ARTIFACTS_WRITTEN: set[str] = set()
-
-
-def _track_read(path: Any) -> None:
-    _ARTIFACTS_READ.add(str(path))
-
-
-def _track_write(path: Any) -> None:
-    _ARTIFACTS_WRITTEN.add(str(path))
-
-
-def _print_artifact_access_summary() -> None:
-    print("[spectracker] Artifacts read:")
-    if _ARTIFACTS_READ:
-        for item in sorted(_ARTIFACTS_READ):
-            print(f"[spectracker]   READ  {item}")
-    else:
-        print("[spectracker]   READ  (none)")
-
-    print("[spectracker] Artifacts created/updated/overwritten/appended:")
-    if _ARTIFACTS_WRITTEN:
-        for item in sorted(_ARTIFACTS_WRITTEN):
-            print(f"[spectracker]   WRITE {item}")
-    else:
-        print("[spectracker]   WRITE (none)")
-
-
-# ════════════════════════════════════════════════════════════════════════════
 # CLI / project setup
 # ════════════════════════════════════════════════════════════════════════════
+
+ROLE = "spectracker"
 
 def _configure_project(
     project: str | None,
@@ -380,11 +355,11 @@ def _save_snapshot_write_once(version: str, text: str) -> tuple[Path, bool]:
     path = _snapshot_path(version)
 
     if path.exists():
-        _track_read(path)
+        track_read(path)
         return path, False
 
-    path.write_text(text)
-    _track_write(path)
+    path.write_text(apply_md_header(text, path, owner="05_spectracker.py"))
+    track_write(path)
     return path, True
 
 
@@ -404,7 +379,7 @@ def _load_latest_snapshot(exclude_version: str) -> tuple[str | None, str | None]
 
     for snap in reversed(snapshots):
         if snap.stem != exclude_stem:
-            _track_read(snap)
+            track_read(snap)
             return snap.stem.removeprefix("spectracker_spec_snapshot_"), snap.read_text()
 
     return None, None
@@ -416,7 +391,7 @@ def _load_snapshot(version: str) -> str | None:
     if not path.exists():
         return None
 
-    _track_read(path)
+    track_read(path)
     return path.read_text()
 
 
@@ -470,7 +445,7 @@ def _changelog_has_version(version: str) -> bool:
     if not CHANGELOG.exists():
         return False
 
-    _track_read(CHANGELOG)
+    track_read(CHANGELOG)
     content = CHANGELOG.read_text()
     pattern = rf"^## \[{re.escape(version)}\]\s+—"
     return bool(re.search(pattern, content, flags=re.MULTILINE))
@@ -532,11 +507,11 @@ def _append_changelog(delta: SpecDelta) -> bool:
     CHANGELOG.parent.mkdir(parents=True, exist_ok=True)
 
     if CHANGELOG.exists():
-        _track_read(CHANGELOG)
+        track_read(CHANGELOG)
         existing = CHANGELOG.read_text()
 
     CHANGELOG.write_text(existing + entry)
-    _track_write(CHANGELOG)
+    track_write(CHANGELOG)
     return True
 
 
@@ -545,7 +520,7 @@ def print_changelog(n: int = 0) -> None:
         print("[spectracker] No changelog yet.")
         return
 
-    _track_read(CHANGELOG)
+    track_read(CHANGELOG)
     content = CHANGELOG.read_text()
 
     if not n:
@@ -568,7 +543,7 @@ def load_applied() -> dict | None:
         return None
 
     try:
-        _track_read(APPLIED_PATH)
+        track_read(APPLIED_PATH)
         return json.loads(APPLIED_PATH.read_text())
     except Exception:
         return None
@@ -618,7 +593,7 @@ def write_applied(
 
     APPLIED_PATH.parent.mkdir(parents=True, exist_ok=True)
     APPLIED_PATH.write_text(json.dumps(applied, indent=2))
-    _track_write(APPLIED_PATH)
+    track_write(APPLIED_PATH)
 
 
 def print_run_history() -> None:
@@ -723,7 +698,7 @@ def _handle_mark_applied(args: argparse.Namespace) -> None:
             )
             sys.exit(1)
 
-        _track_read(spec_path)
+        track_read(spec_path)
         version = parse_spec_version(spec_path.read_text())
 
     write_applied(version=version, status=args.status)
@@ -770,7 +745,7 @@ def main() -> None:
             print(msg)
             return
 
-        _track_read(spec_path)
+        track_read(spec_path)
         current_text = spec_path.read_text()
         current_ver  = parse_spec_version(current_text)
 
@@ -797,7 +772,7 @@ def main() -> None:
         # Write session delta.
         DELTA_OUT.parent.mkdir(parents=True, exist_ok=True)
         DELTA_OUT.write_text(json.dumps(asdict(delta), indent=2))
-        _track_write(DELTA_OUT)
+        track_write(DELTA_OUT)
         print(f"[spectracker] Delta     → {DELTA_OUT}")
 
         # Write-once raw spec snapshot.
@@ -836,7 +811,8 @@ def main() -> None:
         exit_code = 1
 
     finally:
-        _print_artifact_access_summary()
+        print_artifact_summary("[05]")
+        prompt_next_step(ROLE, prefix="[05]")
 
     sys.exit(exit_code)
 
