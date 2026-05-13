@@ -89,9 +89,9 @@ from typing import Any
 #   files explicitly listed in artifacts_<slug>/state/planner_mini_execution_plan.json target_files
 #
 # READS full:
-#   artifacts_<slug>/specwright_spec_<slug>.md
 #   artifacts_<slug>/state/scaffolder_codebase_skeleton.json
 #   artifacts_<slug>/state/planner_full_execution_plan.json
+#   artifacts_<slug>/specwright_spec_<slug>.md          (only in single-call fallback — no plan)
 #
 # READS mini:
 #   artifacts_<slug>/state/planner_mini_execution_plan.json
@@ -507,9 +507,9 @@ def build_system_prompt_per_file(
 You are a senior software developer implementing ONE source file.
 {stack_section}
 You will receive:
-1. The technical spec for full project context
-2. Optional dependency/context files that were already implemented
-3. Optional task plan produced by a senior architect — follow it carefully
+1. A behavior summary describing this file's role in the system — treat as authoritative
+2. A task plan from a senior architect with sub-tasks, gotchas, and notes — follow it carefully
+3. Optional dependency/context files already implemented — for import/API reference
 4. The stub for the SINGLE file you must implement
 
 Your task:
@@ -745,6 +745,10 @@ def _build_task_block(task: dict[str, Any] | None) -> str:
 
     lines: list[str] = ["### Implementation plan from architect\n"]
 
+    behavior_summary = task.get("behavior_summary")
+    if behavior_summary:
+        lines.append(f"**File purpose:** {behavior_summary}\n")
+
     role = task.get("role")
     if role:
         lines.append(f"**Role:** {role}\n")
@@ -765,6 +769,13 @@ def _build_task_block(task: dict[str, Any] | None) -> str:
         lines.append("**Gotchas / edge cases:**")
         for gotcha in gotchas:
             lines.append(f"  - {gotcha}")
+        lines.append("")
+
+    notes = task.get("notes", [])
+    if notes:
+        lines.append("**Cross-cutting notes:**")
+        for note in notes:
+            lines.append(f"  - {note}")
         lines.append("")
 
     tailwind_hints = task.get("tailwind_hints")
@@ -899,7 +910,6 @@ def _build_context_block(
 # ════════════════════════════════════════════════════════════════════════════
 
 def implement_file(
-    spec: str,
     stub: dict[str, Any],
     task: dict[str, Any] | None,
     already_written: dict[str, str],
@@ -911,9 +921,8 @@ def implement_file(
 
     stub_code = stub.get("code", "")
     user_msg = (
-        f"### canonical spec\n\n{spec}\n\n"
-        f"{context_block}\n"
         f"{task_block}\n"
+        f"{context_block}\n"
         f"### Stub file to implement: {file_path}\n"
         f"{_code_fence(file_path, stub_code)}"
     )
@@ -1349,7 +1358,6 @@ def run_mini_scope(args: argparse.Namespace) -> tuple[list[str], list[str], dict
 def run_full_scope(args: argparse.Namespace) -> tuple[list[str], list[str], dict[str, Any]]:
     print("[08] Scope: full")
 
-    spec = _load_spec()
     scaffold = _read_json_file(SCAFFOLD_JSON, "scaffolder_codebase_skeleton.json")
 
     instrs = scaffold.get("implementation_instructions", {}).get("for_executor", "")
@@ -1438,7 +1446,7 @@ def run_full_scope(args: argparse.Namespace) -> tuple[list[str], list[str], dict
             print("[08] WARNING: planner plan has no 'stack'; executor will use generic prompt.")
 
     else:
-        print("[08] No planner plan — using single-call mode.")
+        print("[08] No planner plan — falling back to single-call mode (loading spec).")
 
         if stack:
             print(
@@ -1471,7 +1479,6 @@ def run_full_scope(args: argparse.Namespace) -> tuple[list[str], list[str], dict
 
             try:
                 entry = implement_file(
-                    spec=spec,
                     stub=stub,
                     task=task,
                     already_written=already_written,
@@ -1491,6 +1498,7 @@ def run_full_scope(args: argparse.Namespace) -> tuple[list[str], list[str], dict
                 failed_files.append(fp)
 
     else:
+        spec = _load_spec()
         try:
             entries = implement_all_single_call(
                 spec=spec,
