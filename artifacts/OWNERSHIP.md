@@ -178,6 +178,7 @@ In full harness runs, `write_applied()` is called by harness **at finalization t
                               ├─[spectracker]────► spectracker_session_version_delta.json (cache, session)
                               │                    spectracker_applied_version.json       (state, hybrid)
                               │                    spectracker_version_log.md (append)    (knowledge/history)
+                              │                    spectracker_spec_snapshot_<version>.md (knowledge/history)
                               │
                               └─[scaffolder]─────► scaffolder_codebase_skeleton.json      (state)
 
