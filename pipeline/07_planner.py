@@ -90,7 +90,9 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from artifacts.models import call_model, get_model, get_provider  # noqa: E402
+from modules.artifact_tracking import track_read, track_write, print_summary as print_artifact_summary  # noqa: E402
 from modules.cost import print_call, print_summary, record_usage  # noqa: E402
+from modules.post_interactive import prompt_next_step  # noqa: E402
 from artifacts.paths import (  # noqa: E402
     ABSORBER_BLAME_MAP,
     ABSORBER_CODEBASE_MAP,
@@ -115,36 +117,6 @@ ROLE = "planner"
 
 # ════════════════════════════════════════════════════════════════════════════
 # Artifact access tracking
-# ════════════════════════════════════════════════════════════════════════════
-
-_ARTIFACTS_READ: set[str] = set()
-_ARTIFACTS_WRITTEN: set[str] = set()
-
-
-def _track_read(path: Any) -> None:
-    _ARTIFACTS_READ.add(str(path))
-
-
-def _track_write(path: Any) -> None:
-    _ARTIFACTS_WRITTEN.add(str(path))
-
-
-def _print_artifact_access_summary() -> None:
-    print("[07] Artifacts read:")
-    if _ARTIFACTS_READ:
-        for item in sorted(_ARTIFACTS_READ):
-            print(f"[07]   READ  {item}")
-    else:
-        print("[07]   READ  (none)")
-
-    print("[07] Artifacts created/updated/overwritten/appended:")
-    if _ARTIFACTS_WRITTEN:
-        for item in sorted(_ARTIFACTS_WRITTEN):
-            print(f"[07]   WRITE {item}")
-    else:
-        print("[07]   WRITE (none)")
-
-
 # ════════════════════════════════════════════════════════════════════════════
 # Full-scope prompt
 # ════════════════════════════════════════════════════════════════════════════
@@ -505,7 +477,7 @@ def _read_optional(path: Any, *, max_chars: int | None = None) -> str:
         if not path.exists():
             return ""
 
-        _track_read(path)
+        track_read(path)
 
         if hasattr(path, "read_text"):
             text = path.read_text(encoding="utf-8")
@@ -654,7 +626,7 @@ def _load_full_spec() -> str:
             "  python harness.py --project <name> --scope full"
         )
 
-    _track_read(spec_path)
+    track_read(spec_path)
     return spec_path.read_text(encoding="utf-8")
 
 
@@ -666,7 +638,7 @@ def _load_scaffold() -> dict:
             "  python harness.py --project <name> --scope full --scaffold"
         )
 
-    _track_read(SCAFFOLD_JSON)
+    track_read(SCAFFOLD_JSON)
     return json.loads(SCAFFOLD_JSON.read_text(encoding="utf-8"))
 
 
@@ -748,7 +720,7 @@ def run_full_scope() -> None:
         json.dumps(plan, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
-    _track_write(PLANNER_FULL_PLAN)
+    track_write(PLANNER_FULL_PLAN)
 
     print(f"[07] Full plan written → {PLANNER_FULL_PLAN}")
     print(f"[07] Tasks in plan: {len(plan.get('tasks', []))}")
@@ -1045,13 +1017,13 @@ def run_mini_scope() -> None:
         json.dumps(plan_mini, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
-    _track_write(PLANNER_MINI_PLAN)
+    track_write(PLANNER_MINI_PLAN)
 
     PLANNER_MINI_IMPACT.write_text(
         json.dumps(impact_analysis, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
-    _track_write(PLANNER_MINI_IMPACT)
+    track_write(PLANNER_MINI_IMPACT)
 
     print(f"[07] Mini plan written            → {PLANNER_MINI_PLAN}")
     print(f"[07] Mini impact analysis written → {PLANNER_MINI_IMPACT}")
@@ -1096,7 +1068,8 @@ def main() -> None:
 
     finally:
         print_summary("[07]")
-        _print_artifact_access_summary()
+        print_artifact_summary("[07]")
+        prompt_next_step(ROLE, prefix="[07]")
 
     sys.exit(exit_code)
 
