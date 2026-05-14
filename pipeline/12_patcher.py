@@ -101,7 +101,11 @@ from artifacts.paths import (  # noqa: E402
     get_session_id,
     get_spec_path,
 )
-from artifacts.models import call_model, get_model  # noqa: E402
+from artifacts.models import call_model, get_model, get_provider  # noqa: E402
+from modules.artifact_tracking import track_read, track_write, print_summary as print_artifact_summary  # noqa: E402
+from modules.cost import print_call, print_summary, record_usage  # noqa: E402
+from modules.md_header import apply_header as apply_md_header  # noqa: E402
+from modules.post_interactive import prompt_next_step  # noqa: E402
 
 _PATCHER_MODEL           = get_model("patcher")            # surface fixes
 _PATCHER_SECONDARY_MODEL = get_model("patcher_secondary")  # logic/hook/data + mini scope
@@ -109,34 +113,8 @@ _PATCHER_SECONDARY_MODEL = get_model("patcher_secondary")  # logic/hook/data + m
 # Model roles resolved from artifacts/models.py:
 #   "patcher"           — surface/component fixes (qwen)
 #   "patcher_secondary" — logic/hook/data fixes + mini scope (minimax)
+ROLE = "patcher"  # primary role — used for post_interactive next-step suggestion
 MAX_FILE_CHARS = 80_000
-
-_ARTIFACTS_READ: set[str] = set()
-_ARTIFACTS_WRITTEN: set[str] = set()
-
-
-def _track_read(path: Any) -> None:
-    _ARTIFACTS_READ.add(str(path))
-
-
-def _track_write(path: Any) -> None:
-    _ARTIFACTS_WRITTEN.add(str(path))
-
-
-def _print_artifact_access_summary() -> None:
-    print("[12] Artifacts/files read:")
-    if _ARTIFACTS_READ:
-        for item in sorted(_ARTIFACTS_READ):
-            print(f"[12]   READ  {item}")
-    else:
-        print("[12]   READ  (none)")
-
-    print("[12] Artifacts/files created/updated/overwritten/appended:")
-    if _ARTIFACTS_WRITTEN:
-        for item in sorted(_ARTIFACTS_WRITTEN):
-            print(f"[12]   WRITE {item}")
-    else:
-        print("[12]   WRITE (none)")
 
 
 @dataclass
@@ -232,7 +210,7 @@ def _read_json(path: Any, default: Any) -> Any:
     if not path.exists():
         return default
     try:
-        _track_read(path)
+        track_read(path)
         return json.loads(path.read_text(errors="replace"))
     except Exception as exc:
         print(f"[12][warn] Could not parse JSON {path}: {exc}", file=sys.stderr)
@@ -243,7 +221,7 @@ def _read_text(path: Any) -> str:
     if not path.exists():
         return ""
     try:
-        _track_read(path)
+        track_read(path)
         return path.read_text(errors="replace")
     except Exception as exc:
         print(f"[12][warn] Could not read {path}: {exc}", file=sys.stderr)
@@ -374,7 +352,7 @@ def _read_file_for_prompt(rel: str) -> str:
     if not path.exists():
         return f"[file not found: {path}]"
 
-    _track_read(path)
+    track_read(path)
     text = path.read_text(errors="replace")
     if len(text) > MAX_FILE_CHARS:
         return text[:MAX_FILE_CHARS] + f"\n\n[truncated: {len(text)} chars total]"
@@ -427,12 +405,11 @@ def _model_call(
     for attempt in range(2):
         resp = call_model(role, messages, temperature=0.1, max_tokens=max_tokens)
         usage = getattr(resp, "usage", None)
-        prompt_t = getattr(usage, "prompt_tokens", "?") if usage else "?"
-        completion_t = getattr(usage, "completion_tokens", "?") if usage else "?"
-        print(
-            f"    [tokens] {model_id}: "
-            f"prompt={prompt_t}, completion={completion_t}"
-        )
+        if usage:
+            pt        = getattr(usage, "prompt_tokens",     0) or 0
+            ct        = getattr(usage, "completion_tokens", 0) or 0
+            call_cost = record_usage(usage, model=model_id, provider=get_provider(role))
+            print_call(__file__, pt, ct, call_cost, label=f"[12] {model_id}")
 
         content = resp.choices[0].message.content
         if content and content.strip():
@@ -985,7 +962,7 @@ def fix_finding(
         out_path = _resolve_artifact_path(out_rel)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(code, encoding="utf-8")
-        _track_write(out_path)
+        track_write(out_path)
 
         written.append(out_rel)
         change = entry.get("change_summary", "")
@@ -1043,7 +1020,7 @@ def run_vitest_confirm() -> tuple[bool, str]:
 
 def _verify_python(path: Path) -> tuple[bool, str]:
     try:
-        _track_read(path)
+        track_read(path)
         py_compile.compile(str(path), doraise=True)
         return True, "py_compile OK"
     except Exception as exc:
@@ -1052,7 +1029,7 @@ def _verify_python(path: Path) -> tuple[bool, str]:
 
 def _verify_json(path: Path) -> tuple[bool, str]:
     try:
-        _track_read(path)
+        track_read(path)
         json.loads(path.read_text(errors="replace"))
         return True, "JSON parse OK"
     except Exception as exc:
@@ -1062,7 +1039,7 @@ def _verify_json(path: Path) -> tuple[bool, str]:
 def _verify_toml(path: Path) -> tuple[bool, str]:
     try:
         import tomllib
-        _track_read(path)
+        track_read(path)
         tomllib.loads(path.read_text(errors="replace"))
         return True, "TOML parse OK"
     except Exception as exc:
@@ -1070,7 +1047,7 @@ def _verify_toml(path: Path) -> tuple[bool, str]:
 
 
 def _verify_yaml(path: Path) -> tuple[bool, str]:
-    _track_read(path)
+    track_read(path)
     try:
         import yaml  # type: ignore
     except Exception:
@@ -1112,10 +1089,10 @@ def run_mini_confirm(files_written: list[str]) -> tuple[bool, str]:
             ok, msg = _verify_toml(path)
         elif ext in {".ts", ".tsx", ".js", ".jsx"}:
             ts_like = True
-            _track_read(path)
+            track_read(path)
             ok, msg = True, "TS/JS file written; Vitest will run if package.json exists"
         else:
-            _track_read(path)
+            track_read(path)
             ok, msg = True, "basic existence check OK"
 
         status = "PASS" if ok else "FAIL"
@@ -1217,8 +1194,8 @@ def write_patcher_findings_snapshot(
     ]
 
     PATCHER_FINDINGS_SNAPSHOT.parent.mkdir(parents=True, exist_ok=True)
-    PATCHER_FINDINGS_SNAPSHOT.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
-    _track_write(PATCHER_FINDINGS_SNAPSHOT)
+    PATCHER_FINDINGS_SNAPSHOT.write_text(apply_md_header("\n".join(lines).rstrip() + "\n", PATCHER_FINDINGS_SNAPSHOT, owner="12_patcher.py"), encoding="utf-8")
+    track_write(PATCHER_FINDINGS_SNAPSHOT)
 
     print(f"\n[12] Findings snapshot written → {PATCHER_FINDINGS_SNAPSHOT}")
 
@@ -1292,8 +1269,8 @@ def write_overwrite_fix_summary(
     ]
 
     PATCHER_OVERWRITE_FIX_SUMMARY.parent.mkdir(parents=True, exist_ok=True)
-    PATCHER_OVERWRITE_FIX_SUMMARY.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
-    _track_write(PATCHER_OVERWRITE_FIX_SUMMARY)
+    PATCHER_OVERWRITE_FIX_SUMMARY.write_text(apply_md_header("\n".join(lines).rstrip() + "\n", PATCHER_OVERWRITE_FIX_SUMMARY, owner="12_patcher.py"), encoding="utf-8")
+    track_write(PATCHER_OVERWRITE_FIX_SUMMARY)
 
     print(f"[12] Overwrite fix summary written → {PATCHER_OVERWRITE_FIX_SUMMARY}")
 
@@ -1304,7 +1281,7 @@ def append_attempt_log(report: dict[str, Any]) -> None:
     existing: list[Any] = []
     if PATCHER_ATTEMPT_LOG.exists():
         try:
-            _track_read(PATCHER_ATTEMPT_LOG)
+            track_read(PATCHER_ATTEMPT_LOG)
             loaded = json.loads(PATCHER_ATTEMPT_LOG.read_text(errors="replace"))
             if isinstance(loaded, list):
                 existing = loaded
@@ -1316,7 +1293,7 @@ def append_attempt_log(report: dict[str, Any]) -> None:
         json.dumps(existing, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
-    _track_write(PATCHER_ATTEMPT_LOG)
+    track_write(PATCHER_ATTEMPT_LOG)
 
     print(f"\n[12] Attempt log appended → {PATCHER_ATTEMPT_LOG}")
 
@@ -1520,7 +1497,9 @@ def main() -> None:
         exit_code = 1
 
     finally:
-        _print_artifact_access_summary()
+        print_summary("[12]")
+        print_artifact_summary("[12]")
+        prompt_next_step(ROLE, prefix="[12]")
 
     sys.exit(exit_code)
 
