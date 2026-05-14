@@ -130,43 +130,15 @@ from artifacts.paths import (  # noqa: E402
     get_session_id,
     get_spec_path,
 )
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# Artifact/file access tracking
-# ════════════════════════════════════════════════════════════════════════════
-
-_ARTIFACTS_READ: set[str] = set()
-_ARTIFACTS_WRITTEN: set[str] = set()
-
-
-def _track_read(path: Any) -> None:
-    _ARTIFACTS_READ.add(str(path))
-
-
-def _track_write(path: Any) -> None:
-    _ARTIFACTS_WRITTEN.add(str(path))
-
-
-def _print_artifact_access_summary() -> None:
-    print("[13] Artifacts/files read:")
-    if _ARTIFACTS_READ:
-        for item in sorted(_ARTIFACTS_READ):
-            print(f"[13]   READ  {item}")
-    else:
-        print("[13]   READ  (none)")
-
-    print("[13] Artifacts/files created/updated/overwritten/appended:")
-    if _ARTIFACTS_WRITTEN:
-        for item in sorted(_ARTIFACTS_WRITTEN):
-            print(f"[13]   WRITE {item}")
-    else:
-        print("[13]   WRITE (none)")
+from modules.artifact_tracking import track_read, track_write, print_summary as print_artifact_summary  # noqa: E402
+from modules.post_interactive import prompt_next_step  # noqa: E402
 
 
 # ════════════════════════════════════════════════════════════════════════════
 # Data structures
 # ════════════════════════════════════════════════════════════════════════════
+
+ROLE = "archivist"
 
 @dataclass
 class KnowledgeAction:
@@ -279,7 +251,7 @@ def _load_json(path: Any, default: Any) -> Any:
     if not path.exists():
         return default
     try:
-        _track_read(path)
+        track_read(path)
         return json.loads(path.read_text(encoding="utf-8", errors="replace"))
     except Exception as exc:
         print(f"[13][warn] Could not parse JSON {path}: {exc}", file=sys.stderr)
@@ -290,7 +262,7 @@ def _load_text(path: Any, default: str = "") -> str:
     if not path.exists():
         return default
     try:
-        _track_read(path)
+        track_read(path)
         return path.read_text(encoding="utf-8", errors="replace")
     except Exception as exc:
         print(f"[13][warn] Could not read {path}: {exc}", file=sys.stderr)
@@ -587,14 +559,14 @@ def _append_knowledge_log(entry: str, dry_run: bool) -> None:
     header = "# Archivist Knowledge Log\n\n"
     if not ARCHIVIST_KNOWLEDGE_LOG.exists():
         ARCHIVIST_KNOWLEDGE_LOG.write_text(header, encoding="utf-8")
-        _track_write(ARCHIVIST_KNOWLEDGE_LOG)
+        track_write(ARCHIVIST_KNOWLEDGE_LOG)
 
     existing = _load_text(ARCHIVIST_KNOWLEDGE_LOG)
     ARCHIVIST_KNOWLEDGE_LOG.write_text(
         existing.rstrip() + "\n\n" + entry,
         encoding="utf-8",
     )
-    _track_write(ARCHIVIST_KNOWLEDGE_LOG)
+    track_write(ARCHIVIST_KNOWLEDGE_LOG)
 
     print(f"  ✓ Appended pattern to {ARCHIVIST_KNOWLEDGE_LOG}")
 
@@ -897,14 +869,14 @@ def _apply_spec_gap(content: str, dry_run: bool) -> None:
 
     if not ARCHIVIST_SPEC_GAPS.exists():
         ARCHIVIST_SPEC_GAPS.write_text(header, encoding="utf-8")
-        _track_write(ARCHIVIST_SPEC_GAPS)
+        track_write(ARCHIVIST_SPEC_GAPS)
 
     existing = _load_text(ARCHIVIST_SPEC_GAPS)
     ARCHIVIST_SPEC_GAPS.write_text(
         existing.rstrip() + "\n\n" + content + "\n",
         encoding="utf-8",
     )
-    _track_write(ARCHIVIST_SPEC_GAPS)
+    track_write(ARCHIVIST_SPEC_GAPS)
 
     print(f"  ✓ Appended to {ARCHIVIST_SPEC_GAPS}")
 
@@ -924,14 +896,14 @@ def _apply_knowledge_log(content: str, dry_run: bool) -> None:
     header = "# Archivist Knowledge Log\n_Accumulated architecture decisions, bug patterns, and lessons learned._\n"
     if not ARCHIVIST_KNOWLEDGE_LOG.exists():
         ARCHIVIST_KNOWLEDGE_LOG.write_text(header, encoding="utf-8")
-        _track_write(ARCHIVIST_KNOWLEDGE_LOG)
+        track_write(ARCHIVIST_KNOWLEDGE_LOG)
 
     existing = _load_text(ARCHIVIST_KNOWLEDGE_LOG)
     ARCHIVIST_KNOWLEDGE_LOG.write_text(
         existing.rstrip() + "\n\n" + block.strip() + "\n",
         encoding="utf-8",
     )
-    _track_write(ARCHIVIST_KNOWLEDGE_LOG)
+    track_write(ARCHIVIST_KNOWLEDGE_LOG)
 
     print(f"  ✓ Appended to {ARCHIVIST_KNOWLEDGE_LOG}")
 
@@ -1061,7 +1033,7 @@ def append_curation_log(record: dict[str, Any]) -> None:
         json.dumps(existing_log, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
-    _track_write(ARCHIVIST_CURATION_LOG)
+    track_write(ARCHIVIST_CURATION_LOG)
 
     print(f"\n[13] Curation log appended to {ARCHIVIST_CURATION_LOG}")
 
@@ -1282,7 +1254,8 @@ def main() -> None:
         exit_code = 1
 
     finally:
-        _print_artifact_access_summary()
+        print_artifact_summary("[13]")
+        prompt_next_step(ROLE, prefix="[13]")
 
     sys.exit(exit_code)
 
