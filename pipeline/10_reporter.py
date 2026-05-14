@@ -97,43 +97,16 @@ from artifacts.paths import (  # noqa: E402
     get_project_slug,
     get_session_id,
 )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Artifact access tracking
-# ─────────────────────────────────────────────────────────────────────────────
-
-_ARTIFACTS_READ: set[str] = set()
-_ARTIFACTS_WRITTEN: set[str] = set()
-
-
-def _track_read(path: Any) -> None:
-    _ARTIFACTS_READ.add(str(path))
-
-
-def _track_write(path: Any) -> None:
-    _ARTIFACTS_WRITTEN.add(str(path))
-
-
-def _print_artifact_access_summary() -> None:
-    print("[10] Artifacts read:")
-    if _ARTIFACTS_READ:
-        for item in sorted(_ARTIFACTS_READ):
-            print(f"[10]   READ  {item}")
-    else:
-        print("[10]   READ  (none)")
-
-    print("[10] Artifacts created/updated/overwritten/appended:")
-    if _ARTIFACTS_WRITTEN:
-        for item in sorted(_ARTIFACTS_WRITTEN):
-            print(f"[10]   WRITE {item}")
-    else:
-        print("[10]   WRITE (none)")
+from modules.artifact_tracking import track_read, track_write, print_summary as print_artifact_summary  # noqa: E402
+from modules.md_header import apply_header as apply_md_header  # noqa: E402
+from modules.post_interactive import prompt_next_step  # noqa: E402
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI / project setup
 # ─────────────────────────────────────────────────────────────────────────────
+
+ROLE = "reporter"
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -198,7 +171,7 @@ def _load_json(path: Any) -> dict[str, Any] | None:
         return None
 
     try:
-        _track_read(path)
+        track_read(path)
         data = json.loads(path.read_text(errors="replace"))
     except Exception as exc:
         print(f"[10][warn] Could not parse JSON artifact {path}: {exc}", file=sys.stderr)
@@ -216,7 +189,7 @@ def _load_text(path: Any) -> str:
         return ""
 
     try:
-        _track_read(path)
+        track_read(path)
         return path.read_text(errors="replace").strip()
     except Exception as exc:
         print(f"[10][warn] Could not read artifact {path}: {exc}", file=sys.stderr)
@@ -860,8 +833,8 @@ def _write_github_step_summary(summary_md: str) -> None:
 
 def write_summary(summary_md: str) -> None:
     REPORTER_EXECUTION_SUMMARY.parent.mkdir(parents=True, exist_ok=True)
-    REPORTER_EXECUTION_SUMMARY.write_text(summary_md, encoding="utf-8")
-    _track_write(REPORTER_EXECUTION_SUMMARY)
+    REPORTER_EXECUTION_SUMMARY.write_text(apply_md_header(summary_md, REPORTER_EXECUTION_SUMMARY, owner="10_reporter.py"), encoding="utf-8")
+    track_write(REPORTER_EXECUTION_SUMMARY)
 
     print(summary_md)
     print(f"[10] Report written → {REPORTER_EXECUTION_SUMMARY}")
@@ -937,7 +910,8 @@ def main() -> None:
         exit_code = 1
 
     finally:
-        _print_artifact_access_summary()
+        print_artifact_summary("[10]")
+        prompt_next_step(ROLE, prefix="[10]")
 
     sys.exit(exit_code)
 
