@@ -101,7 +101,9 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from artifacts.models import call_model, get_model, get_provider  # noqa: E402
+from modules.artifact_tracking import track_read, track_write, print_summary as print_artifact_summary  # noqa: E402
 from modules.cost import print_call, print_summary, record_usage, summary as cost_summary  # noqa: E402
+from modules.post_interactive import prompt_next_step  # noqa: E402
 from artifacts.paths import (  # noqa: E402
     EXECUTOR_OVERWRITE_MANIFEST,
     PLANNER_FULL_PLAN,
@@ -120,36 +122,6 @@ ROLE = "executor"
 
 # ════════════════════════════════════════════════════════════════════════════
 # Artifact access tracking
-# ════════════════════════════════════════════════════════════════════════════
-
-_ARTIFACTS_READ: set[str] = set()
-_ARTIFACTS_WRITTEN: set[str] = set()
-
-
-def _track_read(path: Any) -> None:
-    _ARTIFACTS_READ.add(str(path))
-
-
-def _track_write(path: Any) -> None:
-    _ARTIFACTS_WRITTEN.add(str(path))
-
-
-def _print_artifact_access_summary() -> None:
-    print("[08] Artifacts read:")
-    if _ARTIFACTS_READ:
-        for item in sorted(_ARTIFACTS_READ):
-            print(f"[08]   READ  {item}")
-    else:
-        print("[08]   READ  (none)")
-
-    print("[08] Artifacts created/updated/overwritten/appended:")
-    if _ARTIFACTS_WRITTEN:
-        for item in sorted(_ARTIFACTS_WRITTEN):
-            print(f"[08]   WRITE {item}")
-    else:
-        print("[08]   WRITE (none)")
-
-
 # ════════════════════════════════════════════════════════════════════════════
 # Generic source helpers
 # ════════════════════════════════════════════════════════════════════════════
@@ -261,7 +233,7 @@ def _is_probably_source_file(path: Path) -> bool:
 def _read_json_file(path: Any, label: str) -> dict[str, Any]:
     if not path.exists():
         raise FileNotFoundError(f"Missing {label}: {path}")
-    _track_read(path)
+    track_read(path)
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise RuntimeError(f"{label} must be a JSON object: {path}")
@@ -272,7 +244,7 @@ def _read_optional_text(path: Any, *, max_chars: int | None = None) -> str:
     try:
         if not path.exists():
             return ""
-        _track_read(path)
+        track_read(path)
         text = path.read_text(encoding="utf-8")
         if max_chars is not None and len(text) > max_chars:
             return text[:max_chars] + f"\n\n<!-- truncated at {max_chars} chars -->"
@@ -431,7 +403,7 @@ def _load_spec() -> str:
             "Run specwright first."
         )
 
-    _track_read(spec_path)
+    track_read(spec_path)
     return spec_path.read_text(encoding="utf-8")
 
 
@@ -1074,7 +1046,7 @@ def _write_generated_entry(entry: dict[str, Any]) -> str | None:
     out_path.write_text(code, encoding="utf-8")
 
     # src/** is a build output owned by executor; include it in write summary.
-    _track_write(out_path)
+    track_write(out_path)
 
     print(f"[08] WROTE {out_path}")
     return fp
@@ -1107,7 +1079,7 @@ def _load_mini_analysis() -> dict[str, Any] | None:
     if not PLANNER_MINI_IMPACT.exists():
         return None
     try:
-        _track_read(PLANNER_MINI_IMPACT)
+        track_read(PLANNER_MINI_IMPACT)
         data = json.loads(PLANNER_MINI_IMPACT.read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else None
     except Exception as exc:
@@ -1253,7 +1225,7 @@ def _write_mini_result(
         else:
             print(f"[08] DELETE no-op, file not found: {result_path}")
 
-        _track_write(out_path)
+        track_write(out_path)
         return result_path
 
     content = result.get("content")
@@ -1263,7 +1235,7 @@ def _write_mini_result(
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(content, encoding="utf-8")
-    _track_write(out_path)
+    track_write(out_path)
 
     print(f"[08] WROTE {result_path}")
     return result_path
@@ -1566,7 +1538,7 @@ def _write_impl_record(
         json.dumps(record, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
-    _track_write(EXECUTOR_OVERWRITE_MANIFEST)
+    track_write(EXECUTOR_OVERWRITE_MANIFEST)
 
     print(f"[08] Executor manifest → {EXECUTOR_OVERWRITE_MANIFEST}")
 
@@ -1688,7 +1660,8 @@ def main() -> None:
 
     finally:
         print_summary("[08]")
-        _print_artifact_access_summary()
+        print_artifact_summary("[08]")
+        prompt_next_step(ROLE, prefix="[08]")
 
     sys.exit(exit_code)
 
