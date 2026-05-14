@@ -101,7 +101,11 @@ from artifacts.paths import (  # noqa: E402
     get_session_id,
     get_spec_path,
 )
-from artifacts.models import call_model, get_model  # noqa: E402
+from artifacts.models import call_model, get_model, get_provider  # noqa: E402
+from modules.artifact_tracking import track_read, track_write, print_summary as print_artifact_summary  # noqa: E402
+from modules.cost import print_call, print_summary, record_usage  # noqa: E402
+from modules.md_header import apply_header as apply_md_header  # noqa: E402
+from modules.post_interactive import prompt_next_step  # noqa: E402
 
 
 # Model identity resolved from artifacts/models.py role "judge".
@@ -111,40 +115,10 @@ MAX_FILE_CHARS = 80_000
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Artifact/file access tracking
-# ─────────────────────────────────────────────────────────────────────────────
-
-_ARTIFACTS_READ: set[str] = set()
-_ARTIFACTS_WRITTEN: set[str] = set()
-
-
-def _track_read(path: Any) -> None:
-    _ARTIFACTS_READ.add(str(path))
-
-
-def _track_write(path: Any) -> None:
-    _ARTIFACTS_WRITTEN.add(str(path))
-
-
-def _print_artifact_access_summary() -> None:
-    print("[11] Artifacts/files read:")
-    if _ARTIFACTS_READ:
-        for item in sorted(_ARTIFACTS_READ):
-            print(f"[11]   READ  {item}")
-    else:
-        print("[11]   READ  (none)")
-
-    print("[11] Artifacts/files created/updated/overwritten/appended:")
-    if _ARTIFACTS_WRITTEN:
-        for item in sorted(_ARTIFACTS_WRITTEN):
-            print(f"[11]   WRITE {item}")
-    else:
-        print("[11]   WRITE (none)")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Prompt
 # ─────────────────────────────────────────────────────────────────────────────
+
+ROLE = "judge"
 
 JUDGE_SYSTEM = """\
 You are a senior software engineer acting as a final code reviewer and sign-off authority.
@@ -293,7 +267,7 @@ def _read_json(path: Any, default: Any) -> Any:
     if not path.exists():
         return default
     try:
-        _track_read(path)
+        track_read(path)
         return json.loads(path.read_text(errors="replace"))
     except Exception as exc:
         print(f"[11][warn] Could not parse JSON {path}: {exc}", file=sys.stderr)
@@ -304,7 +278,7 @@ def _read_text(path: Any) -> str:
     if not path.exists():
         return ""
     try:
-        _track_read(path)
+        track_read(path)
         return path.read_text(errors="replace")
     except Exception as exc:
         print(f"[11][warn] Could not read {path}: {exc}", file=sys.stderr)
@@ -428,7 +402,7 @@ def _read_file_for_briefing(path: Path) -> str:
     if not path.exists():
         return f"[file not found: {path}]"
 
-    _track_read(path)
+    track_read(path)
     text = path.read_text(errors="replace")
     if len(text) > MAX_FILE_CHARS:
         return text[:MAX_FILE_CHARS] + f"\n\n[truncated: {len(text)} chars total]"
@@ -887,14 +861,14 @@ def call_judge(
     Model identity, provider, and reasoning flag are resolved from
     artifacts/models.py role "judge". Reasoning is ON by default for judge.
     """
-    model_id = get_model("judge")
+    model_id = get_model(ROLE)
     print(f"[11] Calling judge model: {model_id} …")
 
     last_error = None
 
     for attempt in range(2):
         resp = call_model(
-            "judge",
+            ROLE,
             messages=[
                 {"role": "system", "content": JUDGE_SYSTEM},
                 {"role": "user",   "content": briefing},
@@ -904,9 +878,11 @@ def call_judge(
         )
 
         usage = resp.usage
-        prompt_t = getattr(usage, "prompt_tokens", "?") if usage else "?"
-        completion_t = getattr(usage, "completion_tokens", "?") if usage else "?"
-        print(f"[11] Tokens: prompt={prompt_t}, completion={completion_t}")
+        if usage:
+            pt        = getattr(usage, "prompt_tokens",     0) or 0
+            ct        = getattr(usage, "completion_tokens", 0) or 0
+            call_cost = record_usage(usage, model=model_id, provider=get_provider(ROLE))
+            print_call(__file__, pt, ct, call_cost)
 
         choice = resp.choices[0]
         msg = choice.message
@@ -971,7 +947,7 @@ def _parse_json(raw: str) -> dict[str, Any]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def render_report(review: dict[str, Any]) -> str:
-    model = get_model("judge")
+    model = get_model(ROLE)
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     verdict = review.get("verdict", "UNKNOWN")
     run_type = review.get("run_type", _detect_scope())
@@ -1076,7 +1052,7 @@ def _write_raw_verdict(
     raw_response: str,
     reasoning_details: list[Any] | None,
 ) -> None:
-    model = get_model("judge")
+    model = get_model(ROLE)
     JUDGE_OVERWRITE_VERDICT_RAW.parent.mkdir(parents=True, exist_ok=True)
     JUDGE_OVERWRITE_VERDICT_RAW.write_text(
         json.dumps(
@@ -1097,14 +1073,14 @@ def _write_raw_verdict(
         ),
         encoding="utf-8",
     )
-    _track_write(JUDGE_OVERWRITE_VERDICT_RAW)
+    track_write(JUDGE_OVERWRITE_VERDICT_RAW)
     print(f"[11] Raw response + reasoning saved → {JUDGE_OVERWRITE_VERDICT_RAW}")
 
 
 def _write_report(report_md: str) -> None:
     JUDGE_VERDICT_SUMMARY.parent.mkdir(parents=True, exist_ok=True)
-    JUDGE_VERDICT_SUMMARY.write_text(report_md, encoding="utf-8")
-    _track_write(JUDGE_VERDICT_SUMMARY)
+    JUDGE_VERDICT_SUMMARY.write_text(apply_md_header(report_md, JUDGE_VERDICT_SUMMARY, owner="11_judge.py"), encoding="utf-8")
+    track_write(JUDGE_VERDICT_SUMMARY)
     print(f"\n[11] Judge verdict summary written → {JUDGE_VERDICT_SUMMARY}")
 
 
@@ -1167,7 +1143,9 @@ def main() -> None:
         exit_code = 1
 
     finally:
-        _print_artifact_access_summary()
+        print_summary("[11]")
+        print_artifact_summary("[11]")
+        prompt_next_step(ROLE, prefix="[11]")
 
     sys.exit(exit_code)
 
