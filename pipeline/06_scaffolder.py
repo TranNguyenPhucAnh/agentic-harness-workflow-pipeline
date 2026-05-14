@@ -47,7 +47,9 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from artifacts.models import call_model, get_model, get_provider  # noqa: E402
+from modules.artifact_tracking import track_read, track_write, print_summary as print_artifact_summary  # noqa: E402
 from modules.cost import print_call, print_summary, record_usage  # noqa: E402
+from modules.post_interactive import prompt_next_step  # noqa: E402
 from artifacts.paths import (  # noqa: E402
     SCAFFOLD_JSON,
     SRC_DIR,
@@ -62,37 +64,6 @@ MAX_OUTPUT_TOKENS = 65536
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Artifact/file access tracking
-# ─────────────────────────────────────────────────────────────────────────────
-
-_ARTIFACTS_READ: set[str] = set()
-_ARTIFACTS_WRITTEN: set[str] = set()
-
-
-def _track_read(path: Any) -> None:
-    _ARTIFACTS_READ.add(str(path))
-
-
-def _track_write(path: Any) -> None:
-    _ARTIFACTS_WRITTEN.add(str(path))
-
-
-def _print_artifact_access_summary() -> None:
-    print("[06] Artifacts/files read:")
-    if _ARTIFACTS_READ:
-        for item in sorted(_ARTIFACTS_READ):
-            print(f"[06]   READ  {item}")
-    else:
-        print("[06]   READ  (none)")
-
-    print("[06] Artifacts/files created/updated/overwritten/appended:")
-    if _ARTIFACTS_WRITTEN:
-        for item in sorted(_ARTIFACTS_WRITTEN):
-            print(f"[06]   WRITE {item}")
-    else:
-        print("[06]   WRITE (none)")
-
-
 SYSTEM_PROMPT = textwrap.dedent("""
     You are a senior software architect generating a scaffold from a technical spec.
 
@@ -440,14 +411,14 @@ def _destination_for_entry(entry: dict[str, Any]) -> Path:
 def write_files(scaffold: dict[str, Any]) -> None:
     SCAFFOLD_JSON.parent.mkdir(parents=True, exist_ok=True)
     SCAFFOLD_JSON.write_text(json.dumps(scaffold, indent=2))
-    _track_write(SCAFFOLD_JSON)
+    track_write(SCAFFOLD_JSON)
     print(f"[06] Scaffold JSON → {SCAFFOLD_JSON}")
 
     for entry in scaffold["files"]:
         dest = _destination_for_entry(entry)
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(entry["code"])
-        _track_write(dest)
+        track_write(dest)
 
         tag = "TEST" if entry.get("is_test", False) else "SRC "
         print(f"[06] [{tag}] {dest}")
@@ -492,7 +463,7 @@ def main() -> None:
             )
             sys.exit(1)
 
-        _track_read(spec_path)
+        track_read(spec_path)
         spec = spec_path.read_text(errors="replace")
 
         scaffold = call_scaffolder(
@@ -531,7 +502,8 @@ def main() -> None:
 
     finally:
         print_summary("[06]")
-        _print_artifact_access_summary()
+        print_artifact_summary("[06]")
+        prompt_next_step(ROLE, prefix="[06]")
 
     sys.exit(exit_code)
 
