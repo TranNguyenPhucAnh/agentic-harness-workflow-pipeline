@@ -93,13 +93,18 @@ from artifacts.paths import (  # noqa: E402
     ensure_dirs,
     get_spec_path,
 )
-from artifacts.models import call_model, get_model  # noqa: E402
+from artifacts.models import call_model, get_model, get_provider  # noqa: E402
+from modules.artifact_tracking import track_read, track_write, print_summary as print_artifact_summary  # noqa: E402
+from modules.cost import print_call, print_summary, record_usage  # noqa: E402
+from modules.post_interactive import prompt_next_step  # noqa: E402
 
 # Module-level model label constants — derived from models.py at import time.
 # Used as owner labels in FailureCluster / ClusterRepairRecord so logs always
 # show the actual model name, not an abstract role string.
 _DEBUGGER_MODEL           = get_model("debugger")            # surface/component repair
 _DEBUGGER_SECONDARY_MODEL = get_model("debugger_secondary")  # logic/hook/data repair
+
+ROLE = "debugger"  # primary role — used for post_interactive next-step suggestion
 
 
 _SRC_PREFIX = "src"
@@ -115,34 +120,6 @@ MINIMAX_SCOPE_PATTERNS: list[re.Pattern[str]] = [
 # ════════════════════════════════════════════════════════════════════════════
 # Artifact/file access tracking
 # ════════════════════════════════════════════════════════════════════════════
-
-_ARTIFACTS_READ: set[str] = set()
-_ARTIFACTS_WRITTEN: set[str] = set()
-
-
-def _track_read(path: Any) -> None:
-    _ARTIFACTS_READ.add(str(path))
-
-
-def _track_write(path: Any) -> None:
-    _ARTIFACTS_WRITTEN.add(str(path))
-
-
-def _print_artifact_access_summary() -> None:
-    print("[09] Artifacts/files read:")
-    if _ARTIFACTS_READ:
-        for item in sorted(_ARTIFACTS_READ):
-            print(f"[09]   READ  {item}")
-    else:
-        print("[09]   READ  (none)")
-
-    print("[09] Artifacts/files created/updated/overwritten/appended:")
-    if _ARTIFACTS_WRITTEN:
-        for item in sorted(_ARTIFACTS_WRITTEN):
-            print(f"[09]   WRITE {item}")
-    else:
-        print("[09]   WRITE (none)")
-
 
 # ════════════════════════════════════════════════════════════════════════════
 # Data structures
@@ -265,7 +242,7 @@ def _read_json(path: Any, default: Any) -> Any:
     if not path.exists():
         return default
     try:
-        _track_read(path)
+        track_read(path)
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return default
@@ -274,7 +251,7 @@ def _read_json(path: Any, default: Any) -> Any:
 def _read_text_if_exists(path: Any, *, errors: str = "replace") -> str:
     if not path.exists():
         return ""
-    _track_read(path)
+    track_read(path)
     return path.read_text(errors=errors)
 
 
@@ -292,7 +269,7 @@ def _current_scope() -> str:
 def _load_spec_or_full_context() -> str:
     spec_path = get_spec_path()
     if spec_path.exists():
-        _track_read(spec_path)
+        track_read(spec_path)
         return spec_path.read_text(errors="replace").strip()
 
     return ""
@@ -450,9 +427,11 @@ def _model_call(
     for attempt in range(2):
         resp = call_model(role, messages, max_tokens=max_tokens, temperature=0.1)
         usage = getattr(resp, "usage", None)
-        prompt_t = getattr(usage, "prompt_tokens", "?") if usage else "?"
-        completion_t = getattr(usage, "completion_tokens", "?") if usage else "?"
-        print(f"    [tokens] {model_id}: prompt={prompt_t}, completion={completion_t}")
+        if usage:
+            pt        = getattr(usage, "prompt_tokens",     0) or 0
+            ct        = getattr(usage, "completion_tokens", 0) or 0
+            call_cost = record_usage(usage, model=model_id, provider=get_provider(role))
+            print_call(__file__, pt, ct, call_cost, label=f"[09] {model_id}")
 
         content = resp.choices[0].message.content
         if content and content.strip():
@@ -547,7 +526,7 @@ def _mini_allowed_to_write(rel_path: str) -> bool:
 
 def _read_file_safe(path: Path) -> str:
     if path.exists():
-        _track_read(path)
+        track_read(path)
         return path.read_text(errors="replace")
     return f"// FILE NOT FOUND: {path}\n"
 
@@ -583,7 +562,7 @@ def _package_json_exists() -> bool:
 
 def _verify_python(path: Path) -> tuple[bool, str]:
     try:
-        _track_read(path)
+        track_read(path)
         py_compile.compile(str(path), doraise=True)
         return True, "py_compile OK"
     except Exception as exc:
@@ -592,7 +571,7 @@ def _verify_python(path: Path) -> tuple[bool, str]:
 
 def _verify_json(path: Path) -> tuple[bool, str]:
     try:
-        _track_read(path)
+        track_read(path)
         json.loads(path.read_text(errors="replace"))
         return True, "JSON parse OK"
     except Exception as exc:
@@ -602,7 +581,7 @@ def _verify_json(path: Path) -> tuple[bool, str]:
 def _verify_toml(path: Path) -> tuple[bool, str]:
     try:
         import tomllib
-        _track_read(path)
+        track_read(path)
         tomllib.loads(path.read_text(errors="replace"))
         return True, "TOML parse OK"
     except Exception as exc:
@@ -610,7 +589,7 @@ def _verify_toml(path: Path) -> tuple[bool, str]:
 
 
 def _verify_yaml(path: Path) -> tuple[bool, str]:
-    _track_read(path)
+    track_read(path)
 
     try:
         import yaml  # type: ignore
@@ -673,13 +652,13 @@ def _run_mini_verifiers(verbose: bool = False) -> tuple[bool, dict[str, Any]]:
             ok, msg = _verify_toml(path)
         elif ext in {".ts", ".tsx", ".js", ".jsx"}:
             ts_like = True
-            _track_read(path)
+            track_read(path)
             ok, msg = True, "TS/JS file present; Vitest will run if package.json exists"
         elif ext in {".sql", ".md", ".txt", ".cfg", ".conf", ".ini"}:
-            _track_read(path)
+            track_read(path)
             ok, msg = True, "basic existence check OK"
         else:
-            _track_read(path)
+            track_read(path)
             ok, msg = True, "basic existence check OK"
 
         checks.append({
@@ -845,13 +824,13 @@ def _static_fix_transform(path: Path) -> tuple[bool, str]:
     if not path.exists():
         return False, "file not found"
 
-    _track_read(path)
+    track_read(path)
     original = path.read_text(errors="replace")
     patched = _RE_JSX_GENERIC.sub(r"\1\3", original)
 
     if patched != original:
         path.write_text(patched)
-        _track_write(path)
+        track_write(path)
         return True, "removed JSX generic type param causing esbuild parse error"
 
     return False, "no static transform pattern matched"
@@ -861,7 +840,7 @@ def _static_fix_src(path: Path) -> tuple[bool, str]:
     if not path.exists():
         return False, "file not found"
 
-    _track_read(path)
+    track_read(path)
     original = path.read_text(errors="replace")
     patched = _RE_TEMPLATE_WIDTH.sub(r"`${Math.round(\2)}\3", original)
     patched = _RE_FLOAT_WIDTH.sub(
@@ -871,7 +850,7 @@ def _static_fix_src(path: Path) -> tuple[bool, str]:
 
     if patched != original:
         path.write_text(patched)
-        _track_write(path)
+        track_write(path)
         return True, "rounded floating-point percentage widths"
 
     return False, "no static src pattern matched"
@@ -1149,7 +1128,7 @@ def repair_test_file(
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(code)
-    _track_write(out_path)
+    track_write(out_path)
 
     print(f"    [P0-fix] ✓ Test updated — {patch.get('explanation', '(no explanation)')}")
     for change in patch.get("changes_made", []):
@@ -1236,7 +1215,7 @@ def _call_repair(
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(code)
-    _track_write(out_path)
+    track_write(out_path)
 
     root_cause = patch.get("root_cause", "")
     summary = f"{root_cause} — {explanation}" if root_cause else explanation
@@ -1443,7 +1422,7 @@ def _write_report(report: dict[str, Any]) -> None:
         json.dumps(report, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
-    _track_write(DEBUGGER_OVERWRITE_TEST_SUMMARY)
+    track_write(DEBUGGER_OVERWRITE_TEST_SUMMARY)
     print(f"\n[09] Debugger test summary → {DEBUGGER_OVERWRITE_TEST_SUMMARY}")
 
 
@@ -1755,7 +1734,9 @@ def main() -> None:
         exit_code = 1
 
     finally:
-        _print_artifact_access_summary()
+        print_summary("[09]")
+        print_artifact_summary("[09]")
+        prompt_next_step(ROLE, prefix="[09]")
 
     sys.exit(exit_code)
 
