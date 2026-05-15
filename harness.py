@@ -102,12 +102,11 @@ STEP_SCRIPTS: dict[str, str] = {
     "archivist":   "13_archivist.py",
 }
 
-from artifacts.models import PROVIDERS, get_provider  # noqa: E402
+from artifacts.models import PROVIDERS, ROLES, get_provider  # noqa: E402
 
-_LLM_STEPS = {
-    "scaffolder", "planner", "executor", "debugger", "judge", "patcher",
-    "clarificator", "enricher", "specwright",
-}
+# Derived from ROLES in artifacts/models.py — no manual sync needed.
+# Any role added to ROLES automatically gets env-key checking here.
+_LLM_STEPS: frozenset[str] = frozenset(ROLES.keys())
 
 
 def _env_key_for_step(step: str) -> list[str]:
