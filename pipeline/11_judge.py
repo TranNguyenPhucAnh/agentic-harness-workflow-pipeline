@@ -1070,6 +1070,7 @@ def _write_raw_verdict(
             },
             indent=2,
             ensure_ascii=False,
+            default=lambda o: vars(o) if hasattr(o, '__dict__') else str(o),
         ),
         encoding="utf-8",
     )
