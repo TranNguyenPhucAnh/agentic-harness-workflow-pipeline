@@ -101,7 +101,7 @@ ROLES: dict[str, str] = {
     "debugger_secondary": "openrouter/deepseek/deepseek-v4-pro",
     "reporter":           "openrouter/minimax/minimax-m2.7",
     "judge":              "openrouter/moonshotai/kimi-k2.6",
-    "patcher":            "openrouter/xiaomi/mimo-v2.5-pro",
+    "patcher":            "openrouter/deepseek/deepseek-v4-pro",
     #"archivist":         "openrouter/minimax/minimax-m2.7",
 
     # ── Aux / utility roles (thêm khi cần) ─────────────────────────────────
