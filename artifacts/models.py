@@ -97,7 +97,7 @@ ROLES: dict[str, str] = {
     "scaffolder":         "openrouter/z-ai/glm-5.1",
     "planner":            "openrouter/moonshotai/kimi-k2.6",
     "executor":           "openrouter/anthropic/claude-sonnet-4.6",
-    "debugger":           "openrouter/xiaomi/mimo-v2.5-pro",
+    "debugger":           "openrouter/qwen/qwen3.6-plus",
     "debugger_secondary": "openrouter/deepseek/deepseek-v4-pro",
     "reporter":           "openrouter/minimax/minimax-m2.7",
     "judge":              "openrouter/moonshotai/kimi-k2.6",
