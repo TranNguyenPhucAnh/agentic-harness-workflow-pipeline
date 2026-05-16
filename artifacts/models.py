@@ -97,12 +97,12 @@ ROLES: dict[str, str] = {
     "scaffolder":         "openrouter/z-ai/glm-5.1",
     "planner":            "openrouter/moonshotai/kimi-k2.6",
     "executor":           "openrouter/anthropic/claude-sonnet-4.6",
-    "debugger":           "openrouter/minimax/minimax-m2.7",
-    "debugger_secondary": "openrouter/qwen/qwen3.6-plus",
-    "reporter":           "openrouter/deepseek/deepseek-v4-pro",
+    "debugger":           "openrouter/xiaomi/mimo-v2.5-pro",
+    "debugger_secondary": "openrouter/deepseek/deepseek-v4-pro",
+    "reporter":           "openrouter/minimax/minimax-m2.7",
     "judge":              "openrouter/moonshotai/kimi-k2.6",
-    "patcher":            "openrouter/minimax/minimax-m2.7",
-    #"archivist":         "openrouter/deepseek/deepseek-v4-pro",
+    "patcher":            "openrouter/xiaomi/mimo-v2.5-pro",
+    #"archivist":         "openrouter/minimax/minimax-m2.7",
 
     # ── Aux / utility roles (thêm khi cần) ─────────────────────────────────
     # "summarizer":       "deepseek/deepseek-v4-flash",
