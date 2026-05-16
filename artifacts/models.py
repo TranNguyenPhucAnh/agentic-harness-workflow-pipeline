@@ -89,11 +89,11 @@ ROLES: dict[str, str] = {
     # "claude-sonnet-latest" không phải valid Anthropic model ID → OpenRouter
     # trả về HTML 404 thay vì JSON → JSONDecodeError trong openai SDK.
     # Drop ~ để dùng load-balanced routing (resilient hơn, auto-failover).
-    "absorber":           "gemini/gemini-2.5-flash",
+    "absorber":           "gemini-2.5-flash",
     "clarificator":       "openrouter/z-ai/glm-5.1",
     "enricher":           "openrouter/qwen/qwen3.6-plus",
     "specwright":         "openrouter/anthropic/claude-sonnet-4.6",
-    #"spectracker":        "gemini/gemini-2.5-flash",
+    #"spectracker":        "gemini-2.5-flash",
     "scaffolder":         "openrouter/z-ai/glm-5.1",
     "planner":            "openrouter/moonshotai/kimi-k2.6",
     "executor":           "openrouter/anthropic/claude-sonnet-4.6",
