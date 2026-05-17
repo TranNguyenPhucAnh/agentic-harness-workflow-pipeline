@@ -6,17 +6,17 @@ nhận về spec markdown, cho user review/edit, rồi hỏi có muốn kích ho
 full harness không.
 
 Vị trí trong luồng:
-    03_enricher → [04_specwright] → 05_spectracker → artifacts_<slug>/specwright_spec_<slug>.md → (optional) harness
+    03_enricher → [04_specwright] → 05_spectracker → spec/specwright_spec_<slug>.md → (optional) harness
 
 Inputs:
-    execution/enricher_overwrite_enriched_prompt.md    — output của 03_enricher (bắt buộc)
-    state/clarificator_requirement_synthesis.md        — fallback nếu enriched_prompt thiếu
-    execution/clarificator_overwrite_raw.json          — để lấy project metadata
+    enricher/enriched_prompt.md       — output của 03_enricher (bắt buộc)
+    clarificator/session.json         — fallback: field requirement_synthesis
+                                        + project metadata
 
 Output:
-    artifacts_<slug>/specwright_spec_<slug>.md         — technical spec tại get_spec_path()
-                                                         (đây là input canonical cho toàn bộ harness:
-                                                          spectracker, scaffolder, planner, executor, judge, v.v.)
+    spec/specwright_spec_<slug>.md    — technical spec tại get_spec_path()
+                                        (đây là input canonical cho toàn bộ harness:
+                                         spectracker, scaffolder, planner, executor, judge, v.v.)
 
 Usage:
     python 04_specwright.py --project my-app
@@ -27,7 +27,7 @@ Usage:
     # Để đổi model: sửa ROLES["specwright"] trong models.py.
 
 Artifacts produced (owner: specwright):
-    artifacts_<slug>/specwright_spec_<slug>.md         — get_spec_path(), input cho harness.py
+    spec/specwright_spec_<slug>.md    — get_spec_path(), input cho harness.py
 
 At the end of each run, prints:
     - artifacts read
@@ -50,8 +50,7 @@ from typing import Any
 # ── paths ─────────────────────────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from artifacts.paths import (  # type: ignore
-    CLARIFICATOR_OVERWRITE_RAW,
-    CLARIFIED_REQ,
+    CLARIFICATOR_SESSION,
     ENRICHER_OVERWRITE_PROMPT,
     ensure_dirs,
     get_spec_path,
@@ -61,20 +60,11 @@ from modules.artifact_tracking import track_read, track_write, print_summary as 
 from modules.cost import print_call, print_summary, record_usage  # noqa: E402
 from modules.post_interactive import prompt_next_step  # noqa: E402
 
-# Local aliases — map canonical constants to the short names used internally
-CLARIFICATION_REPORT = CLARIFICATOR_OVERWRITE_RAW
-ENRICHED_PROMPT      = ENRICHER_OVERWRITE_PROMPT
-
 # === WRITE AUTHORITY: specwright ===
-# OWNS  : artifacts_<slug>/specwright_spec_<slug>.md   (dynamic path via get_spec_path())
-# READS : artifacts_<slug>/execution/enricher_overwrite_enriched_prompt.md
-#         artifacts_<slug>/state/clarificator_requirement_synthesis.md (fallback)
-#         artifacts_<slug>/execution/clarificator_overwrite_raw.json
+# OWNS  : spec/specwright_spec_<slug>.md   (dynamic path via get_spec_path())
+# READS : enricher/enriched_prompt.md
+#         clarificator/session.json (fallback + metadata)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Artifact access tracking
-# ─────────────────────────────────────────────────────────────────────────────
 
 # ── Model config ──────────────────────────────────────────────────────────────
 # Model identity resolved from artifacts/models.py role "specwright".
@@ -184,6 +174,9 @@ def _format_version_line(version: str) -> str:
     return f"# Version: {version}"
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# LLM call
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _call_llm(
     system: str,
@@ -230,27 +223,31 @@ def _call_llm(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _load_enriched_prompt() -> str:
-    if ENRICHED_PROMPT.exists():
-        track_read(ENRICHED_PROMPT)
-        return ENRICHED_PROMPT.read_text(encoding="utf-8")
+    """Load enricher/enriched_prompt.md — primary input for spec generation."""
+    if ENRICHER_OVERWRITE_PROMPT.exists():
+        track_read(ENRICHER_OVERWRITE_PROMPT)
+        return ENRICHER_OVERWRITE_PROMPT.read_text(encoding="utf-8")
     return ""
 
 
-def _load_clarified_req() -> str:
-    if CLARIFIED_REQ.exists():
-        track_read(CLARIFIED_REQ)
-        return CLARIFIED_REQ.read_text(encoding="utf-8")
-    return ""
-
-
-def _load_clarification_report() -> dict:
-    if CLARIFICATION_REPORT.exists():
-        track_read(CLARIFICATION_REPORT)
+def _load_clarificator_session() -> dict:
+    """
+    Load clarificator/session.json.
+    Returns full session dict with fields: decisions, conflicts, unresolved,
+    tier_counts, input_sources, req_hash, requirement_synthesis.
+    """
+    if CLARIFICATOR_SESSION.exists():
+        track_read(CLARIFICATOR_SESSION)
         try:
-            return json.loads(CLARIFICATION_REPORT.read_text(encoding="utf-8"))
+            return json.loads(CLARIFICATOR_SESSION.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             return {}
     return {}
+
+
+def _extract_requirement_synthesis(session: dict) -> str:
+    """Extract requirement_synthesis text field from clarificator session."""
+    return session.get("requirement_synthesis", "")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -300,7 +297,7 @@ If the system has stateful entities (orders, approvals, jobs), include a state
 transition table: State | Trigger | Next State | Side Effects.
 
 ## Error Handling
-How the system handles: validation errors, external service failures, 
+How the system handles: validation errors, external service failures,
 data integrity violations, unexpected states.
 
 ## Non-Functional Requirements
@@ -372,7 +369,6 @@ def _validate_spec(spec: str) -> list[str]:
     """
     missing: list[str] = []
     for section in _REQUIRED_SECTIONS:
-        # Case-insensitive prefix match — allow minor heading variations
         pattern = re.compile(re.escape(section), re.IGNORECASE)
         if not pattern.search(spec):
             missing.append(section)
@@ -388,9 +384,8 @@ def _review_spec(spec: str, spec_file: Path) -> tuple[str, bool]:
     Show spec summary (first 60 lines) to user, ask to confirm / edit / abort.
     Returns (final_spec_text, should_continue_to_harness).
     """
-    _print_banner(f"Spec generated — review before activating harness")
+    _print_banner("Spec generated — review before activating harness")
 
-    # Show first 60 lines as preview
     lines = spec.strip().splitlines()
     preview_lines = lines[:60]
     print("\n" + "─" * 72)
@@ -428,7 +423,6 @@ def _open_in_editor(content: str, hint_path: Path) -> str:
     """
     import tempfile
     editor = os.environ.get("EDITOR", "nano")
-    # Use spec filename as suffix hint so editor shows correct syntax highlight
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=f"_{hint_path.name}",
         delete=False, encoding="utf-8"
@@ -460,7 +454,7 @@ def _launch_harness(project_name: str) -> None:
     """
     Launch harness.py for the current project.
     harness.py reads PIPELINE_PROJECT from env (already set in main).
-    harness.py picks up the spec from get_spec_path() → specwright_spec_<slug>.md.
+    harness.py picks up the spec from get_spec_path() → spec/specwright_spec_<slug>.md.
     """
     script = Path(__file__).parent / "harness.py"
     if not script.exists():
@@ -527,7 +521,7 @@ def _print_harness_instructions(project_name: str, spec_file: Path) -> None:
 def main() -> None:
     try:
         parser = argparse.ArgumentParser(
-            description="04_specwright — generate artifacts_<slug>/specwright_spec_<slug>.md from enriched prompt"
+            description="04_specwright — generate spec/specwright_spec_<slug>.md from enriched prompt"
         )
         parser.add_argument("--project",   metavar="NAME",
                             help="Project workspace name. Prompted if omitted.")
@@ -544,35 +538,38 @@ def main() -> None:
         os.environ["PIPELINE_PROJECT"] = project_name
         ensure_dirs()
 
-        # get_spec_path() resolves lazily to artifacts_<slug>/specwright_spec_<slug>.md —
+        # get_spec_path() resolves lazily to spec/specwright_spec_<slug>.md —
         # the canonical location every downstream pipeline script reads.
         spec_file = get_spec_path()
 
-        print(f"[specwright] Workspace:  {project_name!r}")
+        print(f"[specwright] Workspace:   {project_name!r}")
         print(f"[specwright] Spec target: {spec_file}")
         print(f"[specwright] Model:       {get_model(ROLE)}")
 
         # ── Load enriched prompt ──────────────────────────────────────────────────
         enriched_prompt = _load_enriched_prompt()
         if enriched_prompt.strip():
-            print(f"[specwright] Loaded enricher_overwrite_enriched_prompt.md ({len(enriched_prompt)} chars)")
+            print(f"[specwright] Loaded enricher/enriched_prompt.md ({len(enriched_prompt)} chars)")
         else:
-            # Fallback: use clarified_req directly (less optimal but functional)
-            print("[specwright][warn] enricher_overwrite_enriched_prompt.md not found — falling back to clarificator_requirement_synthesis.md")
-            enriched_prompt = _load_clarified_req()
+            # Fallback: extract requirement_synthesis from clarificator/session.json
+            print("[specwright][warn] enricher/enriched_prompt.md not found — falling back to clarificator/session.json")
+            session = _load_clarificator_session()
+            enriched_prompt = _extract_requirement_synthesis(session)
             if not enriched_prompt.strip():
                 print(
-                    "[specwright][error] Neither enricher_overwrite_enriched_prompt.md nor clarificator_requirement_synthesis.md found.\n"
-                    "            Run 03_clarificator.py → 03_enricher.py first."
+                    "[specwright][error] Neither enricher/enriched_prompt.md nor "
+                    "clarificator/session.json[requirement_synthesis] found.\n"
+                    "            Run 02_clarificator.py → 03_enricher.py first."
                 )
                 sys.exit(1)
-            print(f"[specwright] Loaded clarificator_requirement_synthesis.md as fallback ({len(enriched_prompt)} chars)")
+            print(f"[specwright] Loaded requirement_synthesis from session.json as fallback ({len(enriched_prompt)} chars)")
 
-        # Optional metadata read. This keeps project/session metadata available for
-        # future prompt expansion and makes the declared READS contract observable.
-        clarification_report = _load_clarification_report()
-        if clarification_report:
-            print("[specwright] Loaded clarificator_overwrite_raw.json metadata")
+        # Load clarificator session for metadata (project context, decisions count, etc.)
+        # This is a non-critical read — used for logging/diagnostics only.
+        clarificator_session = _load_clarificator_session()
+        if clarificator_session:
+            decisions_count = len(clarificator_session.get("decisions", []))
+            print(f"[specwright] Loaded clarificator/session.json metadata ({decisions_count} decisions)")
 
         # ── Check if spec already exists — read version before overwrite ────────────
         existing_version = _read_current_version(spec_file)
@@ -616,7 +613,6 @@ def main() -> None:
             return
 
         # ── Compute new version ───────────────────────────────────────────────────
-        # Full regeneration always bumps MAJOR (or starts at 1.0.0 on first run).
         new_version = _next_version_regenerate(existing_version)
         new_version_tuple = _parse_version(f"# Version: {new_version}")
         print(f"[specwright] Version: {('none' if existing_version is None else 'v' + '.'.join(str(x) for x in existing_version))} → v{new_version}")
@@ -629,13 +625,13 @@ def main() -> None:
             f"<!-- project: {project_name} | model: {get_model(ROLE)} -->\n\n"
         )
         final_spec = header + spec.strip() + "\n"
+        spec_file.parent.mkdir(parents=True, exist_ok=True)
         spec_file.write_text(final_spec, encoding="utf-8")
         track_write(spec_file)
         print(f"[specwright] ✓ Spec written → {spec_file}")
 
         # ── Review ────────────────────────────────────────────────────────────────
         if args.no_review or args.no_harness:
-            # Still show summary but skip full review flow
             lines = spec.strip().splitlines()
             _print_banner(f"Spec ready — {len(lines)} lines")
             print(f"  File:  {spec_file}")
