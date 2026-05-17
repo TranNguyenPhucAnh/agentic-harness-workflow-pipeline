@@ -10,11 +10,12 @@ FULL SCOPE
 Spec-driven planner for the full pipeline.
 
 Reads:
-    artifacts_<slug>/specwright_spec_<slug>.md
-    artifacts_<slug>/state/scaffolder_codebase_skeleton.json
+    artifacts_<slug>/spec/specwright_spec_<slug>.md
+    artifacts_<slug>/scaffolder/blueprint.json
 
 Writes:
-    artifacts_<slug>/state/planner_full_execution_plan.json
+    artifacts_<slug>/planner/full_plan.json        (short-term, overwrite)
+    artifacts_<slug>/planner/plan_log.json         (long-term, append)
 
 Consumed by:
     pipeline/08_executor.py --scope full --use-planner-plan
@@ -25,19 +26,17 @@ MINI SCOPE
 Targeted planner for small daily-driver tasks.
 
 Reads:
-    artifacts_<slug>/state/clarificator_requirement_synthesis.md
-    artifacts_<slug>/execution/enricher_overwrite_enriched_prompt.md        optional
-    artifacts_<slug>/execution/clarificator_overwrite_raw.json              optional
-    artifacts_<slug>/knowledge/current/archivist_knowledge_log.md           optional
-    artifacts_<slug>/knowledge/current/absorber_codebase_map.md             optional
-    artifacts_<slug>/knowledge/current/absorber_config_map.json             optional
-    artifacts_<slug>/knowledge/current/absorber_blame_map.md                optional
-    artifacts_<slug>/knowledge/current/patcher_findings_snapshot.md         optional
-    artifacts_<slug>/knowledge/current/archivist_spec_gaps.md               optional
+    artifacts_<slug>/clarificator/session.json             (field: requirement_synthesis)
+    artifacts_<slug>/enricher/enriched_prompt.md           optional
+    artifacts_<slug>/clarificator/session.json             optional (full object as context)
+    artifacts_<slug>/archivist/knowledge_log.md            optional
+    artifacts_<slug>/absorber/codebase_map.md              optional
+    artifacts_<slug>/patcher/attempt_log.json              optional (last entry)
+    artifacts_<slug>/archivist/spec_gaps.md                optional
 
 Writes:
-    artifacts_<slug>/state/planner_mini_execution_plan.json
-    artifacts_<slug>/state/planner_mini_impact_analysis.json
+    artifacts_<slug>/planner/mini_plan.json        (short-term, overwrite — { "plan": {...}, "impact": {...} })
+    artifacts_<slug>/planner/plan_log.json         (long-term, append)
 
 Consumed by:
     pipeline/08_executor.py --scope mini --use-planner-plan
@@ -66,26 +65,25 @@ from typing import Any
 
 # === WRITE AUTHORITY: planner ===
 # OWNS full:
-#   artifacts_<slug>/state/planner_full_execution_plan.json
+#   artifacts_<slug>/planner/full_plan.json          (short-term, overwrite)
+#   artifacts_<slug>/planner/plan_log.json           (long-term, append)
 #
 # OWNS mini:
-#   artifacts_<slug>/state/planner_mini_execution_plan.json
-#   artifacts_<slug>/state/planner_mini_impact_analysis.json
+#   artifacts_<slug>/planner/mini_plan.json          (short-term, overwrite — {plan, impact})
+#   artifacts_<slug>/planner/plan_log.json           (long-term, append — shared with full)
 #
 # READS full:
-#   artifacts_<slug>/specwright_spec_<slug>.md
-#   artifacts_<slug>/state/scaffolder_codebase_skeleton.json
+#   artifacts_<slug>/spec/specwright_spec_<slug>.md
+#   artifacts_<slug>/scaffolder/blueprint.json
 #
 # READS mini:
-#   artifacts_<slug>/state/clarificator_requirement_synthesis.md
-#   artifacts_<slug>/execution/enricher_overwrite_enriched_prompt.md
-#   artifacts_<slug>/execution/clarificator_overwrite_raw.json
-#   artifacts_<slug>/knowledge/current/archivist_knowledge_log.md
-#   artifacts_<slug>/knowledge/current/absorber_codebase_map.md
-#   artifacts_<slug>/knowledge/current/absorber_config_map.json
-#   artifacts_<slug>/knowledge/current/absorber_blame_map.md
-#   artifacts_<slug>/knowledge/current/patcher_findings_snapshot.md
-#   artifacts_<slug>/knowledge/current/archivist_spec_gaps.md
+#   artifacts_<slug>/clarificator/session.json           (field: requirement_synthesis)
+#   artifacts_<slug>/enricher/enriched_prompt.md
+#   artifacts_<slug>/clarificator/session.json           (full object as context bundle)
+#   artifacts_<slug>/archivist/knowledge_log.md
+#   artifacts_<slug>/absorber/codebase_map.md
+#   artifacts_<slug>/patcher/attempt_log.json            (last entry only)
+#   artifacts_<slug>/archivist/spec_gaps.md
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -94,18 +92,16 @@ from modules.artifact_tracking import track_read, track_write, print_summary as 
 from modules.cost import print_call, print_summary, record_usage  # noqa: E402
 from modules.post_interactive import prompt_next_step  # noqa: E402
 from artifacts.paths import (  # noqa: E402
-    ABSORBER_BLAME_MAP,
     ABSORBER_CODEBASE_MAP,
-    ABSORBER_CONFIG_MAP,
     ARCHIVIST_KNOWLEDGE_LOG,
     ARCHIVIST_SPEC_GAPS,
-    CLARIFICATOR_OVERWRITE_RAW,
+    CLARIFICATOR_SESSION,
     CLARIFIED_REQ,
     ENRICHER_OVERWRITE_PROMPT,
-    PATCHER_FINDINGS_SNAPSHOT,
+    PATCHER_ATTEMPT_LOG,
     PLANNER_FULL_PLAN,
-    PLANNER_MINI_IMPACT,
     PLANNER_MINI_PLAN,
+    PLANNER_PLAN_LOG,
     SCAFFOLD_JSON,
     ensure_dirs,
     get_spec_path,
@@ -396,7 +392,7 @@ Allowed risk values:
 Rules:
 - target_files must contain only files that should be changed by the implementer.
 - Use repo-relative paths only.
-- Do not include artifact paths such as artifacts_*/, state/*, execution/*, run/*, cache/*, knowledge/*, reports/*.
+- Do not include artifact paths such as artifacts_*/, planner/*, executor/*, debugger/*, judge/*, patcher/*, archivist/*, absorber/*, clarificator/*, enricher/*, spectracker/*, scaffolder/*, spec/*, or legacy paths state/*, execution/*, run/*, cache/*, knowledge/*, reports/*.
 - Do not include spec.md or specwright_spec_<slug>.md unless the user explicitly asks to update the canonical spec.
 - If a test file should be added/updated, include it either in target_files or test_suggestions depending on whether implementation should patch it.
 - Keep instructions concrete and actionable.
@@ -413,8 +409,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="07_planner.py",
         description=(
-            "Planner step. Writes planner_full_execution_plan.json "
-            "or planner_mini_execution_plan.json + planner_mini_impact_analysis.json."
+            "Planner step. Writes planner/full_plan.json "
+            "or planner/mini_plan.json (with impact merged). "
+            "Appends to planner/plan_log.json in both modes."
         ),
     )
     parser.add_argument(
@@ -430,9 +427,9 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=["full", "mini"],
         default="full",
         help=(
-            "Planner scope. full writes state/planner_full_execution_plan.json; "
-            "mini writes state/planner_mini_execution_plan.json and "
-            "state/planner_mini_impact_analysis.json."
+            "Planner scope. full writes planner/full_plan.json; "
+            "mini writes planner/mini_plan.json ({plan, impact} merged). "
+            "Both modes append to planner/plan_log.json."
         ),
     )
     return parser
@@ -642,6 +639,50 @@ def _load_scaffold() -> dict:
     return json.loads(SCAFFOLD_JSON.read_text(encoding="utf-8"))
 
 
+def _extract_stub_files(scaffold: dict) -> list[dict]:
+    """
+    Extract non-test files from the new module-centric blueprint schema.
+
+    blueprint.json schema:
+      { modules: [{ module, purpose, files: [{ path, kind }] }] }
+
+    kind values: "source" | "test" | "config" | "migration"
+    Non-test = kind != "test".
+
+    Returns a flat list of { file_path, kind } dicts for the full planner prompt.
+    """
+    modules = scaffold.get("modules", [])
+    if not isinstance(modules, list):
+        # Legacy flat-file schema fallback (is_test field)
+        files = scaffold.get("files", [])
+        if not isinstance(files, list):
+            raise RuntimeError(
+                "Invalid scaffold: expected top-level 'modules' list "
+                "(new schema) or 'files' list (legacy schema)."
+            )
+        print("[07] WARNING: scaffold uses legacy flat-file schema — consider regenerating.")
+        return [
+            f for f in files
+            if isinstance(f, dict) and not f.get("is_test")
+        ]
+
+    stub_files: list[dict] = []
+    for mod in modules:
+        if not isinstance(mod, dict):
+            continue
+        for file_entry in mod.get("files", []):
+            if not isinstance(file_entry, dict):
+                continue
+            if file_entry.get("kind", "source") != "test":
+                stub_files.append({
+                    "file_path": file_entry.get("path", ""),
+                    "kind": file_entry.get("kind", "source"),
+                    "module": mod.get("module", ""),
+                    "module_purpose": mod.get("purpose", ""),
+                })
+    return stub_files
+
+
 def call_full_planner(spec: str, stub_files: list[dict]) -> dict:
     user_message = (
         f"### canonical spec\n\n{spec}\n\n"
@@ -696,18 +737,12 @@ def run_full_scope() -> None:
     spec = _load_full_spec()
     scaffold = _load_scaffold()
 
-    files = scaffold.get("files", [])
-    if not isinstance(files, list):
+    stub_files = _extract_stub_files(scaffold)
+    if not stub_files:
         raise RuntimeError(
-            "Invalid scaffolder_codebase_skeleton.json: expected top-level key "
-            "'files' to be a list."
+            "No non-test files found in scaffold blueprint. "
+            "Ensure scaffolder/blueprint.json has modules with source files."
         )
-
-    stub_files = [
-        file_entry
-        for file_entry in files
-        if isinstance(file_entry, dict) and not file_entry.get("is_test")
-    ]
 
     print("[07] Scope: full")
     print(f"[07] Planning {len(stub_files)} non-test stub file(s) …")
@@ -722,10 +757,74 @@ def run_full_scope() -> None:
     )
     track_write(PLANNER_FULL_PLAN)
 
+    append_plan_log(scope="full", plan=plan, impact=None)
+
     print(f"[07] Full plan written → {PLANNER_FULL_PLAN}")
     print(f"[07] Tasks in plan: {len(plan.get('tasks', []))}")
     print(f"[07] Implementation order: {plan.get('implementation_order', [])}")
     print("[07] Done. Pass --use-planner-plan to 08_executor.py to use this plan.")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Plan log (long-term, shared by full + mini)
+# ════════════════════════════════════════════════════════════════════════════
+
+def append_plan_log(*, scope: str, plan: dict, impact: dict | None) -> None:
+    """
+    Append one entry to planner/plan_log.json (long-term audit trail).
+    Called at the end of both full and mini runs.
+
+    Entry schema:
+      {
+        "scope": "full" | "mini",
+        "generated_at": "<iso>",
+        "plan_version": "...",
+        "task_summary": "..." (mini only),
+        "task_count": N (full) | target_file_count (mini),
+        "impact_warnings": [...] (mini only),
+      }
+    """
+    entry: dict = {
+        "scope": scope,
+        "generated_at": _utc_now_iso(),
+        "plan_version": plan.get("plan_version", "1.0.0"),
+    }
+
+    if scope == "full":
+        entry["task_count"] = len(plan.get("tasks", []))
+        entry["implementation_order"] = plan.get("implementation_order", [])
+    else:
+        entry["task_summary"] = plan.get("task_summary", "")
+        entry["task_count"] = len(plan.get("target_files", []))
+        if impact:
+            entry["impact_warnings"] = impact.get("warnings", [])
+            entry["impact_conflicts"] = impact.get("conflicts", [])
+
+    log_path = PLANNER_PLAN_LOG
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if log_path.exists():
+            raw = log_path.read_text(encoding="utf-8").strip()
+            try:
+                data = json.loads(raw)
+                entries = data.get("entries", []) if isinstance(data, dict) else data
+                if not isinstance(entries, list):
+                    entries = []
+            except Exception:
+                entries = []
+        else:
+            entries = []
+
+        entries.append(entry)
+        log_path.write_text(
+            json.dumps({"entries": entries}, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        track_write(log_path)
+        print(f"[07] Plan log appended ({len(entries)} entries) → {log_path}")
+    except Exception as exc:
+        print(f"[07] WARNING: could not append plan log: {exc}", file=sys.stderr)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -737,15 +836,13 @@ def _load_mini_request() -> str:
     Load the mini request.
 
     Preferred:
-      1. execution/enricher_overwrite_enriched_prompt.md
-      2. state/clarificator_requirement_synthesis.md
+      1. enricher/enriched_prompt.md  (richer context from enricher)
+      2. clarificator/session.json    (field: requirement_synthesis)
 
-    enricher_overwrite_enriched_prompt is optional and may include richer context
-    generated by the enricher. clarificator_requirement_synthesis is the
-    canonical minimum input for mini planning.
+    Both are tried; if both exist, both are included.
     """
     enriched = _read_optional(ENRICHER_OVERWRITE_PROMPT, max_chars=20_000)
-    clarified = _read_optional(CLARIFIED_REQ, max_chars=20_000)
+    clarified = _read_clarificator_synthesis(max_chars=20_000)
 
     if enriched and clarified:
         return (
@@ -765,75 +862,107 @@ def _load_mini_request() -> str:
         "Mini planner requires a clarified request.\n"
         f"Missing both:\n"
         f"  - {ENRICHER_OVERWRITE_PROMPT}\n"
-        f"  - {CLARIFIED_REQ}\n\n"
+        f"  - {CLARIFIED_REQ} (field: requirement_synthesis)\n\n"
         "Run clarificator/enricher first, for example:\n"
         "  python harness.py --project <name> --scope mini --clarify\n"
-        "or provide/create state/clarificator_requirement_synthesis.md."
+        "or provide clarificator/session.json with requirement_synthesis field."
     )
+
+
+def _read_clarificator_synthesis(*, max_chars: int | None = None) -> str:
+    """
+    Extract requirement_synthesis field from clarificator/session.json.
+    Falls back to full JSON text if field is absent.
+    Returns empty string if file missing or unreadable.
+    """
+    try:
+        if not CLARIFIED_REQ.exists():
+            return ""
+        track_read(CLARIFIED_REQ)
+        raw = CLARIFIED_REQ.read_text(encoding="utf-8").strip()
+        if not raw:
+            return ""
+        data = json.loads(raw)
+        synthesis = data.get("requirement_synthesis", "")
+        text = synthesis.strip() if isinstance(synthesis, str) else ""
+        if not text:
+            # Fallback: whole session as context
+            text = raw
+        if max_chars is not None and len(text) > max_chars:
+            return text[:max_chars] + f"\n\n<!-- truncated at {max_chars} chars -->"
+        return text
+    except Exception as exc:
+        print(f"[07] WARNING: could not read clarificator session: {exc}", file=sys.stderr)
+        return ""
 
 
 def _load_mini_context_bundle() -> str:
     """
     Load optional knowledge/context files for mini planning.
     Missing files are ignored.
+
+    Sources (new layout):
+      clarificator/session.json     — full session object (decisions, conflicts, tier_counts …)
+      archivist/knowledge_log.md    — accumulated knowledge
+      absorber/codebase_map.md      — merged codebase + config + blame map
+      patcher/attempt_log.json      — last entry only (replaces PATCHER_FINDINGS_SNAPSHOT)
+      archivist/spec_gaps.md        — known spec gaps
     """
     sections: list[str] = []
 
-    sources: list[tuple[str, Any, str, int]] = [
-        (
-            "execution/clarificator_overwrite_raw.json",
-            CLARIFICATOR_OVERWRITE_RAW,
-            "json",
-            20_000,
-        ),
-        (
-            "knowledge/current/archivist_knowledge_log.md",
-            ARCHIVIST_KNOWLEDGE_LOG,
-            "text",
-            30_000,
-        ),
-        (
-            "knowledge/current/absorber_codebase_map.md",
-            ABSORBER_CODEBASE_MAP,
-            "text",
-            35_000,
-        ),
-        (
-            "knowledge/current/absorber_config_map.json",
-            ABSORBER_CONFIG_MAP,
-            "json",
-            20_000,
-        ),
-        (
-            "knowledge/current/absorber_blame_map.md",
-            ABSORBER_BLAME_MAP,
-            "text",
-            20_000,
-        ),
-        (
-            "knowledge/current/patcher_findings_snapshot.md",
-            PATCHER_FINDINGS_SNAPSHOT,
-            "text",
-            20_000,
-        ),
-        (
-            "knowledge/current/archivist_spec_gaps.md",
-            ARCHIVIST_SPEC_GAPS,
-            "text",
-            15_000,
-        ),
-    ]
+    # ── clarificator full session (context only — synthesis already in request) ──
+    session_text = _read_json_optional(CLARIFICATOR_SESSION, max_chars=20_000)
+    if session_text:
+        sections.append("### clarificator/session.json\n" + session_text)
 
-    for label, path, kind, cap in sources:
-        text = (
-            _read_json_optional(path, max_chars=cap)
-            if kind == "json"
-            else _read_optional(path, max_chars=cap)
-        )
-        if text:
-            sections.append(f"### {label}\n{text}")
+    # ── archivist knowledge log ──
+    knowledge = _read_optional(ARCHIVIST_KNOWLEDGE_LOG, max_chars=30_000)
+    if knowledge:
+        sections.append("### archivist/knowledge_log.md\n" + knowledge)
+
+    # ── absorber codebase map (merged config + blame) ──
+    codebase = _read_optional(ABSORBER_CODEBASE_MAP, max_chars=35_000)
+    if codebase:
+        sections.append("### absorber/codebase_map.md\n" + codebase)
+
+    # ── patcher last attempt entry ──
+    patcher_last = _read_patcher_last_entry(max_chars=20_000)
+    if patcher_last:
+        sections.append("### patcher/attempt_log.json (last entry)\n" + patcher_last)
+
+    # ── spec gaps ──
+    spec_gaps = _read_optional(ARCHIVIST_SPEC_GAPS, max_chars=15_000)
+    if spec_gaps:
+        sections.append("### archivist/spec_gaps.md\n" + spec_gaps)
 
     return "\n\n".join(sections)
+
+
+def _read_patcher_last_entry(*, max_chars: int | None = None) -> str:
+    """
+    Read the last entry from patcher/attempt_log.json.
+    Returns empty string if file missing, empty, or unreadable.
+    Replaces the removed PATCHER_FINDINGS_SNAPSHOT.
+    """
+    try:
+        if not PATCHER_ATTEMPT_LOG.exists():
+            return ""
+        track_read(PATCHER_ATTEMPT_LOG)
+        raw = PATCHER_ATTEMPT_LOG.read_text(encoding="utf-8").strip()
+        if not raw:
+            return ""
+        data = json.loads(raw)
+        entries = data.get("entries", data) if isinstance(data, dict) else data
+        if not isinstance(entries, list) or not entries:
+            return ""
+        last = entries[-1]
+        text = json.dumps(last, indent=2, ensure_ascii=False)
+        if max_chars is not None and len(text) > max_chars:
+            return text[:max_chars] + f"\n\n<!-- truncated at {max_chars} chars -->"
+        return text
+    except Exception as exc:
+        print(f"[07] WARNING: could not read patcher attempt log: {exc}", file=sys.stderr)
+        return ""
 
 
 def call_mini_planner(request: str, context_bundle: str) -> dict:
@@ -875,12 +1004,27 @@ def _is_disallowed_target_path(path: str) -> bool:
     if not normalized:
         return True
 
+    # Artifact folder prefixes — implementer must never touch these
     blocked_prefixes = (
         "artifacts_",
+        "planner/",
+        "executor/",
+        "debugger/",
+        "reporter/",
+        "judge/",
+        "patcher/",
+        "archivist/",
+        "absorber/",
+        "clarificator/",
+        "enricher/",
+        "spectracker/",
+        "scaffolder/",
+        "spec/",
+        # Legacy dirs — still blocked for safety
         "state/",
         "cache/",
         "execution/",
-        "run/",       # legacy artifact dir, still blocked for safety
+        "run/",
         "knowledge/",
         "reports/",
     )
@@ -898,8 +1042,9 @@ def _is_disallowed_target_path(path: str) -> bool:
 
 def validate_and_normalize_mini_result(result: dict) -> tuple[dict, dict]:
     """
-    Validate and normalize model output into
-    (planner_mini_execution_plan, planner_mini_impact_analysis).
+    Validate and normalize model output into (plan, impact).
+
+    The caller merges these into mini_plan.json as {"plan": plan, "impact": impact}.
 
     Backward compatibility:
     - Accepts old top-level keys "plan_mini" and "analysis_mini".
@@ -1010,23 +1155,22 @@ def run_mini_scope() -> None:
     result = call_mini_planner(request, context_bundle)
     plan_mini, impact_analysis = validate_and_normalize_mini_result(result)
 
-    PLANNER_MINI_PLAN.parent.mkdir(parents=True, exist_ok=True)
-    PLANNER_MINI_IMPACT.parent.mkdir(parents=True, exist_ok=True)
+    # Merge plan + impact into single mini_plan.json  { "plan": {...}, "impact": {...} }
+    mini_plan_merged = {
+        "plan": plan_mini,
+        "impact": impact_analysis,
+    }
 
+    PLANNER_MINI_PLAN.parent.mkdir(parents=True, exist_ok=True)
     PLANNER_MINI_PLAN.write_text(
-        json.dumps(plan_mini, indent=2, ensure_ascii=False),
+        json.dumps(mini_plan_merged, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
     track_write(PLANNER_MINI_PLAN)
 
-    PLANNER_MINI_IMPACT.write_text(
-        json.dumps(impact_analysis, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
-    track_write(PLANNER_MINI_IMPACT)
+    append_plan_log(scope="mini", plan=plan_mini, impact=impact_analysis)
 
-    print(f"[07] Mini plan written            → {PLANNER_MINI_PLAN}")
-    print(f"[07] Mini impact analysis written → {PLANNER_MINI_IMPACT}")
+    print(f"[07] Mini plan written → {PLANNER_MINI_PLAN}")
     print(f"[07] Target files: {len(plan_mini.get('target_files', []))}")
     for entry in plan_mini.get("target_files", []):
         print(
