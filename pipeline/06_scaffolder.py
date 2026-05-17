@@ -1,18 +1,18 @@
 """
 pipeline/06_scaffolder.py
 =========================
-Step 6 — Generate scaffold JSON from canonical spec and materialize source/test stubs.
+Step 6 — Generate module-centric blueprint from canonical spec.
 
 This step is intended for the FULL pipeline. Mini runs should normally skip this
 step and use the mini planner/implementer flow instead.
 
-Writes, owner: scaffolder:
-  artifacts_<slug>/state/scaffolder_codebase_skeleton.json
-  artifacts_<slug>/src/**
-  artifacts_<slug>/tests/**
+Writes (owner: scaffolder):
+  artifacts_<slug>/scaffolder/blueprint.json      ← short-term, overwrite
+  artifacts_<slug>/scaffolder/skeleton_log.json   ← long-term, append-only
+  artifacts_<slug>/output/tests/**                ← test stubs (skeleton only)
 
 Reads:
-  artifacts_<slug>/specwright_spec_<slug>.md
+  artifacts_<slug>/spec/specwright_spec_<slug>.md
 
 Direct execution:
   python 06_scaffolder.py --project my-app
@@ -36,14 +36,17 @@ import os
 import re
 import sys
 import textwrap
+import time
+import random
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 # === WRITE AUTHORITY: scaffolder ===
-# OWNS  : artifacts_<slug>/state/scaffolder_codebase_skeleton.json
-#         artifacts_<slug>/src/**
-#         artifacts_<slug>/tests/**
-# READS : artifacts_<slug>/specwright_spec_<slug>.md
+# OWNS  : artifacts_<slug>/scaffolder/blueprint.json
+#          artifacts_<slug>/scaffolder/skeleton_log.json
+#          artifacts_<slug>/output/tests/**
+# READS : artifacts_<slug>/spec/specwright_spec_<slug>.md
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from artifacts.models import call_model, get_model, get_provider  # noqa: E402
@@ -52,7 +55,7 @@ from modules.cost import print_call, print_summary, record_usage  # noqa: E402
 from modules.post_interactive import prompt_next_step  # noqa: E402
 from artifacts.paths import (  # noqa: E402
     SCAFFOLD_JSON,
-    SRC_DIR,
+    SCAFFOLDER_SKELETON_LOG,
     TESTS_DIR,
     ensure_dirs,
     get_spec_path,
@@ -65,56 +68,48 @@ MAX_OUTPUT_TOKENS = 65536
 
 # ─────────────────────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = textwrap.dedent("""
-    You are a senior software architect generating a scaffold from a technical spec.
+    You are a senior software architect generating a module-centric blueprint
+    from a technical spec.
 
     You will receive the canonical spec. The spec is the source of truth. Follow
-    its stack, file tree, output schema, naming, testing framework, and acceptance
-    criteria.
+    its stack, file tree, naming, testing framework, and acceptance criteria.
 
     Your task:
-    1. Read the spec carefully, especially the file tree and output schema sections.
-    2. Produce a SINGLE valid JSON object matching the schema requested by the spec.
-    3. The JSON MUST be valid and parseable by JSON.parse / json.loads.
+    1. Read the spec carefully, especially the file tree and module structure.
+    2. Produce a SINGLE valid JSON object matching the schema below.
+    3. The JSON MUST be valid and parseable by json.loads.
+
+    OUTPUT SCHEMA (strict — no other top-level keys allowed):
+    {
+      "modules": [
+        {
+          "module": "<module_name>",
+          "purpose": "<one-line description of module responsibility>",
+          "files": [
+            { "path": "src/auth/service.py", "kind": "source" },
+            { "path": "tests/auth/test_service.py", "kind": "test" }
+          ]
+        }
+      ]
+    }
+
+    RULES:
+    - "kind" MUST be one of: "source", "test", "config", "migration"
+    - "path" is relative from project root (e.g. src/..., tests/..., config/...)
+    - Group files by logical module. Each module has a clear single responsibility.
+    - Do NOT include a "code" field. This is a blueprint, not implementation.
+    - Do NOT add files not implied by the spec's file tree or architecture.
+    - Preserve file paths exactly as specified by the spec.
+    - Every source file in the spec MUST appear in exactly one module.
+    - Every test file in the spec MUST appear in exactly one module.
+    - If the spec defines config files (docker-compose, .env.example, etc.),
+      include them with kind "config".
+    - If the spec defines migrations, include them with kind "migration".
 
     JSON requirements:
-    - Use double quotes " for all JSON strings.
-    - Escape any internal " characters as \\".
-    - If you output code in a "code" field, it MUST be a single JSON string value
-      with all newlines as \\n and all quotes properly escaped.
-    - Do NOT use single quotes ' as JSON string delimiters.
-    - Do NOT include comments.
-    - Do NOT include trailing commas.
-    - Do NOT wrap the response in markdown fences.
+    - Use double quotes for all strings.
+    - Do NOT include comments, trailing commas, or markdown fences.
     - Output raw JSON only.
-
-    Scaffold requirements:
-    - Do NOT add files not listed by the spec's file tree.
-    - For non-test files, generate interfaces/types/function signatures/stubs as
-      requested by the spec. If the spec asks for stubs, use explicit
-      "not implemented" placeholders.
-    - For test files, generate complete runnable tests using the framework
-      specified by the spec.
-    - Preserve file paths exactly as specified by the spec unless the output
-      schema explicitly says otherwise.
-      
-    STRICT SKELETON RULES — NO EXCEPTIONS:
-    - Do NOT write any business logic, algorithm, or implementation body.
-    - Do NOT write SQL queries, API calls, data transformations, or computation.
-    - Every function/method body MUST be exactly one placeholder line, for examples:
-        Python : raise NotImplementedError
-        TS/JS  : throw new Error("not implemented")
-        Go     : panic("not implemented")
-        Java   : throw new UnsupportedOperationException("not implemented")
-    - Class attributes, fields, constructor params: declare types only, no default values beyond None/null/zero.
-    - Config files (JSON/YAML/TOML): include all keys from spec, values are empty string "", [], or {}.
-    - No helper utilities, no inline logic, no conditional branches.
-    
-    Output schema for each file entry (STRICT — no other key names allowed):
-    {
-      "file_path": "relative/path/to/file.py",   // NOT "path", NOT "filepath"
-      "code": "...",
-      "is_test": false
-    }
 """).strip()
 
 
@@ -125,7 +120,7 @@ SYSTEM_PROMPT = textwrap.dedent("""
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="06_scaffolder.py",
-        description="Generate scaffold JSON/files from the canonical spec.",
+        description="Generate module-centric blueprint from the canonical spec.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""
             Examples:
@@ -148,7 +143,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Call model and validate scaffold, but do not write files.",
+        help="Call model and validate blueprint, but do not write files.",
     )
     parser.add_argument(
         "--max-retries",
@@ -163,12 +158,6 @@ def _configure_project(
     project: str | None,
     parser: argparse.ArgumentParser,
 ) -> None:
-    """
-    Configure project context for direct execution.
-
-    Harness normally sets PIPELINE_PROJECT before invoking this script.
-    Direct usage can pass --project.
-    """
     if project:
         os.environ["PIPELINE_PROJECT"] = project
         return
@@ -192,14 +181,9 @@ def call_scaffolder(
     max_retries: int = 5,
 ) -> dict[str, Any]:
     """
-    Call the scaffolder role (config in artifacts/models.py) with the canonical spec.
-
-    Retries on transient failures with exponential backoff.
-    Returns the parsed scaffold as a dict.
+    Call the scaffolder role with the canonical spec.
+    Returns the parsed blueprint as a dict.
     """
-    import random
-    import time
-
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {
@@ -208,7 +192,7 @@ def call_scaffolder(
         },
     ]
 
-    model    = get_model(ROLE)
+    model = get_model(ROLE)
     provider = get_provider(ROLE)
     print(f"[06] Calling model: {model} (provider: {provider}) …")
 
@@ -225,8 +209,8 @@ def call_scaffolder(
             text = resp.choices[0].message.content or ""
             usage = getattr(resp, "usage", None)
             if usage:
-                pt        = getattr(usage, "prompt_tokens",     0) or 0
-                ct        = getattr(usage, "completion_tokens", 0) or 0
+                pt = getattr(usage, "prompt_tokens", 0) or 0
+                ct = getattr(usage, "completion_tokens", 0) or 0
                 call_cost = record_usage(usage, model=model, provider=provider)
                 print_call(__file__, pt, ct, call_cost)
             return _parse_json(text)
@@ -252,13 +236,9 @@ def call_scaffolder(
 
 def _parse_json(raw: str) -> dict[str, Any]:
     """
-    Robust JSON extraction.
+    Robust JSON extraction from model output.
 
-    Handles:
-      - Accidental markdown fences (```json ... ```)
-      - Top-level array → auto-wrapped into {"files": [...]}
-        (some models like GLM return array of file entries directly)
-      - Fallback: extract outermost JSON object via regex
+    Handles markdown fences, top-level arrays, and regex fallback.
     """
     cleaned = raw.strip()
     cleaned = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", cleaned)
@@ -272,10 +252,10 @@ def _parse_json(raw: str) -> dict[str, Any]:
         if isinstance(parsed, list):
             print(
                 "[06][warn] Model returned top-level array — auto-wrapping into "
-                '{"files": [...]}',
+                '{"modules": [...]}',
                 file=sys.stderr,
             )
-            return {"files": parsed}
+            return {"modules": parsed}
         if not isinstance(parsed, dict):
             raise ValueError(
                 f"Model returned JSON, but top-level value is not an object or array "
@@ -298,12 +278,7 @@ def _parse_json(raw: str) -> dict[str, Any]:
             raise SystemExit(1) from exc
 
         if isinstance(parsed, list):
-            print(
-                "[06][warn] Extracted JSON is top-level array — auto-wrapping into "
-                '{"files": [...]}',
-                file=sys.stderr,
-            )
-            return {"files": parsed}
+            return {"modules": parsed}
         if not isinstance(parsed, dict):
             raise ValueError(
                 f"Extracted JSON top-level value is not an object or array "
@@ -316,124 +291,290 @@ def _parse_json(raw: str) -> dict[str, Any]:
     raise SystemExit(1)
 
 
-_FILE_PATH_ALIASES = ("path", "filepath", "filename", "file", "name")
-
-def _normalize_scaffold_entry(entry: dict[str, Any], idx: int) -> dict[str, Any]:
-    if "file_path" not in entry:
-        for alias in _FILE_PATH_ALIASES:
-            if alias in entry:
-                print(f"[06][warn] files[{idx}]: aliased '{alias}' → 'file_path'")
-                entry = {**entry, "file_path": entry[alias]}
-                break
-    return entry
+_VALID_KINDS = {"source", "test", "config", "migration"}
 
 
-def _validate_scaffold(scaffold: dict[str, Any]) -> None:
-    required = {"files"}
-    missing = required - set(scaffold.keys())
-    if missing:
-        raise ValueError(f"scaffold JSON missing required keys: {sorted(missing)}")
+def _validate_blueprint(blueprint: dict[str, Any]) -> None:
+    """
+    Validate blueprint against the module-centric schema.
+    Raises ValueError on any schema violation.
+    """
+    modules = blueprint.get("modules")
+    if not isinstance(modules, list):
+        raise ValueError('blueprint must contain "modules" as a list')
 
-    files = scaffold.get("files")
-    if not isinstance(files, list):
-        raise ValueError('scaffold["files"] must be a list')
+    if not modules:
+        raise ValueError("blueprint modules list is empty")
 
-    normalized: list[dict] = []
-    for idx, entry in enumerate(files):
-        if not isinstance(entry, dict):
-            raise ValueError(f"scaffold files[{idx}] must be an object")
+    total = 0
+    source_count = 0
+    test_count = 0
 
-        entry = _normalize_scaffold_entry(entry, idx)
+    for idx, mod in enumerate(modules):
+        if not isinstance(mod, dict):
+            raise ValueError(f"modules[{idx}] must be an object")
 
-        file_path = entry.get("file_path")
-        if not isinstance(file_path, str) or not file_path.strip():
-            raise ValueError(f"scaffold files[{idx}].file_path must be a non-empty string")
+        module_name = mod.get("module")
+        if not isinstance(module_name, str) or not module_name.strip():
+            raise ValueError(f"modules[{idx}].module must be a non-empty string")
 
-        code = entry.get("code")
-        if not isinstance(code, str):
-            raise ValueError(f"scaffold files[{idx}].code must be a string")
+        purpose = mod.get("purpose")
+        if not isinstance(purpose, str) or not purpose.strip():
+            raise ValueError(f"modules[{idx}].purpose must be a non-empty string")
 
-        is_test = entry.get("is_test", False)
-        if not isinstance(is_test, bool):
-            raise ValueError(f"scaffold files[{idx}].is_test must be boolean when present")
+        files = mod.get("files")
+        if not isinstance(files, list):
+            raise ValueError(f"modules[{idx}].files must be a list")
 
-        normalized.append(entry)
+        if not files:
+            raise ValueError(f"modules[{idx}].files is empty — each module needs at least one file")
 
-    scaffold["files"] = normalized
+        for fidx, fentry in enumerate(files):
+            if not isinstance(fentry, dict):
+                raise ValueError(f"modules[{idx}].files[{fidx}] must be an object")
+
+            path = fentry.get("path")
+            if not isinstance(path, str) or not path.strip():
+                raise ValueError(
+                    f"modules[{idx}].files[{fidx}].path must be a non-empty string"
+                )
+
+            # Reject path traversal and absolute paths
+            normalized = path.replace("\\", "/").strip()
+            if Path(normalized).is_absolute():
+                raise ValueError(
+                    f"modules[{idx}].files[{fidx}].path must be relative: {path}"
+                )
+            if ".." in Path(normalized).parts:
+                raise ValueError(
+                    f"modules[{idx}].files[{fidx}].path contains path traversal: {path}"
+                )
+
+            kind = fentry.get("kind")
+            if kind not in _VALID_KINDS:
+                raise ValueError(
+                    f"modules[{idx}].files[{fidx}].kind must be one of "
+                    f"{sorted(_VALID_KINDS)}, got: {kind!r}"
+                )
+
+            total += 1
+            if kind == "source":
+                source_count += 1
+            elif kind == "test":
+                test_count += 1
+
+    # Attach summary (computed, not model-provided)
+    blueprint["summary"] = {
+        "total": total,
+        "source": source_count,
+        "test": test_count,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# File writer
+# Spec version extraction
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _extract_spec_version(spec_content: str) -> str:
+    """Extract version string from spec content, fallback to 'unknown'."""
+    match = re.search(r"[Vv]ersion[:\s]+([^\s\n]+)", spec_content)
+    if match:
+        return match.group(1)
+    match = re.search(r"^#+.*?(v\d+\S*)", spec_content, re.MULTILINE)
+    if match:
+        return match.group(1)
+    return "unknown"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Skeleton log (long-term, append-only)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _append_skeleton_log(blueprint: dict[str, Any], spec_version: str) -> None:
+    """Append a summary entry to the long-term skeleton log."""
+    log_path = Path(str(SCAFFOLDER_SKELETON_LOG))
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    entry = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "spec_version": spec_version,
+        "module_count": len(blueprint.get("modules", [])),
+        "summary": blueprint.get("summary", {}),
+        "modules": [
+            {
+                "module": m["module"],
+                "purpose": m["purpose"],
+                "file_count": len(m.get("files", [])),
+            }
+            for m in blueprint.get("modules", [])
+        ],
+    }
+
+    # Append to JSON array
+    entries: list[dict] = []
+    if log_path.exists():
+        try:
+            data = json.loads(log_path.read_text())
+            if isinstance(data, list):
+                entries = data
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    entries.append(entry)
+    log_path.write_text(json.dumps(entries, indent=2))
+    track_write(SCAFFOLDER_SKELETON_LOG)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test stub writer
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _safe_relative_path(raw_path: str) -> Path:
-    """
-    Convert model-provided path to safe relative path.
-
-    Rejects:
-      - absolute paths
-      - path traversal using ..
-      - empty paths
-    """
+    """Convert to safe relative path. Rejects absolute and traversal paths."""
     normalized = raw_path.replace("\\", "/").strip()
     rel = Path(normalized)
 
     if not normalized:
-        raise ValueError("empty file_path is not allowed")
-
+        raise ValueError("empty path is not allowed")
     if rel.is_absolute():
-        raise ValueError(f"absolute file_path is not allowed: {raw_path}")
-
+        raise ValueError(f"absolute path is not allowed: {raw_path}")
     if any(part == ".." for part in rel.parts):
         raise ValueError(f"path traversal is not allowed: {raw_path}")
 
     return rel
 
 
-def _destination_for_entry(entry: dict[str, Any]) -> Path:
-    file_path = entry["file_path"]
-    is_test = entry.get("is_test", False)
+def _generate_test_stub(path: str) -> str:
+    """Generate a minimal test stub based on file extension."""
+    if path.endswith(".py"):
+        module_hint = Path(path).stem.replace("test_", "")
+        return (
+            f'"""Tests for {module_hint}."""\n'
+            f"\n"
+            f"import pytest\n"
+            f"\n"
+            f"\n"
+            f"class Test{module_hint.title().replace('_', '')}:\n"
+            f'    """Test suite for {module_hint}."""\n'
+            f"\n"
+            f"    def test_placeholder(self):\n"
+            f'        raise NotImplementedError("test not implemented")\n'
+        )
+    elif path.endswith((".ts", ".tsx")):
+        module_hint = Path(path).stem.replace(".test", "").replace(".spec", "")
+        return (
+            f'import {{ describe, it, expect }} from "vitest";\n'
+            f"\n"
+            f'describe("{module_hint}", () => {{\n'
+            f'  it("should be implemented", () => {{\n'
+            f'    throw new Error("not implemented");\n'
+            f"  }});\n"
+            f"}});\n"
+        )
+    elif path.endswith((".js", ".jsx")):
+        module_hint = Path(path).stem.replace(".test", "").replace(".spec", "")
+        return (
+            f'const {{ describe, it, expect }} = require("@jest/globals");\n'
+            f"\n"
+            f'describe("{module_hint}", () => {{\n'
+            f'  it("should be implemented", () => {{\n'
+            f'    throw new Error("not implemented");\n'
+            f"  }});\n"
+            f"}});\n"
+        )
+    elif path.endswith(".go"):
+        return (
+            f"package main\n"
+            f"\n"
+            f'import "testing"\n'
+            f"\n"
+            f"func TestPlaceholder(t *testing.T) {{\n"
+            f'\tt.Fatal("not implemented")\n'
+            f"}}\n"
+        )
+    else:
+        return f"// TODO: implement tests\n"
 
-    rel = _safe_relative_path(file_path)
 
-    if is_test:
-        parts = rel.parts
-        if parts and parts[0] == "tests":
-            rel = Path(*parts[1:]) if len(parts) > 1 else Path(rel.name)
-        return TESTS_DIR / rel
+def _write_test_stubs(blueprint: dict[str, Any]) -> int:
+    """
+    Materialize test file stubs from blueprint.
+    Returns count of test files written.
+    """
+    count = 0
+    for mod in blueprint.get("modules", []):
+        for fentry in mod.get("files", []):
+            if fentry["kind"] != "test":
+                continue
 
-    parts = rel.parts
-    if parts and parts[0] == "src":
-        rel = Path(*parts[1:]) if len(parts) > 1 else Path(rel.name)
-    return SRC_DIR / rel
+            raw_path = fentry["path"]
+            rel = _safe_relative_path(raw_path)
+
+            # Strip leading tests/ prefix since TESTS_DIR already points there
+            parts = rel.parts
+            if parts and parts[0] == "tests":
+                rel = Path(*parts[1:]) if len(parts) > 1 else Path(rel.name)
+
+            dest = Path(str(TESTS_DIR)) / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+
+            stub = _generate_test_stub(raw_path)
+            dest.write_text(stub)
+            track_write(dest)
+
+            print(f"[06] [TEST] {dest}")
+            count += 1
+
+    return count
 
 
-def write_files(scaffold: dict[str, Any]) -> None:
-    SCAFFOLD_JSON.parent.mkdir(parents=True, exist_ok=True)
-    SCAFFOLD_JSON.write_text(json.dumps(scaffold, indent=2))
+# ─────────────────────────────────────────────────────────────────────────────
+# Write blueprint
+# ─────────────────────────────────────────────────────────────────────────────
+
+def write_blueprint(blueprint: dict[str, Any], spec_version: str) -> None:
+    """Write blueprint.json and materialize test stubs."""
+    # Add metadata
+    blueprint["generated_at"] = datetime.now(timezone.utc).isoformat()
+    blueprint["spec_version"] = spec_version
+
+    # Write blueprint JSON
+    blueprint_path = Path(str(SCAFFOLD_JSON))
+    blueprint_path.parent.mkdir(parents=True, exist_ok=True)
+    blueprint_path.write_text(json.dumps(blueprint, indent=2))
     track_write(SCAFFOLD_JSON)
-    print(f"[06] Scaffold JSON → {SCAFFOLD_JSON}")
+    print(f"[06] Blueprint → {SCAFFOLD_JSON}")
 
-    for entry in scaffold["files"]:
-        dest = _destination_for_entry(entry)
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(entry["code"])
-        track_write(dest)
+    # Materialize test stubs
+    test_count = _write_test_stubs(blueprint)
+    print(f"[06] Test stubs written: {test_count}")
 
-        tag = "TEST" if entry.get("is_test", False) else "SRC "
-        print(f"[06] [{tag}] {dest}")
+    # Append to long-term log
+    _append_skeleton_log(blueprint, spec_version)
 
-    print("[06] Done.")
+    summary = blueprint.get("summary", {})
+    print(
+        f"[06] Done. Modules: {len(blueprint['modules'])}, "
+        f"Files: {summary.get('total', 0)} "
+        f"(source: {summary.get('source', 0)}, test: {summary.get('test', 0)})"
+    )
 
 
-def preview_files(scaffold: dict[str, Any]) -> None:
-    print("[06] --dry-run: scaffold validated. No files written.")
-    print(f"[06] Would write scaffold JSON → {SCAFFOLD_JSON}")
+def preview_blueprint(blueprint: dict[str, Any]) -> None:
+    """Dry-run: show what would be written without writing."""
+    print("[06] --dry-run: blueprint validated. No files written.")
+    print(f"[06] Would write blueprint → {SCAFFOLD_JSON}")
 
-    for entry in scaffold["files"]:
-        dest = _destination_for_entry(entry)
-        tag = "TEST" if entry.get("is_test", False) else "SRC "
-        print(f"[06] Would write [{tag}] {dest}")
+    for mod in blueprint.get("modules", []):
+        print(f"[06]   Module: {mod['module']} — {mod['purpose']}")
+        for fentry in mod.get("files", []):
+            print(f"[06]     [{fentry['kind'].upper():6s}] {fentry['path']}")
+
+    summary = blueprint.get("summary", {})
+    print(
+        f"[06] Total files: {summary.get('total', 0)} "
+        f"(source: {summary.get('source', 0)}, test: {summary.get('test', 0)})"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -448,9 +589,6 @@ def main() -> None:
         args = parser.parse_args()
 
         _configure_project(args.project, parser)
-
-        # Important: do not call ensure_dirs() at import-time.
-        # PIPELINE_PROJECT must be available before artifact paths are resolved.
         ensure_dirs()
 
         spec_path = get_spec_path()
@@ -465,32 +603,33 @@ def main() -> None:
 
         track_read(spec_path)
         spec = spec_path.read_text(errors="replace")
+        spec_version = _extract_spec_version(spec)
 
-        scaffold = call_scaffolder(
-            spec,
-            max_retries=args.max_retries,
-        )
+        blueprint = call_scaffolder(spec, max_retries=args.max_retries)
 
         # DEBUG
-        if scaffold.get("files"):
-            print(f"[06][debug] files[0] keys: {list(scaffold['files'][0].keys())}", file=sys.stderr)
+        if blueprint.get("modules"):
+            print(
+                f"[06][debug] modules[0] keys: {list(blueprint['modules'][0].keys())}",
+                file=sys.stderr,
+            )
 
         try:
-            _validate_scaffold(scaffold)
+            _validate_blueprint(blueprint)
         except ValueError as exc:
-            print(f"[06][error] Invalid scaffold JSON: {exc}", file=sys.stderr)
+            print(f"[06][error] Invalid blueprint: {exc}", file=sys.stderr)
             print(
-                f"[06][debug] Scaffold first 1000 chars:\n"
-                f"{json.dumps(scaffold, indent=2)[:1000]}",
+                f"[06][debug] Blueprint first 1000 chars:\n"
+                f"{json.dumps(blueprint, indent=2)[:1000]}",
                 file=sys.stderr,
             )
             sys.exit(1)
 
         if args.dry_run:
-            preview_files(scaffold)
+            preview_blueprint(blueprint)
             return
 
-        write_files(scaffold)
+        write_blueprint(blueprint, spec_version)
 
     except SystemExit as exc:
         code = exc.code
