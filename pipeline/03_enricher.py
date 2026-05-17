@@ -8,15 +8,13 @@ Vị trí trong luồng:
     02_clarificator → [03_enricher] → 04_specwright → 05_spectracker → specwright_spec_<slug>.md → harness
 
 Inputs (đọc từ artifacts của project hiện tại):
-    state/clarificator_requirement_synthesis.md        — output chính của clarificator
-    execution/clarificator_overwrite_raw.json          — decisions, conflicts, metadata
-    knowledge/current/archivist_knowledge_log.md       — knowledge base (nếu có)
-    knowledge/current/absorber_codebase_map.md         — absorber output (nếu có)
-    knowledge/current/absorber_config_map.json         — absorber output (nếu có)
-    knowledge/current/absorber_blame_map.md            — absorber output (nếu có)
+    clarificator/session.json                — output chính của clarificator (synthesis embedded)
+    absorber/codebase_map.md                 — knowledge base (nếu có)
+    archivist/knowledge_log.md               — archivist knowledge (nếu có)
 
 Output (ghi vào artifacts của project):
-    execution/enricher_overwrite_enriched_prompt.md    — enriched prompt, user review trước khi gửi spec agent
+    enricher/enriched_prompt.md              — short-term, overwrite per run
+    enricher/prompt_log.json                 — long-term, append-only audit
 
 Usage:
     python 03_enricher.py --project my-app
@@ -26,7 +24,8 @@ Usage:
     # Thường được gọi tự động từ 02_clarificator.py khi user chọn mode full.
 
 Artifacts produced (owner: enricher):
-    artifacts_<slug>/execution/enricher_overwrite_enriched_prompt.md
+    artifacts_<slug>/enricher/enriched_prompt.md
+    artifacts_<slug>/enricher/prompt_log.json
 
 At the end of each run, prints:
     - artifacts read
@@ -38,7 +37,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import subprocess
 import sys
 import textwrap
@@ -49,13 +47,11 @@ from typing import Any
 # ── paths ─────────────────────────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from artifacts.paths import (  # type: ignore
-    ABSORBER_BLAME_MAP,
     ABSORBER_CODEBASE_MAP,
-    ABSORBER_CONFIG_MAP,
     ARCHIVIST_KNOWLEDGE_LOG,
-    CLARIFICATOR_OVERWRITE_RAW,
-    CLARIFIED_REQ,
+    CLARIFICATOR_SESSION,
     ENRICHER_OVERWRITE_PROMPT,
+    ENRICHER_PROMPT_LOG,
     ensure_dirs,
 )
 from artifacts.models import call_model, get_model, get_provider  # type: ignore
@@ -64,29 +60,15 @@ from modules.cost import print_call, print_summary, record_usage  # noqa: E402
 from modules.md_header import apply_header as apply_md_header  # noqa: E402
 from modules.post_interactive import prompt_next_step  # noqa: E402
 
-# Local aliases — map canonical constants to the short names used internally
-CLARIFICATION_REPORT = CLARIFICATOR_OVERWRITE_RAW
-KNOWLEDGE_BASE       = ARCHIVIST_KNOWLEDGE_LOG
-CODEBASE_MAP         = ABSORBER_CODEBASE_MAP
-CONFIG_MAP           = ABSORBER_CONFIG_MAP
-BLAME_MAP            = ABSORBER_BLAME_MAP
-ENRICHED_PROMPT      = ENRICHER_OVERWRITE_PROMPT
-
-# NOTE: run/mini_analysis.md (MINI_ANALYSIS) has been removed — deprecated with mini_mode.py.
-# enricher no longer reads it.
-
 # === WRITE AUTHORITY: enricher ===
-# OWNS  : artifacts_<slug>/execution/enricher_overwrite_enriched_prompt.md
-# READS : artifacts_<slug>/state/clarificator_requirement_synthesis.md
-#         artifacts_<slug>/execution/clarificator_overwrite_raw.json
-#         artifacts_<slug>/knowledge/current/archivist_knowledge_log.md
-#         artifacts_<slug>/knowledge/current/absorber_codebase_map.md
-#         artifacts_<slug>/knowledge/current/absorber_config_map.json
-#         artifacts_<slug>/knowledge/current/absorber_blame_map.md
+# OWNS  : artifacts_<slug>/enricher/enriched_prompt.md
+#          artifacts_<slug>/enricher/prompt_log.json
+# READS : artifacts_<slug>/clarificator/session.json
+#          artifacts_<slug>/absorber/codebase_map.md
+#          artifacts_<slug>/archivist/knowledge_log.md
 
 
 # ── Model config ──────────────────────────────────────────────────────────────
-# Model identity resolved from artifacts/models.py role "enricher".
 ROLE               = "enricher"
 _MAX_TOKENS_ENRICH = 4096
 
@@ -158,49 +140,40 @@ def _call_llm(
 # Context loaders
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _load_clarified_req() -> str:
-    if CLARIFIED_REQ.exists():
-        track_read(CLARIFIED_REQ)
-        return CLARIFIED_REQ.read_text(encoding="utf-8")
-    return ""
-
-
-def _load_clarification_report() -> dict:
-    if CLARIFICATION_REPORT.exists():
-        track_read(CLARIFICATION_REPORT)
+def _load_session() -> dict:
+    """Load clarificator/session.json — the single source for clarification output."""
+    if CLARIFICATOR_SESSION.exists():
+        track_read(CLARIFICATOR_SESSION)
         try:
-            return json.loads(CLARIFICATION_REPORT.read_text(encoding="utf-8"))
+            return json.loads(CLARIFICATOR_SESSION.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             return {}
     return {}
+
+
+def _extract_requirement_synthesis(session: dict) -> str:
+    """Extract the requirement_synthesis text field from session.json."""
+    return session.get("requirement_synthesis", "")
 
 
 def _load_knowledge_layer() -> str:
     """Load all available knowledge layer artifacts for the current project."""
     parts: list[str] = []
 
-    if CODEBASE_MAP.exists():
-        track_read(CODEBASE_MAP)
-        parts.append(f"=== absorber_codebase_map.md ===\n{CODEBASE_MAP.read_text(encoding='utf-8')}")
+    if ABSORBER_CODEBASE_MAP.exists():
+        track_read(ABSORBER_CODEBASE_MAP)
+        parts.append(f"=== absorber/codebase_map.md ===\n{ABSORBER_CODEBASE_MAP.read_text(encoding='utf-8')}")
 
-    if CONFIG_MAP.exists():
-        track_read(CONFIG_MAP)
-        parts.append(f"=== absorber_config_map.json ===\n{CONFIG_MAP.read_text(encoding='utf-8')}")
-
-    if BLAME_MAP.exists():
-        track_read(BLAME_MAP)
-        parts.append(f"=== absorber_blame_map.md ===\n{BLAME_MAP.read_text(encoding='utf-8')}")
-
-    if KNOWLEDGE_BASE.exists():
-        track_read(KNOWLEDGE_BASE)
-        parts.append(f"=== archivist_knowledge_log.md ===\n{KNOWLEDGE_BASE.read_text(encoding='utf-8')}")
+    if ARCHIVIST_KNOWLEDGE_LOG.exists():
+        track_read(ARCHIVIST_KNOWLEDGE_LOG)
+        parts.append(f"=== archivist/knowledge_log.md ===\n{ARCHIVIST_KNOWLEDGE_LOG.read_text(encoding='utf-8')}")
 
     return "\n\n".join(parts)
 
 
-def _summarize_decisions(report: dict) -> str:
-    """Format decisions from clarification report into a compact summary block."""
-    decisions = report.get("decisions", [])
+def _summarize_decisions(session: dict) -> str:
+    """Format decisions from session.json into a compact summary block."""
+    decisions = session.get("decisions", [])
     if not decisions:
         return "(no clarification decisions recorded)"
 
@@ -216,6 +189,43 @@ def _summarize_decisions(report: dict) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Append to long-term log
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _append_prompt_log(
+    project_name: str,
+    enriched_text: str,
+    session: dict,
+    extra_context: str,
+) -> None:
+    """Append an entry to enricher/prompt_log.json (long-term, append-only)."""
+    entry = {
+        "generated_at": _now_iso(),
+        "project": project_name,
+        "model": get_model(ROLE),
+        "input_session_hash": session.get("req_hash", ""),
+        "decisions_count": len(session.get("decisions", [])),
+        "extra_context": extra_context.strip() if extra_context.strip() else None,
+        "enriched_prompt_length": len(enriched_text),
+    }
+
+    entries: list[dict] = []
+    if ENRICHER_PROMPT_LOG.exists():
+        try:
+            data = json.loads(ENRICHER_PROMPT_LOG.read_text(encoding="utf-8"))
+            entries = data.get("entries", [])
+        except (json.JSONDecodeError, KeyError):
+            entries = []
+
+    entries.append(entry)
+    ENRICHER_PROMPT_LOG.write_text(
+        json.dumps({"entries": entries}, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    track_write(ENRICHER_PROMPT_LOG)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Prompt enrichment
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -223,7 +233,7 @@ _ENRICH_SYSTEM = """
 You are a senior software architect and prompt engineer.
 
 Your task: given a clarified requirement document, its clarification decisions,
-an optional mini analysis, and an optional knowledge layer of the existing codebase,
+and an optional knowledge layer of the existing codebase,
 produce ONE structured "Enriched Prompt" document that a spec-writing model can use
 directly to write a complete, unambiguous technical specification.
 
@@ -264,8 +274,7 @@ Format: "- **[CLR-XXX]** <decision summary in one line>"
 These are non-negotiable — the spec must incorporate all of them.
 
 ## Context: Warnings & Risks
-Pull from mini_analysis warnings (if available) + any conflicts from the
-clarification report. If none: "(none identified)"
+Pull from any conflicts in the clarification session. If none: "(none identified)"
 
 ## Constraints
 Technical, business, and process constraints the spec must respect.
@@ -273,7 +282,7 @@ Examples: auth method, deployment target, SLA, compliance requirements,
 existing API contracts that cannot break.
 
 ## Clarified Requirement (full text)
-Paste the full clarified_requirement.md content here verbatim.
+Paste the full requirement_synthesis content here verbatim.
 Do not summarize — the spec model needs the full text.
 
 ## Instructions for the Spec Model
@@ -293,9 +302,8 @@ Always include:
 RULES:
 - Do not write the spec itself. Only write the enriched prompt.
 - Do not truncate the clarified requirement — paste it in full.
-- If mini_analysis is available, mine it for warnings and optimization hints.
-- If knowledge layer is available, extract constraints from config_map.json
-  and file-level context from codebase_map.md.
+- If knowledge layer is available, extract constraints from codebase_map.md
+  and file-level context.
 - Be precise. Vague instructions produce vague specs.
 - Output only the markdown document. No preamble, no postamble.
 """.strip()
@@ -303,14 +311,14 @@ RULES:
 
 def _enrich(
     project_name: str,
-    clarified_req: str,
-    report: dict,
+    requirement_synthesis: str,
+    session: dict,
     knowledge_layer: str,
     extra_context: str,
 ) -> str:
-    decisions_block = _summarize_decisions(report)
+    decisions_block = _summarize_decisions(session)
 
-    conflicts = report.get("conflicts", [])
+    conflicts = session.get("conflicts", [])
     conflicts_block = (
         "\n".join(f"  [{c['id']}] {c['description']}" for c in conflicts)
         if conflicts else "(none detected)"
@@ -318,8 +326,8 @@ def _enrich(
 
     user_msg = f"""PROJECT NAME: {project_name}
 
-CLARIFIED REQUIREMENT:
-{clarified_req}
+CLARIFIED REQUIREMENT (requirement_synthesis):
+{requirement_synthesis}
 
 CLARIFICATION DECISIONS:
 {decisions_block}
@@ -354,7 +362,7 @@ def _review_prompt(enriched: str) -> tuple[str, bool]:
 
     print("\n  [1] confirm — send this prompt to spec agent")
     print("  [2] edit    — open $EDITOR to modify (writes to temp file)")
-    print("  [3] abort   — stop here, enricher_overwrite_enriched_prompt.md saved for manual review\n")
+    print("  [3] abort   — stop here, enriched_prompt.md saved for manual review\n")
 
     while True:
         choice = input("  → Choose 1 / 2 / 3: ").strip()
@@ -468,26 +476,25 @@ def main() -> None:
         print(f"[enricher] Workspace: {project_name!r}")
 
         # ── Load inputs ───────────────────────────────────────────────────────────
-        clarified_req = _load_clarified_req()
-        if not clarified_req.strip():
+        session = _load_session()
+        requirement_synthesis = _extract_requirement_synthesis(session)
+
+        if not requirement_synthesis.strip():
             print(
-                "[enricher][error] clarificator_requirement_synthesis.md not found or empty.\n"
+                "[enricher][error] clarificator/session.json not found or missing requirement_synthesis.\n"
                 "           Run 02_clarificator.py first."
             )
             sys.exit(1)
-        print(f"[enricher] Loaded clarificator_requirement_synthesis.md ({len(clarified_req)} chars)")
+        print(f"[enricher] Loaded clarificator/session.json ({len(requirement_synthesis)} chars synthesis)")
 
-        report = _load_clarification_report()
-        n_decisions = len(report.get("decisions", []))
-        print(f"[enricher] Loaded clarificator_overwrite_raw.json ({n_decisions} decisions)")
+        n_decisions = len(session.get("decisions", []))
+        print(f"[enricher] Session contains {n_decisions} decisions")
 
         knowledge_layer = _load_knowledge_layer()
         if knowledge_layer.strip():
             parts = []
-            if CODEBASE_MAP.exists():   parts.append("absorber_codebase_map")
-            if CONFIG_MAP.exists():     parts.append("absorber_config_map")
-            if BLAME_MAP.exists():      parts.append("absorber_blame_map")
-            if KNOWLEDGE_BASE.exists(): parts.append("archivist_knowledge_log")
+            if ABSORBER_CODEBASE_MAP.exists():    parts.append("absorber/codebase_map")
+            if ARCHIVIST_KNOWLEDGE_LOG.exists():   parts.append("archivist/knowledge_log")
             print(f"[enricher] Knowledge layer loaded: {', '.join(parts)}")
         else:
             print("[enricher] No knowledge layer found — proceeding in greenfield mode")
@@ -498,11 +505,11 @@ def main() -> None:
 
         try:
             enriched = _enrich(
-                project_name   = project_name,
-                clarified_req  = clarified_req,
-                report         = report,
-                knowledge_layer= knowledge_layer,
-                extra_context  = args.extra_context,
+                project_name          = project_name,
+                requirement_synthesis = requirement_synthesis,
+                session               = session,
+                knowledge_layer       = knowledge_layer,
+                extra_context         = args.extra_context,
             )
         except Exception as exc:
             print(f"[enricher][error] Enrichment failed: {exc}")
@@ -514,16 +521,21 @@ def main() -> None:
             print(enriched.strip())
             return
 
-        # ── Write enricher_overwrite_enriched_prompt.md ──────────────────────────
+        # ── Write enricher/enriched_prompt.md (short-term, overwrite) ─────────────
         header = (
             f"# Enriched Prompt — {project_name}\n"
             f"Generated: {_now_iso()}\n\n"
             f"---\n\n"
         )
-        final_content = apply_md_header(header + enriched.strip() + "\n", ENRICHED_PROMPT, owner="03_enricher.py", model=get_model(ROLE))
-        ENRICHED_PROMPT.write_text(final_content, encoding="utf-8")
-        track_write(ENRICHED_PROMPT)
-        print(f"[enricher] ✓ Enriched prompt → {ENRICHED_PROMPT}")
+        final_content = apply_md_header(
+            header + enriched.strip() + "\n",
+            ENRICHER_OVERWRITE_PROMPT,
+            owner="03_enricher.py",
+            model=get_model(ROLE),
+        )
+        ENRICHER_OVERWRITE_PROMPT.write_text(final_content, encoding="utf-8")
+        track_write(ENRICHER_OVERWRITE_PROMPT)
+        print(f"[enricher] ✓ Enriched prompt → {ENRICHER_OVERWRITE_PROMPT}")
 
         # ── Review ────────────────────────────────────────────────────────────────
         if args.no_review:
@@ -533,14 +545,28 @@ def main() -> None:
             final_prompt, should_continue = _review_prompt(enriched)
             # If user edited, overwrite the written file with updated content
             if final_prompt != enriched:
-                updated = apply_md_header(header + final_prompt.strip() + "\n", ENRICHED_PROMPT, owner="03_enricher.py", model=get_model(ROLE))
-                ENRICHED_PROMPT.write_text(updated, encoding="utf-8")
-                track_write(ENRICHED_PROMPT)
-                print(f"[enricher] ✓ Enriched prompt updated → {ENRICHED_PROMPT}")
+                updated = apply_md_header(
+                    header + final_prompt.strip() + "\n",
+                    ENRICHER_OVERWRITE_PROMPT,
+                    owner="03_enricher.py",
+                    model=get_model(ROLE),
+                )
+                ENRICHER_OVERWRITE_PROMPT.write_text(updated, encoding="utf-8")
+                track_write(ENRICHER_OVERWRITE_PROMPT)
+                print(f"[enricher] ✓ Enriched prompt updated → {ENRICHER_OVERWRITE_PROMPT}")
+
+        # ── Append to long-term log ──────────────────────────────────────────────
+        _append_prompt_log(
+            project_name = project_name,
+            enriched_text = final_prompt,
+            session       = session,
+            extra_context = args.extra_context,
+        )
+        print(f"[enricher] ✓ Prompt log appended → {ENRICHER_PROMPT_LOG}")
 
         if not should_continue:
-            _print_banner("Stopped — enricher_overwrite_enriched_prompt.md saved for manual review")
-            print(f"  Review:   {ENRICHED_PROMPT}")
+            _print_banner("Stopped — enricher/enriched_prompt.md saved for manual review")
+            print(f"  Review:   {ENRICHER_OVERWRITE_PROMPT}")
             print(f"  Continue: python 04_specwright.py --project {project_name!r}\n")
             return
 
@@ -551,3 +577,7 @@ def main() -> None:
         print_summary("[03]")
         print_artifact_summary("[03]")
         prompt_next_step(ROLE, prefix="[03]")
+
+
+if __name__ == "__main__":
+    main()
