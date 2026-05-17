@@ -10,15 +10,14 @@ FULL mode:
     - Apply static fixes.
     - Dispatch surface/component bugs to primary repair model (role: debugger).
     - Dispatch hook/data/type/util logic bugs to secondary repair model (role: debugger_secondary).
-    - Write debugger_overwrite_test_summary.json.
+    - Write debugger/test_summary.json (short-term) and append debugger/test_log.json (long-term).
 
 MINI mode:
   Safe targeted verification:
-    - Detect scope from execution/executor_overwrite_manifest.json.
+    - Detect scope from executor/manifest.json.
     - Do not require the canonical spec.
-    - Build context from clarificator_requirement_synthesis.md,
-      planner_mini_execution_plan.json, planner_mini_impact_analysis.json,
-      executor_overwrite_manifest.json.
+    - Build context from clarificator/session.json (field: requirement_synthesis),
+      planner/mini_plan.json (fields: plan + impact), executor/manifest.json.
     - Dispatch lightweight verifiers by target file extension:
         .py                  → py_compile
         .json                → json parse
@@ -28,22 +27,22 @@ MINI mode:
     - For TS/Vitest projects, can still run the full Vitest repair loop.
 
 Writes:
-  artifacts_<slug>/execution/debugger_overwrite_test_summary.json
-  artifacts_<slug>/src/**    repair loop patches, if needed
-  artifacts_<slug>/tests/**  fragile-test repair, if auditor allows
+  artifacts_<slug>/debugger/test_summary.json   (short-term, overwrite)
+  artifacts_<slug>/debugger/test_log.json       (long-term, append)
+  artifacts_<slug>/output/src/**                repair loop patches, if needed
+  artifacts_<slug>/output/tests/**              fragile-test repair, if auditor allows
 
 Reads:
-  artifacts_<slug>/specwright_spec_<slug>.md
-  artifacts_<slug>/state/planner_full_execution_plan.json
-  artifacts_<slug>/state/planner_mini_execution_plan.json
-  artifacts_<slug>/state/planner_mini_impact_analysis.json
-  artifacts_<slug>/state/clarificator_requirement_synthesis.md
-  artifacts_<slug>/execution/enricher_overwrite_enriched_prompt.md
-  artifacts_<slug>/execution/executor_overwrite_manifest.json
-  artifacts_<slug>/knowledge/current/patcher_findings_snapshot.md
-  artifacts_<slug>/knowledge/current/archivist_knowledge_log.md
-  artifacts_<slug>/src/**
-  artifacts_<slug>/tests/**
+  artifacts_<slug>/spec/specwright_spec_<slug>.md
+  artifacts_<slug>/planner/full_plan.json
+  artifacts_<slug>/planner/mini_plan.json         (fields: plan + impact)
+  artifacts_<slug>/clarificator/session.json      (field: requirement_synthesis)
+  artifacts_<slug>/enricher/enriched_prompt.md
+  artifacts_<slug>/executor/manifest.json
+  artifacts_<slug>/patcher/attempt_log.json       (last entry only)
+  artifacts_<slug>/archivist/knowledge_log.md
+  artifacts_<slug>/output/src/**
+  artifacts_<slug>/output/tests/**
 
 Direct execution:
   python 09_debugger.py --project my-app
@@ -71,21 +70,23 @@ from pathlib import Path
 from typing import Any, Callable
 
 # === WRITE AUTHORITY: debugger ===
-# OWNS  : artifacts_<slug>/execution/debugger_overwrite_test_summary.json
-#         artifacts_<slug>/src/**    repair patches, if needed
-#         artifacts_<slug>/tests/**  fragile-test patches, if auditor allows
+# OWNS  : artifacts_<slug>/debugger/test_summary.json   (short-term, overwrite)
+#         artifacts_<slug>/debugger/test_log.json        (long-term, append)
+#         artifacts_<slug>/output/src/**                 repair patches
+#         artifacts_<slug>/output/tests/**               fragile-test patches
 # READS : see module docstring
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from artifacts.paths import (  # noqa: E402
     ARCHIVIST_KNOWLEDGE_LOG,
+    CLARIFICATOR_SESSION,
     CLARIFIED_REQ,
     DEBUGGER_OVERWRITE_TEST_SUMMARY,
+    DEBUGGER_TEST_LOG,
     ENRICHER_OVERWRITE_PROMPT,
     EXECUTOR_OVERWRITE_MANIFEST,
-    PATCHER_FINDINGS_SNAPSHOT,
+    PATCHER_ATTEMPT_LOG,
     PLANNER_FULL_PLAN,
-    PLANNER_MINI_IMPACT,
     PLANNER_MINI_PLAN,
     SRC_DIR,
     TESTS_DIR,
@@ -278,35 +279,72 @@ def _load_spec_or_full_context() -> str:
 def _load_mini_context() -> str:
     parts: list[str] = []
 
+    # clarificator/session.json — extract requirement_synthesis field
     if CLARIFIED_REQ.exists():
-        parts.append(
-            "## clarificator_requirement_synthesis.md\n\n"
-            + _read_text_if_exists(CLARIFIED_REQ).strip()
-        )
+        try:
+            raw = CLARIFIED_REQ.read_text(encoding="utf-8")
+            track_read(CLARIFIED_REQ)
+            data = json.loads(raw)
+            synthesis = data.get("requirement_synthesis", "")
+            if isinstance(synthesis, str) and synthesis.strip():
+                parts.append(
+                    "## clarificator/session.json (requirement_synthesis)\n\n"
+                    + synthesis.strip()
+                )
+            else:
+                # Fallback: whole session as context
+                parts.append(
+                    "## clarificator/session.json\n\n```json\n"
+                    + raw.strip()
+                    + "\n```"
+                )
+        except Exception:
+            text = _read_text_if_exists(CLARIFIED_REQ).strip()
+            if text:
+                parts.append("## clarificator/session.json\n\n" + text)
 
     if ENRICHER_OVERWRITE_PROMPT.exists():
         parts.append(
-            "## enricher_overwrite_enriched_prompt.md\n\n"
+            "## enricher/enriched_prompt.md\n\n"
             + _read_text_if_exists(ENRICHER_OVERWRITE_PROMPT).strip()
         )
 
+    # planner/mini_plan.json — new merged format {plan, impact}
     if PLANNER_MINI_PLAN.exists():
-        parts.append(
-            "## planner_mini_execution_plan.json\n\n```json\n"
-            + _read_text_if_exists(PLANNER_MINI_PLAN).strip()
-            + "\n```"
-        )
-
-    if PLANNER_MINI_IMPACT.exists():
-        parts.append(
-            "## planner_mini_impact_analysis.json\n\n```json\n"
-            + _read_text_if_exists(PLANNER_MINI_IMPACT).strip()
-            + "\n```"
-        )
+        try:
+            raw = _read_text_if_exists(PLANNER_MINI_PLAN).strip()
+            merged = json.loads(raw)
+            if isinstance(merged, dict) and "plan" in merged:
+                plan_obj = merged["plan"]
+                impact_obj = merged.get("impact", {})
+                parts.append(
+                    "## planner/mini_plan.json (plan)\n\n```json\n"
+                    + json.dumps(plan_obj, indent=2, ensure_ascii=False)
+                    + "\n```"
+                )
+                if impact_obj:
+                    parts.append(
+                        "## planner/mini_plan.json (impact)\n\n```json\n"
+                        + json.dumps(impact_obj, indent=2, ensure_ascii=False)
+                        + "\n```"
+                    )
+            else:
+                # Legacy flat format
+                parts.append(
+                    "## planner/mini_plan.json\n\n```json\n"
+                    + raw
+                    + "\n```"
+                )
+        except Exception:
+            parts.append(
+                "## planner/mini_plan.json\n\n```json\n"
+                + _read_text_if_exists(PLANNER_MINI_PLAN).strip()
+                + "\n```"
+            )
 
     if EXECUTOR_OVERWRITE_MANIFEST.exists():
         parts.append(
-            "## executor_overwrite_manifest.json\n\n```json\n"
+            "## executor/manifest.json\n\n```json\n"
             + _read_text_if_exists(EXECUTOR_OVERWRITE_MANIFEST).strip()
             + "\n```"
         )
@@ -354,21 +392,34 @@ def _load_planner_global_notes() -> str:
 
 def _load_judge_findings() -> str:
     """
-    Load patcher_findings_snapshot.md and archivist_knowledge_log.md.
+    Load patcher last attempt entry and archivist_knowledge_log.md.
 
-    Legacy findings.md is now patcher_findings_snapshot.md.
-    Legacy findings_notes.md is now merged into archivist_knowledge_log.md.
+    patcher/attempt_log.json last entry replaces the removed PATCHER_FINDINGS_SNAPSHOT.
+    archivist/knowledge_log.md contains accumulated knowledge.
     """
     parts: list[str] = []
 
-    for fpath in (PATCHER_FINDINGS_SNAPSHOT, ARCHIVIST_KNOWLEDGE_LOG):
-        if fpath.exists():
-            try:
-                text = _read_text_if_exists(fpath).strip()
-                if text:
-                    parts.append(text)
-            except Exception:
-                pass
+    # Read last entry from patcher/attempt_log.json
+    if PATCHER_ATTEMPT_LOG.exists():
+        try:
+            track_read(PATCHER_ATTEMPT_LOG)
+            raw = PATCHER_ATTEMPT_LOG.read_text(encoding="utf-8").strip()
+            if raw:
+                data = json.loads(raw)
+                entries = data.get("entries", data) if isinstance(data, dict) else data
+                if isinstance(entries, list) and entries:
+                    last_entry = json.dumps(entries[-1], indent=2, ensure_ascii=False)
+                    parts.append(last_entry)
+        except Exception as exc:
+            print(f"[09] WARNING: could not read patcher attempt log: {exc}", file=sys.stderr)
+
+    if ARCHIVIST_KNOWLEDGE_LOG.exists():
+        try:
+            text = _read_text_if_exists(ARCHIVIST_KNOWLEDGE_LOG).strip()
+            if text:
+                parts.append(text)
+        except Exception:
+            pass
 
     return "\n\n---\n\n".join(parts)
 
@@ -499,8 +550,23 @@ def _is_under(path: Path, root: Path) -> bool:
 
 
 def _plan_mini_target_files() -> set[str]:
-    plan = _read_json(PLANNER_MINI_PLAN, {})
-    targets = plan.get("target_files", []) if isinstance(plan, dict) else []
+    """
+    Extract target_files from planner/mini_plan.json.
+
+    New format: { "plan": { "target_files": [...] }, "impact": {...} }
+    Legacy format: { "target_files": [...] }
+    """
+    raw = _read_json(PLANNER_MINI_PLAN, {})
+    if not isinstance(raw, dict):
+        return set()
+
+    # New merged format
+    if "plan" in raw and isinstance(raw["plan"], dict):
+        plan = raw["plan"]
+    else:
+        plan = raw  # legacy flat format
+
+    targets = plan.get("target_files", [])
     allowed: set[str] = set()
 
     if isinstance(targets, list):
@@ -1203,7 +1269,7 @@ def _call_repair(
     if _current_scope() == "mini" and not _mini_allowed_to_write(out_rel):
         print(
             f"    [{layer_name}] Mini scope violation: tried to write {out_rel}; "
-            "not in planner_mini_execution_plan.target_files. Patch rejected.",
+            "not in mini_plan target_files. Patch rejected.",
             file=sys.stderr,
         )
         return False, f"mini scope violation: {out_rel}"
@@ -1416,6 +1482,81 @@ def repair_cluster(
 # Report writers
 # ════════════════════════════════════════════════════════════════════════════
 
+def _trim_iteration_for_log(record: dict[str, Any], is_last: bool) -> dict[str, Any]:
+    """
+    Trim policy for test_log.json entries (per markdown spec):
+      keep full : final_status, scope, total_iterations, max_iter, escalated[]
+      keep full : cluster_details for the LAST iteration only
+      trim      : prior iterations → { iteration, passed, clusters_found, clusters_repaired, summary }
+      drop      : log_snippet (still available in short-term test_summary.json)
+    """
+    trimmed = {
+        "iteration": record.get("iteration"),
+        "passed": record.get("passed"),
+        "clusters_found": record.get("clusters_found"),
+        "clusters_repaired": record.get("clusters_repaired"),
+        "summary": record.get("summary"),
+    }
+    if is_last:
+        trimmed["cluster_details"] = record.get("cluster_details", [])
+    # drop log_snippet always
+    return trimmed
+
+
+def append_test_log(report: dict[str, Any]) -> None:
+    """
+    Append one trimmed entry to debugger/test_log.json (long-term audit trail).
+
+    Trim policy per markdown spec:
+      - keep full: final_status, scope, total_iterations, max_iter, escalated[]
+      - keep full: cluster_details of the LAST iteration only
+      - trim: prior iterations → { iteration, passed, clusters_found, clusters_repaired, summary }
+      - drop: log_snippet (available in short-term test_summary.json)
+    """
+    iterations = report.get("iterations", [])
+    trimmed_iterations = []
+    for i, rec in enumerate(iterations):
+        is_last = (i == len(iterations) - 1)
+        trimmed_iterations.append(_trim_iteration_for_log(rec, is_last=is_last))
+
+    entry: dict[str, Any] = {
+        "scope": report.get("scope"),
+        "final_status": report.get("final_status"),
+        "total_iterations": report.get("total_iterations"),
+        "max_iter": report.get("max_iter"),
+        "max_cluster_attempts": report.get("max_cluster_attempts"),
+        "impl": report.get("impl"),
+        "escalated": report.get("escalated", []),
+        "iterations": trimmed_iterations,
+    }
+
+    log_path = DEBUGGER_TEST_LOG
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if log_path.exists():
+            raw = log_path.read_text(encoding="utf-8").strip()
+            try:
+                data = json.loads(raw)
+                entries = data.get("entries", []) if isinstance(data, dict) else data
+                if not isinstance(entries, list):
+                    entries = []
+            except Exception:
+                entries = []
+        else:
+            entries = []
+
+        entries.append(entry)
+        log_path.write_text(
+            json.dumps({"entries": entries}, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        track_write(log_path)
+        print(f"[09] Test log appended ({len(entries)} entries) → {log_path}")
+    except Exception as exc:
+        print(f"[09] WARNING: could not append test log: {exc}", file=sys.stderr)
+
+
 def _write_report(report: dict[str, Any]) -> None:
     DEBUGGER_OVERWRITE_TEST_SUMMARY.parent.mkdir(parents=True, exist_ok=True)
     DEBUGGER_OVERWRITE_TEST_SUMMARY.write_text(
@@ -1424,6 +1565,8 @@ def _write_report(report: dict[str, Any]) -> None:
     )
     track_write(DEBUGGER_OVERWRITE_TEST_SUMMARY)
     print(f"\n[09] Debugger test summary → {DEBUGGER_OVERWRITE_TEST_SUMMARY}")
+
+    append_test_log(report)
 
 
 def _write_mini_report(passed: bool, details: dict[str, Any]) -> None:
