@@ -1,52 +1,41 @@
 """
 pipeline/10_reporter.py
 =======================
-Step 10 — Aggregate pipeline artifacts into reports/reporter_execution_summary.md.
-
-Session model:
-  When PIPELINE_SESSION is set, session-local artifacts resolve under:
-    artifacts_<slug>/sessions/<NNN>/
-
-  When PIPELINE_SESSION is not set, paths.py falls back to the old layout:
-    artifacts_<slug>/
+Step 10 — Aggregate pipeline artifacts into reporter/execution_summary.md.
 
 Supports both:
   - FULL flow:
-      planner_full_execution_plan.json
-      scaffolder_codebase_skeleton.json
-      spectracker_overwrite_version_delta.json
-      debugger_overwrite_test_summary.json
-      executor_overwrite_manifest.json
+      planner/full_plan.json
+      scaffolder/blueprint.json
+      spectracker/version_delta.json
+      debugger/test_summary.json
+      executor/manifest.json
 
   - MINI flow:
-      planner_mini_execution_plan.json
-      planner_mini_impact_analysis.json
-      clarificator_requirement_synthesis.md
-      enricher_overwrite_enriched_prompt.md
-      executor_overwrite_manifest.json
-      debugger_overwrite_test_summary.json
+      planner/mini_plan.json              (fields: plan + impact)
+      clarificator/session.json           (field: requirement_synthesis)
+      enricher/enriched_prompt.md
+      executor/manifest.json
+      debugger/test_summary.json
 
 Writes:
-  artifacts_<slug>/sessions/<NNN>/reports/reporter_execution_summary.md
-  or, without PIPELINE_SESSION:
-  artifacts_<slug>/reports/reporter_execution_summary.md
+  artifacts_<slug>/reporter/execution_summary.md   (short-term, overwrite)
+  artifacts_<slug>/reporter/execution_log.json     (long-term, append)
 
 Reads:
-  artifacts_<slug>/sessions/<NNN>/state/planner_full_execution_plan.json
-  artifacts_<slug>/sessions/<NNN>/state/planner_mini_execution_plan.json
-  artifacts_<slug>/sessions/<NNN>/state/planner_mini_impact_analysis.json
-  artifacts_<slug>/sessions/<NNN>/execution/debugger_overwrite_test_summary.json
-  artifacts_<slug>/sessions/<NNN>/state/scaffolder_codebase_skeleton.json
-  artifacts_<slug>/sessions/<NNN>/cache/spectracker_overwrite_version_delta.json
-  artifacts_<slug>/sessions/<NNN>/execution/executor_overwrite_manifest.json
-  artifacts_<slug>/sessions/<NNN>/reports/judge_verdict_summary.md
-  artifacts_<slug>/sessions/<NNN>/state/clarificator_requirement_synthesis.md
-  artifacts_<slug>/sessions/<NNN>/execution/enricher_overwrite_enriched_prompt.md
+  artifacts_<slug>/planner/full_plan.json
+  artifacts_<slug>/planner/mini_plan.json
+  artifacts_<slug>/debugger/test_summary.json
+  artifacts_<slug>/scaffolder/blueprint.json
+  artifacts_<slug>/spectracker/version_delta.json
+  artifacts_<slug>/executor/manifest.json
+  artifacts_<slug>/judge/verdict_summary.md
+  artifacts_<slug>/clarificator/session.json
+  artifacts_<slug>/enricher/enriched_prompt.md
 
 Direct execution:
   python 10_reporter.py --project my-app
   PIPELINE_PROJECT=my-app python 10_reporter.py
-  PIPELINE_PROJECT=my-app PIPELINE_SESSION=001 python 10_reporter.py
 
 At the end of each run, prints:
   - artifacts read
@@ -67,17 +56,17 @@ from pathlib import Path
 from typing import Any
 
 # === WRITE AUTHORITY: reporter ===
-# OWNS  : artifacts_<slug>/sessions/<NNN>/reports/reporter_execution_summary.md
-# READS : artifacts_<slug>/sessions/<NNN>/state/planner_full_execution_plan.json
-#         artifacts_<slug>/sessions/<NNN>/state/planner_mini_execution_plan.json
-#         artifacts_<slug>/sessions/<NNN>/state/planner_mini_impact_analysis.json
-#         artifacts_<slug>/sessions/<NNN>/execution/debugger_overwrite_test_summary.json
-#         artifacts_<slug>/sessions/<NNN>/state/scaffolder_codebase_skeleton.json
-#         artifacts_<slug>/sessions/<NNN>/cache/spectracker_overwrite_version_delta.json
-#         artifacts_<slug>/sessions/<NNN>/execution/executor_overwrite_manifest.json
-#         artifacts_<slug>/sessions/<NNN>/reports/judge_verdict_summary.md
-#         artifacts_<slug>/sessions/<NNN>/state/clarificator_requirement_synthesis.md
-#         artifacts_<slug>/sessions/<NNN>/execution/enricher_overwrite_enriched_prompt.md
+# OWNS  : artifacts_<slug>/reporter/execution_summary.md   (short-term, overwrite)
+#         artifacts_<slug>/reporter/execution_log.json     (long-term, append)
+# READS : artifacts_<slug>/planner/full_plan.json
+#         artifacts_<slug>/planner/mini_plan.json          (fields: plan + impact)
+#         artifacts_<slug>/debugger/test_summary.json
+#         artifacts_<slug>/scaffolder/blueprint.json
+#         artifacts_<slug>/spectracker/version_delta.json
+#         artifacts_<slug>/executor/manifest.json
+#         artifacts_<slug>/judge/verdict_summary.md
+#         artifacts_<slug>/clarificator/session.json
+#         artifacts_<slug>/enricher/enriched_prompt.md
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from artifacts.paths import (  # noqa: E402
@@ -87,15 +76,14 @@ from artifacts.paths import (  # noqa: E402
     EXECUTOR_OVERWRITE_MANIFEST,
     JUDGE_VERDICT_SUMMARY,
     PLANNER_FULL_PLAN,
-    PLANNER_MINI_IMPACT,
     PLANNER_MINI_PLAN,
+    REPORTER_EXECUTION_LOG,
     REPORTER_EXECUTION_SUMMARY,
     SCAFFOLD_JSON,
     SPECTRACKER_VERSION_DELTA,
     ensure_dirs,
     get_project_name,
     get_project_slug,
-    get_session_id,
 )
 from modules.artifact_tracking import track_read, track_write, print_summary as print_artifact_summary  # noqa: E402
 from modules.md_header import apply_header as apply_md_header  # noqa: E402
@@ -111,13 +99,12 @@ ROLE = "reporter"
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="10_reporter.py",
-        description="Aggregate pipeline artifacts into reports/reporter_execution_summary.md.",
+        description="Aggregate pipeline artifacts into reporter/execution_summary.md.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""
             Examples:
               python 10_reporter.py --project my-app
               PIPELINE_PROJECT=my-app python 10_reporter.py
-              PIPELINE_PROJECT=my-app PIPELINE_SESSION=001 python 10_reporter.py
         """),
     )
     parser.add_argument(
@@ -125,33 +112,15 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Project name for direct execution. Sets PIPELINE_PROJECT.",
     )
-    parser.add_argument(
-        "--session",
-        default=None,
-        help=(
-            "Optional session id for direct execution. Sets PIPELINE_SESSION. "
-            "Example: --session 1 resolves to sessions/001."
-        ),
-    )
     return parser
 
 
 def _configure_project(
     project: str | None,
-    session: str | None,
     parser: argparse.ArgumentParser,
 ) -> None:
     if project:
         os.environ["PIPELINE_PROJECT"] = project
-
-    if session is not None:
-        raw = str(session).strip()
-        if not raw:
-            parser.error("--session cannot be empty.")
-        try:
-            os.environ["PIPELINE_SESSION"] = f"{int(raw):03d}"
-        except ValueError:
-            parser.error("--session must be an integer, e.g. --session 1.")
 
     if os.environ.get("PIPELINE_PROJECT"):
         return
@@ -205,11 +174,30 @@ def load_planner_full_plan() -> dict[str, Any] | None:
 
 
 def load_plan_mini() -> dict[str, Any] | None:
-    return _load_json(PLANNER_MINI_PLAN)
+    """
+    Load mini plan from planner/mini_plan.json.
+    New merged format: { "plan": {...}, "impact": {...} }
+    Returns the "plan" sub-object, or the whole object for legacy flat format.
+    """
+    merged = _load_json(PLANNER_MINI_PLAN)
+    if merged is None:
+        return None
+    if "plan" in merged and isinstance(merged["plan"], dict):
+        return merged["plan"]
+    return merged  # legacy flat format
 
 
 def load_analysis_mini() -> dict[str, Any] | None:
-    return _load_json(PLANNER_MINI_IMPACT)
+    """
+    Load impact analysis from planner/mini_plan.json "impact" field.
+    New merged format: { "plan": {...}, "impact": {...} }
+    Returns the "impact" sub-object, or None if absent.
+    """
+    merged = _load_json(PLANNER_MINI_PLAN)
+    if merged is None:
+        return None
+    impact = merged.get("impact")
+    return impact if isinstance(impact, dict) else None
 
 
 def load_impl_record() -> dict[str, Any] | None:
@@ -228,7 +216,7 @@ def _detect_scope(impl_record: dict[str, Any] | None) -> str:
         if scope in {"full", "mini"}:
             return scope
 
-    if PLANNER_MINI_PLAN.exists() or PLANNER_MINI_IMPACT.exists():
+    if PLANNER_MINI_PLAN.exists():
         return "mini"
 
     return "full"
@@ -294,7 +282,7 @@ def append_full_plan_section(lines: list[str], planner_full_plan: dict[str, Any]
 
     if not planner_full_plan:
         lines += [
-            "_No planner_full_execution_plan.json found._",
+            "_No planner/full_plan.json found._",
             "",
         ]
         return
@@ -355,7 +343,7 @@ def append_mini_plan_section(
 
     if not plan_mini and not analysis_mini:
         lines += [
-            "_No planner_mini_execution_plan.json or planner_mini_impact_analysis.json found._",
+            "_No planner/mini_plan.json found._",
             "",
         ]
         return
@@ -383,12 +371,12 @@ def append_mini_plan_section(
         "| Artifact | Status | Count |",
         "|---|---|---:|",
         (
-            f"| planner_mini_execution_plan.json "
+            f"| planner/mini_plan.json (plan) "
             f"| {'✅ found' if plan_mini else '⚠️ missing'} "
             f"| {len(target_files)} target file(s) |"
         ),
         (
-            f"| planner_mini_impact_analysis.json "
+            f"| planner/mini_plan.json (impact) "
             f"| {'✅ found' if analysis_mini else '⚠️ missing'} "
             f"| — |"
         ),
@@ -448,7 +436,23 @@ def append_mini_plan_section(
 
 
 def append_mini_requirement_section(lines: list[str]) -> None:
-    clarified = _load_text(CLARIFIED_REQ)
+    """
+    Render clarificator requirement synthesis (from session.json field)
+    and enriched prompt.
+    """
+    clarified = ""
+    if CLARIFIED_REQ.exists():
+        try:
+            raw = _load_text(CLARIFIED_REQ)
+            data = json.loads(raw)
+            synthesis = data.get("requirement_synthesis", "")
+            if isinstance(synthesis, str) and synthesis.strip():
+                clarified = synthesis.strip()
+            else:
+                clarified = raw  # fallback: show whole session JSON
+        except Exception:
+            clarified = _load_text(CLARIFIED_REQ)
+
     enriched = _load_text(ENRICHER_OVERWRITE_PROMPT)
 
     if not clarified and not enriched:
@@ -497,7 +501,7 @@ def append_test_results_section(
     ]
 
     if test_report is None:
-        lines.append("| — | — | ⚠️ No report | — | debugger_overwrite_test_summary.json missing |")
+        lines.append("| — | — | ⚠️ No report | — | debugger/test_summary.json missing |")
         lines.append("")
         return False
 
@@ -641,21 +645,44 @@ def append_scaffold_section(lines: list[str]) -> None:
     if not scaffold:
         return
 
-    files = scaffold.get("files", [])
-    if not isinstance(files, list):
-        files = []
-
-    n_src = sum(1 for item in files if isinstance(item, dict) and not item.get("is_test"))
-    n_tests = sum(1 for item in files if isinstance(item, dict) and item.get("is_test"))
+    # New module-centric schema: modules[].files[].{path, kind}
+    modules = scaffold.get("modules")
+    if isinstance(modules, list):
+        summary = scaffold.get("summary", {})
+        n_src = summary.get("source", 0) if isinstance(summary, dict) else 0
+        n_tests = summary.get("test", 0) if isinstance(summary, dict) else 0
+        if not n_src and not n_tests:
+            # Compute from modules if summary absent
+            for mod in modules:
+                if not isinstance(mod, dict):
+                    continue
+                for f in mod.get("files", []):
+                    if not isinstance(f, dict):
+                        continue
+                    if f.get("kind") == "test":
+                        n_tests += 1
+                    else:
+                        n_src += 1
+        n_modules = len(modules)
+    else:
+        # Legacy flat schema fallback
+        files = scaffold.get("files", [])
+        if not isinstance(files, list):
+            files = []
+        n_src = sum(1 for item in files if isinstance(item, dict) and not item.get("is_test"))
+        n_tests = sum(1 for item in files if isinstance(item, dict) and item.get("is_test"))
+        n_modules = None
 
     lines += [
         "",
         "## Scaffold summary",
         "",
-        f"- Scaffold version: {_fmt_code(scaffold.get('scaffold_version'))}",
+        f"- Scaffold version: {_fmt_code(scaffold.get('scaffold_version') or scaffold.get('spec_version'))}",
         f"- Source stubs generated: {n_src}",
         f"- Test files generated: {n_tests}",
     ]
+    if n_modules is not None:
+        lines.append(f"- Modules: {n_modules}")
 
 
 def append_escalated_section(
@@ -831,7 +858,113 @@ def _write_github_step_summary(summary_md: str) -> None:
         print(f"[10][warn] Could not write GITHUB_STEP_SUMMARY: {exc}", file=sys.stderr)
 
 
-def write_summary(summary_md: str) -> None:
+def append_execution_log(
+    *,
+    scope: str,
+    final_status: str,
+    impl_record: dict[str, Any] | None,
+    test_report: dict[str, Any] | None,
+) -> None:
+    """
+    Append one entry to reporter/execution_log.json (long-term audit trail).
+
+    Entry schema per markdown spec:
+      { scope, final_status, iterations_used, max_iter, files_implemented,
+        failed_cluster_count, escalated_count, spec_version, cost_total, generated_at }
+    """
+    iterations_used = 0
+    max_iter = None
+    failed_cluster_count = 0
+    escalated_count = 0
+
+    if test_report:
+        iterations = test_report.get("iterations", [])
+        iterations_used = test_report.get(
+            "total_iterations",
+            len(iterations) if isinstance(iterations, list) else 0,
+        )
+        max_iter = test_report.get("max_iter")
+        escalated = test_report.get("escalated", [])
+        escalated_count = len(escalated) if isinstance(escalated, list) else 0
+
+        # Count failed clusters from last iteration
+        if isinstance(iterations, list) and iterations:
+            last = iterations[-1]
+            if isinstance(last, dict):
+                details = last.get("cluster_details", [])
+                if isinstance(details, list):
+                    failed_cluster_count = sum(
+                        1 for c in details
+                        if isinstance(c, dict) and not c.get("repaired")
+                    )
+
+    files_implemented = 0
+    cost_total = None
+    spec_version = None
+
+    if impl_record:
+        written = impl_record.get("files", [])
+        files_implemented = len(written) if isinstance(written, list) else 0
+        token_summary = impl_record.get("token_summary", {})
+        if isinstance(token_summary, dict):
+            cost_total = token_summary.get("total_cost")
+
+    # Try to get spec_version from spectracker delta
+    try:
+        if SPECTRACKER_VERSION_DELTA.exists():
+            delta_raw = json.loads(SPECTRACKER_VERSION_DELTA.read_text(encoding="utf-8"))
+            spec_version = delta_raw.get("to_version") or delta_raw.get("version")
+    except Exception:
+        pass
+
+    entry: dict[str, Any] = {
+        "scope": scope,
+        "final_status": final_status,
+        "iterations_used": iterations_used,
+        "max_iter": max_iter,
+        "files_implemented": files_implemented,
+        "failed_cluster_count": failed_cluster_count,
+        "escalated_count": escalated_count,
+        "spec_version": spec_version,
+        "cost_total": cost_total,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    log_path = REPORTER_EXECUTION_LOG
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if log_path.exists():
+            raw = log_path.read_text(encoding="utf-8").strip()
+            try:
+                data = json.loads(raw)
+                entries = data.get("entries", []) if isinstance(data, dict) else data
+                if not isinstance(entries, list):
+                    entries = []
+            except Exception:
+                entries = []
+        else:
+            entries = []
+
+        entries.append(entry)
+        log_path.write_text(
+            json.dumps({"entries": entries}, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        track_write(log_path)
+        print(f"[10] Execution log appended ({len(entries)} entries) → {log_path}")
+    except Exception as exc:
+        print(f"[10][warn] Could not append execution log: {exc}", file=sys.stderr)
+
+
+def write_summary(
+    summary_md: str,
+    *,
+    scope: str = "full",
+    final_status: str = "FAIL",
+    impl_record: dict[str, Any] | None = None,
+    test_report: dict[str, Any] | None = None,
+) -> None:
     REPORTER_EXECUTION_SUMMARY.parent.mkdir(parents=True, exist_ok=True)
     REPORTER_EXECUTION_SUMMARY.write_text(apply_md_header(summary_md, REPORTER_EXECUTION_SUMMARY, owner="10_reporter.py"), encoding="utf-8")
     track_write(REPORTER_EXECUTION_SUMMARY)
@@ -840,6 +973,13 @@ def write_summary(summary_md: str) -> None:
     print(f"[10] Report written → {REPORTER_EXECUTION_SUMMARY}")
 
     _write_github_step_summary(summary_md)
+
+    append_execution_log(
+        scope=scope,
+        final_status=final_status,
+        impl_record=impl_record,
+        test_report=test_report,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -850,9 +990,9 @@ def main() -> None:
     parser = _build_parser()
     args = parser.parse_args()
 
-    _configure_project(args.project, args.session, parser)
+    _configure_project(args.project, parser)
 
-    # Important: project/session env must be available before ensure_dirs().
+    # Important: project env must be available before ensure_dirs().
     ensure_dirs()
 
     exit_code = 0
@@ -868,16 +1008,12 @@ def main() -> None:
         plan_mini = load_plan_mini()
         analysis_mini = load_analysis_mini()
 
-        session_id = get_session_id()
-        session_label = session_id if session_id is not None else "legacy/no-session"
-
         lines: list[str] = [
             "# LLM Pipeline Report",
             f"_Generated: {now}_",
             "",
             f"**Project:** `{get_project_name()}`",
             f"**Project slug:** `{get_project_slug()}`",
-            f"**Session:** `{session_label}`",
             f"**Scope:** `{scope}`",
             "",
         ]
@@ -889,6 +1025,7 @@ def main() -> None:
             append_full_plan_section(lines, planner_full_plan)
 
         all_passed = append_test_results_section(lines, test_report)
+        final_status = "PASS" if all_passed else "FAIL"
 
         lines += [
             "",
@@ -903,7 +1040,13 @@ def main() -> None:
         append_judge_section(lines)
 
         summary_md = "\n".join(lines).rstrip() + "\n"
-        write_summary(summary_md)
+        write_summary(
+            summary_md,
+            scope=scope,
+            final_status=final_status,
+            impl_record=impl_record,
+            test_report=test_report,
+        )
 
     except Exception as exc:
         print(f"[10][error] Reporter failed: {exc}", file=sys.stderr)
