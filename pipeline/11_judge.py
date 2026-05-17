@@ -6,39 +6,32 @@ Step 11 — Judge / Validator.
 Runs after verification/tests have passed. Aggregates pipeline artifacts into a
 single briefing, sends it to the judge model for final review, and writes:
 
-  artifacts_<slug>/sessions/<NNN>/execution/judge_overwrite_verdict_raw.json
-  artifacts_<slug>/sessions/<NNN>/reports/judge_verdict_summary.md
-
-When PIPELINE_SESSION is not set, paths.py falls back to the legacy layout:
-
-  artifacts_<slug>/execution/judge_overwrite_verdict_raw.json
-  artifacts_<slug>/reports/judge_verdict_summary.md
+  artifacts_<slug>/judge/verdict_raw.json      (short-term, overwrite)
+  artifacts_<slug>/judge/verdict_summary.md    (short-term, overwrite)
+  artifacts_<slug>/judge/verdict_log.json      (long-term, append)
 
 Supports both:
   - FULL/PARTIAL flow:
-      specwright_spec_<slug>.md,
-      planner_full_execution_plan.json,
-      scaffolder_codebase_skeleton.json,
-      debugger_overwrite_test_summary.json,
-      executor_overwrite_manifest.json,
-      source files,
-      test files,
-      spectracker_overwrite_version_delta.json.
+      spec/specwright_spec_<slug>.md,
+      planner/full_plan.json,
+      scaffolder/blueprint.json,
+      debugger/test_summary.json,
+      executor/manifest.json,
+      output/src/ files,
+      output/tests/ files,
+      spectracker/version_delta.json.
 
   - MINI targeted flow:
-      clarificator_requirement_synthesis.md,
-      enricher_overwrite_enriched_prompt.md,
-      planner_mini_execution_plan.json,
-      planner_mini_impact_analysis.json,
-      executor_overwrite_manifest.json,
-      debugger_overwrite_test_summary.json,
+      clarificator/session.json,
+      enricher/enriched_prompt.md,
+      planner/mini_plan.json (includes impact field),
+      executor/manifest.json,
+      debugger/test_summary.json,
       and only the target/implemented files.
 
 Direct execution:
   python 11_judge.py --project my-app
-  python 11_judge.py --project my-app --session 1
   PIPELINE_PROJECT=my-app python 11_judge.py
-  PIPELINE_PROJECT=my-app PIPELINE_SESSION=001 python 11_judge.py
 
 At the end of each run, prints:
   - artifacts/files read
@@ -62,21 +55,21 @@ from typing import Any
 
 
 # === WRITE AUTHORITY: judge ===
-# OWNS  : artifacts_<slug>/sessions/<NNN>/execution/judge_overwrite_verdict_raw.json
-#         artifacts_<slug>/sessions/<NNN>/reports/judge_verdict_summary.md
-# READS : artifacts_<slug>/specwright_spec_<slug>.md
-#         artifacts_<slug>/sessions/<NNN>/state/planner_full_execution_plan.json
-#         artifacts_<slug>/sessions/<NNN>/state/planner_mini_execution_plan.json
-#         artifacts_<slug>/sessions/<NNN>/state/planner_mini_impact_analysis.json
-#         artifacts_<slug>/sessions/<NNN>/state/scaffolder_codebase_skeleton.json
-#         artifacts_<slug>/sessions/<NNN>/state/clarificator_requirement_synthesis.md
-#         artifacts_<slug>/sessions/<NNN>/cache/spectracker_overwrite_version_delta.json
-#         artifacts_<slug>/sessions/<NNN>/execution/enricher_overwrite_enriched_prompt.md
-#         artifacts_<slug>/sessions/<NNN>/execution/executor_overwrite_manifest.json
-#         artifacts_<slug>/sessions/<NNN>/execution/debugger_overwrite_test_summary.json
-#         artifacts_<slug>/knowledge/current/archivist_spec_gaps.md
-#         artifacts_<slug>/src/**
-#         artifacts_<slug>/tests/**
+# OWNS  : artifacts_<slug>/judge/verdict_raw.json
+#         artifacts_<slug>/judge/verdict_summary.md
+#         artifacts_<slug>/judge/verdict_log.json
+# READS : artifacts_<slug>/spec/specwright_spec_<slug>.md
+#         artifacts_<slug>/planner/full_plan.json
+#         artifacts_<slug>/planner/mini_plan.json
+#         artifacts_<slug>/scaffolder/blueprint.json
+#         artifacts_<slug>/clarificator/session.json
+#         artifacts_<slug>/spectracker/version_delta.json
+#         artifacts_<slug>/enricher/enriched_prompt.md
+#         artifacts_<slug>/executor/manifest.json
+#         artifacts_<slug>/debugger/test_summary.json
+#         artifacts_<slug>/archivist/spec_gaps.md
+#         artifacts_<slug>/output/src/**
+#         artifacts_<slug>/output/tests/**
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from artifacts.paths import (  # noqa: E402
@@ -86,9 +79,9 @@ from artifacts.paths import (  # noqa: E402
     ENRICHER_OVERWRITE_PROMPT,
     EXECUTOR_OVERWRITE_MANIFEST,
     JUDGE_OVERWRITE_VERDICT_RAW,
+    JUDGE_VERDICT_LOG,
     JUDGE_VERDICT_SUMMARY,
     PLANNER_FULL_PLAN,
-    PLANNER_MINI_IMPACT,
     PLANNER_MINI_PLAN,
     SCAFFOLD_JSON,
     SPECTRACKER_VERSION_DELTA,
@@ -98,7 +91,6 @@ from artifacts.paths import (  # noqa: E402
     ensure_dirs,
     get_project_name,
     get_project_slug,
-    get_session_id,
     get_spec_path,
 )
 from artifacts.models import call_model, get_model, get_provider  # noqa: E402
@@ -203,9 +195,7 @@ def _build_parser() -> argparse.ArgumentParser:
         epilog=textwrap.dedent("""
             Examples:
               python 11_judge.py --project my-app
-              python 11_judge.py --project my-app --session 1
               PIPELINE_PROJECT=my-app python 11_judge.py
-              PIPELINE_PROJECT=my-app PIPELINE_SESSION=001 python 11_judge.py
 
               # Model is resolved from artifacts/models.py role "judge".
               # To change: edit ROLES["judge"] in models.py.
@@ -215,14 +205,6 @@ def _build_parser() -> argparse.ArgumentParser:
         "--project",
         default=None,
         help="Project name for direct execution. Sets PIPELINE_PROJECT.",
-    )
-    parser.add_argument(
-        "--session",
-        default=None,
-        help=(
-            "Optional session id for direct execution. Sets PIPELINE_SESSION. "
-            "Example: --session 1 resolves to sessions/001."
-        ),
     )
     parser.add_argument(
         "--max-briefing-chars",
@@ -235,20 +217,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _configure_project(
     project: str | None,
-    session: str | None,
     parser: argparse.ArgumentParser,
 ) -> None:
     if project:
         os.environ["PIPELINE_PROJECT"] = project
-
-    if session is not None:
-        raw = str(session).strip()
-        if not raw:
-            parser.error("--session cannot be empty.")
-        try:
-            os.environ["PIPELINE_SESSION"] = f"{int(raw):03d}"
-        except ValueError:
-            parser.error("--session must be an integer, e.g. --session 1.")
 
     if os.environ.get("PIPELINE_PROJECT"):
         return
@@ -295,9 +267,12 @@ def _load_plan_mini() -> dict[str, Any]:
     return plan if isinstance(plan, dict) else {}
 
 
-def _load_analysis_mini() -> dict[str, Any]:
-    analysis = _read_json(PLANNER_MINI_IMPACT, {})
-    return analysis if isinstance(analysis, dict) else {}
+def _load_analysis_mini(plan_mini: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Extract impact analysis from mini_plan["impact"] field (merged by planner)."""
+    if plan_mini is None:
+        plan_mini = _load_plan_mini()
+    impact = plan_mini.get("impact", {})
+    return impact if isinstance(impact, dict) else {}
 
 
 def _load_delta() -> dict[str, Any] | None:
@@ -326,7 +301,7 @@ def _detect_scope() -> str:
     if scope in {"full", "mini"}:
         return scope
 
-    if PLANNER_MINI_PLAN.exists() or PLANNER_MINI_IMPACT.exists():
+    if PLANNER_MINI_PLAN.exists():
         return "mini"
 
     return "full"
@@ -358,8 +333,12 @@ def _resolve_artifact_path(rel: str) -> Path:
 
     if raw.startswith("src/"):
         return SRC_DIR / raw[len("src/"):]
+    if raw.startswith("output/src/"):
+        return SRC_DIR / raw[len("output/src/"):]
     if raw.startswith("tests/"):
         return TESTS_DIR / raw[len("tests/"):]
+    if raw.startswith("output/tests/"):
+        return TESTS_DIR / raw[len("output/tests/"):]
 
     return artifact_root() / safe
 
@@ -503,7 +482,7 @@ def _collect_changed_src_files() -> dict[str, str]:
 
     for ext in ("*.ts", "*.tsx"):
         for path in sorted(SRC_DIR.rglob(ext)):
-            rel = "src/" + str(path.relative_to(SRC_DIR)).replace("\\", "/")
+            rel = "output/src/" + str(path.relative_to(SRC_DIR)).replace("\\", "/")
             current = _read_file_for_briefing(path)
             stub = stub_map.get(rel, "")
 
@@ -513,7 +492,7 @@ def _collect_changed_src_files() -> dict[str, str]:
     if changed:
         return changed
 
-    return _collect_ts_files(SRC_DIR, "src")
+    return _collect_ts_files(SRC_DIR, "output/src")
 
 
 def _affected_src_set(delta: dict[str, Any] | None) -> set[str]:
@@ -722,7 +701,7 @@ def _append_full_sections(parts: list[str], is_partial: bool, affected_set: set[
         )
 
     # 6. Test files
-    test_files = _collect_ts_files(TESTS_DIR, "tests")
+    test_files = _collect_ts_files(TESTS_DIR, "output/tests")
     test_block = "\n\n".join(
         _format_file_block(fp, code)
         for fp, code in test_files.items()
@@ -828,7 +807,7 @@ def build_briefing(max_chars: int = MAX_BRIEFING_CHARS) -> str:
 
     if scope == "mini":
         plan_mini = _load_plan_mini()
-        analysis_mini = _load_analysis_mini()
+        analysis_mini = _load_analysis_mini(plan_mini)
 
         parts.append(_build_mini_context(plan_mini, analysis_mini, impl_record))
         _append_mini_sections(parts, plan_mini, analysis_mini, impl_record)
@@ -964,7 +943,6 @@ def render_report(review: dict[str, Any]) -> str:
         f"_Model: {model}_",
         f"_Project: **{get_project_name()}**_",
         f"_Project slug: **{get_project_slug()}**_",
-        f"_Session: **{get_session_id() or 'legacy/no-session'}**_",
         f"_Run type: **{run_type}**_",
         "",
         f"## Verdict: {verdict_icon} {verdict}",
@@ -1061,7 +1039,6 @@ def _write_raw_verdict(
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "project": get_project_name(),
                 "project_slug": get_project_slug(),
-                "session_id": get_session_id(),
                 "scope_detected": scope,
                 "briefing_chars": briefing_chars,
                 "usage": usage,
@@ -1078,11 +1055,52 @@ def _write_raw_verdict(
     print(f"[11] Raw response + reasoning saved → {JUDGE_OVERWRITE_VERDICT_RAW}")
 
 
-def _write_report(report_md: str) -> None:
+def _append_verdict_log(review: dict[str, Any], scope: str) -> None:
+    """Append a trimmed verdict entry to the long-term verdict_log.json."""
+    JUDGE_VERDICT_LOG.parent.mkdir(parents=True, exist_ok=True)
+    path = JUDGE_VERDICT_LOG._resolve() if hasattr(JUDGE_VERDICT_LOG, "_resolve") else Path(str(JUDGE_VERDICT_LOG))
+
+    try:
+        existing = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except Exception:
+        existing = {}
+
+    if not isinstance(existing, dict):
+        existing = {}
+
+    entries: list[dict[str, Any]] = existing.get("entries", [])
+    if not isinstance(entries, list):
+        entries = []
+
+    entry: dict[str, Any] = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "project": get_project_name(),
+        "project_slug": get_project_slug(),
+        "scope": scope,
+        "verdict": review.get("verdict"),
+        "run_type": review.get("run_type"),
+        "summary": review.get("summary"),
+        "sections": review.get("sections"),
+        "blocking_issues": review.get("blocking_issues", []),
+        "non_blocking_notes": review.get("non_blocking_notes", []),
+    }
+
+    entries.append(entry)
+    path.write_text(
+        json.dumps({"entries": entries}, indent=2, ensure_ascii=False,
+                   default=lambda o: vars(o) if hasattr(o, '__dict__') else str(o)),
+        encoding="utf-8",
+    )
+    track_write(JUDGE_VERDICT_LOG)
+    print(f"[11] Verdict log appended → {JUDGE_VERDICT_LOG}")
+
+
+def _write_report(report_md: str, review: dict[str, Any], scope: str) -> None:
     JUDGE_VERDICT_SUMMARY.parent.mkdir(parents=True, exist_ok=True)
     JUDGE_VERDICT_SUMMARY.write_text(apply_md_header(report_md, JUDGE_VERDICT_SUMMARY, owner="11_judge.py"), encoding="utf-8")
     track_write(JUDGE_VERDICT_SUMMARY)
     print(f"\n[11] Judge verdict summary written → {JUDGE_VERDICT_SUMMARY}")
+    _append_verdict_log(review, scope)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1093,7 +1111,7 @@ def main() -> None:
     parser = _build_parser()
     args = parser.parse_args()
 
-    _configure_project(args.project, args.session, parser)
+    _configure_project(args.project, parser)
 
     # Important: project/session env must be configured before ensure_dirs().
     ensure_dirs()
@@ -1103,7 +1121,6 @@ def main() -> None:
     try:
         scope = _detect_scope()
         print(f"[11] Project: {get_project_name()} ({get_project_slug()})")
-        print(f"[11] Session: {get_session_id() or 'legacy/no-session'}")
         print(f"[11] Scope detected: {scope}")
         print("[11] Building pipeline briefing …")
 
@@ -1126,7 +1143,7 @@ def main() -> None:
             review["run_type"] = "mini" if scope == "mini" else "full"
 
         report_md = render_report(review)
-        _write_report(report_md)
+        _write_report(report_md, review, scope)
 
         print(f"\n{'=' * 60}")
         print(report_md)
