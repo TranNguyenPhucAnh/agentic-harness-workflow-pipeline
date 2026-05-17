@@ -4,14 +4,18 @@ modules/cost.py — Cost tracking for agentic pipeline.
 Strategy
 ────────
 For OpenRouter calls  → read `resp.usage.cost` directly from the response.
-                        OpenRouter always includes this field (no extra params needed).
-                        Unit: credits (1 credit = $0.000001 USD → divide by 1_000_000).
+                        OpenRouter usually includes this field in credits
+                        (1 credit = $0.000001 USD → divide by 1_000_000).
+                        BUT: some routes return cost=0 even when tokens were
+                        consumed (upstream accounting fail, certain provider
+                        routings). In that case we fall through to the price
+                        table so cost isn't silently lost.
 
 For non-OpenRouter    → fall back to _PRICE_TABLE (hardcoded $/MTok).
                         Covers Google (gemini), direct Anthropic, etc.
 
 Provider detection: check the `provider` param passed alongside `usage`.
-If provider is "openrouter" → use native cost.
+If provider is "openrouter" AND usage.cost > 0 → use native cost.
 Otherwise → use price table lookup on model string.
 
 Usage per script
@@ -40,33 +44,55 @@ Call reset() only in tests or multi-run single-process scenarios.
 from __future__ import annotations
 
 # ─── Fallback pricing table ───────────────────────────────────────────────────
-# Used only for NON-OpenRouter providers (e.g. google/gemini direct).
-# OpenRouter responses carry native cost — no lookup needed for those.
+# Used for:
+#   1) NON-OpenRouter providers (e.g. google/gemini direct).
+#   2) OpenRouter responses where usage.cost is 0 or missing.
 #
 # Format: list of (model_id_prefix, input_$/MTok, output_$/MTok).
-# Matched via str.startswith; ordered most-specific first to avoid collisions.
+# Matched via str.startswith on the LOWERCASED model string passed to
+# record_usage(). Order is most-specific first to avoid prefix collisions.
 # Values in USD per million tokens.
+#
+# IMPORTANT: prefixes for OpenRouter routes must include the org prefix
+# (e.g. "anthropic/claude-..."), because the model string passed in is the
+# part AFTER the provider key — i.e. exactly what was sent to the API.
+#
+# VERIFY all OpenRouter prices against https://openrouter.ai/models before
+# trusting cost numbers in production. Prices below are best-effort placeholders.
 
 _PRICE_TABLE: list[tuple[str, float, float]] = [
     # ── Gemini (Google direct) ────────────────────────────────────────────────
     # Prices as of May 2026 — verify at https://ai.google.dev/pricing
-    ("gemini-2.5-pro",               1.25,  10.00),   # >200k ctx: 2.50/15.00
-    ("gemini-2.5-flash",             0.15,   0.60),
-    ("gemini-2.0-flash",             0.10,   0.40),
-    ("gemini-1.5-pro",               1.25,   5.00),
-    ("gemini-1.5-flash",             0.075,  0.30),
-    # ── Anthropic direct (if ever used without OpenRouter) ───────────────────
-    ("claude-opus-4-7",              5.00,  25.00),
-    ("claude-opus-4-6",              5.00,  25.00),
-    ("claude-sonnet-4-6",            3.00,  15.00),
-    ("claude-opus-4-5",              5.00,  25.00),
-    ("claude-sonnet-4-5",            3.00,  15.00),
-    ("claude-haiku-4-5",             1.00,   5.00),
-    ("claude-opus-4-1",             15.00,  75.00),
-    ("claude-opus-4",               15.00,  75.00),
-    ("claude-sonnet-4",              3.00,  15.00),
-    ("claude-haiku-3-5",             0.80,   4.00),
-    ("claude-haiku-3",               0.25,   1.25),
+    ("gemini-2.5-pro",                       1.25,  10.00),   # >200k ctx: 2.50/15.00
+    ("gemini-2.5-flash",                     0.15,   0.60),
+    ("gemini-2.0-flash",                     0.10,   0.40),
+    ("gemini-1.5-pro",                       1.25,   5.00),
+    ("gemini-1.5-flash",                     0.075,  0.30),
+
+    # ── OpenRouter routes (fallback when usage.cost == 0 / missing) ───────────
+    # Prefix-matched, so e.g. "moonshotai/kimi-k2" matches "moonshotai/kimi-k2.6".
+    # VERIFY at https://openrouter.ai/models — values below are placeholders.
+    ("anthropic/claude-opus-4.7",              5.00,  25.00),
+    ("anthropic/claude-sonnet-4.6",            3.00,  15.00),
+    ("anthropic/claude-haiku-4.5",             1.00,   5.00),
+    ("moonshotai/kimi-k2.6",                   0.73,   3.49),
+    ("deepseek/deepseek-v4-pro",               0.435,  0.87),
+    ("qwen/qwen3.6-plus",                      0.325,  1.95),
+    ("z-ai/glm-5.1",                           0.98,   3.08),
+    ("minimax/minimax-m2.7",                   0.279,  1.20),
+
+    # ── Anthropic direct (if ever used without OpenRouter) ────────────────────
+    ("claude-opus-4-7",                      5.00,  25.00),
+    ("claude-opus-4-6",                      5.00,  25.00),
+    ("claude-sonnet-4-6",                    3.00,  15.00),
+    ("claude-opus-4-5",                      5.00,  25.00),
+    ("claude-sonnet-4-5",                    3.00,  15.00),
+    ("claude-haiku-4-5",                     1.00,   5.00),
+    ("claude-opus-4-1",                     15.00,  75.00),
+    ("claude-opus-4",                       15.00,  75.00),
+    ("claude-sonnet-4",                      3.00,  15.00),
+    ("claude-haiku-3-5",                     0.80,   4.00),
+    ("claude-haiku-3",                       0.25,   1.25),
 ]
 
 _MTOK           = 1_000_000   # tokens per pricing unit
@@ -105,14 +131,21 @@ def record_usage(
     ----------
     usage    : response.usage object (openai-compat: .prompt_tokens / .completion_tokens,
                or anthropic-native: .input_tokens / .output_tokens).
-               OpenRouter also sets usage.cost (in credits).
-    model    : model string — used for fallback price-table lookup on non-OpenRouter.
-    provider : provider key from models.py (e.g. "openrouter", "google").
+               OpenRouter also sets usage.cost (in credits) — but sometimes 0.
+    model    : model string — used for fallback price-table lookup. Pass the
+               value returned by get_model(role) here (no provider prefix).
+    provider : provider key from models.py (e.g. "openrouter", "gemini").
                Pass get_provider(role) here.
 
     Returns
     -------
     float | None — cost for this call in USD, or None if cost couldn't be determined.
+
+    Resolution order
+    ----------------
+    1. OpenRouter native cost (if provider==openrouter AND usage.cost > 0)
+    2. Price-table lookup on `model` string
+    3. Mark cost as missing, return None
     """
     global _total_prompt, _total_completion, _total_cost, _cost_missing
 
@@ -133,20 +166,25 @@ def record_usage(
 
     # ── Cost resolution ───────────────────────────────────────────────────────
 
-    # Path 1: OpenRouter native cost (always present, most accurate).
+    # Path 1: OpenRouter native cost (most accurate when present AND non-zero).
     # usage.cost is in credits; 1 credit = $0.000001.
     # Reflects real routed price including any caching/discounts applied.
+    #
+    # Some routes return cost=0 even when tokens were consumed (upstream
+    # accounting issue, certain provider routings). In that case we DON'T
+    # accept the zero — we fall through to the price table below so the
+    # number isn't silently lost.
     if provider.lower() == "openrouter":
         raw_cost = getattr(usage, "cost", None)
-        if raw_cost is not None:
+        if raw_cost is not None and float(raw_cost) > 0:
             call_cost = float(raw_cost) * _CREDITS_TO_USD
             _total_cost += call_cost
             return call_cost
-        # OpenRouter but cost field missing — unusual, flag it
-        _cost_missing = True
-        return None
+        # cost is None or 0 → fall through to Path 2
 
-    # Path 2: Fallback price-table lookup for other providers (e.g. google direct)
+    # Path 2: Fallback price-table lookup. Covers:
+    #   - Non-OpenRouter providers (e.g. gemini direct)
+    #   - OpenRouter when usage.cost was 0 or missing
     if model:
         prices = _lookup_price(model)
         if prices is not None:
