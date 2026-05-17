@@ -14,7 +14,7 @@ Modes:
         Single API call for all requested non-test stub files.
 
     With planner plan (--use-planner-plan):
-        Reads artifacts_<slug>/state/planner_full_execution_plan.json produced
+        Reads artifacts_<slug>/planner/full_plan.json produced
         by 07_planner.py.
         For each file, injects the matching planner task:
             - role
@@ -30,13 +30,14 @@ Delta mode:
         Other restored files in src/ are used as import/context references.
 
 Reads:
-    artifacts_<slug>/specwright_spec_<slug>.md
-    artifacts_<slug>/state/scaffolder_codebase_skeleton.json
-    artifacts_<slug>/state/planner_full_execution_plan.json         optional, with --use-planner-plan
+    artifacts_<slug>/spec/specwright_spec_<slug>.md
+    artifacts_<slug>/scaffolder/blueprint.json
+    artifacts_<slug>/planner/full_plan.json                         optional, with --use-planner-plan
 
 Writes:
-    artifacts_<slug>/src/**                                        non-test files only
-    artifacts_<slug>/execution/executor_overwrite_manifest.json
+    artifacts_<slug>/output/src/**                                 non-test files only
+    artifacts_<slug>/executor/manifest.json                        (short-term, overwrite)
+    artifacts_<slug>/executor/manifest_log.json                    (long-term, append)
 
 
 MINI SCOPE
@@ -44,20 +45,20 @@ MINI SCOPE
 Targeted implementation for small daily-driver tasks.
 
 Reads:
-    artifacts_<slug>/state/planner_mini_execution_plan.json
-    artifacts_<slug>/state/planner_mini_impact_analysis.json        optional
-    target files listed in planner_mini_execution_plan.json         optional existing content
+    artifacts_<slug>/planner/mini_plan.json                        (field: plan + impact merged)
+    target files listed in mini_plan.json["plan"]["target_files"]  optional existing content
 
 Writes:
-    only files listed in state/planner_mini_execution_plan.json target_files
-    artifacts_<slug>/execution/executor_overwrite_manifest.json
+    only files listed in mini_plan.json target_files
+    artifacts_<slug>/executor/manifest.json                        (short-term, overwrite)
+    artifacts_<slug>/executor/manifest_log.json                    (long-term, append)
 
 Rules:
     - Does NOT read the canonical spec.
-    - Does NOT require scaffolder_codebase_skeleton.json.
+    - Does NOT require scaffolder blueprint.json.
     - Does NOT do broad rewrites.
-    - Does NOT create/modify files outside planner_mini_execution_plan.target_files.
-    - Does NOT write artifact/state/cache/execution/run/knowledge/reports paths.
+    - Does NOT create/modify files outside mini_plan target_files.
+    - Does NOT write artifact folder paths (executor/, planner/, absorber/, etc.).
 
 At the end of each run, prints:
     - artifacts read
@@ -81,22 +82,22 @@ from typing import Any
 
 # === WRITE AUTHORITY: executor ===
 # OWNS full:
-#   artifacts_<slug>/execution/executor_overwrite_manifest.json
-#   artifacts_<slug>/src/**
+#   artifacts_<slug>/executor/manifest.json          (short-term, overwrite)
+#   artifacts_<slug>/executor/manifest_log.json      (long-term, append)
+#   artifacts_<slug>/output/src/**
 #
 # OWNS mini:
-#   artifacts_<slug>/execution/executor_overwrite_manifest.json
-#   files explicitly listed in artifacts_<slug>/state/planner_mini_execution_plan.json target_files
+#   artifacts_<slug>/executor/manifest.json          (short-term, overwrite)
+#   artifacts_<slug>/executor/manifest_log.json      (long-term, append)
+#   files explicitly listed in mini_plan.json target_files
 #
 # READS full:
-#   artifacts_<slug>/state/scaffolder_codebase_skeleton.json
-#   artifacts_<slug>/state/planner_full_execution_plan.json
-#   artifacts_<slug>/specwright_spec_<slug>.md          (only in single-call fallback — no plan)
+#   artifacts_<slug>/scaffolder/blueprint.json
+#   artifacts_<slug>/planner/full_plan.json          (optional, with --use-planner-plan)
+#   artifacts_<slug>/spec/specwright_spec_<slug>.md  (only in single-call fallback)
 #
 # READS mini:
-#   artifacts_<slug>/state/planner_mini_execution_plan.json
-#   artifacts_<slug>/state/planner_mini_impact_analysis.json
-#   existing target files listed in planner_mini_execution_plan.json
+#   artifacts_<slug>/planner/mini_plan.json          (fields: plan + impact)
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -105,9 +106,9 @@ from modules.artifact_tracking import track_read, track_write, print_summary as 
 from modules.cost import print_call, print_summary, record_usage, summary as cost_summary  # noqa: E402
 from modules.post_interactive import prompt_next_step  # noqa: E402
 from artifacts.paths import (  # noqa: E402
+    EXECUTOR_MANIFEST_LOG,
     EXECUTOR_OVERWRITE_MANIFEST,
     PLANNER_FULL_PLAN,
-    PLANNER_MINI_IMPACT,
     PLANNER_MINI_PLAN,
     SCAFFOLD_JSON,
     SRC_DIR,
@@ -336,10 +337,25 @@ def _is_disallowed_artifact_rel_path(rel: str) -> bool:
 
     blocked_prefixes = (
         "artifacts_",
+        # artifact module folders — mini must not touch these
+        "executor/",
+        "planner/",
+        "debugger/",
+        "reporter/",
+        "judge/",
+        "patcher/",
+        "archivist/",
+        "absorber/",
+        "clarificator/",
+        "enricher/",
+        "spectracker/",
+        "scaffolder/",
+        "spec/",
+        # legacy dirs — still blocked for safety
         "state/",
         "cache/",
         "execution/",
-        "run/",       # legacy artifact dir, still blocked for safety
+        "run/",
         "knowledge/",
         "reports/",
     )
@@ -1057,6 +1073,12 @@ def _write_generated_entry(entry: dict[str, Any]) -> str | None:
 # ════════════════════════════════════════════════════════════════════════════
 
 def _load_mini_plan() -> dict[str, Any]:
+    """
+    Load mini_plan.json and extract the "plan" field.
+
+    mini_plan.json schema (new): { "plan": {...}, "impact": {...} }
+    Backward compat: if no "plan" key, treat entire object as the plan.
+    """
     if not PLANNER_MINI_PLAN.exists():
         raise FileNotFoundError(
             f"Missing mini plan: {PLANNER_MINI_PLAN}\n"
@@ -1064,27 +1086,44 @@ def _load_mini_plan() -> dict[str, Any]:
             "  python harness.py --project <name> --scope mini --plan"
         )
 
-    plan = _read_json_file(PLANNER_MINI_PLAN, "planner_mini_execution_plan.json")
+    merged = _read_json_file(PLANNER_MINI_PLAN, "planner/mini_plan.json")
+
+    # New merged format: { "plan": {...}, "impact": {...} }
+    if "plan" in merged and isinstance(merged["plan"], dict):
+        plan = merged["plan"]
+    else:
+        # Backward compat: old format was the plan object itself
+        print("[08] WARNING: mini_plan.json has no 'plan' key — assuming legacy flat format.")
+        plan = merged
+
     if plan.get("scope") != "mini":
-        print("[08] WARNING: planner_mini_execution_plan.json has no scope='mini'. Continuing.")
+        print("[08] WARNING: mini_plan plan has no scope='mini'. Continuing.")
 
     targets = plan.get("target_files", [])
     if not isinstance(targets, list):
-        raise RuntimeError("planner_mini_execution_plan.target_files must be a list.")
+        raise RuntimeError("mini_plan target_files must be a list.")
 
     return plan
 
 
 def _load_mini_analysis() -> dict[str, Any] | None:
-    if not PLANNER_MINI_IMPACT.exists():
+    """
+    Load impact analysis from the merged mini_plan.json "impact" field.
+
+    New format: mini_plan.json = { "plan": {...}, "impact": {...} }
+    Falls back gracefully if file missing or impact field absent.
+    """
+    if not PLANNER_MINI_PLAN.exists():
         return None
     try:
-        track_read(PLANNER_MINI_IMPACT)
-        data = json.loads(PLANNER_MINI_IMPACT.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else None
+        merged = json.loads(PLANNER_MINI_PLAN.read_text(encoding="utf-8"))
+        if not isinstance(merged, dict):
+            return None
+        impact = merged.get("impact")
+        return impact if isinstance(impact, dict) else None
     except Exception as exc:
         print(
-            f"[08] WARNING: could not read planner_mini_impact_analysis.json: {exc}",
+            f"[08] WARNING: could not read impact from mini_plan.json: {exc}",
             file=sys.stderr,
         )
         return None
@@ -1243,7 +1282,7 @@ def _write_mini_result(
 
 def run_mini_scope(args: argparse.Namespace) -> tuple[list[str], list[str], dict[str, Any]]:
     """
-    Execute targeted mini implementation from planner_mini_execution_plan.json.
+    Execute targeted mini implementation from planner/mini_plan.json.
 
     Returns (written, failed_files, record_extra).
     """
@@ -1310,12 +1349,8 @@ def run_mini_scope(args: argparse.Namespace) -> tuple[list[str], list[str], dict
 
     record_extra = {
         "scope": "mini",
-        "plan": "state/planner_mini_execution_plan.json",
-        "impact_analysis": (
-            "state/planner_mini_impact_analysis.json"
-            if PLANNER_MINI_IMPACT.exists()
-            else None
-        ),
+        "plan": "planner/mini_plan.json",
+        "impact_analysis": "planner/mini_plan.json (field: impact)",
         "task_summary": plan.get("task_summary", ""),
         "target_files": [target.get("path") for target in targets],
     }
@@ -1330,20 +1365,42 @@ def run_mini_scope(args: argparse.Namespace) -> tuple[list[str], list[str], dict
 def run_full_scope(args: argparse.Namespace) -> tuple[list[str], list[str], dict[str, Any]]:
     print("[08] Scope: full")
 
-    scaffold = _read_json_file(SCAFFOLD_JSON, "scaffolder_codebase_skeleton.json")
+    scaffold = _read_json_file(SCAFFOLD_JSON, "scaffolder/blueprint.json")
 
     instrs = scaffold.get("implementation_instructions", {}).get("for_executor", "")
     scaffold_stack = scaffold.get("stack")
 
-    files = scaffold.get("files", [])
-    if not isinstance(files, list):
-        raise RuntimeError("scaffolder_codebase_skeleton.json must contain a list field: files")
-
-    all_stubs: list[dict[str, Any]] = [
-        file_entry
-        for file_entry in files
-        if isinstance(file_entry, dict) and not file_entry.get("is_test")
-    ]
+    # ── Extract non-test stubs from new module-centric schema ─────────────────
+    modules = scaffold.get("modules")
+    if isinstance(modules, list):
+        # New schema: modules[].files[].{path, kind}
+        all_stubs: list[dict[str, Any]] = []
+        for mod in modules:
+            if not isinstance(mod, dict):
+                continue
+            for file_entry in mod.get("files", []):
+                if not isinstance(file_entry, dict):
+                    continue
+                if file_entry.get("kind", "source") != "test":
+                    all_stubs.append({
+                        "file_path": file_entry.get("path", ""),
+                        "kind": file_entry.get("kind", "source"),
+                        "module": mod.get("module", ""),
+                    })
+    else:
+        # Legacy flat schema fallback: files[].{file_path, is_test}
+        files = scaffold.get("files", [])
+        if not isinstance(files, list):
+            raise RuntimeError(
+                "scaffolder/blueprint.json must contain 'modules' list (new schema) "
+                "or 'files' list (legacy schema)."
+            )
+        print("[08] WARNING: scaffold uses legacy flat-file schema — consider regenerating.")
+        all_stubs = [
+            file_entry
+            for file_entry in files
+            if isinstance(file_entry, dict) and not file_entry.get("is_test")
+        ]
 
     # ── Delta filtering ───────────────────────────────────────────────────────
     only_set: set[str] = set()
@@ -1396,7 +1453,7 @@ def run_full_scope(args: argparse.Namespace) -> tuple[list[str], list[str], dict
                 "Run 07_planner.py --scope full first."
             )
 
-        plan = _read_json_file(PLANNER_FULL_PLAN, "planner_full_execution_plan.json")
+        plan = _read_json_file(PLANNER_FULL_PLAN, "planner/full_plan.json")
         task_index = {
             task["file_path"]: task
             for task in plan.get("tasks", [])
@@ -1503,7 +1560,7 @@ def run_full_scope(args: argparse.Namespace) -> tuple[list[str], list[str], dict
         "mode": mode,
         "skipped_delta": skipped_delta,
         "stack": stack,
-        "plan": "state/planner_full_execution_plan.json" if plan else None,
+        "plan": "planner/full_plan.json" if plan else None,
     }
 
     return written, failed_files, record_extra
@@ -1512,6 +1569,59 @@ def run_full_scope(args: argparse.Namespace) -> tuple[list[str], list[str], dict
 # ════════════════════════════════════════════════════════════════════════════
 # Run record
 # ════════════════════════════════════════════════════════════════════════════
+
+def append_manifest_log(
+    *,
+    scope: str,
+    mode: str,
+    written: list[str],
+    failed_files: list[str],
+    extra: dict[str, Any],
+) -> None:
+    """
+    Append one entry to executor/manifest_log.json (long-term audit trail).
+
+    Entry schema:
+      { scope, mode, generated_at, files_written, failed_count, task_summary? }
+    """
+    entry: dict[str, Any] = {
+        "scope": scope,
+        "mode": mode,
+        "generated_at": _utc_now_iso(),
+        "files_written": len(written),
+        "failed_count": len(failed_files),
+    }
+    if extra.get("task_summary"):
+        entry["task_summary"] = extra["task_summary"]
+    if extra.get("stack"):
+        entry["stack"] = extra["stack"]
+
+    log_path = EXECUTOR_MANIFEST_LOG
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if log_path.exists():
+            raw = log_path.read_text(encoding="utf-8").strip()
+            try:
+                data = json.loads(raw)
+                entries = data.get("entries", []) if isinstance(data, dict) else data
+                if not isinstance(entries, list):
+                    entries = []
+            except Exception:
+                entries = []
+        else:
+            entries = []
+
+        entries.append(entry)
+        log_path.write_text(
+            json.dumps({"entries": entries}, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        track_write(log_path)
+        print(f"[08] Manifest log appended ({len(entries)} entries) → {log_path}")
+    except Exception as exc:
+        print(f"[08] WARNING: could not append manifest log: {exc}", file=sys.stderr)
+
 
 def _write_impl_record(
     *,
@@ -1539,8 +1649,15 @@ def _write_impl_record(
         encoding="utf-8",
     )
     track_write(EXECUTOR_OVERWRITE_MANIFEST)
-
     print(f"[08] Executor manifest → {EXECUTOR_OVERWRITE_MANIFEST}")
+
+    append_manifest_log(
+        scope=scope,
+        mode=mode,
+        written=written,
+        failed_files=failed_files,
+        extra=extra,
+    )
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1566,16 +1683,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "--scope",
         choices=["full", "mini"],
         default="full",
-        help="Executor scope. full uses scaffold/spec; mini uses planner_mini_execution_plan.json.",
+        help="Executor scope. full uses scaffolder/blueprint.json; mini uses planner/mini_plan.json.",
     )
 
     parser.add_argument(
         "--use-planner-plan",
         action="store_true",
         help=(
-            "Full scope: inject state/planner_full_execution_plan.json as per-file "
+            "Full scope: inject planner/full_plan.json as per-file "
             "implementation guidance. Mini scope: accepted for harness compatibility; "
-            "mini always uses planner_mini_execution_plan.json."
+            "mini always uses planner/mini_plan.json."
         ),
     )
 
@@ -1585,7 +1702,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Comma-separated paths to implement. "
             "Full scope: delta mode against scaffold. "
-            "Mini scope: filters planner_mini_execution_plan.target_files."
+            "Mini scope: filters mini_plan target_files."
         ),
     )
 
