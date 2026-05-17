@@ -11,8 +11,8 @@ Nhận raw requirement dưới nhiều dạng:
     - attachment-only input
 
 Sau đó phân tích holes/conflicts/assumptions, tổ chức Q&A với user theo
-3-tier system, và output clarificator_requirement_synthesis.md cùng structured
-report cho downstream steps.
+3-tier system, và output clarificator/session.json cùng structured
+decision_log.json cho downstream steps.
 
 Usage:
     python pipeline/02_clarificator.py --project my-app --input requirement.pdf
@@ -26,10 +26,8 @@ When run directly, --project or interactive project prompt is used and
 PIPELINE_PROJECT is set before any artifact path is resolved.
 
 Artifacts produced (owner: clarificator):
-    artifacts_<slug>/sessions/<NNN>/execution/clarificator_overwrite_raw.json
-    artifacts_<slug>/sessions/<NNN>/execution/clarificator_overwrite_questions.md
-    artifacts_<slug>/knowledge/current/clarificator_decision_log.md
-    artifacts_<slug>/sessions/<NNN>/state/clarificator_requirement_synthesis.md
+    artifacts_<slug>/clarificator/session.json       (short-term, overwrite)
+    artifacts_<slug>/clarificator/decision_log.json  (long-term, append)
 
 At the end of each run, prints:
     - artifacts/files read
@@ -59,37 +57,28 @@ sys.path.insert(0, str(_REPO_ROOT))
 from artifacts.paths import (  # type: ignore  # noqa: E402
     ARCHIVIST_KNOWLEDGE_LOG,
     CLARIFICATOR_DECISION_LOG,
-    CLARIFICATOR_OVERWRITE_QUESTIONS,
-    CLARIFICATOR_OVERWRITE_RAW,
-    CLARIFIED_REQ,
+    CLARIFICATOR_SESSION,
     ensure_dirs,
     get_project_name,
 )
 from artifacts.models import call_model, get_model, get_provider  # noqa: E402
 
 # New shared interactive/drag-drop abstraction.
-# File will be implemented separately: modules/drag_and_drop.py
 from modules.drag_and_drop import gather_text_file_bundle  # type: ignore  # noqa: E402
 from modules.artifact_tracking import track_read, track_write, print_summary as print_artifact_summary  # noqa: E402
 from modules.cost import print_call, print_summary, record_usage  # noqa: E402
-from modules.md_header import apply_header as apply_md_header  # noqa: E402
 from modules.post_interactive import prompt_next_step  # noqa: E402
 
 
 # Local aliases
 KNOWLEDGE_BASE = ARCHIVIST_KNOWLEDGE_LOG
-CLARIFICATION_REPORT = CLARIFICATOR_OVERWRITE_RAW
-CLARIFICATION_QUESTIONS = CLARIFICATOR_OVERWRITE_QUESTIONS
-CLARIFICATION_LOG = CLARIFICATOR_DECISION_LOG
 
 
 # === WRITE AUTHORITY: clarificator ===
-# OWNS  : execution/clarificator_overwrite_raw.json
-#         execution/clarificator_overwrite_questions.md
-#         knowledge/current/clarificator_decision_log.md
-#         state/clarificator_requirement_synthesis.md
-# READS : knowledge/current/archivist_knowledge_log.md
-#         knowledge/current/clarificator_decision_log.md
+# OWNS  : clarificator/session.json
+#         clarificator/decision_log.json
+# READS : archivist/knowledge_log.md
+#         clarificator/decision_log.json
 #         optional user-provided requirement file(s)
 
 
@@ -217,31 +206,35 @@ def _parse_json_response(raw: str, label: str) -> dict[str, Any]:
     raise RuntimeError(f"No JSON object found in {label}.")
 
 
-def _load_clarification_log() -> str:
-    if CLARIFICATION_LOG.exists():
-        track_read(CLARIFICATION_LOG)
-        return CLARIFICATION_LOG.read_text(encoding="utf-8")
-    return ""
+def _load_decision_log() -> list[dict[str, Any]]:
+    """Load decision_log.json entries list."""
+    if not CLARIFICATOR_DECISION_LOG.exists():
+        return []
+    track_read(CLARIFICATOR_DECISION_LOG)
+    try:
+        data = json.loads(CLARIFICATOR_DECISION_LOG.read_text(encoding="utf-8"))
+        entries = data.get("entries", [])
+        if not isinstance(entries, list):
+            return []
+        return entries
+    except (json.JSONDecodeError, Exception):
+        return []
 
 
-def _extract_answered_qa_pairs(log_text: str) -> list[dict[str, str]]:
+def _extract_answered_qa_pairs(entries: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """Extract Q/A pairs from decision_log.json entries for semantic dedup."""
     pairs: list[dict[str, str]] = []
-    blocks = re.split(r"\n(?=###\s+CLR-)", log_text)
-
-    for block in blocks:
-        id_match = re.search(r"###\s+(CLR-\d{3})", block)
-        q_match = re.search(r"\*\*Q:\*\*\s*(.+?)(?=\n\*\*|\Z)", block, re.DOTALL)
-        a_match = re.search(r"\*\*A:\*\*\s*(.+?)(?=\n\*\*|\Z)", block, re.DOTALL)
-
-        if id_match and q_match:
+    for entry in entries:
+        for decision in entry.get("decisions", []):
+            if not isinstance(decision, dict):
+                continue
             pairs.append(
                 {
-                    "id": id_match.group(1),
-                    "question": q_match.group(1).strip(),
-                    "answer": a_match.group(1).strip() if a_match else "",
+                    "id": decision.get("id", ""),
+                    "question": decision.get("question", ""),
+                    "answer": decision.get("answer", ""),
                 }
             )
-
     return pairs
 
 
@@ -252,9 +245,16 @@ def _load_knowledge_context() -> str:
         track_read(KNOWLEDGE_BASE)
         parts.append(f"=== archivist_knowledge_log.md ===\n{KNOWLEDGE_BASE.read_text(encoding='utf-8')}")
 
-    log_text = _load_clarification_log()
-    if log_text:
-        parts.append(f"=== clarificator_decision_log.md ===\n{log_text}")
+    entries = _load_decision_log()
+    if entries:
+        # Render a summary of past decisions for LLM context
+        log_lines: list[str] = []
+        for entry in entries:
+            log_lines.append(f"Session: {entry.get('session_id', '?')}")
+            for d in entry.get("decisions", []):
+                log_lines.append(f"  [{d.get('id')}] Q: {d.get('question', '')}")
+                log_lines.append(f"           A: {d.get('answer', '')}")
+        parts.append(f"=== clarificator_decision_log ===\n" + "\n".join(log_lines))
 
     return "\n\n".join(parts)
 
@@ -298,12 +298,13 @@ def _list_projects() -> None:
     print("[clarificator] Known project workspaces:")
     for p in projects:
         slug = p.name.removeprefix("artifacts_")
-        log = p / "knowledge" / "current" / "clarificator_decision_log.md"
+        log = p / "clarificator" / "decision_log.json"
         sessions = 0
         if log.exists():
             try:
                 track_read(log)
-                sessions = len(re.findall(r"^## \d{4}-", log.read_text(encoding="utf-8"), re.MULTILINE))
+                data = json.loads(log.read_text(encoding="utf-8"))
+                sessions = len(data.get("entries", []))
             except Exception:
                 sessions = 0
         print(f"  - {slug:<30} {sessions} clarification session(s)")
@@ -758,6 +759,7 @@ def _batch_derive_impacts(decisions: list[dict[str, Any]]) -> None:
         )
 
 
+```python
 def _run_interactive_loop(
     findings: list[dict[str, Any]],
     project_name: str,
@@ -976,69 +978,17 @@ def _normalize_input_sources_for_report(sources: Any) -> list[dict[str, Any]]:
     return normalized
 
 
-def _write_report(
-    session_id: str,
-    req_hash: str,
-    project_name: str,
-    decisions: list[dict[str, Any]],
-    unresolved: list[dict[str, Any]],
-    conflicts: list[dict[str, Any]],
-    findings: list[dict[str, Any]],
-    input_sources: list[dict[str, Any]] | None = None,
-    attachment_only: bool = False,
-) -> None:
-    tier_counts = {1: 0, 2: 0, 3: 0}
-    tier3_accepted = 0
-    tier3_rejected = 0
-
-    for decision in decisions:
-        tier_counts[decision["tier"]] = tier_counts.get(decision["tier"], 0) + 1
-        if decision["tier"] == 3:
-            if decision["accepted"]:
-                tier3_accepted += 1
-            else:
-                tier3_rejected += 1
-
-    report = {
-        "requirement_hash": req_hash,
-        "session_id": session_id,
-        "project_name": project_name,
-        "input_sources": input_sources or [],
-        "attachment_only_input": attachment_only,
-        "initial_findings": len(findings),
-        "delta_injected": sum(1 for d in decisions if d["id"].startswith("NEW-")),
-        "total_decisions": len(decisions),
-        "tier1_answered": tier_counts.get(1, 0),
-        "tier2_answered": tier_counts.get(2, 0),
-        "tier3_accepted": tier3_accepted,
-        "tier3_rejected": tier3_rejected,
-        "conflicts_detected": len(conflicts),
-        "unresolved": [u["id"] for u in unresolved],
-        "decisions": decisions,
-        "conflicts": conflicts,
-    }
-
-    CLARIFICATION_REPORT.parent.mkdir(parents=True, exist_ok=True)
-    CLARIFICATION_REPORT.write_text(
-        json.dumps(report, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
-    track_write(CLARIFICATION_REPORT)
-
-    print(f"\n[clarificator] ✓ Report → {CLARIFICATION_REPORT}")
-
-
-def _write_questions_md(
+def _print_questions_to_terminal(
     project_name: str,
     session_id: str,
     findings: list[dict[str, Any]],
     conflicts: list[dict[str, Any]],
 ) -> None:
-    lines: list[str] = [
-        f"# Clarification Questions — {project_name}",
-        f"Generated: {session_id[:10]}",
-        "",
-    ]
+    """Print questions to terminal only — no file write."""
+    print(f"\n{'─' * 60}")
+    print(f"  Clarification Questions — {project_name}")
+    print(f"  Generated: {session_id[:10]}")
+    print(f"{'─' * 60}")
 
     tier1 = sorted(
         [f for f in findings if f.get("tier") == 1],
@@ -1053,118 +1003,142 @@ def _write_questions_md(
     tier1_blocking = [f for f in tier1 if f.get("priority") == "blocking"]
     tier1_other = [f for f in tier1 if f.get("priority") != "blocking"]
 
-    def _render_q(finding: dict[str, Any], numbered: int) -> list[str]:
-        out = [f"{numbered}. [{finding['id']}] {finding['text']}"]
-        if finding.get("scenarios"):
-            for scenario in finding["scenarios"]:
-                out.append(f"   - {scenario}")
-        return out
-
     if tier1_blocking:
-        lines += ["## 🔴 Blocking — Tier 1 (cần trả lời trước khi estimate)", ""]
+        print("\n  🔴 Blocking — Tier 1 (cần trả lời trước khi estimate)")
         for n, finding in enumerate(tier1_blocking, 1):
-            lines += _render_q(finding, n)
-            lines.append("")
+            print(f"    {n}. [{finding['id']}] {finding['text']}")
+            for scenario in finding.get("scenarios", []):
+                print(f"       - {scenario}")
 
     if tier1_other:
-        lines += ["## 🔴 Tier 1 — Business & Policy Decisions", ""]
+        print("\n  🔴 Tier 1 — Business & Policy Decisions")
         for n, finding in enumerate(tier1_other, 1):
-            priority_tag = (
-                f"[{finding.get('priority', '').upper()}]"
-                if finding.get("priority") != "high"
-                else ""
-            )
-            rendered = _render_q(finding, n)
-            if priority_tag:
-                rendered[0] = f"{rendered[0]}  {priority_tag}"
-            lines += rendered
-            lines.append("")
+            print(f"    {n}. [{finding['id']}] {finding['text']}")
+            for scenario in finding.get("scenarios", []):
+                print(f"       - {scenario}")
 
     if tier2:
-        lines += ["## 🟡 Tier 2 — Bounded Choices", ""]
+        print("\n  🟡 Tier 2 — Bounded Choices")
         for n, finding in enumerate(tier2, 1):
-            lines += _render_q(finding, n)
-            lines.append("")
+            print(f"    {n}. [{finding['id']}] {finding['text']}")
+            for scenario in finding.get("scenarios", []):
+                print(f"       - {scenario}")
 
     if suggestions:
-        lines += ["## 🟢 Tier 3 — Suggestions (confirm nếu đồng ý)", ""]
+        print("\n  🟢 Tier 3 — Suggestions (confirm nếu đồng ý)")
         for finding in suggestions:
             conf = finding.get("confidence", 0)
             conf_str = f"{int(conf * 100)}%" if conf else "?"
-            lines.append(f"- [{finding['id']}] **Context:** {finding['text']}")
-            lines.append(f"  **Suggestion:** {finding.get('suggestion', '')}")
-            lines.append(f"  Confidence: {conf_str} | Reasoning: {finding.get('citation', 'N/A')}")
-            lines.append("  → Accept / Reject / Modify?")
-            lines.append("")
+            print(f"    [{finding['id']}] {finding['text']}")
+            print(f"      Suggestion: {finding.get('suggestion', '')}")
+            print(f"      Confidence: {conf_str} | Citation: {finding.get('citation', 'N/A')}")
 
     if conflicts:
-        lines += ["---", "## ⚠️ Conflicts Detected", ""]
+        print("\n  ⚠️  Conflicts Detected")
         for conflict in conflicts:
-            lines.append(f"- [{conflict['id']}] {conflict['description']}")
+            print(f"    [{conflict['id']}] {conflict['description']}")
             if conflict.get("source_a"):
-                lines.append(f"  New requirement: _{conflict['source_a']}_")
+                print(f"      New requirement: {conflict['source_a']}")
             if conflict.get("source_b"):
-                lines.append(f"  Existing decision: _{conflict['source_b']}_")
-            lines.append("")
+                print(f"      Existing decision: {conflict['source_b']}")
 
-    CLARIFICATION_QUESTIONS.parent.mkdir(parents=True, exist_ok=True)
-    CLARIFICATION_QUESTIONS.write_text(apply_md_header("\n".join(lines), CLARIFICATION_QUESTIONS, owner="02_clarificator.py"), encoding="utf-8")
-    track_write(CLARIFICATION_QUESTIONS)
-
-    print(f"[clarificator] ✓ Questions → {CLARIFICATION_QUESTIONS}")
+    print()
 
 
-def _append_to_log(
+def _write_session(
+    session_id: str,
+    req_hash: str,
+    project_name: str,
+    decisions: list[dict[str, Any]],
+    unresolved: list[dict[str, Any]],
+    conflicts: list[dict[str, Any]],
+    findings: list[dict[str, Any]],
+    input_sources: list[dict[str, Any]] | None = None,
+    attachment_only: bool = False,
+    requirement_synthesis: str = "",
+) -> None:
+    """Write clarificator/session.json (short-term, overwrite each run)."""
+    tier_counts = {1: 0, 2: 0, 3: 0}
+    tier3_accepted = 0
+    tier3_rejected = 0
+
+    for decision in decisions:
+        tier_counts[decision["tier"]] = tier_counts.get(decision["tier"], 0) + 1
+        if decision["tier"] == 3:
+            if decision["accepted"]:
+                tier3_accepted += 1
+            else:
+                tier3_rejected += 1
+
+    session_data = {
+        "requirement_hash": req_hash,
+        "session_id": session_id,
+        "project_name": project_name,
+        "input_sources": input_sources or [],
+        "attachment_only_input": attachment_only,
+        "initial_findings": len(findings),
+        "delta_injected": sum(1 for d in decisions if d["id"].startswith("NEW-")),
+        "tier_counts": tier_counts,
+        "total_decisions": len(decisions),
+        "tier3_accepted": tier3_accepted,
+        "tier3_rejected": tier3_rejected,
+        "conflicts_detected": len(conflicts),
+        "unresolved": [u["id"] for u in unresolved],
+        "decisions": decisions,
+        "conflicts": conflicts,
+        "requirement_synthesis": requirement_synthesis,
+    }
+
+    CLARIFICATOR_SESSION.parent.mkdir(parents=True, exist_ok=True)
+    CLARIFICATOR_SESSION.write_text(
+        json.dumps(session_data, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    track_write(CLARIFICATOR_SESSION)
+
+    print(f"\n[clarificator] ✓ Session → {CLARIFICATOR_SESSION}")
+
+
+def _append_decision_log(
     session_id: str,
     project_name: str,
+    req_hash: str,
     decisions: list[dict[str, Any]],
     conflicts: list[dict[str, Any]],
 ) -> None:
-    blocks: list[str] = [
-        f"## {session_id[:10]} | Project: {project_name} | Session: {session_id[11:19]}"
-    ]
+    """Append entry to clarificator/decision_log.json (long-term, append-only)."""
+    entry = {
+        "session_id": session_id,
+        "project_name": project_name,
+        "requirement_hash": req_hash,
+        "generated_at": _now_iso(),
+        "total_decisions": len(decisions),
+        "conflicts_detected": len(conflicts),
+        "decisions": decisions,
+        "conflicts": conflicts,
+    }
 
-    for decision in decisions:
-        tier_label = {1: "Tier 1", 2: "Tier 2", 3: "Tier 3"}.get(decision["tier"], "?")
-        accepted_label = (
-            ""
-            if decision["tier"] != 3
-            else (" / accepted" if decision["accepted"] else " / rejected")
-        )
+    CLARIFICATOR_DECISION_LOG.parent.mkdir(parents=True, exist_ok=True)
 
-        entry_lines = [
-            f"### {decision['id']} [{tier_label}{accepted_label}]",
-            f"**Q:** {decision['question']}",
-            f"**A:** {decision['answer']}",
-        ]
+    if CLARIFICATOR_DECISION_LOG.exists():
+        try:
+            data = json.loads(CLARIFICATOR_DECISION_LOG.read_text(encoding="utf-8"))
+            if not isinstance(data, dict) or "entries" not in data:
+                data = {"entries": []}
+        except (json.JSONDecodeError, Exception):
+            data = {"entries": []}
+    else:
+        data = {"entries": []}
 
-        if decision.get("impact"):
-            entry_lines.append(f"**Impact:** {decision['impact']}")
+    data["entries"].append(entry)
 
-        blocks.append("\n".join(entry_lines))
+    CLARIFICATOR_DECISION_LOG.write_text(
+        json.dumps(data, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    track_write(CLARIFICATOR_DECISION_LOG)
 
-    if conflicts:
-        conflict_lines = ["### Conflicts resolved this session"]
-        for conflict in conflicts:
-            conflict_lines.append(f"- [{conflict['id']}] {conflict['description']}")
-        blocks.append("\n".join(conflict_lines))
-
-    content = "\n\n" + "\n\n".join(blocks) + "\n"
-
-    CLARIFICATION_LOG.parent.mkdir(parents=True, exist_ok=True)
-    with CLARIFICATION_LOG.open("a", encoding="utf-8") as fh:
-        fh.write(content)
-    track_write(CLARIFICATION_LOG)
-
-    print(f"[clarificator] ✓ Log appended → {CLARIFICATION_LOG}")
-
-
-def _write_clarified_req(content: str) -> None:
-    CLARIFIED_REQ.parent.mkdir(parents=True, exist_ok=True)
-    CLARIFIED_REQ.write_text(apply_md_header(content, CLARIFIED_REQ, owner="02_clarificator.py"), encoding="utf-8")
-    track_write(CLARIFIED_REQ)
-
-    print(f"[clarificator] ✓ Clarified requirement → {CLARIFIED_REQ}")
+    print(f"[clarificator] ✓ Decision log appended → {CLARIFICATOR_DECISION_LOG}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1242,7 +1216,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-synth",
         action="store_true",
-        help="Skip synthesis step; do not generate clarificator_requirement_synthesis.md.",
+        help="Skip synthesis step; do not generate requirement_synthesis field.",
     )
     parser.add_argument(
         "--dry-run",
@@ -1306,8 +1280,8 @@ def main() -> None:
         session_id = _now_iso()
 
         # ── Load knowledge context ──────────────────────────────────────────
-        log_text = _load_clarification_log()
-        standalone = not (KNOWLEDGE_BASE.exists() or bool(log_text))
+        log_entries = _load_decision_log()
+        standalone = not (KNOWLEDGE_BASE.exists() or bool(log_entries))
 
         if standalone:
             print("[clarificator] Standalone mode — no knowledge context found for this workspace.")
@@ -1316,7 +1290,7 @@ def main() -> None:
         else:
             print("[clarificator] Loading knowledge context ...")
             knowledge_context = _load_knowledge_context()
-            answered_qa_pairs = _extract_answered_qa_pairs(log_text)
+            answered_qa_pairs = _extract_answered_qa_pairs(log_entries)
             if answered_qa_pairs:
                 print(f"[clarificator] Loaded {len(answered_qa_pairs)} past Q/A pairs for semantic dedup")
 
@@ -1341,7 +1315,19 @@ def main() -> None:
         if not findings and not conflicts:
             print("[clarificator] ✓ No ambiguities found — requirement is already clear.")
             if not args.dry_run:
-                _write_clarified_req(requirement_text)
+                # Write session with synthesis = original requirement
+                _write_session(
+                    session_id=session_id,
+                    req_hash=req_hash,
+                    project_name=project_name,
+                    decisions=[],
+                    unresolved=[],
+                    conflicts=[],
+                    findings=[],
+                    input_sources=input_sources,
+                    attachment_only=attachment_only,
+                    requirement_synthesis=requirement_text,
+                )
             return
 
         print(f"[clarificator] Found {len(findings)} findings, {len(conflicts)} conflicts.")
@@ -1356,7 +1342,8 @@ def main() -> None:
                     print(f"  {conflict['id']}: {conflict['description']}")
             return
 
-        _write_questions_md(project_name, session_id, _sort_findings(findings), conflicts)
+        # Print questions to terminal (no file write)
+        _print_questions_to_terminal(project_name, session_id, _sort_findings(findings), conflicts)
 
         decisions, unresolved = _run_interactive_loop(
             findings,
@@ -1387,7 +1374,19 @@ def main() -> None:
 
         _batch_derive_impacts(decisions)
 
-        _write_report(
+        # ── Synthesis ────────────────────────────────────────────────────────
+        requirement_synthesis = ""
+        if not args.no_synth:
+            print("\n[clarificator] Synthesizing clarified requirement ...")
+            requirement_synthesis = _synthesize_requirement(
+                requirement_text,
+                decisions,
+                conflicts,
+                clarified_sum,
+            )
+
+        # ── Write session.json (short-term, overwrite) ───────────────────────
+        _write_session(
             session_id=session_id,
             req_hash=req_hash,
             project_name=project_name,
@@ -1397,23 +1396,21 @@ def main() -> None:
             findings=findings,
             input_sources=input_sources,
             attachment_only=attachment_only,
+            requirement_synthesis=requirement_synthesis,
         )
 
-        _append_to_log(session_id, project_name, decisions, conflicts)
-
-        if not args.no_synth:
-            print("\n[clarificator] Synthesizing clarified requirement ...")
-            clarified_md = _synthesize_requirement(
-                requirement_text,
-                decisions,
-                conflicts,
-                clarified_sum,
-            )
-            _write_clarified_req(clarified_md)
+        # ── Append decision_log.json (long-term, append) ─────────────────────
+        _append_decision_log(
+            session_id=session_id,
+            project_name=project_name,
+            req_hash=req_hash,
+            decisions=decisions,
+            conflicts=conflicts,
+        )
 
         _print_banner(f"Done — {len(decisions)} decisions recorded  [{project_name}]")
-        print(f"  Workspace log: {CLARIFICATION_LOG}")
-        print(f"  Artifacts     → {CLARIFIED_REQ}")
+        print(f"  Decision log: {CLARIFICATOR_DECISION_LOG}")
+        print(f"  Session      → {CLARIFICATOR_SESSION}")
 
     finally:
         print_summary("[02]")
