@@ -759,7 +759,6 @@ def _batch_derive_impacts(decisions: list[dict[str, Any]]) -> None:
         )
 
 
-```python
 def _run_interactive_loop(
     findings: list[dict[str, Any]],
     project_name: str,
@@ -1099,6 +1098,34 @@ def _write_session(
     print(f"\n[clarificator] ✓ Session → {CLARIFICATOR_SESSION}")
 
 
+_IMPACT_TRIM_THRESHOLD = 20  # decisions per entry trước khi trim impacts
+
+
+def _trim_decision_impacts(decisions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Trim `impacts` list trong mỗi decision nếu entry lớn để tránh log phình.
+
+    Chỉ áp dụng khi số decisions vượt threshold — với session nhỏ giữ nguyên.
+    Impact text được truncate ở 200 chars, không xóa hoàn toàn để vẫn track được.
+    """
+    if len(decisions) <= _IMPACT_TRIM_THRESHOLD:
+        return decisions
+
+    trimmed: list[dict[str, Any]] = []
+    for d in decisions:
+        entry = dict(d)
+        impacts = entry.get("impacts")
+        if isinstance(impacts, list) and len(impacts) > 3:
+            entry["impacts"] = [
+                (imp[:200] + "…" if isinstance(imp, str) and len(imp) > 200 else imp)
+                for imp in impacts[:3]
+            ] + [f"… ({len(impacts) - 3} more impacts trimmed)"]
+        elif isinstance(entry.get("impact"), str) and len(entry["impact"]) > 200:
+            entry["impact"] = entry["impact"][:200] + "…"
+        trimmed.append(entry)
+    return trimmed
+
+
 def _append_decision_log(
     session_id: str,
     project_name: str,
@@ -1114,7 +1141,7 @@ def _append_decision_log(
         "generated_at": _now_iso(),
         "total_decisions": len(decisions),
         "conflicts_detected": len(conflicts),
-        "decisions": decisions,
+        "decisions": _trim_decision_impacts(decisions),
         "conflicts": conflicts,
     }
 
