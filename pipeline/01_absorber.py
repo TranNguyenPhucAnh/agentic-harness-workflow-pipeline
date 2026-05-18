@@ -876,9 +876,12 @@ def call_llm_for_map(
     target_name: str,
     config_section: str = "",
     git_section: str = "",
-) -> str:
+) -> tuple[str, float]:
     """
     Call LLM to produce codebase_map.md with merged Config and Git/Blame sections.
+
+    Returns:
+      (content, call_cost)  — call_cost is 0.0 if usage unavailable or call failed.
     """
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     system = _MAP_SYSTEM.replace("{date}", date_str)
@@ -908,6 +911,7 @@ def call_llm_for_map(
         )
         choice = resp.choices[0]
         usage  = getattr(resp, "usage", None)
+        call_cost = 0.0
         if usage:
             pt        = getattr(usage, "prompt_tokens",     0) or 0
             ct        = getattr(usage, "completion_tokens", 0) or 0
@@ -925,11 +929,11 @@ def call_llm_for_map(
         else:
             print(f"[absorber] LLM finish_reason: {finish_reason}")
 
-        return content
+        return content, call_cost
 
     except Exception as e:
         print(f"[absorber][error] LLM call failed: {e}", file=sys.stderr)
-        return _fallback_map(context, target_name, config_section, git_section)
+        return _fallback_map(context, target_name, config_section, git_section), 0.0
 
 
 def _fallback_map(
@@ -996,12 +1000,16 @@ def _resolve_git_scope(scope: str) -> list[str]:
     return ["--since=6.months.ago"]
 
 
-def _git_log_stats(target: Path, scope: str) -> str:
+def _git_log_stats(target: Path, scope: str) -> tuple[str, list[tuple[str, int]]]:
     """
     Run git log --stat and produce a summary for the Git/Blame section.
+
+    Returns:
+      (section_str, hotspots) — hotspots is [(file, change_count), ...] top-20,
+      or ("", []) if not a git repo or git command fails.
     """
     if not (target / ".git").exists():
-        return ""
+        return "", []
 
     scope_args = _resolve_git_scope(scope)
 
@@ -1015,7 +1023,7 @@ def _git_log_stats(target: Path, scope: str) -> str:
             timeout=30,
         )
         if result.returncode != 0:
-            return ""
+            return "", []
 
         file_counts: dict[str, int] = {}
         for line in result.stdout.splitlines():
@@ -1026,7 +1034,7 @@ def _git_log_stats(target: Path, scope: str) -> str:
         # Top 20 hotspots
         hotspots = sorted(file_counts.items(), key=lambda x: -x[1])[:20]
     except Exception:
-        return ""
+        return "", []
 
     # Get contributor stats
     try:
@@ -1088,7 +1096,7 @@ def _git_log_stats(target: Path, scope: str) -> str:
         for mod, count in top_modules:
             lines.append(f"| {mod} | {count} |")
 
-    return "\n".join(lines)
+    return "\n".join(lines), hotspots
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1101,9 +1109,18 @@ def _append_codebase_log(
     cached_count: int,
     extracted_count: int,
     map_size: int,
+    *,
+    call_cost: float = 0.0,
+    git_scope: str = "",
+    hotspot_summary: list[tuple[str, int]] | None = None,
 ) -> None:
     """
     Append an entry to absorber/codebase_log.json for audit trail.
+
+    Args:
+      call_cost        — USD cost returned by record_usage(); 0.0 if not available.
+      git_scope        — raw --git-scope flag value (e.g. "6m", "all"); empty if --skip-git.
+      hotspot_summary  — top-N [(file, change_count)] from _git_log_stats(); None if skipped.
     """
     entry = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -1118,6 +1135,13 @@ def _append_codebase_log(
         },
         "languages": _count_languages(inventory),
         "map_size_bytes": map_size,
+        "cost": round(call_cost, 6),
+        "git_scope": git_scope or None,
+        "hotspot_summary": (
+            [{"file": f, "changes": c} for f, c in hotspot_summary]
+            if hotspot_summary
+            else None
+        ),
     }
 
     log_path = Path(str(CODEBASE_LOG))
@@ -1307,9 +1331,10 @@ def run_absorber(args: argparse.Namespace) -> None:
 
     # --- Phase 4: Git crawl (before LLM so we can include in prompt) ---
     git_section = ""
+    hotspots: list[tuple[str, int]] = []
     if not args.skip_git:
         print(f"[absorber] Phase 4 — Git crawl (scope: {args.git_scope})")
-        git_section = _git_log_stats(target, args.git_scope)
+        git_section, hotspots = _git_log_stats(target, args.git_scope)
         if git_section:
             print(f"  Git data: {len(git_section):,} chars")
         else:
@@ -1321,7 +1346,7 @@ def run_absorber(args: argparse.Namespace) -> None:
 
     # --- Phase 3: Semantic compression → codebase_map.md ---
     print("[absorber] Phase 3 — LLM semantic compression")
-    map_content = call_llm_for_map(context, target_name, config_section, git_section)
+    map_content, call_cost = call_llm_for_map(context, target_name, config_section, git_section)
 
     # Apply markdown header
     map_content = apply_md_header(map_content, owner="absorber", artifact_type="short-term")
@@ -1334,7 +1359,16 @@ def run_absorber(args: argparse.Namespace) -> None:
     print(f"[absorber] Wrote: {map_path} ({len(map_content):,} bytes)")
 
     # --- Phase 5: Append codebase_log ---
-    _append_codebase_log(target, inventory, cached_count, extracted_count, len(map_content))
+    _append_codebase_log(
+        target,
+        inventory,
+        cached_count,
+        extracted_count,
+        len(map_content),
+        call_cost=call_cost,
+        git_scope="" if args.skip_git else args.git_scope,
+        hotspot_summary=hotspots if hotspots else None,
+    )
 
     # --- Summary ---
     print()
