@@ -471,7 +471,7 @@ Your task:
       }}
     ]
   }}
-- Do NOT modify test files, where is_test is true.
+- Do NOT modify test files (kind: "test" in the scaffold).
 - Do NOT add new files beyond what is in the scaffold.
 - Follow the detected project stack strictly.
 - Preserve the scaffold's language, module system, imports style, public APIs, exported names, function signatures, and file paths.
@@ -897,6 +897,7 @@ def _build_context_block(
 # Per-file generation — full scope
 # ════════════════════════════════════════════════════════════════════════════
 
+```python
 def implement_file(
     stub: dict[str, Any],
     task: dict[str, Any] | None,
@@ -1582,14 +1583,19 @@ def append_manifest_log(
     Append one entry to executor/manifest_log.json (long-term audit trail).
 
     Entry schema:
-      { scope, mode, generated_at, files_written, failed_count, task_summary? }
+      { scope, mode, generated_at, files_written, failed_count, cost, task_summary? }
     """
+    # Extract cost from the current run's token summary
+    token_sum = cost_summary()
+    cost_total = token_sum.get("total_cost_usd") if isinstance(token_sum, dict) else None
+
     entry: dict[str, Any] = {
         "scope": scope,
         "mode": mode,
         "generated_at": _utc_now_iso(),
         "files_written": len(written),
         "failed_count": len(failed_files),
+        "cost": cost_total,
     }
     if extra.get("task_summary"):
         entry["task_summary"] = extra["task_summary"]
@@ -1601,6 +1607,7 @@ def append_manifest_log(
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
         if log_path.exists():
+            track_read(log_path)
             raw = log_path.read_text(encoding="utf-8").strip()
             try:
                 data = json.loads(raw)
@@ -1631,6 +1638,9 @@ def _write_impl_record(
     failed_files: list[str],
     extra: dict[str, Any],
 ) -> None:
+    token_sum = cost_summary()
+    cost_total = token_sum.get("total_cost_usd") if isinstance(token_sum, dict) else None
+
     record = {
         "executor_role": ROLE,
         "executor_model": get_model(ROLE),
@@ -1639,7 +1649,8 @@ def _write_impl_record(
         "generated_at": _utc_now_iso(),
         "files": written,
         "failed_files": failed_files,
-        "token_summary": cost_summary(),
+        "token_summary": token_sum,
+        "cost": cost_total,
     }
     record.update(extra)
 
