@@ -101,11 +101,14 @@ def _call_llm(
     system: str,
     user: str,
     max_tokens: int = _MAX_TOKENS_ENRICH,
-) -> str:
+) -> tuple[str, float]:
     """
     Call the enricher model via the central model registry.
     Model identity and provider are resolved from artifacts/models.py role "enricher".
     Falls back to stdin mock when API key is missing (offline dev).
+
+    Returns:
+      (content, call_cost) — call_cost is 0.0 if usage unavailable or offline fallback.
     """
     try:
         resp = call_model(
@@ -117,6 +120,7 @@ def _call_llm(
             max_tokens=max_tokens,
         )
         usage = getattr(resp, "usage", None)
+        call_cost = 0.0
         if usage:
             pt        = getattr(usage, "prompt_tokens",     0) or 0
             ct        = getattr(usage, "completion_tokens", 0) or 0
@@ -125,11 +129,11 @@ def _call_llm(
         content = resp.choices[0].message.content
         if not content or not content.strip():
             raise RuntimeError("Model returned empty content.")
-        return content
+        return content, call_cost
     except RuntimeError as exc:
         if "not set" in str(exc):
             print("\n[enricher][offline] No API key found. Paste LLM response then EOF (Ctrl-D):")
-            return sys.stdin.read()
+            return sys.stdin.read(), 0.0
         raise
     except Exception as exc:
         print(f"[enricher][error] LLM call failed: {exc}")
@@ -197,6 +201,7 @@ def _append_prompt_log(
     enriched_text: str,
     session: dict,
     extra_context: str,
+    call_cost: float = 0.0,
 ) -> None:
     """Append an entry to enricher/prompt_log.json (long-term, append-only)."""
     entry = {
@@ -207,11 +212,13 @@ def _append_prompt_log(
         "decisions_count": len(session.get("decisions", [])),
         "extra_context": extra_context.strip() if extra_context.strip() else None,
         "enriched_prompt_length": len(enriched_text),
+        "cost": round(call_cost, 6),
     }
 
     entries: list[dict] = []
     if ENRICHER_PROMPT_LOG.exists():
         try:
+            track_read(ENRICHER_PROMPT_LOG)
             data = json.loads(ENRICHER_PROMPT_LOG.read_text(encoding="utf-8"))
             entries = data.get("entries", [])
         except (json.JSONDecodeError, KeyError):
@@ -315,7 +322,7 @@ def _enrich(
     session: dict,
     knowledge_layer: str,
     extra_context: str,
-) -> str:
+) -> tuple[str, float]:
     decisions_block = _summarize_decisions(session)
 
     conflicts = session.get("conflicts", [])
@@ -504,7 +511,7 @@ def main() -> None:
         print("[enricher] Calling LLM to build enriched prompt ...")
 
         try:
-            enriched = _enrich(
+            enriched, call_cost = _enrich(
                 project_name          = project_name,
                 requirement_synthesis = requirement_synthesis,
                 session               = session,
@@ -557,10 +564,11 @@ def main() -> None:
 
         # ── Append to long-term log ──────────────────────────────────────────────
         _append_prompt_log(
-            project_name = project_name,
+            project_name  = project_name,
             enriched_text = final_prompt,
             session       = session,
             extra_context = args.extra_context,
+            call_cost     = call_cost,
         )
         print(f"[enricher] ✓ Prompt log appended → {ENRICHER_PROMPT_LOG}")
 
