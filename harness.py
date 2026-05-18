@@ -886,7 +886,6 @@ def _run_judge_fix_loop(args: argparse.Namespace, results: dict[str, bool]) -> N
         return
 
 
-```python
 def _run_fix_from_existing_judge(args: argparse.Namespace, results: dict[str, bool]) -> None:
     from artifacts.paths import JUDGE_VERDICT_RAW, ARCHIVIST_CURATION_LOG
 
