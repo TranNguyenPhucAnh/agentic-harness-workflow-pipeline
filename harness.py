@@ -20,15 +20,14 @@ harness.py is the ONLY entrypoint for end-to-end pipeline runs.
 
 Design:
     - Project-global artifacts live under artifacts_<slug>/
-    - Session-local artifacts live under artifacts_<slug>/sessions/<NNN>/
     - harness owns orchestration metadata only:
-        artifacts_<slug>/session_runs/session_<NNN>_runs.json
+        harness_run_log.json (append-only, project root)
     - step scripts own their artifact writes.
     - harness calls spectracker.write_applied() during finalization only.
 
-Session model:
-    Session = logical unit of work.
-    Run     = one harness.py invocation.
+Run model:
+    Run = one harness.py invocation.
+    All run metadata is appended to harness_run_log.json.
 
 Delta model (post spectracker refactor):
     spectracker_overwrite_version_delta.json contains section-level diff only.
@@ -87,25 +86,24 @@ STEPS = [
 ]
 
 STEP_SCRIPTS: dict[str, str] = {
-    "absorber":    "01_absorber.py",
+    "absorber":     "01_absorber.py",
     "clarificator": "02_clarificator.py",
-    "enricher":    "03_enricher.py",
-    "specwright":  "04_specwright.py",
-    "spectracker": "05_spectracker.py",
-    "scaffolder":  "06_scaffolder.py",
-    "planner":     "07_planner.py",
-    "executor":    "08_executor.py",
-    "debugger":    "09_debugger.py",
-    "reporter":    "10_reporter.py",
-    "judge":       "11_judge.py",
-    "patcher":     "12_patcher.py",
-    "archivist":   "13_archivist.py",
+    "enricher":     "03_enricher.py",
+    "specwright":   "04_specwright.py",
+    "spectracker":  "05_spectracker.py",
+    "scaffolder":   "06_scaffolder.py",
+    "planner":      "07_planner.py",
+    "executor":     "08_executor.py",
+    "debugger":     "09_debugger.py",
+    "reporter":     "10_reporter.py",
+    "judge":        "11_judge.py",
+    "patcher":      "12_patcher.py",
+    "archivist":    "13_archivist.py",
 }
 
 from artifacts.models import PROVIDERS, ROLES, get_provider  # noqa: E402
 
 # Derived from ROLES in artifacts/models.py — no manual sync needed.
-# Any role added to ROLES automatically gets env-key checking here.
 _LLM_STEPS: frozenset[str] = frozenset(ROLES.keys())
 
 
@@ -126,162 +124,159 @@ SCOPE_CHOICES = ("full", "mini")
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Artifact trace declaration registry
+# Artifact trace declaration registry (module-folder paths)
 # ════════════════════════════════════════════════════════════════════════════
 
 STEP_ARTIFACT_READS: dict[str, list[str]] = {
     "absorber": [],
     "clarificator": [
-        "sessions/<NNN>/cache/absorber_overwrite_codebase_snapshot.json",
-        "sessions/<NNN>/cache/absorber_overwrite_git_snapshot.json",
-        "knowledge/current/clarificator_decision_log.md",
-        "knowledge/current/absorber_codebase_map.md",
-        "knowledge/current/absorber_config_map.json",
-        "knowledge/current/absorber_blame_map.md",
+        "absorber/codebase_snapshot.json",
+        "absorber/git_snapshot.json",
+        "clarificator/decision_log.json",
+        "absorber/codebase_map.md",
+        "absorber/config_map.json",
+        "absorber/blame_map.md",
     ],
     "enricher": [
-        "sessions/<NNN>/state/clarificator_requirement_synthesis.md",
-        "sessions/<NNN>/execution/clarificator_overwrite_raw.json",
-        "sessions/<NNN>/cache/absorber_overwrite_codebase_snapshot.json",
-        "sessions/<NNN>/cache/absorber_overwrite_git_snapshot.json",
-        "knowledge/current/clarificator_decision_log.md",
-        "knowledge/current/absorber_codebase_map.md",
-        "knowledge/current/absorber_config_map.json",
-        "knowledge/current/absorber_blame_map.md",
+        "clarificator/requirement_synthesis.md",
+        "clarificator/raw.json",
+        "absorber/codebase_snapshot.json",
+        "absorber/git_snapshot.json",
+        "clarificator/decision_log.json",
+        "absorber/codebase_map.md",
+        "absorber/config_map.json",
+        "absorber/blame_map.md",
     ],
     "specwright": [
-        "sessions/<NNN>/execution/enricher_overwrite_enriched_prompt.md",
-        "sessions/<NNN>/state/clarificator_requirement_synthesis.md",
-        "knowledge/current/archivist_spec_gaps.md",
+        "enricher/enriched_prompt.md",
+        "clarificator/requirement_synthesis.md",
+        "archivist/spec_gaps.md",
     ],
     "spectracker": [
-        "specwright_spec_<slug>.md",
-        "state/spectracker_applied_version.json",
-        "knowledge/history/<version>.md",
-        "knowledge/history/spectracker_version_log.md",
+        "spec/specwright_spec_<slug>.md",
+        "spectracker/version_log.json",
     ],
     "scaffolder": [
-        "specwright_spec_<slug>.md",
+        "spec/specwright_spec_<slug>.md",
     ],
     "planner": [
-        "specwright_spec_<slug>.md",
-        "sessions/<NNN>/state/scaffolder_codebase_skeleton.json",
-        "sessions/<NNN>/cache/absorber_overwrite_codebase_snapshot.json",
-        "knowledge/current/absorber_codebase_map.md",
-        "knowledge/current/absorber_blame_map.md",
-        "knowledge/current/archivist_knowledge_log.md",
-        "sessions/<NNN>/execution/clarificator_overwrite_raw.json",
+        "spec/specwright_spec_<slug>.md",
+        "scaffolder/blueprint.json",
+        "absorber/codebase_snapshot.json",
+        "absorber/codebase_map.md",
+        "absorber/blame_map.md",
+        "archivist/knowledge_log.md",
+        "clarificator/raw.json",
     ],
     "executor": [
-        "specwright_spec_<slug>.md",
-        "sessions/<NNN>/state/scaffolder_codebase_skeleton.json",
-        "sessions/<NNN>/state/planner_full_execution_plan.json",
-        "sessions/<NNN>/state/planner_mini_execution_plan.json",
-        "sessions/<NNN>/state/planner_mini_impact_analysis.json",
-        "knowledge/current/absorber_codebase_map.md",
-        "knowledge/current/archivist_knowledge_log.md",
+        "spec/specwright_spec_<slug>.md",
+        "scaffolder/blueprint.json",
+        "planner/full_plan.json",
+        "planner/mini_plan.json",
+        "absorber/codebase_map.md",
+        "archivist/knowledge_log.md",
     ],
     "debugger": [
-        "sessions/<NNN>/state/planner_full_execution_plan.json",
-        "sessions/<NNN>/state/planner_mini_execution_plan.json",
-        "sessions/<NNN>/execution/executor_overwrite_manifest.json",
-        "knowledge/current/patcher_findings_snapshot.md",
-        "knowledge/current/archivist_knowledge_log.md",
+        "planner/full_plan.json",
+        "planner/mini_plan.json",
+        "executor/manifest.json",
+        "archivist/knowledge_log.md",
     ],
     "reporter": [
-        "sessions/<NNN>/state/scaffolder_codebase_skeleton.json",
-        "sessions/<NNN>/state/planner_full_execution_plan.json",
-        "sessions/<NNN>/state/planner_mini_execution_plan.json",
-        "sessions/<NNN>/execution/executor_overwrite_manifest.json",
-        "sessions/<NNN>/execution/debugger_overwrite_test_summary.json",
-        "sessions/<NNN>/cache/spectracker_overwrite_version_delta.json",
+        "scaffolder/blueprint.json",
+        "planner/full_plan.json",
+        "planner/mini_plan.json",
+        "executor/manifest.json",
+        "debugger/test_summary.json",
+        "spectracker/version_delta.json",
     ],
     "judge": [
-        "specwright_spec_<slug>.md",
-        "sessions/<NNN>/state/scaffolder_codebase_skeleton.json",
-        "sessions/<NNN>/state/planner_full_execution_plan.json",
-        "sessions/<NNN>/state/planner_mini_execution_plan.json",
-        "sessions/<NNN>/execution/executor_overwrite_manifest.json",
-        "sessions/<NNN>/execution/debugger_overwrite_test_summary.json",
-        "sessions/<NNN>/reports/reporter_execution_summary.md",
-        "knowledge/current/archivist_knowledge_log.md",
-        "knowledge/current/archivist_spec_gaps.md",
+        "spec/specwright_spec_<slug>.md",
+        "scaffolder/blueprint.json",
+        "planner/full_plan.json",
+        "planner/mini_plan.json",
+        "executor/manifest.json",
+        "debugger/test_summary.json",
+        "reporter/execution_summary.md",
+        "archivist/knowledge_log.md",
+        "archivist/spec_gaps.md",
     ],
     "patcher": [
-        "sessions/<NNN>/execution/judge_overwrite_verdict_raw.json",
-        "sessions/<NNN>/state/planner_full_execution_plan.json",
-        "sessions/<NNN>/state/planner_mini_execution_plan.json",
-        "sessions/<NNN>/execution/executor_overwrite_manifest.json",
-        "knowledge/current/archivist_knowledge_log.md",
+        "judge/verdict_raw.json",
+        "planner/full_plan.json",
+        "planner/mini_plan.json",
+        "executor/manifest.json",
+        "archivist/knowledge_log.md",
     ],
     "archivist": [
-        "sessions/<NNN>/execution/debugger_overwrite_test_summary.json",
-        "sessions/<NNN>/execution/judge_overwrite_verdict_raw.json",
-        "knowledge/current/patcher_findings_snapshot.md",
-        "knowledge/history/patcher_attempt_log.json",
+        "debugger/test_summary.json",
+        "judge/verdict_raw.json",
+        "patcher/attempt_log.json",
     ],
 }
 
 STEP_ARTIFACT_WRITES: dict[str, list[str]] = {
     "absorber": [
-        "sessions/<NNN>/cache/absorber_overwrite_codebase_snapshot.json",
-        "sessions/<NNN>/cache/absorber_overwrite_git_snapshot.json",
-        "knowledge/current/absorber_codebase_map.md",
-        "knowledge/current/absorber_config_map.json",
-        "knowledge/current/absorber_blame_map.md",
+        "absorber/codebase_snapshot.json",
+        "absorber/git_snapshot.json",
+        "absorber/codebase_map.md",
+        "absorber/config_map.json",
+        "absorber/blame_map.md",
+        "absorber/codebase_log.json",
     ],
     "clarificator": [
-        "sessions/<NNN>/execution/clarificator_overwrite_raw.json",
-        "sessions/<NNN>/execution/clarificator_overwrite_questions.md",
-        "sessions/<NNN>/state/clarificator_requirement_synthesis.md",
-        "knowledge/current/clarificator_decision_log.md",
+        "clarificator/raw.json",
+        "clarificator/questions.md",
+        "clarificator/requirement_synthesis.md",
+        "clarificator/decision_log.json",
     ],
     "enricher": [
-        "sessions/<NNN>/execution/enricher_overwrite_enriched_prompt.md",
+        "enricher/enriched_prompt.md",
+        "enricher/prompt_log.json",
     ],
     "specwright": [
-        "specwright_spec_<slug>.md",
+        "spec/specwright_spec_<slug>.md",
     ],
     "spectracker": [
-        "sessions/<NNN>/cache/spectracker_overwrite_version_delta.json",
-        "knowledge/history/spectracker_version_log.md",
-        "knowledge/history/<version>.md",
-        "state/spectracker_applied_version.json  (finalization via write_applied)",
+        "spectracker/version_delta.json",
+        "spectracker/version_log.json",
     ],
     "scaffolder": [
-        "sessions/<NNN>/state/scaffolder_codebase_skeleton.json",
-        "tests/",
+        "scaffolder/blueprint.json",
+        "scaffolder/skeleton_log.json",
+        "output/tests/",
     ],
     "planner": [
-        "sessions/<NNN>/state/planner_full_execution_plan.json",
-        "sessions/<NNN>/state/planner_mini_execution_plan.json",
-        "sessions/<NNN>/state/planner_mini_impact_analysis.json",
+        "planner/full_plan.json",
+        "planner/mini_plan.json",
+        "planner/plan_log.json",
     ],
     "executor": [
-        "sessions/<NNN>/execution/executor_overwrite_manifest.json",
-        "src/",
+        "executor/manifest.json",
+        "executor/manifest_log.json",
+        "output/src/",
     ],
     "debugger": [
-        "sessions/<NNN>/execution/debugger_overwrite_test_summary.json",
-        "src/",
+        "debugger/test_summary.json",
+        "output/src/",
     ],
     "reporter": [
-        "sessions/<NNN>/reports/reporter_execution_summary.md",
+        "reporter/execution_summary.md",
     ],
     "judge": [
-        "sessions/<NNN>/execution/judge_overwrite_verdict_raw.json",
-        "sessions/<NNN>/reports/judge_verdict_summary.md",
+        "judge/verdict_raw.json",
+        "judge/verdict_summary.md",
+        "judge/verdict_log.json",
     ],
     "patcher": [
-        "sessions/<NNN>/execution/patcher_overwrite_fix_summary.md",
-        "knowledge/current/patcher_findings_snapshot.md",
-        "knowledge/history/patcher_attempt_log.json",
-        "src/",
+        "patcher/fix_summary.md",
+        "patcher/attempt_log.json",
+        "output/src/",
     ],
     "archivist": [
-        "knowledge/current/archivist_knowledge_log.md",
-        "knowledge/current/archivist_spec_gaps.md",
-        "knowledge/history/archivist_curation_log.json",
+        "archivist/knowledge_log.md",
+        "archivist/spec_gaps.md",
+        "archivist/curation_log.json",
     ],
 }
 
@@ -320,10 +315,6 @@ def check_env(keys: list[str]) -> bool:
     return True
 
 
-def _normalize_session_id(raw: str | int) -> str:
-    return f"{int(raw):03d}"
-
-
 def _pipeline_script(script: str) -> Path:
     return ROOT / "pipeline" / script
 
@@ -357,48 +348,12 @@ def _scope_args_for_script(script: str, scope: str) -> list[str]:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Session selection + run metadata
+# Run log — append-only harness_run_log.json
 # ════════════════════════════════════════════════════════════════════════════
 
-def _existing_session_ids() -> list[str]:
+def _run_log_path() -> Path:
     from artifacts.paths import artifact_root
-
-    sessions_dir = artifact_root() / "sessions"
-    if not sessions_dir.exists():
-        return []
-
-    ids: list[str] = []
-    for path in sessions_dir.iterdir():
-        if path.is_dir() and path.name.isdigit():
-            ids.append(_normalize_session_id(path.name))
-    return sorted(set(ids))
-
-
-def _next_session_id() -> str:
-    ids = _existing_session_ids()
-    if not ids:
-        return "001"
-    return _normalize_session_id(int(ids[-1]) + 1)
-
-
-def _resolve_session_for_run(args: argparse.Namespace) -> str:
-    if args.session:
-        return _normalize_session_id(args.session)
-
-    if args.new_session:
-        return _next_session_id()
-
-    ids = _existing_session_ids()
-    if ids:
-        return ids[-1]
-
-    return "001"
-
-
-def _session_runs_path(session_id: str) -> Path:
-    from artifacts.paths import get_session_runs_path
-
-    return get_session_runs_path(session_id)
+    return artifact_root() / "harness_run_log.json"
 
 
 def _atomic_write_json(path: Path, data: Any) -> None:
@@ -408,34 +363,25 @@ def _atomic_write_json(path: Path, data: Any) -> None:
     tmp.replace(path)
 
 
-def _load_session_runs(session_id: str) -> dict[str, Any]:
-    path = _session_runs_path(session_id)
-
+def _load_run_log() -> dict[str, Any]:
+    path = _run_log_path()
     if path.exists():
         try:
             data = json.loads(path.read_text())
             if isinstance(data, dict):
-                data.setdefault("session_id", session_id)
-                data.setdefault("created_at", _now_iso())
                 data.setdefault("runs", [])
                 return data
         except Exception:
             pass
-
-    return {
-        "session_id": session_id,
-        "created_at": _now_iso(),
-        "runs": [],
-    }
+    return {"runs": []}
 
 
 def _start_run_record(
-    session_id: str,
     args: argparse.Namespace,
     from_step: str,
     until_step: str,
 ) -> str:
-    data   = _load_session_runs(session_id)
+    data   = _load_run_log()
     run_id = f"run_{int(time.time())}_{uuid.uuid4().hex[:8]}"
 
     data["runs"].append(
@@ -448,18 +394,16 @@ def _start_run_record(
             "from_step":        from_step,
             "until_step":       until_step,
             "stopped_at_step":  None,
-            "resumed_from_run": data["runs"][-1]["run_id"] if data["runs"] else None,
             "steps":            [],
             "spec_version":     None,
         }
     )
 
-    _atomic_write_json(_session_runs_path(session_id), data)
+    _atomic_write_json(_run_log_path(), data)
     return run_id
 
 
 def _update_run_record(
-    session_id: str,
     run_id: str,
     *,
     status: str | None = None,
@@ -468,7 +412,7 @@ def _update_run_record(
     stopped_at_step: str | None = None,
     spec_version: str | None = None,
 ) -> None:
-    data = _load_session_runs(session_id)
+    data = _load_run_log()
 
     for run in data.get("runs", []):
         if run.get("run_id") != run_id:
@@ -496,7 +440,7 @@ def _update_run_record(
 
         break
 
-    _atomic_write_json(_session_runs_path(session_id), data)
+    _atomic_write_json(_run_log_path(), data)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -533,7 +477,7 @@ def _snapshot_artifacts() -> ArtifactSnapshot:
 
         rel = path.relative_to(root).as_posix()
 
-        if rel.startswith("state/prev_src/"):
+        if rel.startswith("output/prev_src/"):
             continue
 
         try:
@@ -556,11 +500,11 @@ def _classify_artifact_changes(
     before: ArtifactSnapshot,
     after: ArtifactSnapshot,
 ) -> dict[str, list[str]]:
-    created:    list[str] = []
-    appended:   list[str] = []
+    created:     list[str] = []
+    appended:    list[str] = []
     overwritten: list[str] = []
-    touched:    list[str] = []
-    deleted:    list[str] = []
+    touched:     list[str] = []
+    deleted:     list[str] = []
 
     before_keys = set(before)
     after_keys  = set(after)
@@ -586,11 +530,11 @@ def _classify_artifact_changes(
             overwritten.append(rel)
 
     return {
-        "created":    created,
-        "appended":   appended,
+        "created":     created,
+        "appended":    appended,
         "overwritten": overwritten,
-        "touched":    touched,
-        "deleted":    deleted,
+        "touched":     touched,
+        "deleted":     deleted,
     }
 
 
@@ -600,9 +544,8 @@ def _print_artifact_list(title: str, items: list[str], indent: str = "    ") -> 
         print(f"{indent}  - (none)")
         return
 
-    sid = os.environ.get("PIPELINE_SESSION", "<NNN>")
     for item in items:
-        print(f"{indent}  - {item.replace('<NNN>', sid)}")
+        print(f"{indent}  - {item}")
 
 
 def _print_artifact_trace(
@@ -623,11 +566,11 @@ def _print_artifact_trace(
     changes = _classify_artifact_changes(before, after)
 
     print("    actual changes:")
-    _print_artifact_list("created",                          changes["created"],     indent="      ")
-    _print_artifact_list("appended",                         changes["appended"],    indent="      ")
-    _print_artifact_list("overwritten/updated",              changes["overwritten"], indent="      ")
-    _print_artifact_list("touched without content change",   changes["touched"],     indent="      ")
-    _print_artifact_list("deleted",                          changes["deleted"],     indent="      ")
+    _print_artifact_list("created",                        changes["created"],     indent="      ")
+    _print_artifact_list("appended",                       changes["appended"],    indent="      ")
+    _print_artifact_list("overwritten/updated",            changes["overwritten"], indent="      ")
+    _print_artifact_list("touched without content change", changes["touched"],     indent="      ")
+    _print_artifact_list("deleted",                        changes["deleted"],     indent="      ")
 
 
 def _run_step_with_trace(
@@ -659,7 +602,13 @@ def _load_project_dir_cache() -> dict[str, str]:
         return {}
     try:
         data = json.loads(_PROJECT_DIR_CACHE.read_text())
-        return data if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            return {}
+        # Lazy cleanup: prune stale entries whose directories no longer exist
+        pruned = {k: v for k, v in data.items() if Path(v).exists()}
+        if len(pruned) != len(data):
+            _save_project_dir_cache(pruned)
+        return pruned
     except Exception:
         return {}
 
@@ -757,7 +706,7 @@ def _artifact_rel(path: Any) -> str:
 def _prev_src_dir() -> Path:
     from artifacts.paths import artifact_root
 
-    return artifact_root() / "state" / "prev_src"
+    return artifact_root() / "output" / "prev_src"
 
 
 def _canonical_spec_path() -> Path:
@@ -817,7 +766,9 @@ def snapshot_src() -> None:
 
     src = Path(SRC_DIR)
     if not src.exists():
-        src = ROOT / "src"
+        # Fallback: use output/src under artifact root
+        from artifacts.paths import artifact_root
+        src = artifact_root() / "output" / "src"
 
     if not src.exists():
         return
@@ -835,9 +786,9 @@ def snapshot_src() -> None:
 # ════════════════════════════════════════════════════════════════════════════
 
 def _read_judge_verdict() -> str:
-    from artifacts.paths import JUDGE_SESSION_VERDICT_RAW
+    from artifacts.paths import JUDGE_VERDICT_RAW
 
-    raw_path = JUDGE_SESSION_VERDICT_RAW
+    raw_path = JUDGE_VERDICT_RAW
     if not raw_path.exists():
         return ""
 
@@ -935,12 +886,13 @@ def _run_judge_fix_loop(args: argparse.Namespace, results: dict[str, bool]) -> N
         return
 
 
+```python
 def _run_fix_from_existing_judge(args: argparse.Namespace, results: dict[str, bool]) -> None:
-    from artifacts.paths import JUDGE_SESSION_VERDICT_RAW, ARCHIVIST_CURATION_LOG
+    from artifacts.paths import JUDGE_VERDICT_RAW, ARCHIVIST_CURATION_LOG
 
-    raw_path = JUDGE_SESSION_VERDICT_RAW
+    raw_path = JUDGE_VERDICT_RAW
     if not raw_path.exists():
-        print("[harness] --repair-from-judge: judge_overwrite_verdict_raw.json not found.")
+        print("[harness] --repair-from-judge: judge verdict_raw.json not found.")
         results["patcher_from_judge"] = False
         return
 
@@ -1093,7 +1045,6 @@ def _print_dry_run(from_step: str, until_step: str, args: argparse.Namespace) ->
 
     print("\n[harness] DRY RUN — nothing will be executed.")
     print(f"  Project         : {os.environ.get('PIPELINE_PROJECT', '?')}")
-    print(f"  Session         : {os.environ.get('PIPELINE_SESSION', '?')}")
     print(f"  Scope           : {args.scope}")
     print(f"  Range           : {from_step} → {until_step}")
     print(f"  Artifact trace  : {'on' if args.trace_artifacts else 'off'}")
@@ -1121,14 +1072,14 @@ def _print_dry_run(from_step: str, until_step: str, args: argparse.Namespace) ->
 # ════════════════════════════════════════════════════════════════════════════
 
 def _retry_impl_args(executor_args: list[str]) -> list[str] | None:
-    from artifacts.paths import EXECUTOR_SESSION_MANIFEST
+    from artifacts.paths import EXECUTOR_OVERWRITE_MANIFEST
 
-    if not EXECUTOR_SESSION_MANIFEST.exists():
-        print("[harness] --retry-impl: executor_overwrite_manifest.json not found.")
+    if not EXECUTOR_OVERWRITE_MANIFEST.exists():
+        print("[harness] --retry-impl: executor manifest.json not found.")
         return None
 
     try:
-        record = json.loads(EXECUTOR_SESSION_MANIFEST.read_text())
+        record = json.loads(EXECUTOR_OVERWRITE_MANIFEST.read_text())
         failed = record.get("failed_files", [])
 
         if not failed:
@@ -1140,18 +1091,18 @@ def _retry_impl_args(executor_args: list[str]) -> list[str] | None:
         return executor_args
 
     except Exception:
-        print("[harness] --retry-impl: could not read executor_overwrite_manifest.json.")
+        print("[harness] --retry-impl: could not read executor manifest.json.")
         return None
 
 
 def _print_impl_failed() -> None:
-    from artifacts.paths import EXECUTOR_SESSION_MANIFEST
+    from artifacts.paths import EXECUTOR_OVERWRITE_MANIFEST
 
-    if not EXECUTOR_SESSION_MANIFEST.exists():
+    if not EXECUTOR_OVERWRITE_MANIFEST.exists():
         return
 
     try:
-        record = json.loads(EXECUTOR_SESSION_MANIFEST.read_text())
+        record = json.loads(EXECUTOR_OVERWRITE_MANIFEST.read_text())
         failed = record.get("failed_files", [])
 
         if failed:
@@ -1327,7 +1278,7 @@ def _print_summary(
     tests_passed: bool,
 ) -> None:
     from artifacts.paths import (
-        CLARIFICATOR_SESSION_QUESTIONS,
+        CLARIFICATOR_QUESTIONS,
         JUDGE_VERDICT_SUMMARY,
         REPORTER_EXECUTION_SUMMARY,
     )
@@ -1337,7 +1288,6 @@ def _print_summary(
     print(f"{'=' * 60}")
 
     print(f"  Project        : {os.environ.get('PIPELINE_PROJECT', '?')}")
-    print(f"  Session        : {os.environ.get('PIPELINE_SESSION', '?')}")
     print(f"  Scope          : {args.scope}")
     print(f"  Artifact trace : {'on' if args.trace_artifacts else 'off'}")
 
@@ -1354,8 +1304,8 @@ def _print_summary(
     print(f"\n  Overall: {'✅ PASS' if all_ok else '❌ FAIL'}")
 
     print("\n  Reports:")
-    if CLARIFICATOR_SESSION_QUESTIONS.exists() and results.get("clarificator"):
-        print(f"    Clarificator → {CLARIFICATOR_SESSION_QUESTIONS}")
+    if CLARIFICATOR_QUESTIONS.exists() and results.get("clarificator"):
+        print(f"    Clarificator → {CLARIFICATOR_QUESTIONS}")
 
     print(f"    Pipeline     → {REPORTER_EXECUTION_SUMMARY}")
 
@@ -1388,8 +1338,6 @@ def _load_write_applied():
 
 
 def _write_apply_record(delta: dict, results: dict[str, bool]) -> None:
-    from artifacts.paths import SPECTRACKER_APPLIED
-
     write_applied = _load_write_applied()
     if write_applied is None:
         print("[harness] WARNING: could not load spectracker.write_applied")
@@ -1399,7 +1347,7 @@ def _write_apply_record(delta: dict, results: dict[str, bool]) -> None:
     write_applied(version=version, status="PASS")
 
     print(
-        f"\n  Apply record → {SPECTRACKER_APPLIED}  "
+        f"\n  Apply record written  "
         f"(v{version} marked as applied)"
     )
 
@@ -1455,8 +1403,7 @@ def _build_parser() -> argparse.ArgumentParser:
         epilog="""
 Examples:
   python harness.py --project demo
-  python harness.py --project demo --new-session
-  python harness.py --project demo --session 001 --from-executor --until-debugger
+  python harness.py --project demo --from-executor --until-debugger
   python harness.py --project demo --scope mini --from-clarificator --until-executor
   python harness.py --project demo --dry-run
   python harness.py --project demo --no-trace-artifacts
@@ -1470,18 +1417,6 @@ Examples:
         default=None,
         metavar="NAME",
         help="Project name → artifacts_<slug>/. If omitted, interactive prompt lists projects.",
-    )
-    parser.add_argument(
-        "--session",
-        type=str,
-        default=None,
-        metavar="NNN",
-        help="Use/resume a specific session id. Example: --session 001",
-    )
-    parser.add_argument(
-        "--new-session",
-        action="store_true",
-        help="Create the next session id instead of resuming the latest session.",
     )
     parser.add_argument(
         "--scope",
@@ -1606,9 +1541,6 @@ def main() -> None:
     _validate_scope(args.scope)
     _validate_execution_mode_conflicts(args)
 
-    if args.session and args.new_session:
-        _die("Cannot combine --session and --new-session.")
-
     if not args.project:
         args.project = _interactive_project_select(ROOT)
 
@@ -1622,19 +1554,13 @@ def main() -> None:
         artifact_root,
         ensure_dirs,
         get_project_slug,
-        session_root,
     )
-
-    session_id = _resolve_session_for_run(args)
-    os.environ["PIPELINE_SESSION"] = session_id
 
     ensure_dirs()
 
     print(f"[harness] Project        : {args.project}")
     print(f"[harness] Project slug   : {get_project_slug()}")
     print(f"[harness] Workspace      : {artifact_root()}")
-    print(f"[harness] Session        : {session_id}")
-    print(f"[harness] Session root   : {session_root()}")
     print(f"[harness] Scope          : {args.scope}")
     print(f"[harness] Artifact trace : {'on' if args.trace_artifacts else 'off'}")
 
@@ -1664,21 +1590,21 @@ def main() -> None:
         if args.dry_run:
             print(
                 "\n[harness] DRY RUN — would consume existing "
-                "execution/judge_overwrite_verdict_raw.json, run patcher, "
+                "judge/verdict_raw.json, run patcher, "
                 "refresh reporter, and re-run judge."
             )
             return
 
-        run_id = _start_run_record(session_id, args, "patcher", "judge")
+        run_id = _start_run_record(args, "patcher", "judge")
 
         try:
             _run_fix_from_existing_judge(args, results)
             _print_summary(results, delta=None, args=args, tests_passed=True)
             all_ok = all(results.values()) if results else False
-            _update_run_record(session_id, run_id, status="PASS" if all_ok else "FAIL")
+            _update_run_record(run_id, status="PASS" if all_ok else "FAIL")
             sys.exit(0 if all_ok else 1)
         except Exception:
-            _update_run_record(session_id, run_id, status="FAIL")
+            _update_run_record(run_id, status="FAIL")
             raise
 
     from_step, until_step = _resolve_run_range(args)
@@ -1687,7 +1613,7 @@ def main() -> None:
         _print_dry_run(from_step, until_step, args)
         return
 
-    run_id = _start_run_record(session_id, args, from_step, until_step)
+    run_id = _start_run_record(args, from_step, until_step)
 
     from_idx      = STEPS.index(from_step)
     until_idx     = STEPS.index(until_step)
@@ -1714,7 +1640,6 @@ def main() -> None:
                     args,
                 )
                 _update_run_record(
-                    session_id,
                     run_id,
                     step="spectracker_preflight",
                     step_status="PASS" if ok else "FAIL",
@@ -1740,7 +1665,7 @@ def main() -> None:
         elif args.scope == "mini":
             print("[harness] mini scope: skipping specwright/spectracker/scaffolder contracts.")
 
-        tests_passed  = True
+        tests_passed   = True
         plan_available = PLANNER_MINI_PLAN.exists() if args.scope == "mini" else PLANNER_FULL_PLAN.exists()
 
         for step in steps_to_run:
@@ -1748,7 +1673,6 @@ def main() -> None:
             results[step] = ok
 
             _update_run_record(
-                session_id,
                 run_id,
                 step=step,
                 step_status="PASS" if ok else "FAIL",
@@ -1760,7 +1684,6 @@ def main() -> None:
                 if delta:
                     print_delta_summary(delta)
                     _update_run_record(
-                        session_id,
                         run_id,
                         spec_version=delta.get("to_version"),
                     )
@@ -1784,7 +1707,6 @@ def main() -> None:
                 print(f"\n[harness] {step} failed — stopping pipeline.")
                 _print_summary(results, delta, args, tests_passed)
                 _update_run_record(
-                    session_id,
                     run_id,
                     status="FAIL",
                     stopped_at_step=step,
@@ -1808,7 +1730,6 @@ def main() -> None:
                 print("[harness] Apply record skipped — finalization criteria not met.")
 
         _update_run_record(
-            session_id,
             run_id,
             status="PASS" if all_ok else "FAIL",
             spec_version=delta.get("to_version") if delta else None,
@@ -1818,11 +1739,11 @@ def main() -> None:
 
     except KeyboardInterrupt:
         print("\n[harness] Interrupted.")
-        _update_run_record(session_id, run_id, status="STOPPED")
+        _update_run_record(run_id, status="STOPPED")
         raise
 
     except Exception:
-        _update_run_record(session_id, run_id, status="FAIL")
+        _update_run_record(run_id, status="FAIL")
         raise
 
 
