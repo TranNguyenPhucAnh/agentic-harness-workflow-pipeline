@@ -1057,11 +1057,15 @@ def _write_raw_verdict(
 
 def _append_verdict_log(review: dict[str, Any], scope: str) -> None:
     """Append a trimmed verdict entry to the long-term verdict_log.json."""
-    JUDGE_VERDICT_LOG.parent.mkdir(parents=True, exist_ok=True)
-    path = JUDGE_VERDICT_LOG._resolve() if hasattr(JUDGE_VERDICT_LOG, "_resolve") else Path(str(JUDGE_VERDICT_LOG))
+    log_path = JUDGE_VERDICT_LOG
+    log_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
-        existing = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        if log_path.exists():
+            track_read(log_path)
+            existing = json.loads(log_path.read_text(encoding="utf-8"))
+        else:
+            existing = {}
     except Exception:
         existing = {}
 
@@ -1086,13 +1090,13 @@ def _append_verdict_log(review: dict[str, Any], scope: str) -> None:
     }
 
     entries.append(entry)
-    path.write_text(
+    log_path.write_text(
         json.dumps({"entries": entries}, indent=2, ensure_ascii=False,
                    default=lambda o: vars(o) if hasattr(o, '__dict__') else str(o)),
         encoding="utf-8",
     )
-    track_write(JUDGE_VERDICT_LOG)
-    print(f"[11] Verdict log appended → {JUDGE_VERDICT_LOG}")
+    track_write(log_path)
+    print(f"[11] Verdict log appended → {log_path}")
 
 
 def _write_report(report_md: str, review: dict[str, Any], scope: str) -> None:
