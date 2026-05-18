@@ -65,6 +65,7 @@ import re
 import subprocess
 import sys
 import time
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -100,12 +101,10 @@ from modules.cost import print_call, print_summary, record_usage  # noqa: E402
 from modules.post_interactive import prompt_next_step  # noqa: E402
 
 # Module-level model label constants — derived from models.py at import time.
-# Used as owner labels in FailureCluster / ClusterRepairRecord so logs always
-# show the actual model name, not an abstract role string.
-_DEBUGGER_MODEL           = get_model("debugger")            # surface/component repair
-_DEBUGGER_SECONDARY_MODEL = get_model("debugger_secondary")  # logic/hook/data repair
+_DEBUGGER_MODEL           = get_model("debugger")
+_DEBUGGER_SECONDARY_MODEL = get_model("debugger_secondary")
 
-ROLE = "debugger"  # primary role — used for post_interactive next-step suggestion
+ROLE = "debugger"
 
 
 _SRC_PREFIX = "src"
@@ -117,10 +116,6 @@ MINIMAX_SCOPE_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"^src/utils/"),
 ]
 
-
-# ════════════════════════════════════════════════════════════════════════════
-# Artifact/file access tracking
-# ════════════════════════════════════════════════════════════════════════════
 
 # ════════════════════════════════════════════════════════════════════════════
 # Data structures
@@ -143,7 +138,7 @@ class FailureCluster:
     last_fingerprint: str = ""
     escalated: bool = False
     is_transform_error: bool = False
-    owner: str = ""  # set at runtime to get_model("debugger"); see _DEBUGGER_MODEL / _DEBUGGER_SECONDARY_MODEL
+    owner: str = ""
 
     @property
     def key(self) -> str:
@@ -292,7 +287,6 @@ def _load_mini_context() -> str:
                     + synthesis.strip()
                 )
             else:
-                # Fallback: whole session as context
                 parts.append(
                     "## clarificator/session.json\n\n```json\n"
                     + raw.strip()
@@ -329,7 +323,6 @@ def _load_mini_context() -> str:
                         + "\n```"
                     )
             else:
-                # Legacy flat format
                 parts.append(
                     "## planner/mini_plan.json\n\n```json\n"
                     + raw
@@ -364,13 +357,6 @@ def _load_run_context() -> str:
 
 
 def _load_planner_global_notes() -> str:
-    """
-    Load global_notes from planner_full_execution_plan.json and augment with
-    archivist_knowledge_log.md.
-
-    Legacy state/plan_notes.json was removed and merged into
-    archivist_knowledge_log.md.
-    """
     parts: list[str] = []
 
     if PLANNER_FULL_PLAN.exists():
@@ -391,15 +377,8 @@ def _load_planner_global_notes() -> str:
 
 
 def _load_judge_findings() -> str:
-    """
-    Load patcher last attempt entry and archivist_knowledge_log.md.
-
-    patcher/attempt_log.json last entry replaces the removed PATCHER_FINDINGS_SNAPSHOT.
-    archivist/knowledge_log.md contains accumulated knowledge.
-    """
     parts: list[str] = []
 
-    # Read last entry from patcher/attempt_log.json
     if PATCHER_ATTEMPT_LOG.exists():
         try:
             track_read(PATCHER_ATTEMPT_LOG)
@@ -470,10 +449,6 @@ def _model_call(
     messages: list[dict[str, str]],
     max_tokens: int = 32768,
 ) -> str:
-    """
-    Thin wrapper around call_model() with retry, token logging, and empty-response guard.
-    role must be registered in artifacts/models.py ROLES.
-    """
     model_id = get_model(role)
     for attempt in range(2):
         resp = call_model(role, messages, max_tokens=max_tokens, temperature=0.1)
@@ -499,12 +474,12 @@ def _model_call(
 
 
 def call_qwen(messages: list[dict[str, str]]) -> str:
-    """Surface/component repair — role: debugger. Owner label: _DEBUGGER_MODEL."""
+    """Surface/component repair — role: debugger."""
     return _model_call("debugger", messages)
 
 
 def call_minimax(messages: list[dict[str, str]]) -> str:
-    """Logic/hook/data repair — role: debugger_secondary. Owner label: _DEBUGGER_SECONDARY_MODEL."""
+    """Logic/hook/data repair — role: debugger_secondary."""
     return _model_call("debugger_secondary", messages)
 
 
@@ -550,21 +525,14 @@ def _is_under(path: Path, root: Path) -> bool:
 
 
 def _plan_mini_target_files() -> set[str]:
-    """
-    Extract target_files from planner/mini_plan.json.
-
-    New format: { "plan": { "target_files": [...] }, "impact": {...} }
-    Legacy format: { "target_files": [...] }
-    """
     raw = _read_json(PLANNER_MINI_PLAN, {})
     if not isinstance(raw, dict):
         return set()
 
-    # New merged format
     if "plan" in raw and isinstance(raw["plan"], dict):
         plan = raw["plan"]
     else:
-        plan = raw  # legacy flat format
+        plan = raw
 
     targets = plan.get("target_files", [])
     allowed: set[str] = set()
@@ -873,6 +841,57 @@ def merge_cluster_state(
             cluster.escalated = prev.escalated
             cluster.owner = prev.owner
     return new_clusters
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Early-exit and systemic error detection
+# ════════════════════════════════════════════════════════════════════════════
+
+def _detect_systemic_error(clusters: list[FailureCluster]) -> str | None:
+    """
+    If the same error message appears in > 50% of clusters, return it.
+    This indicates a systemic issue that looping won't fix.
+    """
+    if len(clusters) < 2:
+        return None
+
+    # Extract first error snippet from each cluster, normalized
+    snippets: list[str] = []
+    for cluster in clusters:
+        if cluster.failures:
+            # Take first line of first failure's error as the "signature"
+            first_err = cluster.failures[0].error_snippet.strip().splitlines()[0] if cluster.failures[0].error_snippet else ""
+            # Normalize: strip file paths and line numbers
+            normalized = re.sub(r"at .+:\d+:\d+", "", first_err).strip()
+            normalized = re.sub(r"\s+", " ", normalized)[:200]
+            if normalized:
+                snippets.append(normalized)
+
+    if not snippets:
+        return None
+
+    counts = Counter(snippets)
+    most_common_msg, most_common_count = counts.most_common(1)[0]
+
+    if most_common_count > len(clusters) * 0.5:
+        return most_common_msg
+
+    return None
+
+
+def _should_early_exit(cluster_counts: list[int]) -> bool:
+    """
+    If cluster count has not decreased over 2 consecutive iterations,
+    the repair loop is not making progress — break early.
+    """
+    if len(cluster_counts) < 3:
+        return False
+
+    # Check last 2 transitions: if count didn't decrease either time, bail
+    return (
+        cluster_counts[-1] >= cluster_counts[-2]
+        and cluster_counts[-2] >= cluster_counts[-3]
+    )
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1483,13 +1502,6 @@ def repair_cluster(
 # ════════════════════════════════════════════════════════════════════════════
 
 def _trim_iteration_for_log(record: dict[str, Any], is_last: bool) -> dict[str, Any]:
-    """
-    Trim policy for test_log.json entries (per markdown spec):
-      keep full : final_status, scope, total_iterations, max_iter, escalated[]
-      keep full : cluster_details for the LAST iteration only
-      trim      : prior iterations → { iteration, passed, clusters_found, clusters_repaired, summary }
-      drop      : log_snippet (still available in short-term test_summary.json)
-    """
     trimmed = {
         "iteration": record.get("iteration"),
         "passed": record.get("passed"),
@@ -1499,20 +1511,10 @@ def _trim_iteration_for_log(record: dict[str, Any], is_last: bool) -> dict[str, 
     }
     if is_last:
         trimmed["cluster_details"] = record.get("cluster_details", [])
-    # drop log_snippet always
     return trimmed
 
 
 def append_test_log(report: dict[str, Any]) -> None:
-    """
-    Append one trimmed entry to debugger/test_log.json (long-term audit trail).
-
-    Trim policy per markdown spec:
-      - keep full: final_status, scope, total_iterations, max_iter, escalated[]
-      - keep full: cluster_details of the LAST iteration only
-      - trim: prior iterations → { iteration, passed, clusters_found, clusters_repaired, summary }
-      - drop: log_snippet (available in short-term test_summary.json)
-    """
     iterations = report.get("iterations", [])
     trimmed_iterations = []
     for i, rec in enumerate(iterations):
@@ -1620,6 +1622,7 @@ def _run_full_vitest_loop(
     iteration_records: list[IterationRecord] = []
     cluster_state: dict[str, FailureCluster] = {}
     escalated_log: list[dict[str, Any]] = []
+    cluster_counts: list[int] = []
 
     for iteration in range(1, max_iter + 1):
         tag = f"[09][{iteration}/{max_iter}]"
@@ -1646,6 +1649,7 @@ def _run_full_vitest_loop(
 
         clusters = parse_failures(output)
         clusters = merge_cluster_state(clusters, cluster_state)
+        cluster_counts.append(len(clusters))
 
         print(f"{tag} {len(clusters)} failing cluster(s):")
         for cluster in clusters:
@@ -1674,6 +1678,81 @@ def _run_full_vitest_loop(
                     clusters_found=0,
                     clusters_repaired=0,
                     cluster_details=[],
+                    log_snippet=output[-1200:],
+                )
+            )
+            break
+
+        # Systemic error detection: if same error in >50% clusters, escalate immediately
+        systemic_msg = _detect_systemic_error(clusters)
+        if systemic_msg:
+            print(
+                f"{tag} ⚠ Systemic error detected in >{len(clusters)//2} clusters: "
+                f"{systemic_msg[:120]}"
+            )
+            print(f"{tag} Escalating all clusters — looping will not help.")
+            for cluster in clusters:
+                cluster.escalated = True
+                escalated_log.append({
+                    "iteration": iteration,
+                    "cluster": cluster.key,
+                    "src_file": cluster.src_file,
+                    "failures": len(cluster.failures),
+                    "repaired": False,
+                    "layer_used": "skipped",
+                    "escalated": True,
+                    "escalated_to": "human",
+                    "owner": cluster.owner,
+                    "note": f"systemic error: {systemic_msg[:200]}",
+                })
+            iteration_records.append(
+                IterationRecord(
+                    iteration=iteration,
+                    passed=False,
+                    summary=f"systemic error: {systemic_msg[:120]}",
+                    clusters_found=len(clusters),
+                    clusters_repaired=0,
+                    cluster_details=[
+                        {
+                            "cluster": c.key,
+                            "src_file": c.src_file,
+                            "failures": len(c.failures),
+                            "escalated": True,
+                            "escalated_to": "human",
+                            "owner": c.owner,
+                            "note": f"systemic: {systemic_msg[:100]}",
+                        }
+                        for c in clusters
+                    ],
+                    log_snippet=output[-1200:],
+                )
+            )
+            break
+
+        # Early-exit: if cluster count hasn't decreased over 2 consecutive iterations
+        if _should_early_exit(cluster_counts):
+            print(
+                f"{tag} ⚠ Cluster count not decreasing over last 3 iterations "
+                f"({cluster_counts[-3:]}). Breaking early."
+            )
+            iteration_records.append(
+                IterationRecord(
+                    iteration=iteration,
+                    passed=False,
+                    summary=f"early exit: no progress ({cluster_counts[-3:]})",
+                    clusters_found=len(clusters),
+                    clusters_repaired=0,
+                    cluster_details=[
+                        {
+                            "cluster": c.key,
+                            "src_file": c.src_file,
+                            "failures": len(c.failures),
+                            "escalated": c.escalated,
+                            "owner": c.owner,
+                            "attempts": c.attempt_count,
+                        }
+                        for c in clusters
+                    ],
                     log_snippet=output[-1200:],
                 )
             )
