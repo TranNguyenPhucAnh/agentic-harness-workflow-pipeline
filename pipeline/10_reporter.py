@@ -907,7 +907,7 @@ def append_execution_log(
         files_implemented = len(written) if isinstance(written, list) else 0
         token_summary = impl_record.get("token_summary", {})
         if isinstance(token_summary, dict):
-            cost_total = token_summary.get("total_cost")
+            cost_total = token_summary.get("total_cost_usd")
 
     # Try to get spec_version from spectracker delta
     try:
