@@ -89,7 +89,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from artifacts.models import call_model, get_model, get_provider  # noqa: E402
 from modules.artifact_tracking import track_read, track_write, print_summary as print_artifact_summary  # noqa: E402
-from modules.cost import print_call, print_summary, record_usage  # noqa: E402
+from modules.cost import print_call, print_summary, record_usage, summary as cost_summary  # noqa: E402
 from modules.post_interactive import prompt_next_step  # noqa: E402
 from artifacts.paths import (  # noqa: E402
     ABSORBER_CODEBASE_MAP,
@@ -779,15 +779,23 @@ def append_plan_log(*, scope: str, plan: dict, impact: dict | None) -> None:
         "scope": "full" | "mini",
         "generated_at": "<iso>",
         "plan_version": "...",
+        "model": "...",
+        "cost": ...,
         "task_summary": "..." (mini only),
         "task_count": N (full) | target_file_count (mini),
         "impact_warnings": [...] (mini only),
       }
     """
+    
+    token_sum = cost_summary()
+    cost_total = token_sum.get("total_cost_usd") if isinstance(token_sum, dict) else None
+
     entry: dict = {
         "scope": scope,
         "generated_at": _utc_now_iso(),
         "plan_version": plan.get("plan_version", "1.0.0"),
+        "model": get_model(ROLE),
+        "cost": cost_total,
     }
 
     if scope == "full":
@@ -805,6 +813,7 @@ def append_plan_log(*, scope: str, plan: dict, impact: dict | None) -> None:
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
         if log_path.exists():
+            track_read(log_path)
             raw = log_path.read_text(encoding="utf-8").strip()
             try:
                 data = json.loads(raw)
@@ -825,7 +834,6 @@ def append_plan_log(*, scope: str, plan: dict, impact: dict | None) -> None:
         print(f"[07] Plan log appended ({len(entries)} entries) → {log_path}")
     except Exception as exc:
         print(f"[07] WARNING: could not append plan log: {exc}", file=sys.stderr)
-
 
 # ════════════════════════════════════════════════════════════════════════════
 # Mini-scope planner
