@@ -410,18 +410,22 @@ def _append_skeleton_log(blueprint: dict[str, Any], spec_version: str) -> None:
         ],
     }
 
-    # Append to JSON array
+    # Append to {"entries": [...]} wrapper — consistent with all other pipeline logs.
     entries: list[dict] = []
     if log_path.exists():
         try:
+            track_read(SCAFFOLDER_SKELETON_LOG)
             data = json.loads(log_path.read_text())
-            if isinstance(data, list):
+            if isinstance(data, dict):
+                entries = data.get("entries", [])
+            elif isinstance(data, list):
+                # Migrate legacy raw-list format on first read.
                 entries = data
         except (json.JSONDecodeError, OSError):
             pass
 
     entries.append(entry)
-    log_path.write_text(json.dumps(entries, indent=2))
+    log_path.write_text(json.dumps({"entries": entries}, indent=2))
     track_write(SCAFFOLDER_SKELETON_LOG)
 
 
