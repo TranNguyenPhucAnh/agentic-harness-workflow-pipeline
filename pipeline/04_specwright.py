@@ -627,11 +627,14 @@ def main() -> None:
         final_spec = header + spec.strip() + "\n"
         spec_file.parent.mkdir(parents=True, exist_ok=True)
         spec_file.write_text(final_spec, encoding="utf-8")
-        track_write(spec_file)
+        # NOTE: track_write is intentionally deferred to after review.
+        # If the user edits the spec, only the final written version is tracked
+        # (one track_write per file per run, not one per write() call).
         print(f"[specwright] ✓ Spec written → {spec_file}")
 
         # ── Review ────────────────────────────────────────────────────────────────
         if args.no_review or args.no_harness:
+            track_write(spec_file)
             lines = spec.strip().splitlines()
             _print_banner(f"Spec ready — {len(lines)} lines")
             print(f"  File:  {spec_file}")
@@ -660,6 +663,9 @@ def main() -> None:
             spec_file.write_text(updated, encoding="utf-8")
             track_write(spec_file)
             print(f"[specwright] ✓ Spec updated (v{new_version} → v{edited_version}) → {spec_file}")
+        else:
+            # No edit — track the initial write exactly once.
+            track_write(spec_file)
 
         if run_harness:
             _launch_harness(project_name)
