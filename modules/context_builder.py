@@ -1,23 +1,39 @@
 """
 modules/context_builder.py
 ==========================
-Pure-logic context builder — no LLM calls, deterministic, testable.
+Cross-module artifact access layer — no LLM calls, deterministic, testable.
 
-Builds a structured context dict for each pipeline step by reading:
-  [upstream]  Aggregate short-term artifacts of ALL prior steps (cumulative)
-  [history]   Own long-term log (*_log.json) — last N entries
-  [knowledge] archivist/knowledge_log.md + archivist/spec_gaps.md
+Two distinct roles served by this module:
+
+  1. read_artifact()  →  structured data  →  script logic
+     Controlled single-artifact read. Single point of entry for cross-module
+     access; enforces ownership rules and applies the same projection logic
+     as build_context(). Returns parsed dict/list for JSON, str for markdown.
+
+  2. build_context()  →  formatted string  →  LLM prompt injection
+     Convenience wrapper that calls read_artifact() for multiple artifacts and
+     formats the results as labeled blocks for direct prompt concatenation.
+     Builds a structured context dict for each pipeline step by reading:
+       [upstream]  Aggregate short-term artifacts of ALL prior steps (cumulative)
+       [history]   Own long-term log (*_log.json) — last N entries
+       [knowledge] archivist/knowledge_log.md + archivist/spec_gaps.md
 
 RULE: This module only reads. It never writes any artifact.
-      Caller (each pipeline script) injects the returned dict into its prompt.
 
 Usage
 ─────
-    from modules.context_builder import build_context
+    from modules.context_builder import build_context, read_artifact
 
+    # --- Structured data for script logic ---
+    synthesis = read_artifact(
+        owner="clarificator",
+        artifact_dir=artifact_root,
+        artifact_key="session",
+        fields=["requirement_synthesis", "decisions"],
+    )
+
+    # --- Formatted string for LLM prompt injection ---
     ctx = build_context("executor", artifact_root, scope="full")
-
-    # Inject into prompt:
     system_prompt += ctx["knowledge"]
     user_msg      += ctx["upstream"] + ctx["history"]
 
@@ -242,7 +258,29 @@ _PROJECTION: dict[str, dict[str, Any]] = {
 }
 
 
-# ── Internal readers ──────────────────────────────────────────────────────────
+# ── Artifact key map ──────────────────────────────────────────────────────────
+# Centralized (owner, key) → relpath registry.
+# Scripts use read_artifact(owner, artifact_dir, key) instead of hardcoding
+# paths. Covers all short-term artifacts that external scripts may need to read.
+#
+# Note: spec path is slug-dependent — not listed here; resolve via get_spec_path()
+# from artifacts/paths.py and pass the full path directly to _read_artifact_path().
+
+_ARTIFACT_KEY_MAP: dict[str, str] = {
+    "absorber.codebase_map":       "absorber/codebase_map.md",
+    "clarificator.session":        "clarificator/session.json",
+    "enricher.enriched_prompt":    "enricher/enriched_prompt.md",
+    "spectracker.version_delta":   "spectracker/version_delta.json",
+    "scaffolder.blueprint":        "scaffolder/blueprint.json",
+    "planner.full_plan":           "planner/full_plan.json",
+    "planner.mini_plan":           "planner/mini_plan.json",
+    "executor.manifest":           "executor/manifest.json",
+    "debugger.test_summary":       "debugger/test_summary.json",
+    "judge.verdict_raw":           "judge/verdict_raw.json",
+    "patcher.attempt_log":         "patcher/attempt_log.json",
+    "archivist.knowledge_log":     "archivist/knowledge_log.md",
+    "archivist.spec_gaps":         "archivist/spec_gaps.md",
+}
 
 def _read_text_safe(path: Path) -> str | None:
     """Read text file; return None if missing or unreadable."""
@@ -599,6 +637,113 @@ def _knowledge_excerpt(
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
+def _read_artifact_path(
+    path: Path,
+    fields: list[str] | None = None,
+) -> Any:
+    """
+    Internal: read a single artifact file and apply optional field projection.
+    Returns parsed dict/list for .json, str for .md/.txt.
+    Returns None if file is missing or unreadable.
+    """
+    if path.suffix == ".json":
+        data = _read_json_safe(path)
+        if data is None:
+            return None
+        if fields is not None:
+            if isinstance(data, dict):
+                return {k: data[k] for k in fields if k in data}
+            # For list artifacts (e.g. append-only logs), return as-is
+            return data
+        return data
+
+    # Markdown / text
+    return _read_text_safe(path)
+
+
+def read_artifact(
+    owner: str,
+    artifact_dir: Path,
+    artifact_key: str,
+    fields: list[str] | None = None,
+) -> Any:
+    """
+    Controlled cross-module artifact read.
+
+    Single point of entry for scripts that need structured data from another
+    module's artifact (e.g. enricher needing `requirement_synthesis` from
+    clarificator/session.json). Enforces the ownership model: only short-term
+    artifacts registered in _ARTIFACT_KEY_MAP may be read this way.
+
+    Applies the same projection rules as build_context() when fields is None
+    and a _PROJECTION entry exists — so both callers stay consistent.
+    When fields is provided, that list overrides the _PROJECTION config.
+
+    Args:
+        owner:        Module that owns the artifact (e.g. "clarificator").
+        artifact_dir: Path to artifacts_<slug>/ root directory.
+        artifact_key: Short key for the artifact (e.g. "session", "full_plan").
+                      Combines with owner as "<owner>.<artifact_key>" to look
+                      up the relpath in _ARTIFACT_KEY_MAP.
+        fields:       Optional list of top-level keys to extract (JSON only).
+                      None = return full parsed content (with _PROJECTION applied
+                      if a config entry exists, otherwise raw).
+
+    Returns:
+        - dict  for JSON artifacts (projected to fields if specified)
+        - list  for JSON list artifacts
+        - str   for markdown / text artifacts
+        - None  if artifact does not exist or is unreadable
+
+    Raises:
+        KeyError: if (owner, artifact_key) is not in _ARTIFACT_KEY_MAP.
+
+    Examples:
+        # Extract specific fields
+        session = read_artifact("clarificator", artifact_root, "session",
+                                fields=["requirement_synthesis", "decisions"])
+
+        # Full structured read (projection applied if configured)
+        blueprint = read_artifact("scaffolder", artifact_root, "blueprint")
+
+        # Markdown artifact — returns str
+        codebase_map = read_artifact("absorber", artifact_root, "codebase_map")
+    """
+    map_key = f"{owner}.{artifact_key}"
+    if map_key not in _ARTIFACT_KEY_MAP:
+        raise KeyError(
+            f"[context_builder.read_artifact] Unknown artifact: {map_key!r}.\n"
+            f"  Registered keys: {sorted(_ARTIFACT_KEY_MAP)}"
+        )
+
+    relpath = _ARTIFACT_KEY_MAP[map_key]
+    path    = artifact_dir / relpath
+
+    if fields is not None:
+        # Caller-specified projection — skip _PROJECTION
+        return _read_artifact_path(path, fields=fields)
+
+    # Apply _PROJECTION config if available (same rules as build_context)
+    cfg = _PROJECTION.get(relpath)
+    if cfg:
+        proj_type = cfg.get("type", "json_full")
+        if relpath.endswith(".json"):
+            data = _read_json_safe(path)
+            if data is None:
+                return None
+            return _project_json(data, cfg)
+        elif relpath.endswith(".md"):
+            text = _read_text_safe(path)
+            if text is None:
+                return None
+            if proj_type == "md":
+                # Return full text for read_artifact (projection is for prompt context only)
+                return text
+            return text
+    # No projection config — return raw
+    return _read_artifact_path(path, fields=None)
+
+
 def build_context(
     step: str,
     artifact_dir: Path,
@@ -609,6 +754,11 @@ def build_context(
 ) -> dict[str, str]:
     """
     Build context dict for a pipeline step.
+
+    Convenience wrapper over read_artifact() — calls it for each upstream
+    artifact and formats the results as labeled blocks for prompt injection.
+    All projection logic lives in read_artifact() / _project_json() / _project_md();
+    this function does not duplicate it.
 
     Args:
         step:            Pipeline step name (e.g. "executor", "judge").
@@ -670,6 +820,7 @@ def context_token_estimate(ctx: dict[str, str], chars_per_token: int = 4) -> dic
 
 
 # ── CLI: python -m modules.context_builder (or python context_builder.py) ─────
+# Tests build_context() only. For read_artifact(), import and call directly.
 
 if __name__ == "__main__":
     import sys
