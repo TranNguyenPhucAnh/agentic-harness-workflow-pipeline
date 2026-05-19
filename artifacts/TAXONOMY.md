@@ -13,181 +13,185 @@ All paths are relative to `artifacts_<slug>/`.
 ```
 artifacts_<slug>/
 │
-├── specwright_spec_<slug>.md              ← canonical spec, project-global (specwright)
+├── spec/
+│   └── specwright_spec_<slug>.md          ← canonical spec (specwright)
 │
-├── state/                                 ← project-global exception (spectracker only)
-│   └── spectracker_applied_version.json
+├── absorber/
+│   ├── codebase_map.md                    ← short-term, overwrite (merged config + git/blame)
+│   ├── codebase_log.json                  ← long-term, append
+│   └── cache/
+│       └── codebase_snapshot.json         ← internal cache, no long-term pair
 │
-├── sessions/
-│   └── <NNN>/                             ← session-local scope
-│       ├── state/
-│       │   ├── clarificator_requirement_synthesis.md
-│       │   ├── scaffolder_codebase_skeleton.json
-│       │   ├── planner_full_execution_plan.json
-│       │   ├── planner_mini_execution_plan.json
-│       │   └── planner_mini_impact_analysis.json
-│       │
-│       ├── cache/
-│       │   ├── spectracker_overwrite_version_delta.json
-│       │   ├── absorber_overwrite_codebase_snapshot.json
-│       │   └── absorber_overwrite_git_snapshot.json
-│       │
-│       ├── execution/
-│       │   ├── clarificator_overwrite_raw.json
-│       │   ├── clarificator_overwrite_questions.md
-│       │   ├── enricher_overwrite_enriched_prompt.md
-│       │   ├── executor_overwrite_manifest.json
-│       │   ├── debugger_overwrite_test_summary.json
-│       │   ├── judge_overwrite_verdict_raw.json
-│       │   └── patcher_overwrite_fix_summary.md
-│       │
-│       └── reports/
-│           ├── reporter_execution_summary.md
-│           └── judge_verdict_summary.md
+├── clarificator/
+│   ├── session.json                       ← short-term, overwrite (incl. requirement_synthesis)
+│   └── decision_log.json                  ← long-term, append
 │
-├── knowledge/                             ← project-global, shared across sessions
-│   ├── current/
-│   │   ├── clarificator_decision_log.md
-│   │   ├── absorber_codebase_map.md
-│   │   ├── absorber_config_map.json
-│   │   ├── absorber_blame_map.md
-│   │   ├── patcher_findings_snapshot.md
-│   │   ├── archivist_spec_gaps.md
-│   │   └── archivist_knowledge_log.md
-│   └── history/
-│       ├── archivist_curation_log.json
-│       ├── patcher_attempt_log.json
-│       ├── spectracker_version_log.md
-│       ├── spectracker_spec_snapshot_<version>.md      ← write-once spec snapshots (spectracker)
+├── enricher/
+│   ├── enriched_prompt.md                 ← short-term, overwrite
+│   └── prompt_log.json                    ← long-term, append
 │
-├── session_runs/                          ← project-global run history (harness)
-│   ├── session_001_runs.json
-│   └── session_002_runs.json
+├── spectracker/
+│   ├── version_delta.json                 ← short-term, overwrite (drives harness control flow)
+│   └── version_log.json                   ← long-term, append (applied state + snapshot history)
 │
-├── src/                                   ← build output, project-global (executor)
-└── tests/                                 ← build output, project-global (scaffolder)
+├── scaffolder/
+│   ├── blueprint.json                     ← short-term, overwrite
+│   └── skeleton_log.json                  ← long-term, append
+│
+├── planner/
+│   ├── full_plan.json                     ← short-term, overwrite (full scope)
+│   ├── mini_plan.json                     ← short-term, overwrite (mini scope, plan+impact merged)
+│   └── plan_log.json                      ← long-term, append (shared by full + mini)
+│
+├── executor/
+│   ├── manifest.json                      ← short-term, overwrite
+│   └── manifest_log.json                  ← long-term, append
+│
+├── debugger/
+│   ├── test_summary.json                  ← short-term, overwrite
+│   └── test_log.json                      ← long-term, append
+│
+├── reporter/
+│   ├── execution_summary.md               ← short-term, overwrite (human)
+│   └── execution_log.json                 ← long-term, append
+│
+├── judge/
+│   ├── verdict_raw.json                   ← short-term, overwrite (machine)
+│   ├── verdict_summary.md                 ← short-term, overwrite (human)
+│   └── verdict_log.json                   ← long-term, append
+│
+├── patcher/
+│   ├── fix_summary.md                     ← short-term, overwrite
+│   └── attempt_log.json                   ← long-term, append
+│
+├── archivist/
+│   ├── knowledge_log.md                   ← append, LLM prompt injection target
+│   ├── spec_gaps.md                       ← append, LLM prompt injection target
+│   └── curation_log.json                  ← append, human audit
+│
+├── output/
+│   ├── src/                               ← build output (executor, debugger, patcher)
+│   ├── tests/                             ← build output (scaffolder)
+│   ├── dist/                              ← future
+│   └── coverage/                          ← future
+│
+└── harness_run_log.json                   ← harness-owned, append-only (replaces session_runs/)
 ```
 
-> `src/` and `tests/` are **build outputs**, not pipeline artifacts. Project-global.
-> `state/prev_src/` is **scratch space** used by harness for delta runs — not a pipeline artifact, safe to delete.
-> `state/spectracker_applied_version.json` is a **project-global exception** — see Special Notes.
+> `output/src/` and `output/tests/` are **build outputs**, not pipeline artifacts.
+> `output/prev_src/` is **scratch space** used by harness for delta runs — not a pipeline artifact, safe to delete.
+> `spectracker/version_delta.json` is a **documented control-flow exception** — see Special Notes.
+
+---
+
+## Lifecycle Pattern
+
+Every module follows the same **short-term ↔ long-term pair** pattern:
+
+| Type | Filename convention | Write mode | Purpose |
+|---|---|---|---|
+| Short-term | `<noun>.json` / `<noun>.md` | overwrite each run | consumed by downstream steps |
+| Long-term | `<noun>_log.json` | append-only | audit trail across all runs |
+
+`.md` short-term files target human/LLM reading. `.json` short-term files target machine consumers.
+All long-term logs use `.json` to facilitate structured append.
+
+**Exception:** `archivist/` has no short-term overwrite — it is a pure accumulation module by design.
 
 ---
 
 ## Ownership & Lifecycle Table
 
-**Scope legend:** `[P]` project-global · `[S]` session-local
+| Artifact | Owner | Write mode | Consumers |
+|---|---|---|---|
+| `spec/specwright_spec_<slug>.md` | `specwright` | overwrite | spectracker, scaffolder, planner, executor, judge, harness |
+| `absorber/codebase_map.md` | `absorber` | overwrite | clarificator, enricher, planner, executor |
+| `absorber/codebase_log.json` | `absorber` | append | human review |
+| `absorber/cache/codebase_snapshot.json` | `absorber` | overwrite | absorber (self, incremental runs) |
+| `clarificator/session.json` | `clarificator` | overwrite | enricher, planner, executor, debugger, patcher |
+| `clarificator/decision_log.json` | `clarificator` | append | clarificator (next run), enricher |
+| `enricher/enriched_prompt.md` | `enricher` | overwrite | specwright, planner |
+| `enricher/prompt_log.json` | `enricher` | append | human review |
+| `spectracker/version_delta.json` | `spectracker` | overwrite | harness (control flow)† |
+| `spectracker/version_log.json` | `spectracker` | append‡ | spectracker (self), harness |
+| `scaffolder/blueprint.json` | `scaffolder` | overwrite | planner, executor, reporter, judge, harness |
+| `scaffolder/skeleton_log.json` | `scaffolder` | append | human review |
+| `planner/full_plan.json` | `planner` | overwrite | executor, debugger, reporter, judge, patcher, harness |
+| `planner/mini_plan.json` | `planner` | overwrite | executor, debugger, reporter, judge, patcher, harness |
+| `planner/plan_log.json` | `planner` | append | human review |
+| `executor/manifest.json` | `executor` | overwrite | reporter, judge, patcher, harness |
+| `executor/manifest_log.json` | `executor` | append | human review |
+| `debugger/test_summary.json` | `debugger` | overwrite | reporter, judge, archivist |
+| `debugger/test_log.json` | `debugger` | append | human review |
+| `reporter/execution_summary.md` | `reporter` | overwrite | human review only |
+| `reporter/execution_log.json` | `reporter` | append | human review |
+| `judge/verdict_raw.json` | `judge` | overwrite | patcher, archivist, harness |
+| `judge/verdict_summary.md` | `judge` | overwrite | human review only |
+| `judge/verdict_log.json` | `judge` | append | human review |
+| `patcher/fix_summary.md` | `patcher` | overwrite | human review |
+| `patcher/attempt_log.json` | `patcher` | append | debugger (last entry), archivist, planner (mini) |
+| `archivist/knowledge_log.md` | `archivist` | append | planner, executor, debugger, patcher, judge |
+| `archivist/spec_gaps.md` | `archivist` | append/curated | specwright, judge |
+| `archivist/curation_log.json` | `archivist` | append | human review |
+| `harness_run_log.json` | `harness` | append§ | harness, human review |
 
-| Artifact | Scope | Owner | Write mode | Consumers |
-|---|---|---|---|---|
-| `specwright_spec_<slug>.md` | P | `specwright` | overwrite | spectracker, scaffolder, planner, executor, judge, harness |
-| `state/spectracker_applied_version.json` | P | `spectracker` | hybrid† | spectracker (self), harness |
-| `sessions/<N>/state/clarificator_requirement_synthesis.md` | S | `clarificator` | overwrite | enricher, specwright |
-| `sessions/<N>/state/scaffolder_codebase_skeleton.json` | S | `scaffolder` | overwrite | planner, executor, reporter, judge, harness |
-| `sessions/<N>/state/planner_full_execution_plan.json` | S | `planner` | overwrite | executor, debugger, reporter, judge, patcher, harness |
-| `sessions/<N>/state/planner_mini_execution_plan.json` | S | `planner` | overwrite | executor, debugger, reporter, judge, patcher, harness |
-| `sessions/<N>/state/planner_mini_impact_analysis.json` | S | `planner` | overwrite | executor |
-| `sessions/<N>/cache/spectracker_overwrite_version_delta.json` | S | `spectracker` | overwrite | harness |
-| `sessions/<N>/cache/absorber_overwrite_codebase_snapshot.json` | S | `absorber` | overwrite | clarificator, enricher, planner |
-| `sessions/<N>/cache/absorber_overwrite_git_snapshot.json` | S | `absorber` | overwrite | clarificator, enricher |
-| `sessions/<N>/execution/clarificator_overwrite_raw.json` | S | `clarificator` | overwrite | enricher, planner |
-| `sessions/<N>/execution/clarificator_overwrite_questions.md` | S | `clarificator` | overwrite | human review |
-| `sessions/<N>/execution/enricher_overwrite_enriched_prompt.md` | S | `enricher` | overwrite | specwright |
-| `sessions/<N>/execution/executor_overwrite_manifest.json` | S | `executor` | overwrite | reporter, judge, patcher, harness |
-| `sessions/<N>/execution/debugger_overwrite_test_summary.json` | S | `debugger` | overwrite | reporter, judge, archivist |
-| `sessions/<N>/execution/judge_overwrite_verdict_raw.json` | S | `judge` | overwrite | patcher, archivist, harness |
-| `sessions/<N>/execution/patcher_overwrite_fix_summary.md` | S | `patcher` | overwrite | human review |
-| `sessions/<N>/reports/reporter_execution_summary.md` | S | `reporter` | overwrite | human review only |
-| `sessions/<N>/reports/judge_verdict_summary.md` | S | `judge` | overwrite | human review only |
-| `knowledge/current/clarificator_decision_log.md` | P | `clarificator` | append | clarificator (next session), enricher |
-| `knowledge/current/absorber_codebase_map.md` | P | `absorber` | overwrite | clarificator, enricher, planner, executor |
-| `knowledge/current/absorber_config_map.json` | P | `absorber` | overwrite | clarificator, enricher |
-| `knowledge/current/absorber_blame_map.md` | P | `absorber` | overwrite | clarificator, enricher, planner |
-| `knowledge/current/patcher_findings_snapshot.md` | P | `patcher` | overwrite | debugger, archivist |
-| `knowledge/current/archivist_spec_gaps.md` | P | `archivist` | append/curated | specwright |
-| `knowledge/current/archivist_knowledge_log.md` | P | `archivist` | append | planner, executor, debugger, patcher, judge |
-| `knowledge/history/archivist_curation_log.json` | P | `archivist` | append | human review |
-| `knowledge/history/patcher_attempt_log.json` | P | `patcher` | append | human review, archivist |
-| `knowledge/history/spectracker_version_log.md` | P | `spectracker` | append | human review |
-| `knowledge/history/spectracker_spec_snapshot_<version>.md` | P | `spectracker` | write-once | spectracker (delta computation) |
-| `session_runs/session_<N>_runs.json` | P | `harness` | append‡ | harness, human review |
-
-† `spectracker_applied_version.json`: top-level fields overwrite each run; embedded `run_history[]` is append-only.
-‡ `session_<N>_runs.json`: append-only at run-entry level — run entries are never deleted. File is atomically rewritten on each update (read full JSON → append entry → write back). Not byte-level append.
+† `spectracker/version_delta.json`: documented exception — derivable from spec + log, but drives harness step-skipping control flow rather than being a passive cache.
+‡ `spectracker/version_log.json`: append-only at entry level; `write_applied()` mutates the matching entry's `applied` field in-place after downstream pipeline succeeds.
+§ `harness_run_log.json`: append-only at run level — entries never deleted. File is atomically rewritten (read → append → write to temp → rename). Not byte-level append.
 
 ---
 
 ## Data Flow
 
 ```
-[absorber]───────────────► absorber_codebase_map.md
-                            absorber_config_map.json
-                            absorber_blame_map.md
-                            absorber_overwrite_codebase_snapshot.json     (cache)
-                            absorber_overwrite_git_snapshot.json          (cache)
+[absorber]───────────────► absorber/codebase_map.md
+                            absorber/codebase_log.json        (append)
+                            absorber/cache/codebase_snapshot.json
 
-[clarificator]───────────► clarificator_overwrite_raw.json
-                            clarificator_overwrite_questions.md
-                            clarificator_requirement_synthesis.md
-                            clarificator_decision_log.md (append)
+[clarificator]───────────► clarificator/session.json
+                            clarificator/decision_log.json    (append)
 
-[enricher]───────────────► enricher_overwrite_enriched_prompt.md
+[enricher]───────────────► enricher/enriched_prompt.md
+                            enricher/prompt_log.json          (append)
 
-[specwright]─────────────► specwright_spec_<slug>.md
+[specwright]─────────────► spec/specwright_spec_<slug>.md
                               │
-                              ├─[spectracker]────► spectracker_overwrite_version_delta.json → harness
-                              │                     spectracker_applied_version.json
-                              │                     spectracker_version_log.md (append)
-                              │                     spectracker_spec_snapshot_<version>.md
+                              ├─[spectracker]────► spectracker/version_delta.json → harness
+                              │                    spectracker/version_log.json    (append)
                               │
-                              └─[scaffolder]─────► scaffolder_codebase_skeleton.json
+                              └─[scaffolder]─────► scaffolder/blueprint.json
+                                                   scaffolder/skeleton_log.json   (append)
 
-[planner]────────────────► planner_full_execution_plan.json
-                            planner_mini_execution_plan.json
-                            planner_mini_impact_analysis.json
+[planner]────────────────► planner/full_plan.json
+                            planner/mini_plan.json            ({ "plan": {...}, "impact": {...} })
+                            planner/plan_log.json             (append)
 
-[executor]───────────────► executor_overwrite_manifest.json
+[executor]───────────────► executor/manifest.json
+                            executor/manifest_log.json        (append)
 
-[debugger]───────────────► debugger_overwrite_test_summary.json
+[debugger]───────────────► debugger/test_summary.json
+                            debugger/test_log.json            (append)
 
-[reporter]───────────────► reporter_execution_summary.md
+[reporter]───────────────► reporter/execution_summary.md
+                            reporter/execution_log.json       (append)
 
-[judge]──────────────────► judge_overwrite_verdict_raw.json
-                            judge_verdict_summary.md
+[judge]──────────────────► judge/verdict_raw.json
+                            judge/verdict_summary.md
+                            judge/verdict_log.json            (append)
 
-[patcher]────────────────► patcher_overwrite_fix_summary.md
-                            patcher_findings_snapshot.md
-                            patcher_attempt_log.json (append)
+[patcher]────────────────► patcher/fix_summary.md
+                            patcher/attempt_log.json          (append)
 
-[archivist]──────────────► archivist_knowledge_log.md (append)
-                            archivist_spec_gaps.md
-                            archivist_curation_log.json (append)
+[archivist]──────────────► archivist/knowledge_log.md        (append)
+                            archivist/spec_gaps.md            (append/curated)
+                            archivist/curation_log.json       (append)
 ```
 
 ---
 
 ## Special Notes
 
-### Session isolation model
-
-Pipeline artifacts are split into two scopes:
-
-**Session-local** (`[S]`) — `sessions/<NNN>/state/`, `cache/`, `execution/`, `reports/`:
-Isolated per session. Runs within the same session share these artifacts (later runs may overwrite earlier runs' outputs within the session). Different sessions never interfere.
-
-**Project-global** (`[P]`) — `knowledge/`, `session_runs/`, `specwright_spec_<slug>.md`, `state/spectracker_applied_version.json`, `src/`, `tests/`:
-Shared across all sessions. Long-term memory and applied state live here.
-
-**Session** = logical unit of work (implement one spec version through to judge APPROVED).
-**Run** = one harness.py invocation. A session may contain multiple runs (stop → review → resume).
-
-`session_runs/session_<N>_runs.json` tracks all runs within a session: which steps ran, pass/fail status, from/until step, resume chain. Owned by `harness`, not a pipeline step.
-
----
-
-### Execution order note
-
-Although spectracker owns the spec delta artifacts, it runs **after specwright** in the canonical full flow because it requires `specwright_spec_<slug>.md`.
+### Execution order
 
 Canonical full flow:
 
@@ -195,114 +199,190 @@ Canonical full flow:
 absorber → clarificator → enricher → specwright → spectracker → scaffolder → planner → executor → debugger → reporter → judge → patcher → archivist
 ```
 
-If the canonical spec does not exist yet, harness skips spectracker preflight and waits until specwright creates the spec. Spectracker itself exits cleanly with a `SKIP` message when run against a missing spec (default non-strict mode); use `--strict` to treat missing spec as exit 1 in CI.
+Spectracker runs **after** specwright because it requires `spec/specwright_spec_<slug>.md`. If the spec does not exist yet, harness skips spectracker until specwright creates it. Spectracker exits cleanly with a `SKIP` message when run against a missing spec (default non-strict mode); use `--strict` to treat missing spec as exit 1 in CI.
 
 ---
 
-### `specwright_spec_<slug>.md`
+### `spec/specwright_spec_<slug>.md`
+
 Canonical spec per project. Slug embedded in filename enables cross-project extraction without renaming. Use `get_spec_path()` from `artifacts/paths.py` — not a static constant. Owner is specwright; all other modules read only.
 
-### `state/clarificator_requirement_synthesis.md`
-Raw requirement rewritten inline with all clarification decisions resolved. Not a summary — full document with decisions incorporated. Consumed by enricher as primary input; specwright falls back to this if enriched prompt absent.
+---
 
-### `state/scaffolder_codebase_skeleton.json`
-Generated by scaffolder from spec. Contains full stub file tree: function signatures, interfaces, JSDoc, test skeletons — no implementation bodies. Also carries `implementation_instructions.for_executor` read by executor as briefing. Overwritten fully each run.
+### `absorber/codebase_map.md`
 
-### `state/planner_full_execution_plan.json`
-Output of planner for full-scope runs. Per-file implementation tasks, ordered sub-tasks, dependency order, gotchas, Tailwind hints. **Immutable after planner writes** — downstream scripts read only.
+Merged output of three old separate artifacts. Sections: `## Codebase`, `## Config`, `## Git/Blame`. Single file reduces consumer complexity. `codebase_log.json` records per-run metadata including `cost`, `git_scope`, and `hotspot_summary[]` (top-N files by change frequency).
 
-### `state/planner_mini_impact_analysis.json`
-Planner analysis of which files are impacted by the mini task scope. Distinct from the execution plan — this is the impact analysis that informs what executor touches.
+---
 
-### `state/spectracker_applied_version.json`
-Deliberate hybrid lifecycle: top-level fields (current version, last run metadata) overwrite each run; embedded `run_history[]` array is append-only across runs. Rationale: keeps history coupled with current state without an additional artifact. Used by spectracker to determine first-run vs delta, and to load the previous snapshot for diffing.
+### `clarificator/session.json`
 
-**Project-global exception:** this file lives at project root `state/`, not inside `sessions/<NNN>/state/`. Rationale: spectracker must know the last successfully applied version across all sessions to compute deltas correctly. If session-local, each new session would lose the applied baseline and force a full rerun. All other `state/` artifacts are session-local.
+Replaces three old artifacts (`clarificator_overwrite_raw.json`, `clarificator_requirement_synthesis.md`, `clarificator_session_questions.md`). Questions are now printed to terminal only — not persisted. `requirement_synthesis` is embedded as a text field inside `session.json`.
 
-In full harness runs, `write_applied()` is called by harness **at finalization time** only after the downstream pipeline succeeds — not during spectracker's normal run. This prevents a spec version from being marked applied before executor/debugger/judge completion. Ownership remains spectracker. A manual CLI fallback (`--mark-applied`) is available for recovery.
+Fields: `decisions[]`, `conflicts[]`, `unresolved[]`, `tier_counts`, `input_sources`, `req_hash`, `requirement_synthesis`.
 
-### `cache/spectracker_overwrite_version_delta.json`
-Computed by spectracker from diff between current spec and last applied snapshot. Describes changed sections, affected files, steps to skip. Documented exception: placed in cache/ because derivable from spec + applied_version, but drives harness control flow rather than being a passive cache.
+Consumers extract `session["requirement_synthesis"]` directly.
 
-### `cache/absorber_overwrite_git_snapshot.json`
-Point-in-time git state captured by absorber: recent commits, blame data. Overwritten each run — not a persistent log. Moved from knowledge/history/ to cache/ to reflect snapshot semantics.
+---
 
-### `execution/clarificator_overwrite_raw.json`
-Structured session metadata: decisions array with tier/category/impact, tier counts, conflicts detected, unresolved findings list, requirement hash. Machine-readable; consumed by enricher and planner. For long-term Q&A memory see `clarificator_decision_log.md`.
+### `spectracker/version_delta.json`
 
-### `execution/judge_overwrite_verdict_raw.json`
-Raw judge API response, fully unprocessed. Preserved so patcher and archivist can parse independently, and failures are debuggable without re-calling the API. Human-readable rendering in `judge_verdict_summary.md`.
+Documented exception: derivable artifact placed in `spectracker/` (not `cache/`) because it is module-owned and drives harness step-skipping — not a passive cache. Harness reads this file to decide which pipeline steps to skip for delta runs.
 
-### `knowledge/current/patcher_findings_snapshot.md`
-Per-run snapshot of judge findings processed by patcher: what was patched, escalated, confirm result. Overwritten each run — not a persistent log. Injected into debugger prompts as regression prevention context. For longitudinal history see `patcher_attempt_log.json`.
+---
 
-### `knowledge/current/archivist_knowledge_log.md`
-Core persistent knowledge base. Consolidates three retired artifacts: `base.md`, `findings_notes.md`, `plan_notes.json`. Accumulates architecture decisions, recurring bug patterns, lessons learned across all runs. Append-only; human controls additions via archivist interactive mode. Human-editable by design — one of the few artifacts where manual editing is intended.
+### `spectracker/version_log.json`
 
-### `knowledge/current/archivist_spec_gaps.md`
-Edge cases and spec gaps surfaced by judge, human-approved via archivist interactive flow. Injected into judge briefing so future runs are aware of known gaps. Also feeds specwright on next spec revision. Human-editable.
+Replaces two old artifacts (`spectracker_applied_version.json` and `spectracker_version_log.md`). Each entry embeds `spec_content` — eliminates separate per-version `.md` snapshot files. `write_applied()` patches `applied: true` on the matching entry after downstream pipeline succeeds. Harness calls `write_applied()` at finalization time only — prevents a version being marked applied before executor/debugger/judge complete.
 
-### `knowledge/history/spectracker_spec_snapshot_<version>.md.md`
-Write-once files created by spectracker each time a new spec version is applied. `spectracker_spec_snapshot_<version>.md` is the raw spec snapshot used internally by spectracker for future delta computation (`_load_latest_snapshot`). Dynamic path constructed at runtime — not static constants in paths.py.
+Trim policy: if `len(spec_content) > 50_000` then truncate deterministically. No LLM summarization.
 
-### `knowledge/history/archivist_curation_log.json`
-Audit trail of human decisions when reviewing judge findings: which findings were applied to knowledge base, skipped, or escalated to spec bump. Distinct from `patcher_attempt_log.json` — archivist modifies knowledge artifacts while patcher modifies src/ directly.
+---
 
-### `reports/reporter_execution_summary.md` and `reports/judge_verdict_summary.md`
-Human-readable only — no pipeline script parses either file. `reporter_execution_summary.md` summarises the full pipeline execution; on GitHub Actions it is piped to `$GITHUB_STEP_SUMMARY` and not committed. `judge_verdict_summary.md` is the primary artifact for a human deciding whether pipeline output is acceptable before merging.
+### `scaffolder/blueprint.json`
 
-### `session_runs/session_<N>_runs.json`
-Owned by `harness`, not a pipeline step. Records all runs within a session in chronological order. Schema: `{ session_id, created_at, runs: [{ run_id, started_at, completed_at, status, scope, from_step, until_step, stopped_at_step, resumed_from_run, steps: [...], spec_version }] }`.
+Module-centric schema replaces old flat-file `scaffolder_codebase_skeleton.json`:
 
-"Append-only" means run entries are never deleted — it is the semantic guarantee. Mechanically, the file is atomically rewritten on each update (read full JSON → append/update current run entry → write to temp → rename). Not byte-level append.
+```json
+{
+  "generated_at": "...",
+  "spec_version": "v1.3",
+  "modules": [
+    {
+      "module": "auth",
+      "purpose": "authentication and session management",
+      "files": [
+        { "path": "src/auth/service.py", "kind": "source" },
+        { "path": "tests/auth/test_service.py", "kind": "test" }
+      ]
+    }
+  ],
+  "summary": { "total": 12, "source": 8, "test": 4 }
+}
+```
 
-### Scratch space: `state/prev_src/`
-Used exclusively by harness to stash unaffected source files before a delta run and restore them after executor overwrites `src/`. Not a pipeline artifact — not tracked in paths.py, not versioned, safe to delete.
+`kind` values: `"source"` | `"test"` | `"config"` | `"migration"`. Fields `is_test` and `code` are removed. Consumers use `kind != "test"` instead of `is_test == false`.
+
+---
+
+### `planner/mini_plan.json`
+
+Merges two old artifacts (`planner_mini_execution_plan.json` + `planner_mini_impact_analysis.json`) into one file:
+
+```json
+{ "plan": { ... }, "impact": { ... } }
+```
+
+Consumers extract `mini_plan["plan"]` and `mini_plan["impact"]` independently. `plan_log.json` is shared by both `full` and `mini` scope runs — entries carry a `"scope"` field, plus `"cost"` and `"model"` fields.
+
+---
+
+### `archivist/` — pure accumulation
+
+No short-term overwrite file — intentional. `knowledge_log.md` and `spec_gaps.md` use `.md` because their primary target is LLM prompt injection. Human-editable by design — one of the few artifacts where manual editing is intended. `decision_log.json` entries are trimmed if `decisions > 20` per entry to prevent unbounded growth.
+
+---
+
+### `harness_run_log.json`
+
+Replaces `session_runs/session_<N>_runs.json`. Session concept removed — there is no longer a `sessions/<NNN>/` layer. Each harness invocation appends one run entry:
+
+```json
+{
+  "entries": [
+    {
+      "run_id": "run_1747123456_abc12345",
+      "started_at": "2026-05-16T08:00:00Z",
+      "completed_at": "2026-05-16T09:23:00Z",
+      "status": "FAIL",
+      "scope": "full",
+      "from_step": "absorber",
+      "until_step": "judge",
+      "stopped_at_step": "judge",
+      "spec_version": "v1.3",
+      "steps": [
+        { "step": "absorber", "status": "PASS", "at": "..." },
+        { "step": "judge", "status": "FAIL", "at": "..." }
+      ]
+    }
+  ]
+}
+```
+
+---
+
+### `output/prev_src/`
+
+Scratch space used exclusively by harness to stash unaffected source files before a delta run and restore them after executor overwrites `output/src/`. Not a pipeline artifact — not in paths.py, not versioned, safe to delete.
+
+---
+
+### `KNOWLEDGE_SOURCES` in `paths.py`
+
+Enumerates all long-term append logs so future hypothesis/consultant modules can query the full pipeline history:
+
+```python
+KNOWLEDGE_SOURCES: list = [
+    ABSORBER_CODEBASE_LOG,
+    CLARIFICATOR_DECISION_LOG,
+    ENRICHER_PROMPT_LOG,
+    SPECTRACKER_VERSION_LOG,
+    SCAFFOLDER_SKELETON_LOG,
+    PLANNER_PLAN_LOG,
+    EXECUTOR_MANIFEST_LOG,
+    DEBUGGER_TEST_LOG,
+    REPORTER_EXECUTION_LOG,
+    JUDGE_VERDICT_LOG,
+    PATCHER_ATTEMPT_LOG,
+    ARCHIVIST_KNOWLEDGE_LOG,
+    ARCHIVIST_SPEC_GAPS,
+    ARCHIVIST_CURATION_LOG,
+]
+```
 
 ---
 
 ## Removed Artifacts
 
-| Old name | Reason |
+| Old artifact | Reason |
 |---|---|
-| `state/plan_notes.json` | Merged into `archivist_knowledge_log.md`. Planner reads knowledge log directly — no separate injection file needed. |
-| `state/enriched_prompt.md` | Moved to `execution/enricher_overwrite_enriched_prompt.md`. Session artifact; wrong location in state/. |
-| `run/analysis_mini.json` | Legacy from deprecated `mini_mode.py`. Replaced by `planner_mini_impact_analysis.json`. |
-| `run/mini_log.json` | Legacy from deprecated `mini_mode.py`. Entire mode removed. |
-| `knowledge/history/git_history.json` | Point-in-time snapshot semantics, not a persistent log. Moved to `cache/absorber_overwrite_git_snapshot.json`. |
-| `knowledge/current/base.md` | Merged into `archivist_knowledge_log.md`. |
-| `knowledge/current/findings_notes.md` | Merged into `archivist_knowledge_log.md`. |
-| `knowledge/current/findings.md` | Renamed to `patcher_findings_snapshot.md` — clarifies owner and snapshot lifecycle. |
-| `knowledge/current/spec_addendum.md` | Renamed to `archivist_spec_gaps.md` — corrects owner (archivist, not judge) and clarifies purpose. |
+| `sessions/<NNN>/` entire layer | Session model removed — audit trail via append-only logs per module |
+| `session_runs/session_<N>_runs.json` | Replaced by `harness_run_log.json` at project root |
+| `state/spectracker_applied_version.json` | Merged into `spectracker/version_log.json` entries (`applied` field) |
+| `knowledge/history/spectracker_spec_snapshot_<v>.md` | Embedded as `spec_content` in `spectracker/version_log.json` entries |
+| `knowledge/current/absorber_config_map.json` | Merged into `absorber/codebase_map.md` §§ Config |
+| `knowledge/current/absorber_blame_map.md` | Merged into `absorber/codebase_map.md` §§ Git/Blame |
+| `cache/absorber_overwrite_git_snapshot.json` | Git data now inline in `codebase_map.md` |
+| `state/clarificator_requirement_synthesis.md` | Merged as `requirement_synthesis` field in `clarificator/session.json` |
+| `execution/clarificator_overwrite_questions.md` | Print to terminal only — not persisted |
+| `knowledge/current/clarificator_decision_log.md` | Converted to `clarificator/decision_log.json` |
+| `knowledge/current/patcher_findings_snapshot.md` | Removed — consumers read last entry of `patcher/attempt_log.json` |
+| `state/planner_mini_impact_analysis.json` | Merged as `impact` field in `planner/mini_plan.json` |
+| `knowledge/current/base.md` | Merged into `archivist/knowledge_log.md` |
+| `knowledge/current/findings_notes.md` | Merged into `archivist/knowledge_log.md` |
+| `state/plan_notes.json` | Merged into `archivist/knowledge_log.md` |
+| `run/analysis_mini.json` | Legacy from deprecated `mini_mode.py` |
+| `run/mini_log.json` | Legacy from deprecated `mini_mode.py` |
 
 ---
 
 ## Adding New Artifacts
 
-First, decide scope:
+First decide lifecycle: short-term overwrite or long-term append?
 
-- **Session-local** → goes into `sessions/<N>/state/`, `cache/`, `execution/`, or `reports/`; use `_SessLazyPath` in paths.py
-- **Project-global** → goes into `knowledge/`, `session_runs/`, or project root; use `_LazyPath` in paths.py
+- **Short-term** → `<module>/<noun>.json` or `<module>/<noun>.md` (`.md` if human/LLM target)
+- **Long-term** → `<module>/<noun>_log.json` (always `.json`)
+- **Internal cache** → `<module>/cache/<noun>.json`
 
-Then pick the right directory:
+Then register in all three places:
 
-1. **`sessions/<N>/state/`** — persistent within a session, enables step-skipping across runs in same session.
-2. **`sessions/<N>/cache/`** — heavy intermediates regenerable from source. Use `_overwrite_` in filename. Document if used for control flow (exception).
-3. **`sessions/<N>/execution/`** — per-run outputs consumed by downstream steps. Use `_overwrite_` in filename.
-4. **`sessions/<N>/reports/`** — human-readable only. Never consumed by pipeline logic.
-5. **`knowledge/current/`** — files read by pipeline steps across sessions. Append-only or curated overwrite.
-6. **`knowledge/history/`** — append-only logs and write-once snapshots. Human audit only unless noted.
-7. **Build outputs** (`src/`, `tests/`) — written only by scaffolder and executor. Project-global.
-8. **Scratch space** — use `state/` subdirs; not versioned as artifacts.
+1. `artifacts/paths.py` — add `_LazyPath`, update `ensure_dirs()`, add to `KNOWLEDGE_SOURCES` if long-term log
+2. `artifacts/OWNERSHIP.md` — add row to ownership table
+3. This document — add to directory overview, lifecycle table, and a Special Note if non-obvious
 
-Hybrid lifecycle (e.g., embedded append arrays inside overwritten file) must be documented as exception with rationale in Special Notes.
-
-Every new artifact must be registered in all three places:
-- `artifacts/paths.py` — with owner, consumers, lifecycle, purpose, **scope** comments; correct `_LazyPath` vs `_SessLazyPath`
-- `artifacts/OWNERSHIP.md` — in ownership table with scope column
-- This document — directory overview, lifecycle table, special note
+Hybrid lifecycle (e.g., in-place field mutation within an append log) must be documented as an exception with rationale in Special Notes.
 
 ---
 
-*Last updated: 2026-05-09*
+*Last updated: 2026-05-19*
 *Maintained alongside `pipeline/` and `harness.py`.*
