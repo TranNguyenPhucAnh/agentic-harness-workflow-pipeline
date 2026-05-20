@@ -69,11 +69,12 @@ from pathlib import Path
 from typing import Any
 
 # === WRITE AUTHORITY: absorber ===
-# OWNS  : artifacts_<slug>/absorber/codebase_map.md
-#         artifacts_<slug>/absorber/codebase_log.json
-#         artifacts_<slug>/absorber/cache/codebase_snapshot.json
+# OWNS  : artifacts_<slug>/absorber/codebase_map.md (short-term, overwrite)
+#         artifacts_<slug>/absorber/codebase_log.json (long-term, append)
+#         artifacts_<slug>/absorber/cache/codebase_snapshot.json (cache - internal, overwrite)
+
 # READS : project source files (target codebase)
-#         artifacts_<slug>/absorber/cache/codebase_snapshot.json
+#         artifacts_<slug>/absorber/cache/codebase_snapshot.json (cache)
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from artifacts.paths import (  # noqa: E402
@@ -1348,12 +1349,13 @@ def run_absorber(args: argparse.Namespace) -> None:
     print("[absorber] Phase 3 — LLM semantic compression")
     map_content, call_cost = call_llm_for_map(context, target_name, config_section, git_section)
 
-    # Apply markdown header
-    map_content = apply_md_header(map_content, owner="absorber", artifact_type="short-term")
-
     # Write codebase_map.md
     map_path = Path(str(CODEBASE_MAP))
     map_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Apply markdown header (needs map_path to detect existing header for created_ts)
+    map_content = apply_md_header(map_content, map_path, owner="absorber")
+
     map_path.write_text(map_content)
     track_write(map_path)
     print(f"[absorber] Wrote: {map_path} ({len(map_content):,} bytes)")
