@@ -1127,11 +1127,7 @@ def _run_step(
     tests_passed: bool,
 ) -> bool:
     if step == "absorber":
-        absorber_args: list[str] = []
-        target_dir = os.environ.get("PIPELINE_TARGET_DIR")
-        if target_dir:
-            absorber_args += ["--target", target_dir]
-        return _run_step_with_trace(step, "absorber", STEP_SCRIPTS[step], args, absorber_args or None)
+        return _run_step_with_trace(step, "absorber", STEP_SCRIPTS[step], args)
 
     if step == "clarificator":
         clarify_args: list[str] = []
@@ -1281,7 +1277,7 @@ def _print_summary(
     tests_passed: bool,
 ) -> None:
     from artifacts.paths import (
-        CLARIFICATOR_QUESTIONS,
+        CLARIFICATOR_SESSION,
         JUDGE_VERDICT_SUMMARY,
         REPORTER_EXECUTION_SUMMARY,
     )
@@ -1307,8 +1303,8 @@ def _print_summary(
     print(f"\n  Overall: {'✅ PASS' if all_ok else '❌ FAIL'}")
 
     print("\n  Reports:")
-    if CLARIFICATOR_QUESTIONS.exists() and results.get("clarificator"):
-        print(f"    Clarificator → {CLARIFICATOR_QUESTIONS}")
+    if CLARIFICATOR_SESSION.exists() and results.get("clarificator"):
+        print(f"    Clarificator → {CLARIFICATOR_SESSION}")
 
     print(f"    Pipeline     → {REPORTER_EXECUTION_SUMMARY}")
 
