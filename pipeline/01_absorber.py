@@ -31,7 +31,6 @@ Usage:
   python 01_absorber.py --git-scope 500
   python 01_absorber.py --git-scope all
   python 01_absorber.py --force
-  python 01_absorber.py --skip-git
   python 01_absorber.py --dry-run
   python 01_absorber.py --target /path/to/repo
 
@@ -308,10 +307,6 @@ def _should_skip_dir(name: str, *, skip_artifact_control_dirs: bool = False) -> 
         return True
 
     if name in _BUILTIN_SKIP_DIRS:
-        return True
-
-    # Always skip pipeline artifact output dirs (artifacts_<slug>/)
-    if name.startswith("artifacts_"):
         return True
 
     if skip_artifact_control_dirs and name in _ARTIFACT_CONTROL_DIRS:
@@ -1124,7 +1119,7 @@ def _append_codebase_log(
 
     Args:
       call_cost        — USD cost returned by record_usage(); 0.0 if not available.
-      git_scope        — raw --git-scope flag value (e.g. "6m", "all"); empty if --skip-git.
+      git_scope        — raw --git-scope flag value (e.g. "6m", "all").
       hotspot_summary  — top-N [(file, change_count)] from _git_log_stats(); None if skipped.
     """
     entry = {
@@ -1292,7 +1287,6 @@ def run_absorber(args: argparse.Namespace) -> None:
     print(f"[absorber] Target: {target}")
     print(f"[absorber] Force: {args.force}")
     print(f"[absorber] Git scope: {args.git_scope}")
-    print(f"[absorber] Skip git: {args.skip_git}")
     print(f"[absorber] Dry run: {args.dry_run}")
     print()
 
@@ -1337,14 +1331,13 @@ def run_absorber(args: argparse.Namespace) -> None:
     # --- Phase 4: Git crawl (before LLM so we can include in prompt) ---
     git_section = ""
     hotspots: list[tuple[str, int]] = []
-    if not args.skip_git:
-        print(f"[absorber] Phase 4 — Git crawl (scope: {args.git_scope})")
-        git_section, hotspots = _git_log_stats(target, args.git_scope)
-        if git_section:
-            print(f"  Git data: {len(git_section):,} chars")
-        else:
-            print("  No git data (not a git repo or no history in scope)")
-        print()
+    print(f"[absorber] Phase 4 — Git crawl (scope: {args.git_scope})")
+    git_section, hotspots = _git_log_stats(target, args.git_scope)
+    if git_section:
+        print(f"  Git data: {len(git_section):,} chars")
+    else:
+        print("  No git data (not a git repo or no history in scope)")
+    print()
 
     # --- Build config section ---
     config_section = _build_config_section(inventory, cache)
@@ -1353,13 +1346,12 @@ def run_absorber(args: argparse.Namespace) -> None:
     print("[absorber] Phase 3 — LLM semantic compression")
     map_content, call_cost = call_llm_for_map(context, target_name, config_section, git_section)
 
+    # Apply markdown header
+    map_content = apply_md_header(map_content, owner="absorber", artifact_type="short-term")
+
     # Write codebase_map.md
     map_path = Path(str(CODEBASE_MAP))
     map_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Apply markdown header (needs map_path to detect existing header for created_ts)
-    map_content = apply_md_header(map_content, map_path, owner="absorber")
-
     map_path.write_text(map_content)
     track_write(map_path)
     print(f"[absorber] Wrote: {map_path} ({len(map_content):,} bytes)")
@@ -1372,7 +1364,7 @@ def run_absorber(args: argparse.Namespace) -> None:
         extracted_count,
         len(map_content),
         call_cost=call_cost,
-        git_scope="" if args.skip_git else args.git_scope,
+        git_scope=args.git_scope,
         hotspot_summary=hotspots if hotspots else None,
     )
 
@@ -1403,18 +1395,13 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--git-scope",
-        default="6m",
-        help="Git history scope: 6m, 3m, 500, all (default: 6m)",
+        default="all",
+        help="Git history scope: 6m, 3m, 500, all (default: all)",
     )
     parser.add_argument(
         "--force",
         action="store_true",
         help="Bypass cache, re-extract all files",
-    )
-    parser.add_argument(
-        "--skip-git",
-        action="store_true",
-        help="Skip git log analysis",
     )
     parser.add_argument(
         "--dry-run",
