@@ -1347,7 +1347,7 @@ def run_absorber(args: argparse.Namespace) -> None:
     map_content, call_cost = call_llm_for_map(context, target_name, config_section, git_section)
 
     # Apply markdown header
-    map_content = apply_md_header(map_content, owner="absorber")
+    map_content = apply_md_header(map_content, CODEBASE_MAP, owner="absorber")
 
     # Write codebase_map.md
     map_path = Path(str(CODEBASE_MAP))
