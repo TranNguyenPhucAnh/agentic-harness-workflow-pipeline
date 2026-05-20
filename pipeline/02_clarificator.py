@@ -80,12 +80,11 @@ KNOWLEDGE_BASE = ARCHIVIST_KNOWLEDGE_LOG
 
 
 # === WRITE AUTHORITY: clarificator ===
-# OWNS  : clarificator/session.json
-#         clarificator/decision_log.json
-# READS : archivist/knowledge_log.md
-#         absorber/codebase_map.md          (optional — existing projects only)
-#         clarificator/decision_log.json
-#         optional user-provided requirement file(s)
+# OWNS  : clarificator/session.json         (short-term - overwrite)
+#         clarificator/decision_log.json    (long-term - append only)
+# READS : archivist/knowledge_log.md        (knowledge-aware)
+#         absorber/codebase_map.md          (upstream-aware/codebase-aware - existing project only)
+#         clarificator/decision_log.json    (history-aware)
 
 
 # ── Model config ─────────────────────────────────────────────────────────────
