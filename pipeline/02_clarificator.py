@@ -14,6 +14,10 @@ Sau đó phân tích holes/conflicts/assumptions, tổ chức Q&A với user the
 3-tier system, và output clarificator/session.json cùng structured
 decision_log.json cho downstream steps.
 
+Khi absorber/codebase_map.md có sẵn, clarificator sẽ hỏi câu hỏi cụ thể
+hơn — map được vào files/classes/methods trong codebase hiện tại thay vì
+hỏi generic. Findings có codebase_refs[] để downstream trace về code thực.
+
 Usage:
     python pipeline/02_clarificator.py --project my-app --input requirement.pdf
     python pipeline/02_clarificator.py --project my-app --input spec.md notes.md
@@ -55,6 +59,7 @@ _REPO_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
 
 from artifacts.paths import (  # type: ignore  # noqa: E402
+    ABSORBER_CODEBASE_MAP,
     ARCHIVIST_KNOWLEDGE_LOG,
     CLARIFICATOR_DECISION_LOG,
     CLARIFICATOR_SESSION,
@@ -78,6 +83,7 @@ KNOWLEDGE_BASE = ARCHIVIST_KNOWLEDGE_LOG
 # OWNS  : clarificator/session.json
 #         clarificator/decision_log.json
 # READS : archivist/knowledge_log.md
+#         absorber/codebase_map.md          (optional — existing projects only)
 #         clarificator/decision_log.json
 #         optional user-provided requirement file(s)
 
@@ -243,7 +249,14 @@ def _load_knowledge_context() -> str:
 
     if KNOWLEDGE_BASE.exists():
         track_read(KNOWLEDGE_BASE)
-        parts.append(f"=== archivist_knowledge_log.md ===\n{KNOWLEDGE_BASE.read_text(encoding='utf-8')}")
+        parts.append(f"=== archivist/knowledge_log.md ===\n{KNOWLEDGE_BASE.read_text(encoding='utf-8')}")
+
+    # Codebase snapshot — optional, chỉ có khi absorber đã chạy.
+    # Clarificator dùng để hỏi câu hỏi map được vào files/classes/methods
+    # cụ thể thay vì hỏi generic. Missing = greenfield hoặc absorber chưa chạy.
+    if ABSORBER_CODEBASE_MAP.exists():
+        track_read(ABSORBER_CODEBASE_MAP)
+        parts.append(f"=== absorber/codebase_map.md ===\n{ABSORBER_CODEBASE_MAP.read_text(encoding='utf-8')}")
 
     entries = _load_decision_log()
     if entries:
@@ -254,7 +267,7 @@ def _load_knowledge_context() -> str:
             for d in entry.get("decisions", []):
                 log_lines.append(f"  [{d.get('id')}] Q: {d.get('question', '')}")
                 log_lines.append(f"           A: {d.get('answer', '')}")
-        parts.append(f"=== clarificator_decision_log ===\n" + "\n".join(log_lines))
+        parts.append(f"=== clarificator/decision_log ===\n" + "\n".join(log_lines))
 
     return "\n\n".join(parts)
 
@@ -363,6 +376,15 @@ Use them to:
    contains a semantically equivalent or closely related question.
 2. CONFLICT DETECTION — Does the new requirement contradict any past decision?
 3. ASSUMPTION SURFACING — Does the requirement assume behavior that may not exist yet?
+4. CODEBASE-AWARE QUESTIONING — If absorber/codebase_map.md is present in
+   KNOWLEDGE CONTEXT, use it to ask concrete questions that reference actual
+   files, classes, methods, or patterns in the codebase. Prefer specific
+   questions (e.g. "Should the new rate limiter hook into the existing
+   `auth/middleware.py` request pipeline, or run as a separate layer?") over
+   generic ones ("Where should rate limiting be implemented?").
+   If a requirement mentions a feature or module that already exists in the
+   codebase, surface that in the finding's citation and codebase_refs fields.
+   If codebase_map.md is absent, treat the project as greenfield and skip this rule.
 
 Output ONLY a valid JSON object — no markdown fences, no preamble.
 Schema:
@@ -380,7 +402,8 @@ Schema:
       "scenarios": ["option A", "option B"],
       "suggestion": "",
       "confidence": 0.0,
-      "citation": ""
+      "citation": "",
+      "codebase_refs": []
     }
   ],
   "conflicts": [
@@ -458,6 +481,9 @@ REQUIREMENT DOCUMENT:
 {requirement_text}
 
 Analyze thoroughly. Apply semantic dedup against ALREADY_ANSWERED_QA above.
+If absorber/codebase_map.md is present in KNOWLEDGE CONTEXT, reference specific
+files or modules in findings where relevant — populate codebase_refs[] with
+repo-relative paths (e.g. ["src/auth/middleware.py"]).
 Output only the JSON object."""
 
     raw = _call_llm(_ANALYZE_SYSTEM, user_msg)
@@ -481,6 +507,13 @@ Output only the JSON object."""
                 "No / needs different approach",
                 "Other (specify below)",
             ]
+
+        # Normalize codebase_refs — ensure list[str], never missing
+        refs = finding.get("codebase_refs")
+        if not isinstance(refs, list):
+            finding["codebase_refs"] = []
+        else:
+            finding["codebase_refs"] = [r for r in refs if isinstance(r, str)]
 
     result["findings"] = _enforce_tiers([f for f in findings if isinstance(f, dict)])
     result.setdefault("conflicts", [])
@@ -831,6 +864,7 @@ def _run_interactive_loop(
                 "answer": answer,
                 "accepted": accepted,
                 "impact": "",
+                "codebase_refs": finding.get("codebase_refs", []),
             }
         )
 
