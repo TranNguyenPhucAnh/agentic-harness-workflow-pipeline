@@ -115,7 +115,6 @@ def _build_chain() -> dict[str, StepInfo]:
         # clarificator
         CLARIFICATOR_SESSION,
         CLARIFICATOR_DECISION_LOG,
-        CLARIFIED_REQ,
         # enricher
         ENRICHER_OVERWRITE_PROMPT,
         ENRICHER_PROMPT_LOG,
@@ -189,7 +188,7 @@ def _build_chain() -> dict[str, StepInfo]:
         "enricher": StepInfo(
             script        = "03_enricher.py",
             consumes      = [
-                CLARIFIED_REQ,
+                CLARIFICATOR_SESSION,
                 ABSORBER_CODEBASE_MAP,
                 CLARIFICATOR_DECISION_LOG,
                 ARCHIVIST_KNOWLEDGE_LOG,
