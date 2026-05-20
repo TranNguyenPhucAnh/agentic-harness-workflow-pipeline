@@ -310,6 +310,10 @@ def _should_skip_dir(name: str, *, skip_artifact_control_dirs: bool = False) -> 
     if name in _BUILTIN_SKIP_DIRS:
         return True
 
+    # Always skip pipeline artifact output dirs (artifacts_<slug>/)
+    if name.startswith("artifacts_"):
+        return True
+
     if skip_artifact_control_dirs and name in _ARTIFACT_CONTROL_DIRS:
         return True
 
