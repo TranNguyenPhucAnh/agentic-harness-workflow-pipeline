@@ -1127,7 +1127,11 @@ def _run_step(
     tests_passed: bool,
 ) -> bool:
     if step == "absorber":
-        return _run_step_with_trace(step, "absorber", STEP_SCRIPTS[step], args)
+        absorber_args: list[str] = []
+        target_dir = os.environ.get("PIPELINE_TARGET_DIR")
+        if target_dir:
+            absorber_args += ["--target", target_dir]
+        return _run_step_with_trace(step, "absorber", STEP_SCRIPTS[step], args, absorber_args or None)
 
     if step == "clarificator":
         clarify_args: list[str] = []
