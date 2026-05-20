@@ -1231,7 +1231,7 @@ def _build_context(
     extracted_count = 0
 
     # Budget: ~100k chars for context to stay within token limits
-    _MAX_CONTEXT_CHARS = 100_000
+    _MAX_CONTEXT_CHARS = 500_000
     total_chars = 0
 
     for entry in inventory:
