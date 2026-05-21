@@ -75,6 +75,7 @@ class StepInfo:
 
 def _build_chain() -> dict[str, StepInfo]:
     """Build lazily — paths.py requires PIPELINE_PROJECT env var at resolve time."""
+# Dòng hiện tại (line 78–101)
     from artifacts.paths import (
         ABSORBER_CODEBASE_MAP,
         ABSORBER_CODEBASE_LOG,
@@ -100,6 +101,8 @@ def _build_chain() -> dict[str, StepInfo]:
         get_spec_path,
     )
 
+# Sửa thành — thêm SPECTRACKER_APPLIED không có, dùng SPECTRACKER_VERSION_LOG thay thế
+# KHÔNG cần thêm import mới, chỉ fix dòng dùng nó
     class _SpecPath:
         """Lazy wrapper — resolves at display time, not import time."""
         def __str__(self):  return str(get_spec_path())
@@ -150,7 +153,7 @@ def _build_chain() -> dict[str, StepInfo]:
         ),
         "spectracker": StepInfo(
             script             = "05_spectracker.py",
-            consumes           = [SPEC, SPECTRACKER_APPLIED],
+            consumes           = [SPEC, SPECTRACKER_VERSION_LOG],
             produces           = [
                 SPECTRACKER_VERSION_DELTA,
                 SPECTRACKER_VERSION_LOG,
