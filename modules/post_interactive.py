@@ -85,20 +85,17 @@ def _build_chain() -> dict[str, StepInfo]:
         SCAFFOLD_JSON,
         PLANNER_FULL_PLAN,
         PLANNER_MINI_PLAN,
-        PLANNER_MINI_IMPACT,
         EXECUTOR_OVERWRITE_MANIFEST,
         DEBUGGER_OVERWRITE_TEST_SUMMARY,
         REPORTER_EXECUTION_SUMMARY,
         JUDGE_OVERWRITE_VERDICT_RAW,
         JUDGE_VERDICT_SUMMARY,
         PATCHER_OVERWRITE_FIX_SUMMARY,
-        PATCHER_FINDINGS_SNAPSHOT,
         PATCHER_ATTEMPT_LOG,
         ARCHIVIST_KNOWLEDGE_LOG,
         ARCHIVIST_SPEC_GAPS,
         ARCHIVIST_CURATION_LOG,
         SPECTRACKER_VERSION_DELTA,
-        SPECTRACKER_APPLIED,
         SPECTRACKER_VERSION_LOG,
         get_spec_path,
     )
@@ -156,7 +153,6 @@ def _build_chain() -> dict[str, StepInfo]:
             consumes           = [SPEC, SPECTRACKER_APPLIED],
             produces           = [
                 SPECTRACKER_VERSION_DELTA,
-                SPECTRACKER_APPLIED,
                 SPECTRACKER_VERSION_LOG,
             ],
             next_step              = "scaffolder",
@@ -176,7 +172,7 @@ def _build_chain() -> dict[str, StepInfo]:
                 ABSORBER_CODEBASE_MAP,
                 ARCHIVIST_KNOWLEDGE_LOG,
             ],
-            produces  = [PLANNER_FULL_PLAN, PLANNER_MINI_PLAN, PLANNER_MINI_IMPACT],
+            produces  = [PLANNER_FULL_PLAN, PLANNER_MINI_PLAN],
             next_step = "executor",
         ),
         "executor": StepInfo(
@@ -196,7 +192,6 @@ def _build_chain() -> dict[str, StepInfo]:
             consumes  = [
                 EXECUTOR_OVERWRITE_MANIFEST,
                 PLANNER_FULL_PLAN,
-                PATCHER_FINDINGS_SNAPSHOT,
             ],
             produces  = [DEBUGGER_OVERWRITE_TEST_SUMMARY],
             next_step = "reporter",
@@ -228,11 +223,9 @@ def _build_chain() -> dict[str, StepInfo]:
             script    = "12_patcher.py",
             consumes  = [
                 JUDGE_OVERWRITE_VERDICT_RAW,
-                PATCHER_FINDINGS_SNAPSHOT,
             ],
             produces  = [
                 PATCHER_OVERWRITE_FIX_SUMMARY,
-                PATCHER_FINDINGS_SNAPSHOT,
                 PATCHER_ATTEMPT_LOG,
             ],
             next_step = "archivist",
