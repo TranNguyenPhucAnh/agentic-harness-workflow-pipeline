@@ -62,6 +62,7 @@ from artifacts.paths import (  # type: ignore  # noqa: E402
     ABSORBER_CODEBASE_MAP,
     ARCHIVIST_KNOWLEDGE_LOG,
     CLARIFICATOR_DECISION_LOG,
+    CLARIFICATOR_REQUIREMENT_SYNTHESIS,
     CLARIFICATOR_SESSION,
     ensure_dirs,
     get_project_name,
@@ -81,11 +82,11 @@ KNOWLEDGE_BASE = ARCHIVIST_KNOWLEDGE_LOG
 
 # === WRITE AUTHORITY: clarificator ===
 # OWNS  : clarificator/session.json         (short-term - overwrite)
+#         clarificator/requirement_synthesis.md (short-term - overwrite)
 #         clarificator/decision_log.json    (long-term - append only)
 # READS : archivist/knowledge_log.md        (knowledge-aware)
 #         absorber/codebase_map.md          (upstream-aware/codebase-aware - existing project only)
 #         clarificator/decision_log.json    (history-aware)
-
 
 # ── Model config ─────────────────────────────────────────────────────────────
 
