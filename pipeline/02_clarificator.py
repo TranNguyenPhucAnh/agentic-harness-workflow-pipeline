@@ -1175,7 +1175,7 @@ def _write_session(
         "unresolved": [u["id"] for u in unresolved],
         "decisions": decisions,
         "conflicts": conflicts,
-        "requirement_synthesis": requirement_synthesis,
+        "requirement_synthesis_path": str(CLARIFICATOR_REQUIREMENT_SYNTHESIS) if requirement_synthesis else "",
     }
 
     CLARIFICATOR_SESSION.parent.mkdir(parents=True, exist_ok=True)
@@ -1184,8 +1184,15 @@ def _write_session(
         encoding="utf-8",
     )
     track_write(CLARIFICATOR_SESSION)
+    print(f"[clarificator] ✓ Session   → {CLARIFICATOR_SESSION}")
 
-    print(f"\n[clarificator] ✓ Session → {CLARIFICATOR_SESSION}")
+    # Write requirement_synthesis.md separately (document, not data)
+    if requirement_synthesis:
+        synth_path = Path(str(CLARIFICATOR_REQUIREMENT_SYNTHESIS))
+        synth_path.parent.mkdir(parents=True, exist_ok=True)
+        synth_path.write_text(requirement_synthesis, encoding="utf-8")
+        track_write(synth_path)
+        print(f"[clarificator] ✓ Synthesis → {synth_path}")
 
 
 _IMPACT_TRIM_THRESHOLD = 50  # decisions per entry trước khi trim impacts
@@ -1371,12 +1378,17 @@ def _build_parser() -> argparse.ArgumentParser:
 # ════════════════════════════════════════════════════════════════════════════
 
 def _needs_synthesis(session: dict[str, Any]) -> bool:
-    """Return True if session.json is missing a real synthesis."""
-    synth = session.get("requirement_synthesis", "")
-    if not synth or not str(synth).strip():
+    """Return True if requirement_synthesis.md is missing or contains fallback text."""
+    synth_path = Path(str(CLARIFICATOR_REQUIREMENT_SYNTHESIS))
+    if not synth_path.exists():
         return True
-    # Fallback marker written by _synthesize_requirement on retry exhaustion
-    if str(synth).startswith("> ⚠️ LLM synthesis failed"):
+    try:
+        synth = synth_path.read_text(encoding="utf-8").strip()
+    except Exception:
+        return True
+    if not synth:
+        return True
+    if synth.startswith("> ⚠️ LLM synthesis failed"):
         return True
     return False
 
@@ -1407,11 +1419,12 @@ def _run_synth_only(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     if not _needs_synthesis(session):
-        existing = str(session.get("requirement_synthesis", ""))
+        synth_path = Path(str(CLARIFICATOR_REQUIREMENT_SYNTHESIS))
+        existing_size = synth_path.stat().st_size if synth_path.exists() else 0
         print(
-            f"[clarificator] session.json already has synthesis "
-            f"({len(existing)} chars) — nothing to patch.\n"
-            "  Use --no-synth to skip, or delete requirement_synthesis field to force re-synthesis."
+            f"[clarificator] requirement_synthesis.md already exists "
+            f"({existing_size:,} bytes) — nothing to patch.\n"
+            "  Delete the file to force re-synthesis."
         )
         return
 
@@ -1487,7 +1500,8 @@ def _run_synth_only(args: argparse.Namespace) -> None:
         if not synthesis_fallback
         else "Synthesis patched (fallback)"
     )
-    print(f"  Session → {CLARIFICATOR_SESSION}")
+    print(f"  Session   → {CLARIFICATOR_SESSION}")
+    print(f"  Synthesis → {CLARIFICATOR_REQUIREMENT_SYNTHESIS}")
 
 def main() -> None:
     try:
@@ -1687,8 +1701,9 @@ def main() -> None:
         )
 
         _print_banner(f"Done — {len(decisions)} decisions recorded  [{project_name}]")
-        print(f"  Decision log: {CLARIFICATOR_DECISION_LOG}")
+        print(f"  Decision log : {CLARIFICATOR_DECISION_LOG}")
         print(f"  Session      → {CLARIFICATOR_SESSION}")
+        print(f"  Synthesis    → {CLARIFICATOR_REQUIREMENT_SYNTHESIS}")
 
     finally:
         print_summary("[02]")
