@@ -60,7 +60,7 @@ sys.path.insert(0, str(_REPO_ROOT))
 
 from artifacts.paths import (  # type: ignore  # noqa: E402
     ABSORBER_CODEBASE_MAP,
-    ABSORBER_CODEBASE_MD
+    ABSORBER_CODEBASE_MD,
     ARCHIVIST_KNOWLEDGE_LOG,
     CLARIFICATOR_DECISION_LOG,
     CLARIFICATOR_REQUIREMENT_SYNTHESIS,
