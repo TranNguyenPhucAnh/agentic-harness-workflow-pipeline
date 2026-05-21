@@ -1483,7 +1483,7 @@ def run_absorber(args: argparse.Namespace) -> None:
             "cached_files":     cached_count,
             "extracted_files":  extracted_count,
             "map_size_bytes":   len(map_text.encode()),
-            "cost":             round(call_cost, 6),
+            "cost":             round(call_cost or 0.0, 6),
             "modes": {
                 "full":           sum(1 for f in inventory if f["mode"] == "full"),
                 "key_only":       sum(1 for f in inventory if f["mode"] == "key-only"),
