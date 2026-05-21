@@ -56,7 +56,7 @@ Artifact root layout:
         spec/
             specwright_spec_<slug>.md
         absorber/
-            codebase_map.md          ← short-term
+            codebase_map.json        ← short-term
             codebase_log.json        ← long-term
             cache/
                 codebase_snapshot.json
@@ -310,7 +310,7 @@ TESTS_DIR   = _LazyPath("output/tests")   # build output (scaffolder)
 # lifecycle: short-term — overwrite per absorber run
 # purpose:   merged codebase + config + git/blame map (single source of truth
 #            for codebase structure as exposed to downstream LLM steps)
-ABSORBER_CODEBASE_MAP = _LazyPath("absorber/codebase_map.md")
+ABSORBER_CODEBASE_MAP = _LazyPath("absorber/codebase_map.json")
 
 # owner:     absorber (01_absorber.py)
 # consumers: human review, hypothesis/consultant queries
@@ -573,8 +573,8 @@ KNOWLEDGE_SOURCES: list = [
 
 # absorber
 CODEBASE_MAP    = ABSORBER_CODEBASE_MAP
-CONFIG_MAP      = ABSORBER_CODEBASE_MAP   # merged into codebase_map.md
-BLAME_MAP       = ABSORBER_CODEBASE_MAP   # merged into codebase_map.md
+CONFIG_MAP      = ABSORBER_CODEBASE_MAP   # merged into codebase_map.json
+BLAME_MAP       = ABSORBER_CODEBASE_MAP   # merged into codebase_map.json
 ABSORBER_CACHE  = ABSORBER_CODEBASE_SNAPSHOT
 
 # clarificator
