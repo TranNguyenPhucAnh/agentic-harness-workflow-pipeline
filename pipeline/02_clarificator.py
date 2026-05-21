@@ -60,6 +60,7 @@ sys.path.insert(0, str(_REPO_ROOT))
 
 from artifacts.paths import (  # type: ignore  # noqa: E402
     ABSORBER_CODEBASE_MAP,
+    ABSORBER_CODEBASE_MD
     ARCHIVIST_KNOWLEDGE_LOG,
     CLARIFICATOR_DECISION_LOG,
     CLARIFICATOR_REQUIREMENT_SYNTHESIS,
@@ -86,6 +87,7 @@ KNOWLEDGE_BASE = ARCHIVIST_KNOWLEDGE_LOG
 #         clarificator/decision_log.json    (long-term - append only)
 # READS : archivist/knowledge_log.md        (knowledge-aware)
 #         absorber/codebase_map.md          (upstream-aware/codebase-aware - existing project only)
+#         absorber/codebase_map.json        (upstream-aware/codebase-aware - existing project only)
 #         clarificator/decision_log.json    (history-aware)
 
 # ── Model config ─────────────────────────────────────────────────────────────
@@ -251,16 +253,22 @@ def _load_knowledge_context() -> str:
         track_read(KNOWLEDGE_BASE)
         parts.append(f"=== archivist/knowledge_log.md ===\n{KNOWLEDGE_BASE.read_text(encoding='utf-8')}")
 
-    # Codebase snapshot — optional, chỉ có khi absorber đã chạy.
-    # Clarificator dùng để hỏi câu hỏi map được vào files/classes/methods
-    # cụ thể thay vì hỏi generic. Missing = greenfield hoặc absorber chưa chạy.
+    # Consume cả hai absorber artifacts:
+    # - codebase_map.md: LLM-readable narrative (Project Overview, Module Inventory,
+    #   Entry Points, Data Flow, Tech Debt) — inject trực tiếp vào prompt.
+    # - codebase_map.json: structured data (config services, env vars, git hotspots,
+    #   language breakdown) — bổ sung context mà .md không cover.
+    # Trước đây .json chứa cả .md content, nay tách ra vì nội dung quá dài.
+    if ABSORBER_CODEBASE_MD.exists():
+        track_read(ABSORBER_CODEBASE_MD)
+        parts.append(f"=== absorber/codebase_map.md ===\n{ABSORBER_CODEBASE_MD.read_text(encoding='utf-8')}")
+
     if ABSORBER_CODEBASE_MAP.exists():
         track_read(ABSORBER_CODEBASE_MAP)
-        parts.append(f"=== absorber/codebase_map.md ===\n{ABSORBER_CODEBASE_MAP.read_text(encoding='utf-8')}")
+        parts.append(f"=== absorber/codebase_map.json ===\n{ABSORBER_CODEBASE_MAP.read_text(encoding='utf-8')}")
 
     entries = _load_decision_log()
     if entries:
-        # Render a summary of past decisions for LLM context
         log_lines: list[str] = []
         for entry in entries:
             log_lines.append(f"Session: {entry.get('session_id', '?')}")
