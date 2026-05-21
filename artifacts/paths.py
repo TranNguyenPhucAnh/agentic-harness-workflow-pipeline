@@ -331,9 +331,16 @@ ABSORBER_CODEBASE_SNAPSHOT = _LazyPath("absorber/cache/codebase_snapshot.json")
 # consumers: enricher, planner, specwright, debugger, patcher
 # lifecycle: short-term — overwrite per clarification run
 # purpose:   structured run output: decisions[], conflicts[], unresolved[],
-#            tier_counts, input_sources, req_hash, requirement_synthesis (text field).
-#            Consumers extract field requirement_synthesis for prompts.
+#            tier_counts, input_sources, req_hash, requirement_text.
+#            requirement_synthesis lives in CLARIFICATOR_REQUIREMENT_SYNTHESIS.
 CLARIFICATOR_SESSION = _LazyPath("clarificator/session.json")
+
+# owner:     clarificator (02_clarificator.py)
+# consumers: enricher, specwriter, planner — inject directly into LLM prompts
+# lifecycle: short-term — overwrite per clarification run
+# purpose:   LLM-generated clarified requirement document (markdown).
+#            Tách khỏi session.json vì đây là document, không phải structured data.
+CLARIFICATOR_REQUIREMENT_SYNTHESIS = _LazyPath("clarificator/requirement_synthesis.md")
 
 # owner:     clarificator (02_clarificator.py)
 # consumers: clarificator (next run — semantic dedup of already-answered Qs)
@@ -578,7 +585,7 @@ BLAME_MAP       = ABSORBER_CODEBASE_MAP   # merged into codebase_map.json
 ABSORBER_CACHE  = ABSORBER_CODEBASE_SNAPSHOT
 
 # clarificator
-CLARIFIED_REQ        = CLARIFICATOR_SESSION   # synthesis is now a field on session
+CLARIFIED_REQ        = CLARIFICATOR_REQUIREMENT_SYNTHESIS   # LLM-synthesized requirement doc
 CLARIFIED_REQUEST    = CLARIFICATOR_SESSION
 CLARIFICATION_REPORT = CLARIFICATOR_SESSION
 CLARIFICATION_LOG    = CLARIFICATOR_DECISION_LOG
