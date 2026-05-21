@@ -346,8 +346,14 @@ def _call_llm(
             ct        = getattr(usage, "completion_tokens", 0) or 0
             call_cost = record_usage(usage, model=get_model(ROLE), provider=get_provider(ROLE))
             print_call(__file__, pt, ct, call_cost)
-        content = resp.choices[0].message.content
-        if not content or not content.strip():
+        content = getattr(resp.choices[0].message, "content", None)
+        if isinstance(content, list):
+            content = "".join(
+                part.get("text", "") if isinstance(part, dict) else getattr(part, "text", "")
+                for part in content
+            )
+        content = (content or "").strip()
+        if not content:
             raise RuntimeError("Model returned empty content.")
         return content
     except RuntimeError as exc:
