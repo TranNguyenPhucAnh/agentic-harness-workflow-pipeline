@@ -1131,7 +1131,7 @@ def _write_session(
     print(f"\n[clarificator] ✓ Session → {CLARIFICATOR_SESSION}")
 
 
-_IMPACT_TRIM_THRESHOLD = 20  # decisions per entry trước khi trim impacts
+_IMPACT_TRIM_THRESHOLD = 50  # decisions per entry trước khi trim impacts
 
 
 def _trim_decision_impacts(decisions: list[dict[str, Any]]) -> list[dict[str, Any]]:
