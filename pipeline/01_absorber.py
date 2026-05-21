@@ -9,8 +9,8 @@ changes significantly enough to warrant a refresh.
 Phases:
   1. File tree scan        — apply absorber.ignored rules, build file inventory
   2. Content extraction    — full / key-only / signature-only per file
-  3. Semantic compression  — single LLM call → codebase_map.md (includes Config + Git/Blame)
-  4. Git crawl             — git log → merged into codebase_map.md ## Git/Blame section
+  3. Semantic compression  — single LLM call → codebase_map.json field "map"
+  4. Git crawl             — git log → structured into codebase_map.json field "git"
   5. Append codebase_log   — long-term audit trail
 
 External integrations optional, graceful fallback:
@@ -35,7 +35,7 @@ Usage:
   python 01_absorber.py --target /path/to/repo
 
 Writes, owner: absorber (01_absorber.py):
-  artifacts_<slug>/absorber/codebase_map.md          (short-term, overwrite)
+  artifacts_<slug>/absorber/codebase_map.json        (short-term, overwrite)
   artifacts_<slug>/absorber/codebase_log.json        (long-term, append)
   artifacts_<slug>/absorber/cache/codebase_snapshot.json  (internal cache)
 
@@ -68,7 +68,7 @@ from pathlib import Path
 from typing import Any
 
 # === WRITE AUTHORITY: absorber ===
-# OWNS  : artifacts_<slug>/absorber/codebase_map.md (short-term, overwrite)
+# OWNS  : artifacts_<slug>/absorber/codebase_map.json (short-term, overwrite)
 #         artifacts_<slug>/absorber/codebase_log.json (long-term, append)
 #         artifacts_<slug>/absorber/cache/codebase_snapshot.json (cache - internal, overwrite)
 
@@ -86,7 +86,6 @@ from artifacts.paths import (  # noqa: E402
 from artifacts.models import call_model, get_model, get_provider  # noqa: E402
 from modules.artifact_tracking import track_read, track_write, print_summary as print_artifact_summary  # noqa: E402
 from modules.cost import print_call, print_summary, record_usage  # noqa: E402
-from modules.md_header import apply_header as apply_md_header  # noqa: E402
 from modules.post_interactive import prompt_next_step  # noqa: E402
 
 # Local aliases
@@ -822,14 +821,238 @@ def _extract_ts_signatures(path: Path) -> str:
     return "\n".join(lines) if lines else source[:500]
 
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Phase 3 — Semantic compression → codebase_map.md
+# Config inventory helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SERVICE_PATTERNS: dict[str, re.Pattern] = {
+    "database":   re.compile(r"(?i)(mysql|postgres|mongodb|redis|sqlite|sqlserver|mssql|mariadb|aurora|dynamodb|rds)"),
+    "auth":       re.compile(r"(?i)(oauth|openid|jwt|keycloak|auth0|okta|cognito|openiddict|identity)"),
+    "cloud":      re.compile(r"(?i)(aws|azure|gcp|s3|lambda|ecs|eks|cloudformation|cloudfront|route53|ecr|iam)"),
+    "email":      re.compile(r"(?i)(smtp|sendgrid|mailgun|ses|email|mailchimp)"),
+    "storage":    re.compile(r"(?i)(s3|blob|minio|gcs|cloudinary|uploadcare)"),
+    "monitoring": re.compile(r"(?i)(datadog|newrelic|prometheus|grafana|sentry|cloudwatch|loki|opentelemetry)"),
+    "messaging":  re.compile(r"(?i)(kafka|rabbitmq|sqs|sns|pubsub|nats|eventbridge)"),
+}
+
+
+def _parse_env_vars_from_text(raw: str) -> set[str]:
+    """Extract likely env var names from config file text."""
+    env_vars: set[str] = set()
+    env_vars.update(re.findall(r"process\.env\.([A-Z_][A-Z0-9_]+)", raw))
+    env_vars.update(re.findall(r"\$\{([A-Z_][A-Z0-9_]+)\}", raw))
+    env_vars.update(re.findall(r"^([A-Z_][A-Z0-9_]{2,})\s*=", raw, re.MULTILINE))
+    for key in re.findall(r'"([A-Za-z][A-Za-z0-9]{2,})"\s*:', raw):
+        screaming = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", key).upper()
+        if re.match(r"^[A-Z][A-Z0-9_]{2,}$", screaming):
+            env_vars.add(screaming)
+    return env_vars
+
+def _build_config_structured(inventory: list[dict[str, Any]], cache: dict[str, Any]) -> dict[str, Any]:
+    """
+    Build structured config inventory from key-only files.
+    Returns dict matching codebase_map.json "config" field schema.
+    """
+    config_files_data: list[dict[str, Any]] = []
+    all_env_vars: set[str] = set()
+    all_services: set[str] = set()
+
+    eligible = [
+        f for f in inventory
+        if f["mode"] == "key-only" and _should_include_in_config_inventory(f["rel_path"])
+    ]
+
+    for cf in eligible[:30]:
+        rel         = cf["rel_path"]
+        cached_entry = cache.get(rel, {})
+        redacted    = cached_entry.get("content", "")
+
+        abs_path = Path(cf.get("abs_path", ""))
+        raw = ""
+        if abs_path.exists():
+            try:
+                track_read(abs_path)
+                raw = abs_path.read_text(errors="replace")
+            except Exception:
+                pass
+        raw = raw or redacted
+
+        file_env_vars = _parse_env_vars_from_text(raw)
+        all_env_vars.update(file_env_vars)
+
+        file_services: list[str] = []
+        scan_text = raw or redacted
+        for svc_name, pattern in _SERVICE_PATTERNS.items():
+            if pattern.search(scan_text):
+                file_services.append(svc_name)
+                all_services.add(svc_name)
+
+        config_files_data.append({
+            "path":     rel,
+            "env_vars": sorted(file_env_vars),
+            "services": sorted(file_services),
+        })
+
+    return {
+        "total_configs":     len(config_files_data),
+        "services_detected": sorted(all_services),
+        "env_vars_detected": sorted(all_env_vars),
+        "files":             config_files_data,
+    }
+
+
+def _config_structured_to_prompt(config: dict[str, Any]) -> str:
+    """Serialize structured config dict to compact string for the LLM prompt."""
+    if not config or not config.get("files"):
+        return ""
+    lines = [
+        f"Config files: {config['total_configs']}",
+        f"Services detected: {', '.join(config['services_detected'])}",
+        f"Env vars ({len(config['env_vars_detected'])}): {', '.join(config['env_vars_detected'][:60])}",
+        "",
+    ]
+    for f in config["files"]:
+        parts = []
+        if f["env_vars"]:
+            parts.append(f"env={','.join(f['env_vars'][:10])}")
+        if f["services"]:
+            parts.append(f"svc={','.join(f['services'])}")
+        if parts:
+            lines.append(f"  {f['path']}: {' | '.join(parts)}")
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Git crawl helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _git_log_stats(target: Path, scope: str) -> dict[str, Any]:
+    """
+    Run git log and return structured git data for codebase_map.json "git" field.
+
+    Returns {} if not a git repo or git command fails.
+    """
+    if not (target / ".git").exists():
+        return {}
+
+    scope_args = _resolve_git_scope(scope)
+
+    # File churn with per-file author tracking
+    file_counts: dict[str, int] = {}
+    file_authors: dict[str, set[str]] = {}
+    try:
+        result = subprocess.run(
+            ["git", "log", "--format=%ae", "--name-only", *scope_args],
+            capture_output=True, text=True, cwd=target, timeout=60,
+        )
+        if result.returncode != 0:
+            return {}
+        current_author = ""
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if "@" in line or line.startswith("github-"):
+                current_author = line
+            else:
+                file_counts[line] = file_counts.get(line, 0) + 1
+                file_authors.setdefault(line, set()).add(current_author)
+    except Exception:
+        return {}
+
+    # Total commit count
+    try:
+        r = subprocess.run(
+            ["git", "rev-list", "--count", "HEAD", *scope_args],
+            capture_output=True, text=True, cwd=target, timeout=10,
+        )
+        total_commits = int(r.stdout.strip()) if r.returncode == 0 else 0
+    except Exception:
+        total_commits = 0
+
+    # Contributors
+    try:
+        r = subprocess.run(
+            ["git", "shortlog", "-sn", "--no-merges", *scope_args],
+            capture_output=True, text=True, cwd=target, timeout=30,
+        )
+        authors: list[str] = []
+        if r.returncode == 0:
+            for line in r.stdout.strip().splitlines()[:15]:
+                parts = line.strip().split("\t", 1)
+                if len(parts) == 2:
+                    authors.append(f"{parts[1]} ({parts[0].strip()} commits)")
+    except Exception:
+        authors = []
+
+    # Hotspots tiered
+    all_sorted = sorted(file_counts.items(), key=lambda x: -x[1])
+    high   = [
+        {"file": f, "changes": c, "authors": sorted(file_authors.get(f, set()))}
+        for f, c in all_sorted if c >= 10
+    ][:20]
+    medium = [
+        {"file": f, "changes": c}
+        for f, c in all_sorted if 5 <= c < 10
+    ][:20]
+
+    # Module activity
+    module_counts: dict[str, int] = {}
+    total_changes = sum(file_counts.values())
+    for fname, count in file_counts.items():
+        parts = fname.split("/")
+        module = parts[0] if len(parts) > 1 else "(root)"
+        module_counts[module] = module_counts.get(module, 0) + count
+
+    module_activity = [
+        {"module": mod, "changes": cnt, "pct": round(cnt / total_changes * 100, 1) if total_changes else 0}
+        for mod, cnt in sorted(module_counts.items(), key=lambda x: -x[1])[:10]
+    ]
+
+    return {
+        "scope":           scope,
+        "total_commits":   total_commits,
+        "authors":         authors,
+        "hotspots":        {"high": high, "medium": medium},
+        "module_activity": module_activity,
+    }
+
+
+def _git_structured_to_prompt(git: dict[str, Any]) -> str:
+    """Serialize structured git dict to compact string for the LLM prompt."""
+    if not git:
+        return ""
+    lines = [
+        f"Total commits (scope: {git.get('scope','?')}): {git.get('total_commits', '?')}",
+        "",
+    ]
+    high   = git.get("hotspots", {}).get("high", [])
+    medium = git.get("hotspots", {}).get("medium", [])
+    if high:
+        lines += ["High-churn files (>=10 changes):", "| File | Changes | Authors |", "|------|---------|---------|"]
+        for h in high:
+            lines.append(f"| {h['file']} | {h['changes']} | {', '.join(h.get('authors', []))} |")
+        lines.append("")
+    if medium:
+        lines += ["Medium-churn files (5-9 changes):", "| File | Changes |", "|------|---------|"]
+        for m in medium:
+            lines.append(f"| {m['file']} | {m['changes']} |")
+        lines.append("")
+    for m in git.get("module_activity", []):
+        lines.append(f"  {m['module']}: {m['pct']}% ({m['changes']} changes)")
+    if git.get("authors"):
+        lines += ["", "Contributors:"] + [f"  {a}" for a in git["authors"]]
+    return "\n".join(lines)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 3 — Semantic compression → codebase_map.json["map"]
 # ─────────────────────────────────────────────────────────────────────────────
 
 _MAP_SYSTEM = textwrap.dedent("""
     You are a senior software architect performing a codebase intake.
     You will receive extracted signatures and structure of a codebase.
-    Your job is to produce a structured codebase_map.md document.
+    Your job is to produce a structured codebase map document (the "map" field).
 
     Output a SINGLE markdown document with these sections, no extra commentary:
 
@@ -874,11 +1097,11 @@ _MAP_SYSTEM = textwrap.dedent("""
 def call_llm_for_map(
     context: str,
     target_name: str,
-    config_section: str = "",
-    git_section: str = "",
+    config: dict[str, Any] | None = None,
+    git: dict[str, Any] | None = None,
 ) -> tuple[str, float]:
     """
-    Call LLM to produce codebase_map.md with merged Config and Git/Blame sections.
+    Call LLM to produce the "map" field for codebase_map.json.
 
     Returns:
       (content, call_cost)  — call_cost is 0.0 if usage unavailable or call failed.
@@ -888,11 +1111,13 @@ def call_llm_for_map(
 
     user_parts = [f"Codebase: {target_name}\n\nExtracted content:\n\n{context}"]
 
-    if config_section:
-        user_parts.append(f"\n\n--- CONFIG INVENTORY DATA ---\n{config_section}")
+    config_prompt = _config_structured_to_prompt(config or {})
+    if config_prompt:
+        user_parts.append(f"\n\n--- CONFIG INVENTORY DATA ---\n{config_prompt}")
 
-    if git_section:
-        user_parts.append(f"\n\n--- GIT/BLAME DATA ---\n{git_section}")
+    git_prompt = _git_structured_to_prompt(git or {})
+    if git_prompt:
+        user_parts.append(f"\n\n--- GIT/BLAME DATA ---\n{git_prompt}")
 
     user = "".join(user_parts)
 
@@ -933,21 +1158,19 @@ def call_llm_for_map(
 
     except Exception as e:
         print(f"[absorber][error] LLM call failed: {e}", file=sys.stderr)
-        return _fallback_map(context, target_name, config_section, git_section), 0.0
+        return _fallback_map(context, target_name, config, git), 0.0
 
 
 def _fallback_map(
     context: str,
     target_name: str,
-    config_section: str = "",
-    git_section: str = "",
+    config: dict[str, Any] | None = None,
+    git: dict[str, Any] | None = None,
 ) -> str:
-    """
-    Produce a minimal codebase_map.md without LLM when the call fails.
-    """
+    """Produce minimal map markdown without LLM when the call fails."""
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     parts = [
-        f"# Codebase Map",
+        "# Codebase Map",
         f"_Generated: {date_str} | Absorber v2 (fallback — LLM unavailable)_\n",
         "## Project Overview",
         f"Target: {target_name}\n",
@@ -955,18 +1178,16 @@ def _fallback_map(
         "## Raw Extraction\n",
         context[:8000],
     ]
-
-    if config_section:
+    config_prompt = _config_structured_to_prompt(config or {})
+    if config_prompt:
         parts.append("\n## Config\n")
-        parts.append(config_section[:4000])
-
-    if git_section:
+        parts.append(config_prompt[:4000])
+    git_prompt = _git_structured_to_prompt(git or {})
+    if git_prompt:
         parts.append("\n## Git/Blame\n")
-        parts.append(git_section[:4000])
-
+        parts.append(git_prompt[:4000])
     parts.append("\n## Absorber Notes\n")
     parts.append("- This map was generated in fallback mode (no LLM). Re-run when model is available.")
-
     return "\n".join(parts)
 
 
@@ -1000,103 +1221,6 @@ def _resolve_git_scope(scope: str) -> list[str]:
     return ["--since=6.months.ago"]
 
 
-def _git_log_stats(target: Path, scope: str) -> tuple[str, list[tuple[str, int]]]:
-    """
-    Run git log --stat and produce a summary for the Git/Blame section.
-
-    Returns:
-      (section_str, hotspots) — hotspots is [(file, change_count), ...] top-20,
-      or ("", []) if not a git repo or git command fails.
-    """
-    if not (target / ".git").exists():
-        return "", []
-
-    scope_args = _resolve_git_scope(scope)
-
-    # Get file churn (hotspots)
-    try:
-        result = subprocess.run(
-            ["git", "log", "--format=", "--name-only", *scope_args],
-            capture_output=True,
-            text=True,
-            cwd=target,
-            timeout=30,
-        )
-        if result.returncode != 0:
-            return "", []
-
-        file_counts: dict[str, int] = {}
-        for line in result.stdout.splitlines():
-            line = line.strip()
-            if line:
-                file_counts[line] = file_counts.get(line, 0) + 1
-
-        # Top 20 hotspots
-        hotspots = sorted(file_counts.items(), key=lambda x: -x[1])[:20]
-    except Exception:
-        return "", []
-
-    # Get contributor stats
-    try:
-        result = subprocess.run(
-            ["git", "shortlog", "-sn", "--no-merges", *scope_args],
-            capture_output=True,
-            text=True,
-            cwd=target,
-            timeout=30,
-        )
-        contributors = result.stdout.strip().splitlines()[:15] if result.returncode == 0 else []
-    except Exception:
-        contributors = []
-
-    # Get total commit count
-    try:
-        result = subprocess.run(
-            ["git", "rev-list", "--count", "HEAD", *scope_args],
-            capture_output=True,
-            text=True,
-            cwd=target,
-            timeout=10,
-        )
-        total_commits = result.stdout.strip() if result.returncode == 0 else "?"
-    except Exception:
-        total_commits = "?"
-
-    # Build section
-    lines: list[str] = []
-    lines.append(f"Total commits (scope: {scope}): {total_commits}")
-    lines.append("")
-
-    if hotspots:
-        lines.append("### Hotspot Files (most changed)")
-        lines.append("| File | Changes |")
-        lines.append("|------|---------|")
-        for fname, count in hotspots:
-            lines.append(f"| {fname} | {count} |")
-        lines.append("")
-
-    if contributors:
-        lines.append("### Contributors")
-        for c in contributors:
-            lines.append(f"  {c.strip()}")
-        lines.append("")
-
-    # Module activity distribution
-    if hotspots:
-        module_counts: dict[str, int] = {}
-        for fname, count in file_counts.items():
-            parts = fname.split("/")
-            module = parts[0] if len(parts) > 1 else "(root)"
-            module_counts[module] = module_counts.get(module, 0) + count
-
-        top_modules = sorted(module_counts.items(), key=lambda x: -x[1])[:10]
-        lines.append("### Module Activity")
-        lines.append("| Module | Total file changes |")
-        lines.append("|--------|-------------------|")
-        for mod, count in top_modules:
-            lines.append(f"| {mod} | {count} |")
-
-    return "\n".join(lines), hotspots
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1176,44 +1300,16 @@ def _count_languages(inventory: list[dict[str, Any]]) -> dict[str, int]:
     return dict(sorted(counts.items(), key=lambda x: -x[1]))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Config inventory builder (merged into codebase_map.md ## Config)
-# ─────────────────────────────────────────────────────────────────────────────
 
-def _build_config_section(inventory: list[dict[str, Any]], cache: dict[str, Any]) -> str:
-    """
-    Build config inventory data from key-only files for the LLM prompt.
-    """
-    config_files = [
-        f for f in inventory
-        if f["mode"] == "key-only" and _should_include_in_config_inventory(f["rel_path"])
-    ]
-
-    if not config_files:
-        return ""
-
-    lines: list[str] = []
-    lines.append(f"Config files detected: {len(config_files)}")
-    lines.append("")
-
-    for cf in config_files[:30]:  # Cap at 30 to avoid token explosion
-        rel = cf["rel_path"]
-        cached_entry = cache.get(rel, {})
-        content = cached_entry.get("content", "")
-
-        lines.append(f"### {rel}")
-        # Truncate individual config content
-        if len(content) > 2000:
-            content = content[:2000] + "\n... (truncated)"
-        lines.append(content)
-        lines.append("")
-
-    return "\n".join(lines)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Context builder — assemble extraction results for LLM
 # ─────────────────────────────────────────────────────────────────────────────
+
+_MAX_PER_FILE      = 2_000    # chars per file — every file present, just capped
+_MAX_CONTEXT_CHARS = 800_000  # ~200k tokens total budget
+
 
 def _build_context(
     inventory: list[dict[str, Any]],
@@ -1223,40 +1319,68 @@ def _build_context(
     """
     Extract content from all files and build the context string for LLM.
 
+    Strategy (ported from v1):
+    - Per-file cap _MAX_PER_FILE: every file is present, content truncated not dropped
+    - Group by top-level directory for structured context
+    - Total budget _MAX_CONTEXT_CHARS: drop whole groups only when exhausted
+
     Returns:
       (context_str, cached_count, extracted_count)
     """
-    sections: list[str] = []
     cached_count = 0
     extracted_count = 0
 
-    # Budget: ~100k chars for context to stay within token limits
-    _MAX_CONTEXT_CHARS = 500_000
-    total_chars = 0
-
+    # Group by top-level directory
+    groups: dict[str, list[dict[str, Any]]] = {}
     for entry in inventory:
-        content, from_cache = extract_content(entry, cache, force)
+        rel   = entry["rel_path"]
+        parts = rel.split("/")
+        group = parts[0] if len(parts) > 1 else "(root)"
+        groups.setdefault(group, []).append(entry)
 
-        if from_cache:
-            cached_count += 1
-        else:
-            extracted_count += 1
+    sections: list[str] = []
+    total_chars = 0
+    omitted_groups: list[str] = []
 
-        rel = entry["rel_path"]
-        mode = entry["mode"]
-        lang = entry["lang"] or "text"
+    for group, entries in groups.items():
+        group_lines: list[str] = [f"\n## {group}/"]
+        group_chars = len(group_lines[0])
 
-        section = f"--- {rel} [{mode}] ({lang}) ---\n{content}\n"
+        for entry in entries:
+            raw_content, from_cache = extract_content(entry, cache, force)
+            if from_cache:
+                cached_count += 1
+            else:
+                extracted_count += 1
 
-        if total_chars + len(section) > _MAX_CONTEXT_CHARS:
-            sections.append(f"\n... (context budget reached, {len(inventory) - len(sections)} files omitted)")
-            break
+            rel  = entry["rel_path"]
+            mode = entry["mode"]
+            lang = entry["lang"] or "text"
 
-        sections.append(section)
-        total_chars += len(section)
+            if len(raw_content) > _MAX_PER_FILE:
+                display = raw_content[:_MAX_PER_FILE] + f"\n... ({len(raw_content) - _MAX_PER_FILE} chars truncated)"
+            else:
+                display = raw_content
 
-    context = "\n".join(sections)
-    return context, cached_count, extracted_count
+            block = f"--- {rel} [{mode}] ({lang}) ---\n{display}\n"
+            group_lines.append(block)
+            group_chars += len(block)
+
+        if total_chars + group_chars > _MAX_CONTEXT_CHARS:
+            omitted_groups.append(group)
+            continue
+
+        sections.extend(group_lines)
+        total_chars += group_chars
+
+    if omitted_groups:
+        omitted_files = sum(len(groups[g]) for g in omitted_groups)
+        sections.append(
+            f"\n... (context budget reached — {len(omitted_groups)} groups / "
+            f"{omitted_files} files omitted: {', '.join(omitted_groups[:5])})"
+        )
+
+    return "\n".join(sections), cached_count, extracted_count
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1329,43 +1453,73 @@ def run_absorber(args: argparse.Namespace) -> None:
         return
 
     # --- Phase 4: Git crawl (before LLM so we can include in prompt) ---
-    git_section = ""
-    hotspots: list[tuple[str, int]] = []
+    git_data: dict[str, Any] = {}
     print(f"[absorber] Phase 4 — Git crawl (scope: {args.git_scope})")
-    git_section, hotspots = _git_log_stats(target, args.git_scope)
-    if git_section:
-        print(f"  Git data: {len(git_section):,} chars")
+    git_data = _git_log_stats(target, args.git_scope)
+    if git_data:
+        total_c = git_data.get("total_commits", 0)
+        high_n  = len(git_data.get("hotspots", {}).get("high", []))
+        med_n   = len(git_data.get("hotspots", {}).get("medium", []))
+        print(f"  Commits: {total_c} | High-churn: {high_n} | Medium-churn: {med_n}")
     else:
         print("  No git data (not a git repo or no history in scope)")
     print()
 
-    # --- Build config section ---
-    config_section = _build_config_section(inventory, cache)
+    # --- Build structured config ---
+    config_data = _build_config_structured(inventory, cache)
 
-    # --- Phase 3: Semantic compression → codebase_map.md ---
+    # --- Phase 3: Semantic compression → codebase_map.json["map"] ---
     print("[absorber] Phase 3 — LLM semantic compression")
-    map_content, call_cost = call_llm_for_map(context, target_name, config_section, git_section)
+    map_text, call_cost = call_llm_for_map(context, target_name, config_data, git_data)
 
-    # Apply markdown header
-    map_content = apply_md_header(map_content, CODEBASE_MAP, owner="absorber")
+    # --- Assemble codebase_map.json ---
+    codebase_map = {
+        "meta": {
+            "generated_at":     datetime.now(timezone.utc).isoformat(),
+            "target":           str(target),
+            "git_scope":        args.git_scope,
+            "absorber_version": 2,
+            "total_files":      len(inventory),
+            "cached_files":     cached_count,
+            "extracted_files":  extracted_count,
+            "map_size_bytes":   len(map_text.encode()),
+            "cost":             round(call_cost, 6),
+            "modes": {
+                "full":           sum(1 for f in inventory if f["mode"] == "full"),
+                "key_only":       sum(1 for f in inventory if f["mode"] == "key-only"),
+                "signature_only": sum(1 for f in inventory if f["mode"] == "signature-only"),
+            },
+            "languages": _count_languages(inventory),
+        },
+        "map":    map_text,
+        "config": config_data,
+        "git":    git_data,
+    }
 
-    # Write codebase_map.md
+    # Write codebase_map.json
     map_path = Path(str(CODEBASE_MAP))
     map_path.parent.mkdir(parents=True, exist_ok=True)
-    map_path.write_text(map_content)
+    map_path.write_text(json.dumps(codebase_map, indent=2, ensure_ascii=False))
     track_write(map_path)
-    print(f"[absorber] Wrote: {map_path} ({len(map_content):,} bytes)")
+    print(f"[absorber] Wrote: {map_path} ({map_path.stat().st_size:,} bytes)")
 
-    # --- Phase 5: Append codebase_log ---
+    # --- Phase 5: Append codebase_log (terse audit trail) ---
+    hotspot_pairs = [
+        (h["file"], h["changes"])
+        for h in (
+            git_data.get("hotspots", {}).get("high", []) +
+            git_data.get("hotspots", {}).get("medium", [])
+        )
+    ] if git_data else None
     _append_codebase_log(
         target,
         inventory,
         cached_count,
         extracted_count,
-        len(map_content),
+        len(map_text.encode()),
         call_cost=call_cost,
         git_scope=args.git_scope,
-        hotspot_summary=hotspots if hotspots else None,
+        hotspot_summary=hotspot_pairs,
     )
 
     # --- Summary ---
