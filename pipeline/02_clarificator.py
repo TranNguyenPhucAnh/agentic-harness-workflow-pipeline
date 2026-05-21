@@ -944,12 +944,22 @@ Rules:
 """
 
 
+_MAX_SYNTH_RETRIES = 3
+
+
 def _synthesize_requirement(
     original: str,
     decisions: list[dict[str, Any]],
     conflicts: list[dict[str, Any]],
     summary: str,
-) -> str:
+) -> tuple[str, bool]:
+    """
+    Synthesize the clarified requirement document.
+
+    Returns:
+      (synthesis_text, is_fallback)
+      is_fallback=True means all LLM retries failed; fallback text was built locally.
+    """
     decisions_text = "\n".join(
         f"- {d['id']} [{d.get('priority', '').upper()}]: {d['question']} → {d['answer']}"
         for d in decisions
@@ -973,7 +983,46 @@ CONFLICTS DETECTED:
 
 Produce the clarified requirement document now."""
 
-    return _call_llm(_SYNTHESIS_SYSTEM, user_msg, max_tokens=_MAX_TOKENS_SYNTHESIS)
+    last_exc: Exception | None = None
+    for attempt in range(1, _MAX_SYNTH_RETRIES + 1):
+        try:
+            result = _call_llm(_SYNTHESIS_SYSTEM, user_msg, max_tokens=_MAX_TOKENS_SYNTHESIS)
+            return result, False
+        except RuntimeError as exc:
+            last_exc = exc
+            print(
+                f"[clarificator][warn] Synthesis attempt {attempt}/{_MAX_SYNTH_RETRIES} failed: {exc}"
+                + (" — retrying..." if attempt < _MAX_SYNTH_RETRIES else " — using fallback.")
+            )
+        except Exception as exc:
+            last_exc = exc
+            print(f"[clarificator][error] Synthesis attempt {attempt} unexpected error: {exc}")
+            break  # non-retryable
+
+    # Fallback: assemble from decisions so work is not lost
+    fallback_lines = [
+        "# Clarified Requirement (Synthesis Fallback)",
+        "",
+        "> ⚠️ LLM synthesis failed after retries — this document was assembled locally from decisions.",
+        "> Re-run with --synth-only to retry LLM synthesis.",
+        "",
+        "## Original Requirement",
+        "",
+        original.strip(),
+        "",
+        "## Decisions Log",
+        "",
+    ]
+    for d in decisions:
+        fallback_lines.append(
+            f"- **{d['id']}** [{d.get('priority', '').upper()}]: {d['question']} → {d['answer']}"
+        )
+    if conflicts:
+        fallback_lines += ["", "## Conflicts", ""]
+        for c in conflicts:
+            fallback_lines.append(f"- **{c['id']}**: {c['description']}")
+
+    return "\n".join(fallback_lines), True
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1094,6 +1143,7 @@ def _write_session(
     input_sources: list[dict[str, Any]] | None = None,
     attachment_only: bool = False,
     requirement_synthesis: str = "",
+    requirement_text: str = "",
 ) -> None:
     """Write clarificator/session.json (short-term, overwrite each run)."""
     tier_counts = {1: 0, 2: 0, 3: 0}
@@ -1112,6 +1162,7 @@ def _write_session(
         "requirement_hash": req_hash,
         "session_id": session_id,
         "project_name": project_name,
+        "requirement_text": requirement_text,
         "input_sources": input_sources or [],
         "attachment_only_input": attachment_only,
         "initial_findings": len(findings),
@@ -1285,6 +1336,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Skip synthesis step; do not generate requirement_synthesis field.",
     )
     parser.add_argument(
+        "--synth-only",
+        action="store_true",
+        help=(
+            "Re-run synthesis only. Reads decisions from existing session.json, "
+            "patches requirement_synthesis in-place. Use when synthesis failed "
+            "with 'Model returned empty content' on a previous run."
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Run analysis only, print findings, no Q&A and no file writes.",
@@ -1305,10 +1365,139 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+
+# ════════════════════════════════════════════════════════════════════════════
+# --synth-only: patch missing synthesis into existing session.json
+# ════════════════════════════════════════════════════════════════════════════
+
+def _needs_synthesis(session: dict[str, Any]) -> bool:
+    """Return True if session.json is missing a real synthesis."""
+    synth = session.get("requirement_synthesis", "")
+    if not synth or not str(synth).strip():
+        return True
+    # Fallback marker written by _synthesize_requirement on retry exhaustion
+    if str(synth).startswith("> ⚠️ LLM synthesis failed"):
+        return True
+    return False
+
+
+def _run_synth_only(args: argparse.Namespace) -> None:
+    """
+    --synth-only mode: read existing session.json, re-run synthesis, patch in-place.
+    Exits with code 1 if session.json is missing or synthesis not needed.
+    """
+    project_name = _resolve_project(args.project)
+    os.environ["PIPELINE_PROJECT"] = project_name
+    ensure_dirs()
+
+    print(f"[clarificator] --synth-only mode | project: {project_name!r}")
+
+    if not CLARIFICATOR_SESSION.exists():
+        print(
+            f"[clarificator][error] No session.json found at {CLARIFICATOR_SESSION}.\n"
+            "  Run clarificator normally first.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    try:
+        session = json.loads(CLARIFICATOR_SESSION.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"[clarificator][error] Could not read session.json: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if not _needs_synthesis(session):
+        existing = str(session.get("requirement_synthesis", ""))
+        print(
+            f"[clarificator] session.json already has synthesis "
+            f"({len(existing)} chars) — nothing to patch.\n"
+            "  Use --no-synth to skip, or delete requirement_synthesis field to force re-synthesis."
+        )
+        return
+
+    decisions  = session.get("decisions",  [])
+    conflicts  = session.get("conflicts",  [])
+    findings   = session.get("findings",   [])
+    unresolved = session.get("unresolved", [])
+    input_sources   = session.get("input_sources",   [])
+    attachment_only = session.get("attachment_only", False)
+    session_id      = session.get("session_id", _now_iso())
+    req_hash        = session.get("req_hash",   "")
+
+    # Reconstruct requirement text: prefer original field, fall back to synthesis stub
+    requirement_text = (
+        session.get("requirement_text")
+        or session.get("original_requirement")
+        or ""
+    )
+    if not requirement_text:
+        # Last resort: extract from fallback synthesis header
+        synth = session.get("requirement_synthesis", "")
+        marker = "## Original Requirement"
+        if marker in synth:
+            after = synth.split(marker, 1)[1].strip()
+            requirement_text = after.split("##")[0].strip()
+
+    if not requirement_text:
+        print(
+            "[clarificator][error] Could not recover requirement text from session.json.\n"
+            "  Add a 'requirement_text' field manually, or re-run clarificator normally.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    clarified_sum = session.get("clarified_summary", "")
+
+    print(
+        f"[clarificator] Found session with {len(decisions)} decisions, "
+        f"{len(conflicts)} conflicts — re-running synthesis ..."
+    )
+
+    requirement_synthesis, synthesis_fallback = _synthesize_requirement(
+        requirement_text,
+        decisions,
+        conflicts,
+        clarified_sum,
+    )
+
+    if synthesis_fallback:
+        print(
+            "[clarificator][warn] Synthesis still returned fallback after retries.\n"
+            "  Patching session.json with fallback text. Re-run --synth-only later to retry."
+        )
+    else:
+        print("[clarificator] ✓ Synthesis succeeded.")
+
+    # Patch session.json in-place
+    _write_session(
+        session_id=session_id,
+        req_hash=req_hash,
+        project_name=project_name,
+        decisions=decisions,
+        unresolved=unresolved,
+        conflicts=conflicts,
+        findings=findings,
+        input_sources=input_sources,
+        attachment_only=attachment_only,
+        requirement_synthesis=requirement_synthesis,
+    )
+
+    _print_banner(
+        "Synthesis patched"
+        if not synthesis_fallback
+        else "Synthesis patched (fallback)"
+    )
+    print(f"  Session → {CLARIFICATOR_SESSION}")
+
 def main() -> None:
     try:
         parser = _build_parser()
         args = parser.parse_args()
+
+        # Fast-path: --synth-only bypasses the full Q&A flow
+        if getattr(args, "synth_only", False):
+            _run_synth_only(args)
+            return
 
         if args.list_projects and not args.project and not os.environ.get("PIPELINE_PROJECT"):
             _list_projects()
@@ -1440,18 +1629,49 @@ def main() -> None:
 
         _batch_derive_impacts(decisions)
 
+        # ── Checkpoint: write decisions BEFORE synthesis ─────────────────────
+        # Protects all Q&A work even if synthesis LLM call fails.
+        # If --synth-only is re-run later, it reads from this checkpoint.
+        _write_session(
+            session_id=session_id,
+            req_hash=req_hash,
+            project_name=project_name,
+            decisions=decisions,
+            unresolved=unresolved,
+            conflicts=conflicts,
+            findings=findings,
+            input_sources=input_sources,
+            attachment_only=attachment_only,
+            requirement_synthesis="",   # patched below after synthesis
+            requirement_text=requirement_text,
+        )
+        _append_decision_log(
+            session_id=session_id,
+            project_name=project_name,
+            req_hash=req_hash,
+            decisions=decisions,
+            conflicts=conflicts,
+        )
+        print("[clarificator] Checkpoint — decisions written to session.json + decision_log.json.")
+
         # ── Synthesis ────────────────────────────────────────────────────────
         requirement_synthesis = ""
+        synthesis_fallback    = False
         if not args.no_synth:
             print("\n[clarificator] Synthesizing clarified requirement ...")
-            requirement_synthesis = _synthesize_requirement(
+            requirement_synthesis, synthesis_fallback = _synthesize_requirement(
                 requirement_text,
                 decisions,
                 conflicts,
                 clarified_sum,
             )
+            if synthesis_fallback:
+                print(
+                    "[clarificator][warn] Synthesis used fallback text.\n"
+                    "  Re-run with --synth-only to retry LLM synthesis."
+                )
 
-        # ── Write session.json (short-term, overwrite) ───────────────────────
+        # ── Patch session.json with synthesis result ──────────────────────────
         _write_session(
             session_id=session_id,
             req_hash=req_hash,
@@ -1463,15 +1683,7 @@ def main() -> None:
             input_sources=input_sources,
             attachment_only=attachment_only,
             requirement_synthesis=requirement_synthesis,
-        )
-
-        # ── Append decision_log.json (long-term, append) ─────────────────────
-        _append_decision_log(
-            session_id=session_id,
-            project_name=project_name,
-            req_hash=req_hash,
-            decisions=decisions,
-            conflicts=conflicts,
+            requirement_text=requirement_text,
         )
 
         _print_banner(f"Done — {len(decisions)} decisions recorded  [{project_name}]")
