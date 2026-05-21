@@ -1259,7 +1259,7 @@ def _append_codebase_log(
         },
         "languages": _count_languages(inventory),
         "map_size_bytes": map_size,
-        "cost": round(call_cost, 6),
+        "cost": round(call_cost or 0.0, 6),
         "git_scope": git_scope or None,
         "hotspot_summary": (
             [{"file": f, "changes": c} for f, c in hotspot_summary]
