@@ -98,9 +98,9 @@ ROLE = "clarificator"
 _TIER3_MIN_CONF = 0.75
 
 _MAX_TOKENS_ANALYZE = 8192
-_MAX_TOKENS_DELTA = 2048
-_MAX_TOKENS_SYNTHESIS = 4096
-_DELTA_REQ_CHARS = 4000
+_MAX_TOKENS_DELTA = 8192
+_MAX_TOKENS_SYNTHESIS = 12288
+_DELTA_REQ_CHARS = 8192
 
 
 # ════════════════════════════════════════════════════════════════════════════
