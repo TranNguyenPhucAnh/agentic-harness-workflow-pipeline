@@ -91,18 +91,18 @@ ROLES: dict[str, str] = {
     # Drop ~ để dùng load-balanced routing (resilient hơn, auto-failover).
     "absorber":           "gemini/gemini-3.5-flash",
     "clarificator":       "openrouter/z-ai/glm-5.1",
-    "enricher":           "openrouter/qwen/qwen3.6-plus",
+    "enricher":           "openrouter/minimax/minimax-m2.7",
     "specwright":         "openrouter/anthropic/claude-sonnet-4.6",
-    #"spectracker":        "gemini/gemini-2.5-flash",
+    #"spectracker":        "gemini/gemini-3.5-flash",
     "scaffolder":         "openrouter/z-ai/glm-5.1",
     "planner":            "openrouter/moonshotai/kimi-k2.6",
     "executor":           "openrouter/anthropic/claude-sonnet-4.6",
-    "debugger":           "openrouter/qwen/qwen3.6-plus",
-    "debugger_secondary": "openrouter/deepseek/deepseek-v4-pro",
+    "debugger":           "openrouter/deepseek/deepseek-v4-pro",
+    "debugger_secondary": "openrouter/xiaomi/mimo-v2.5-pro",
     "reporter":           "openrouter/minimax/minimax-m2.7",
     "judge":              "openrouter/moonshotai/kimi-k2.6",
     "patcher":            "openrouter/deepseek/deepseek-v4-pro",
-    "patcher_secondary":  "openrouter/minimax/minimax-m2.7",
+    "patcher_secondary":  "openrouter/xiaomi/mimo-v2.5-pro",
     #"archivist":         "openrouter/minimax/minimax-m2.7",
 
     # ── Aux / utility roles (thêm khi cần) ─────────────────────────────────
