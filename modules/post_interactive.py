@@ -63,6 +63,10 @@ class StepInfo:
     # Flag: this step requires explicit human confirmation before running.
     # prompt_next_step will show a notice instead of a run command.
     requires_manual_confirm: bool      = False
+    # Long-term artifact for this step — append-only log that survives runs.
+    # If set, post_interactive auto-appends a run entry then asks to keep/discard.
+    # None = no long-term artifact, skip the commit prompt entirely.
+    long_term_artifact:    Any | None  = None
 
 
 # ─── Pipeline chain ───────────────────────────────────────────────────────────
@@ -83,14 +87,21 @@ def _build_chain() -> dict[str, StepInfo]:
         CLARIFICATOR_SESSION,
         CLARIFICATOR_DECISION_LOG,
         ENRICHER_OVERWRITE_PROMPT,
+        ENRICHER_PROMPT_LOG,
         SCAFFOLD_JSON,
+        SCAFFOLDER_SKELETON_LOG,
         PLANNER_FULL_PLAN,
         PLANNER_MINI_PLAN,
+        PLANNER_PLAN_LOG,
         EXECUTOR_OVERWRITE_MANIFEST,
+        EXECUTOR_MANIFEST_LOG,
         DEBUGGER_OVERWRITE_TEST_SUMMARY,
+        DEBUGGER_TEST_LOG,
         REPORTER_EXECUTION_SUMMARY,
+        REPORTER_EXECUTION_LOG,
         JUDGE_OVERWRITE_VERDICT_RAW,
         JUDGE_VERDICT_SUMMARY,
+        JUDGE_VERDICT_LOG,
         PATCHER_OVERWRITE_FIX_SUMMARY,
         PATCHER_ATTEMPT_LOG,
         ARCHIVIST_KNOWLEDGE_LOG,
@@ -112,38 +123,41 @@ def _build_chain() -> dict[str, StepInfo]:
 
     return {
         "absorber": StepInfo(
-            script    = "01_absorber.py",
-            consumes  = [],
-            produces  = [
+            script               = "01_absorber.py",
+            consumes             = [],
+            produces             = [
                 ABSORBER_CODEBASE_MAP,
                 ABSORBER_CODEBASE_LOG,
                 ABSORBER_CODEBASE_SNAPSHOT,
             ],
-            next_step = "clarificator",
+            next_step            = "clarificator",
+            long_term_artifact   = ABSORBER_CODEBASE_LOG,
         ),
         "clarificator": StepInfo(
-            script    = "02_clarificator.py",
-            consumes  = [
+            script               = "02_clarificator.py",
+            consumes             = [
                 ABSORBER_CODEBASE_MAP,
                 ABSORBER_CODEBASE_SNAPSHOT,
                 CLARIFICATOR_DECISION_LOG,
             ],
-            produces  = [
+            produces             = [
                 CLARIFICATOR_SESSION,
                 CLARIFICATOR_DECISION_LOG,
             ],
-            next_step = "enricher",
+            next_step            = "enricher",
+            long_term_artifact   = CLARIFICATOR_DECISION_LOG,
         ),
         "enricher": StepInfo(
-            script    = "03_enricher.py",
-            consumes  = [
+            script             = "03_enricher.py",
+            consumes           = [
                 CLARIFICATOR_SESSION,
                 ABSORBER_CODEBASE_MAP,
                 CLARIFICATOR_DECISION_LOG,
                 ARCHIVIST_KNOWLEDGE_LOG,
             ],
-            produces  = [ENRICHER_OVERWRITE_PROMPT],
-            next_step = "specwright",
+            produces           = [ENRICHER_OVERWRITE_PROMPT, ENRICHER_PROMPT_LOG],
+            next_step          = "specwright",
+            long_term_artifact = ENRICHER_PROMPT_LOG,
         ),
         "specwright": StepInfo(
             script    = "04_specwright.py",
@@ -152,102 +166,111 @@ def _build_chain() -> dict[str, StepInfo]:
             next_step = "spectracker",
         ),
         "spectracker": StepInfo(
-            script             = "05_spectracker.py",
-            consumes           = [SPEC, SPECTRACKER_VERSION_LOG],
-            produces           = [
+            script                  = "05_spectracker.py",
+            consumes                = [SPEC, SPECTRACKER_VERSION_LOG],
+            produces                = [
                 SPECTRACKER_VERSION_DELTA,
                 SPECTRACKER_VERSION_LOG,
             ],
-            next_step              = "scaffolder",
+            next_step               = "scaffolder",
             requires_manual_confirm = True,
+            long_term_artifact      = SPECTRACKER_VERSION_LOG,
         ),
         "scaffolder": StepInfo(
-            script    = "06_scaffolder.py",
-            consumes  = [SPEC],
-            produces  = [SCAFFOLD_JSON],
-            next_step = "planner",
+            script             = "06_scaffolder.py",
+            consumes           = [SPEC],
+            produces           = [SCAFFOLD_JSON, SCAFFOLDER_SKELETON_LOG],
+            next_step          = "planner",
+            long_term_artifact = SCAFFOLDER_SKELETON_LOG,
         ),
         "planner": StepInfo(
-            script    = "07_planner.py",
-            consumes  = [
+            script             = "07_planner.py",
+            consumes           = [
                 SPEC,
                 SCAFFOLD_JSON,
                 ABSORBER_CODEBASE_MAP,
                 ARCHIVIST_KNOWLEDGE_LOG,
             ],
-            produces  = [PLANNER_FULL_PLAN, PLANNER_MINI_PLAN],
-            next_step = "executor",
+            produces           = [PLANNER_FULL_PLAN, PLANNER_MINI_PLAN, PLANNER_PLAN_LOG],
+            next_step          = "executor",
+            long_term_artifact = PLANNER_PLAN_LOG,
         ),
         "executor": StepInfo(
-            script    = "08_executor.py",
-            consumes  = [
+            script             = "08_executor.py",
+            consumes           = [
                 SPEC,
                 SCAFFOLD_JSON,
                 PLANNER_FULL_PLAN,
                 ABSORBER_CODEBASE_MAP,
                 ARCHIVIST_KNOWLEDGE_LOG,
             ],
-            produces  = [EXECUTOR_OVERWRITE_MANIFEST],
-            next_step = "debugger",
+            produces           = [EXECUTOR_OVERWRITE_MANIFEST, EXECUTOR_MANIFEST_LOG],
+            next_step          = "debugger",
+            long_term_artifact = EXECUTOR_MANIFEST_LOG,
         ),
         "debugger": StepInfo(
-            script    = "09_debugger.py",
-            consumes  = [
+            script             = "09_debugger.py",
+            consumes           = [
                 EXECUTOR_OVERWRITE_MANIFEST,
                 PLANNER_FULL_PLAN,
             ],
-            produces  = [DEBUGGER_OVERWRITE_TEST_SUMMARY],
-            next_step = "reporter",
+            produces           = [DEBUGGER_OVERWRITE_TEST_SUMMARY, DEBUGGER_TEST_LOG],
+            next_step          = "reporter",
+            long_term_artifact = DEBUGGER_TEST_LOG,
         ),
         "reporter": StepInfo(
-            script    = "10_reporter.py",
-            consumes  = [
+            script             = "10_reporter.py",
+            consumes           = [
                 EXECUTOR_OVERWRITE_MANIFEST,
                 DEBUGGER_OVERWRITE_TEST_SUMMARY,
                 SCAFFOLD_JSON,
                 PLANNER_FULL_PLAN,
             ],
-            produces  = [REPORTER_EXECUTION_SUMMARY],
-            next_step = "judge",
+            produces           = [REPORTER_EXECUTION_SUMMARY, REPORTER_EXECUTION_LOG],
+            next_step          = "judge",
+            long_term_artifact = REPORTER_EXECUTION_LOG,
         ),
         "judge": StepInfo(
-            script    = "11_judge.py",
-            consumes  = [
+            script             = "11_judge.py",
+            consumes           = [
                 SPEC,
                 EXECUTOR_OVERWRITE_MANIFEST,
                 DEBUGGER_OVERWRITE_TEST_SUMMARY,
                 ARCHIVIST_KNOWLEDGE_LOG,
                 ARCHIVIST_SPEC_GAPS,
             ],
-            produces  = [JUDGE_OVERWRITE_VERDICT_RAW, JUDGE_VERDICT_SUMMARY],
-            next_step = "patcher",
+            produces           = [JUDGE_OVERWRITE_VERDICT_RAW, JUDGE_VERDICT_SUMMARY, JUDGE_VERDICT_LOG],
+            next_step          = "patcher",
+            long_term_artifact = JUDGE_VERDICT_LOG,
         ),
         "patcher": StepInfo(
-            script    = "12_patcher.py",
-            consumes  = [
+            script             = "12_patcher.py",
+            consumes           = [
                 JUDGE_OVERWRITE_VERDICT_RAW,
             ],
-            produces  = [
+            produces           = [
                 PATCHER_OVERWRITE_FIX_SUMMARY,
                 PATCHER_ATTEMPT_LOG,
             ],
-            next_step = "archivist",
+            next_step          = "archivist",
+            long_term_artifact = PATCHER_ATTEMPT_LOG,
         ),
         "archivist": StepInfo(
-            script             = "13_archivist.py",
-            consumes           = [
+            script              = "13_archivist.py",
+            consumes            = [
                 JUDGE_OVERWRITE_VERDICT_RAW,
                 DEBUGGER_OVERWRITE_TEST_SUMMARY,
                 ARCHIVIST_KNOWLEDGE_LOG,
                 ARCHIVIST_SPEC_GAPS,
             ],
-            produces           = [
+            produces            = [
                 ARCHIVIST_KNOWLEDGE_LOG,
                 ARCHIVIST_SPEC_GAPS,
                 ARCHIVIST_CURATION_LOG,
             ],
-            next_step          = None,       # end of linear chain
-            suggest_after_run  = "spectracker",  # natural post-pipeline confirmation
+            next_step           = None,
+            suggest_after_run   = "spectracker",
+            long_term_artifact  = None,   # ngoại lệ: archivist là pure accumulation — skip commit prompt
         ),
     }
 
@@ -363,75 +386,102 @@ def prompt_next_step(role: str, prefix: str = "[pipeline]") -> None:
     _maybe_commit_run_log(role, prefix)
 
     # ── Proceed / stop ────────────────────────────────────────────────────────
-    print(f"  [1] proceed — run {next_role} now")
-    print( "  [2] stop    — exit, run manually later\n")
+    try:
+        ans = input(f"  Proceed to {next_role}? [Y/n]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print(f"\n{prefix} Non-interactive — stopping.")
+        return
 
-    while True:
-        choice = input("  → Choose 1 / 2: ").strip()
-        if choice in ("1", "proceed"):
-            cmd = _run_command(next_info)
-            print(f"\n{prefix} Run:\n\n    {cmd}\n")
-            return
-        if choice in ("2", "stop"):
-            print(f"\n{prefix} Stopped. To run {next_role} later:\n")
-            print(f"    {_run_command(next_info)}\n")
-            return
-        print("  Please enter 1 or 2.")
+    if ans in ("n", "no"):
+        print(f"\n{prefix} Stopped. To run {next_role} later:\n")
+        print(f"    {_run_command(next_info)}\n")
+    else:
+        cmd = _run_command(next_info)
+        print(f"\n{prefix} Run:\n\n    {cmd}\n")
 
 
 
-# ─── Run log commit ───────────────────────────────────────────────────────────
+# ─── Long-term artifact commit ───────────────────────────────────────────────
+
+def _load_json_entries(path: Path) -> list[dict]:
+    """Load entries list from a JSON file. Returns [] on any error."""
+    import json
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and "entries" in data:
+            return list(data["entries"])
+        if isinstance(data, list):
+            return list(data)
+    except Exception:
+        pass
+    return []
+
+
+def _save_json_entries(path: Path, entries: list[dict]) -> None:
+    import json
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"entries": entries}, indent=2, ensure_ascii=False))
+
 
 def _maybe_commit_run_log(role: str, prefix: str = "[pipeline]") -> None:
     """
-    Prompt user to commit this run to harness_run_log.json.
-    Appends a terse entry: step, timestamp, status=completed.
-    Skips silently on EOFError (non-interactive / harness subprocess).
+    Auto-append a run entry to the step's long-term artifact, then ask
+    the user to keep or discard it.
+
+    Behaviour:
+      - If the step has no long_term_artifact → skip silently.
+      - Otherwise: append entry, then prompt "Keep this entry in <file>? [Y/n]"
+        - Y (default): keep — done.
+        - N: remove the entry just appended and rewrite the file.
+      - EOFError / KeyboardInterrupt → keep silently (non-interactive mode).
     """
     import json
     from datetime import datetime, timezone
 
-    try:
-        ans = input("  Commit this run to harness_run_log.json? [Y/n]: ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        return  # non-interactive — skip silently
-
-    if ans in ("n", "no"):
-        print(f"  {prefix} Run not committed to log.")
+    chain        = get_chain()
+    current_info = chain.get(role)
+    if current_info is None or current_info.long_term_artifact is None:
         return
 
-    # Resolve log path
-    try:
-        from artifacts.paths import artifact_root
-        log_path = Path(str(artifact_root())) / "harness_run_log.json"
-    except Exception:
-        print(f"  {prefix}[warn] Could not resolve artifact root — run log skipped.")
-        return
+    artifact_path = Path(str(current_info.long_term_artifact))
+    artifact_name = artifact_path.name
 
     entry = {
-        "step":       role,
-        "timestamp":  datetime.now(timezone.utc).isoformat(),
-        "status":     "completed",
-        "project":    os.environ.get("PIPELINE_PROJECT", "unknown"),
+        "step":      role,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "status":    "completed",
+        "project":   os.environ.get("PIPELINE_PROJECT", "unknown"),
     }
 
-    existing: list[dict] = []
-    if log_path.exists():
-        try:
-            data = json.loads(log_path.read_text())
-            if isinstance(data, dict) and "entries" in data:
-                existing = data["entries"]
-            elif isinstance(data, list):
-                existing = data
-        except Exception:
-            pass
-
-    existing.append(entry)
+    # Auto-append first
+    entries = _load_json_entries(artifact_path)
+    entries.append(entry)
     try:
-        log_path.write_text(json.dumps({"entries": existing}, indent=2))
-        print(f"  {prefix} Run committed to {log_path.name} (total entries: {len(existing)})")
-    except Exception as e:
-        print(f"  {prefix}[warn] Could not write run log: {e}")
+        _save_json_entries(artifact_path, entries)
+    except Exception as exc:
+        print(f"  {prefix}[warn] Could not write {artifact_name}: {exc}")
+        return
+
+    # Ask user to keep or discard
+    try:
+        ans = input(f"  Keep this entry in {artifact_name}? [Y/n]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        # Non-interactive: keep silently
+        print(f"  {prefix} Entry kept in {artifact_name} (non-interactive).")
+        return
+
+    if ans in ("n", "no"):
+        # Remove the last entry (the one we just appended)
+        entries.pop()
+        try:
+            _save_json_entries(artifact_path, entries)
+            print(f"  {prefix} Entry discarded — {artifact_name} unchanged.")
+        except Exception as exc:
+            print(f"  {prefix}[warn] Could not revert {artifact_name}: {exc}")
+    else:
+        print(f"  {prefix} Entry kept in {artifact_name} (total: {len(entries)}).")
 
 
 # ─── Standalone: inspect chain ────────────────────────────────────────────────
