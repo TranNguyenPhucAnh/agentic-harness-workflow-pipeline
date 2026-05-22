@@ -107,7 +107,7 @@ def _wrap(text: str, indent: int = 0) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _load_session() -> dict:
-    """Load clarificator/session.json — the single source for clarification output."""
+    """Load clarificator/session.json — decisions and conflicts metadata."""
     if CLARIFICATOR_SESSION.exists():
         track_read(CLARIFICATOR_SESSION)
         try:
@@ -117,15 +117,25 @@ def _load_session() -> dict:
     return {}
 
 
-def _extract_requirement_synthesis(session: dict) -> str:
+def _load_requirement_synthesis() -> str:
     """
-    Extract requirement_synthesis text from session.json.
+    Load clarificator/requirement_synthesis.md — primary synthesis document.
 
-    Supports both storage formats:
-    - Legacy: inline text field "requirement_synthesis" (pre-split)
-    - Current: path reference "requirement_synthesis_path" → read .md file
+    Priority:
+    1. Direct .md file (current format after clarificator split)
+    2. Path reference in session.json (requirement_synthesis_path)
+    3. Inline field in session.json (legacy pre-split sessions)
     """
-    # Current format: path reference
+    # Primary: direct .md file
+    if CLARIFICATOR_REQUIREMENT_SYNTHESIS.exists():
+        try:
+            track_read(CLARIFICATOR_REQUIREMENT_SYNTHESIS)
+            return CLARIFICATOR_REQUIREMENT_SYNTHESIS.read_text(encoding="utf-8").strip()
+        except Exception as exc:
+            print(f"[enricher][warn] Could not read requirement_synthesis.md: {exc}")
+
+    # Legacy: path ref or inline field in session.json
+    session = _load_session()
     synth_path_str = session.get("requirement_synthesis_path", "")
     if synth_path_str:
         synth_path = Path(synth_path_str)
@@ -135,12 +145,7 @@ def _extract_requirement_synthesis(session: dict) -> str:
                 return synth_path.read_text(encoding="utf-8").strip()
             except Exception:
                 pass
-        # Path recorded but file missing — warn and fall through
-        print(
-            f"[enricher][warn] requirement_synthesis_path points to missing file: {synth_path_str}"
-        )
-
-    # Legacy fallback: inline text field
+        print(f"[enricher][warn] requirement_synthesis_path missing: {synth_path_str}")
     return session.get("requirement_synthesis", "")
 
 
@@ -386,19 +391,18 @@ def main() -> None:
         print(f"[enricher] Workspace: {project_name!r}")
 
         # ── Load inputs ───────────────────────────────────────────────────────────
-        session = _load_session()
-        requirement_synthesis = _extract_requirement_synthesis(session)
-
+        requirement_synthesis = _load_requirement_synthesis()
         if not requirement_synthesis.strip():
             print(
-                "[enricher][error] clarificator/session.json not found or missing requirement_synthesis.\n"
+                "[enricher][error] clarificator/requirement_synthesis.md not found.\n"
                 "           Run 02_clarificator.py first."
             )
             sys.exit(1)
-        print(f"[enricher] Loaded clarificator/session.json ({len(requirement_synthesis)} chars synthesis)")
+        print(f"[enricher] Loaded requirement_synthesis.md ({len(requirement_synthesis):,} chars)")
 
+        session = _load_session()
         n_decisions = len(session.get("decisions", []))
-        print(f"[enricher] Session contains {n_decisions} decisions")
+        print(f"[enricher] Session: {n_decisions} decisions")
 
         knowledge_layer = _load_knowledge_layer()
         if knowledge_layer.strip():
