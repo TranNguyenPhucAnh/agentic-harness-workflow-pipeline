@@ -58,14 +58,15 @@ from artifacts.models import call_model, get_model, get_provider  # type: ignore
 from modules.artifact_tracking import track_read, track_write, print_summary as print_artifact_summary  # noqa: E402
 from modules.cost import print_call, print_summary, record_usage  # noqa: E402
 from modules.md_header import apply_header as apply_md_header  # noqa: E402
+from modules.call_llm import call_llm
 from modules.post_interactive import prompt_next_step  # noqa: E402
 
 # === WRITE AUTHORITY: enricher ===
-# OWNS  : artifacts_<slug>/enricher/enriched_prompt.md
-#          artifacts_<slug>/enricher/prompt_log.json
-# READS : artifacts_<slug>/clarificator/session.json
-#          artifacts_<slug>/absorber/codebase_map.md
-#          artifacts_<slug>/archivist/knowledge_log.md
+# OWNS  : artifacts_<slug>/enricher/enriched_prompt.md (short-term - overwrite)
+#          artifacts_<slug>/enricher/prompt_log.json (long-term - append-only)
+# READS : artifacts_<slug>/clarificator/session.json (upstream-aware - clarificator)
+#          artifacts_<slug>/absorber/codebase_map.md (upstream-aware/codebase-aware - absorber)
+#          artifacts_<slug>/archivist/knowledge_log.md (knowledge-aware)
 
 
 # ── Model config ──────────────────────────────────────────────────────────────
@@ -97,47 +98,8 @@ def _wrap(text: str, indent: int = 0) -> str:
 # LLM call — thin wrapper delegating to central model registry
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _call_llm(
-    system: str,
-    user: str,
-    max_tokens: int = _MAX_TOKENS_ENRICH,
-) -> tuple[str, float]:
-    """
-    Call the enricher model via the central model registry.
-    Model identity and provider are resolved from artifacts/models.py role "enricher".
-    Falls back to stdin mock when API key is missing (offline dev).
+# _call_llm removed — use call_llm() from modules.call_llm
 
-    Returns:
-      (content, call_cost) — call_cost is 0.0 if usage unavailable or offline fallback.
-    """
-    try:
-        resp = call_model(
-            ROLE,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user",   "content": user},
-            ],
-            max_tokens=max_tokens,
-        )
-        usage = getattr(resp, "usage", None)
-        call_cost = 0.0
-        if usage:
-            pt        = getattr(usage, "prompt_tokens",     0) or 0
-            ct        = getattr(usage, "completion_tokens", 0) or 0
-            call_cost = record_usage(usage, model=get_model(ROLE), provider=get_provider(ROLE))
-            print_call(__file__, pt, ct, call_cost)
-        content = resp.choices[0].message.content
-        if not content or not content.strip():
-            raise RuntimeError("Model returned empty content.")
-        return content, call_cost
-    except RuntimeError as exc:
-        if "not set" in str(exc):
-            print("\n[enricher][offline] No API key found. Paste LLM response then EOF (Ctrl-D):")
-            return sys.stdin.read(), 0.0
-        raise
-    except Exception as exc:
-        print(f"[enricher][error] LLM call failed: {exc}")
-        raise
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -350,7 +312,7 @@ EXTRA CONTEXT FROM USER:
 
 Produce the enriched prompt document now."""
 
-    return _call_llm(_ENRICH_SYSTEM, user_msg)
+    return call_llm(ROLE, _ENRICH_SYSTEM, user_msg, caller_file=__file__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
