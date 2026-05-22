@@ -313,6 +313,14 @@ TESTS_DIR   = _LazyPath("output/tests")   # build output (scaffolder)
 ABSORBER_CODEBASE_MAP = _LazyPath("absorber/codebase_map.json")
 
 # owner:     absorber (01_absorber.py)
+# consumers: clarificator, enricher, planner
+# lifecycle: short-term — overwrite per absorber run
+# purpose:   LLM-generated narrative: Project Overview, Module Inventory,
+#            Entry Points, Data Flow, Tech Debt, Absorber Notes.
+#            Plain markdown, injected directly into downstream LLM prompts.
+ABSORBER_CODEBASE_MD = _LazyPath("absorber/codebase_map.md")
+
+# owner:     absorber (01_absorber.py)
 # consumers: human review, hypothesis/consultant queries
 # lifecycle: long-term — append-only audit log
 # purpose:   per-run history of codebase scans (counts, file deltas, scan time)
