@@ -50,6 +50,7 @@ from artifacts.paths import (  # type: ignore
     ABSORBER_CODEBASE_MAP,
     ARCHIVIST_KNOWLEDGE_LOG,
     CLARIFICATOR_SESSION,
+    CLARIFICATOR_REQUIREMENT_SYNTHESIS,
     ENRICHER_OVERWRITE_PROMPT,
     ENRICHER_PROMPT_LOG,
     ensure_dirs,
@@ -64,7 +65,7 @@ from modules.post_interactive import prompt_next_step  # noqa: E402
 # === WRITE AUTHORITY: enricher ===
 # OWNS  : artifacts_<slug>/enricher/enriched_prompt.md (short-term - overwrite)
 #          artifacts_<slug>/enricher/prompt_log.json (long-term - append-only)
-# READS : artifacts_<slug>/clarificator/session.json (upstream-aware - clarificator)
+# READS : artifacts_<slug>/clarificator/requirement_synthesis.md (upstream-aware - clarificator)
 #          artifacts_<slug>/absorber/codebase_map.md (upstream-aware/codebase-aware - absorber)
 #          artifacts_<slug>/archivist/knowledge_log.md (knowledge-aware)
 

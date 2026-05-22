@@ -88,7 +88,6 @@ KNOWLEDGE_BASE = ARCHIVIST_KNOWLEDGE_LOG
 #         clarificator/decision_log.json    (long-term - append only)
 # READS : archivist/knowledge_log.md        (knowledge-aware)
 #         absorber/codebase_map.md          (upstream-aware/codebase-aware - existing project only)
-#         absorber/codebase_map.json        (upstream-aware/codebase-aware - existing project only)
 #         clarificator/decision_log.json    (history-aware)
 
 # ── Model config ─────────────────────────────────────────────────────────────
@@ -254,19 +253,12 @@ def _load_knowledge_context() -> str:
         track_read(KNOWLEDGE_BASE)
         parts.append(f"=== archivist/knowledge_log.md ===\n{KNOWLEDGE_BASE.read_text(encoding='utf-8')}")
 
-    # Consume cả hai absorber artifacts:
+    # Consume absorber artifacts:
     # - codebase_map.md: LLM-readable narrative (Project Overview, Module Inventory,
     #   Entry Points, Data Flow, Tech Debt) — inject trực tiếp vào prompt.
-    # - codebase_map.json: structured data (config services, env vars, git hotspots,
-    #   language breakdown) — bổ sung context mà .md không cover.
-    # Trước đây .json chứa cả .md content, nay tách ra vì nội dung quá dài.
     if ABSORBER_CODEBASE_MD.exists():
         track_read(ABSORBER_CODEBASE_MD)
         parts.append(f"=== absorber/codebase_map.md ===\n{ABSORBER_CODEBASE_MD.read_text(encoding='utf-8')}")
-
-    if ABSORBER_CODEBASE_MAP.exists():
-        track_read(ABSORBER_CODEBASE_MAP)
-        parts.append(f"=== absorber/codebase_map.json ===\n{ABSORBER_CODEBASE_MAP.read_text(encoding='utf-8')}")
 
     entries = _load_decision_log()
     if entries:
