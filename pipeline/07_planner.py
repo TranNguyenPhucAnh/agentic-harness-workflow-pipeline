@@ -73,23 +73,24 @@ from typing import Any
 #   artifacts_<slug>/planner/plan_log.json           (long-term, append — shared with full)
 #
 # READS full:
-#   artifacts_<slug>/spec/specwright_spec_<slug>.md
-#   artifacts_<slug>/scaffolder/blueprint.json
+#   artifacts_<slug>/spec/specwright_spec_<slug>.md  (upstream-aware, specwright)
+#   artifacts_<slug>/scaffolder/blueprint.json       (upstream-aware, scaffolder)
 #
 # READS mini:
-#   artifacts_<slug>/clarificator/session.json           (field: requirement_synthesis)
-#   artifacts_<slug>/enricher/enriched_prompt.md
-#   artifacts_<slug>/clarificator/session.json           (full object as context bundle)
-#   artifacts_<slug>/archivist/knowledge_log.md
-#   artifacts_<slug>/absorber/codebase_map.md
-#   artifacts_<slug>/patcher/attempt_log.json            (last entry only)
-#   artifacts_<slug>/archivist/spec_gaps.md
+#   artifacts_<slug>/clarificator/session.json       (upstream-aware, clarificator, field: requirement_synthesis + full object as context bundle)
+#   artifacts_<slug>/enricher/enriched_prompt.md     (upstream-aware, enricher, optional)
+#   artifacts_<slug>/absorber/codebase_map.md        (upstream-aware, absorber)
+#   artifacts_<slug>/archivist/knowledge_log.md      (knowledge-aware, archivist)
+#   artifacts_<slug>/archivist/spec_gaps.md          (knowledge-aware, archivist)
+#   artifacts_<slug>/patcher/attempt_log.json        (last entry only)
+
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from artifacts.models import call_model, get_model, get_provider  # noqa: E402
 from modules.artifact_tracking import track_read, track_write, print_summary as print_artifact_summary  # noqa: E402
 from modules.cost import print_call, print_summary, record_usage, summary as cost_summary  # noqa: E402
+from modules.call_llm import call_llm_json
 from modules.post_interactive import prompt_next_step  # noqa: E402
 from artifacts.paths import (  # noqa: E402
     ABSORBER_CODEBASE_MAP,
@@ -542,72 +543,8 @@ def _parse_json(raw: str, label: str) -> dict:
 # Core model call
 # ════════════════════════════════════════════════════════════════════════════
 
-def _call_planner_json(
-    *,
-    system_prompt: str,
-    user_message: str,
-    label: str,
-    temperature: float = 0.2,
-    max_tokens: int = 32768,
-) -> dict:
-    """
-    Call the planner role (config in artifacts/models.py) and return parsed JSON.
+# _call_planner_json removed — use call_llm_json() from modules.call_llm
 
-    Retries once on transient failures.
-    """
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_message},
-    ]
-
-    model    = get_model(ROLE)
-    provider = get_provider(ROLE)
-    print(f"[07] Calling model: {model} (provider: {provider}) — {label} …")
-
-    last_error: Exception | None = None
-
-    for attempt in range(2):
-        try:
-            resp = call_model(
-                ROLE,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-
-            usage = getattr(resp, "usage", None)
-            if usage:
-                pt        = getattr(usage, "prompt_tokens",     0) or 0
-                ct        = getattr(usage, "completion_tokens", 0) or 0
-                call_cost = record_usage(usage, model=model, provider=provider)
-                print_call(__file__, pt, ct, call_cost)
-
-            choice  = resp.choices[0]
-            message = choice.message
-            content = message.content
-            tool_calls = getattr(message, "tool_calls", None)
-            finish_reason = getattr(choice, "finish_reason", None)
-
-            if tool_calls:
-                raise RuntimeError(f"Model returned tool_calls instead of text: {tool_calls}")
-
-            if not content or not content.strip():
-                raise RuntimeError(
-                    f"Model returned empty content. finish_reason={finish_reason}, "
-                    f"message={message}"
-                )
-
-            return _parse_json(content.strip(), label=label)
-
-        except Exception as exc:
-            last_error = exc
-            print(f"[07] {label} failed: {exc}", file=sys.stderr)
-
-            if attempt == 0:
-                print("[07] Retrying in 3s …", file=sys.stderr)
-                time.sleep(3)
-
-    raise RuntimeError(f"{label} failed after retries: {last_error}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -690,13 +627,19 @@ def call_full_planner(spec: str, stub_files: list[dict]) -> dict:
         f"{json.dumps(stub_files, indent=2, ensure_ascii=False)}"
     )
 
-    return _call_planner_json(
-        system_prompt=FULL_SYSTEM_PROMPT,
-        user_message=user_message,
-        label="full planner response",
+    print(f"[07] Calling model: {get_model(ROLE)} (provider: {get_provider(ROLE)}) — full planner response …")
+    result, _ = call_llm_json(
+        ROLE,
+        FULL_SYSTEM_PROMPT,
+        user_message,
         temperature=0.2,
         max_tokens=32768,
+        retries=2,
+        backoff=False,
+        caller_file=__file__,
+        label="[07] full planner response",
     )
+    return _parse_json(str(result), label="full planner response")
 
 
 def validate_full_plan(plan: dict, stub_files: list[dict]) -> None:
@@ -986,13 +929,19 @@ def call_mini_planner(request: str, context_bundle: str) -> dict:
         f"{context_block}"
     )
 
-    return _call_planner_json(
-        system_prompt=MINI_SYSTEM_PROMPT,
-        user_message=user_message,
-        label="mini planner response",
+    print(f"[07] Calling model: {get_model(ROLE)} (provider: {get_provider(ROLE)}) — mini planner response …")
+    result, _ = call_llm_json(
+        ROLE,
+        MINI_SYSTEM_PROMPT,
+        user_message,
         temperature=0.15,
         max_tokens=32768,
+        retries=2,
+        backoff=False,
+        caller_file=__file__,
+        label="[07] mini planner response",
     )
+    return _parse_json(str(result), label="mini planner response")
 
 
 def _normalize_target_action(action: Any) -> str:
