@@ -50,6 +50,7 @@ from typing import Any
 # ── paths ─────────────────────────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from artifacts.paths import (  # type: ignore
+    ABSORBER_CODEBASE_MAP,
     CLARIFICATOR_SESSION,
     ENRICHER_OVERWRITE_PROMPT,
     ensure_dirs,
@@ -64,6 +65,7 @@ from modules.post_interactive import prompt_next_step  # noqa: E402
 # === WRITE AUTHORITY: specwright ===
 # OWNS  : spec/specwright_spec_<slug>.md   (dynamic path via get_spec_path())
 # READS : enricher/enriched_prompt.md (upstream-aware, enricher)
+#         absorber/codebase_map.json       (codebase context, optional)
 #         clarificator/session.json        (fallback + metadata)
 #         spec/specwright_spec_<slug>.md   (self-read: exists check + overwrite guard)
 
@@ -160,6 +162,17 @@ def _next_version_regenerate(current: tuple[int, int, int] | None) -> str:
     return f"{major + 1}.0.0"
 
 
+def _next_version_edit(current: tuple[int, int, int] | None) -> str:
+    """
+    Compute next version for a post-generation editor edit (MINOR bump).
+    Should only be called when current is already set from this run's header.
+    """
+    if current is None:
+        return "1.0.0"
+    major, minor, _ = current
+    return f"{major}.{minor + 1}.0"
+
+
 def _format_version_line(version: str) -> str:
     """Return the canonical version header line spectracker expects."""
     return f"# Version: {version}"
@@ -198,6 +211,23 @@ def _load_clarificator_session() -> dict:
         except json.JSONDecodeError:
             return {}
     return {}
+
+
+def _load_codebase_map() -> str:
+    """
+    Load the LLM-generated map text from absorber/codebase_map.json.
+    Returns the "map" field (markdown string), or "" if unavailable.
+    """
+    if not ABSORBER_CODEBASE_MAP.exists():
+        return ""
+    try:
+        import json as _json
+        track_read(ABSORBER_CODEBASE_MAP)
+        data = _json.loads(ABSORBER_CODEBASE_MAP.read_text(encoding="utf-8"))
+        return data.get("map", "").strip()
+    except Exception as exc:
+        print(f"[specwright][warn] Could not read codebase_map.json: {exc}")
+        return ""
 
 
 def _extract_requirement_synthesis(session: dict) -> str:
@@ -285,18 +315,37 @@ QUALITY RULES (strictly enforced):
 """.strip()
 
 
-def _generate_spec(enriched_prompt: str) -> str:
+def _generate_spec(enriched_prompt: str, codebase_map: str = "") -> str:
     """Call specwright model with enriched prompt, return raw spec markdown."""
-    user_msg = f"""Use the enriched prompt below to write the technical specification.
-Follow all instructions in the prompt exactly.
-
-{enriched_prompt}
-
-Write the specification now."""
-
+    parts = [
+        "Use the enriched prompt below to write the technical specification.",
+        "Follow all instructions in the prompt exactly.",
+        "",
+    ]
+    if codebase_map:
+        parts += [
+            "--- EXISTING CODEBASE CONTEXT ---",
+            "The following is a map of the existing codebase.",
+            "Use it to ensure the spec integrates correctly with existing architecture,",
+            "file structure, patterns, and conventions.",
+            "",
+            codebase_map,
+            "--- END CODEBASE CONTEXT ---",
+            "",
+        ]
+    parts += [
+        "--- ENRICHED PROMPT ---",
+        enriched_prompt,
+        "--- END ENRICHED PROMPT ---",
+        "",
+        "Write the specification now.",
+    ]
+    user_msg = "\n".join(parts)
     print(f"[specwright] Using model: {get_model(ROLE)}")
-    content, _ = call_llm(ROLE, _SPEC_SYSTEM, user_msg, caller_file=__file__)
-    return content
+    if codebase_map:
+        print(f"[specwright] Codebase context: {len(codebase_map):,} chars")
+    result, _ = call_llm(ROLE, _SPEC_SYSTEM, user_msg, caller_file=__file__)
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -336,6 +385,110 @@ def _validate_spec(spec: str) -> list[str]:
 # User review
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _review_spec(spec: str, spec_file: Path) -> tuple[str, bool]:
+    """
+    Show spec summary (first 60 lines) to user, ask to confirm / edit / abort.
+    Returns (final_spec_text, should_continue_to_harness).
+    """
+    _print_banner("Spec generated — review before activating harness")
+
+    lines = spec.strip().splitlines()
+    preview_lines = lines[:60]
+    print("\n" + "─" * 72)
+    print("\n".join(preview_lines))
+    if len(lines) > 60:
+        print(f"\n  ... [{len(lines) - 60} more lines] — full spec written to {spec_file.name}")
+    print("─" * 72)
+
+    print(f"\n  Full spec: {spec_file}")
+    print()
+    print("  [1] confirm — activate full harness pipeline")
+    print("  [2] edit    — open $EDITOR to modify spec before running harness")
+    print("  [3] stop    — keep spec, do not run harness now\n")
+
+    while True:
+        choice = input("  → Choose 1 / 2 / 3: ").strip()
+        if choice in ("1", "confirm"):
+            return spec, True
+        if choice in ("2", "edit"):
+            edited = _open_in_editor(spec, spec_file)
+            if edited and edited.strip():
+                print("\n[specwright] Updated spec loaded.")
+                return edited, True
+            print("[specwright] Editor returned empty — keeping generated spec.")
+            return spec, True
+        if choice in ("3", "stop"):
+            return spec, False
+        print("  Please enter 1, 2, or 3.")
+
+
+def _open_in_editor(content: str, hint_path: Path) -> str:
+    """
+    Write content to a temp file named after the spec, open $EDITOR,
+    return modified content.
+    """
+    import tempfile
+    editor = os.environ.get("EDITOR", "nano")
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=f"_{hint_path.name}",
+        delete=False, encoding="utf-8"
+    ) as tf:
+        tf.write(content)
+        tmp_path = tf.name
+
+    try:
+        subprocess.run([editor, tmp_path], check=True)
+        return Path(tmp_path).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        print(f"[specwright][warn] Editor '{editor}' not found. Set $EDITOR env var.")
+        return content
+    except subprocess.CalledProcessError as exc:
+        print(f"[specwright][warn] Editor exited with error: {exc}")
+        return content
+    finally:
+        try:
+            Path(tmp_path).unlink()
+        except OSError:
+            pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Harness launcher
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _launch_harness(project_name: str) -> None:
+    """
+    Launch harness.py for the current project.
+    harness.py reads PIPELINE_PROJECT from env (already set in main).
+    harness.py picks up the spec from get_spec_path() → spec/specwright_spec_<slug>.md.
+    """
+    script = Path(__file__).parent / "harness.py"
+    if not script.exists():
+        print(f"\n[specwright][warn] harness.py not found at {script}")
+        print(f"[specwright]       Run manually: PIPELINE_PROJECT={project_name!r} python harness.py")
+        return
+
+    print(f"\n[specwright] Launching harness → {script.name}  [project: {project_name!r}]")
+    print(f"[specwright] Spec: {get_spec_path()}")
+    print(f"[specwright] Press Ctrl-C to abort harness at any time.\n")
+
+    env = os.environ.copy()
+    env["PIPELINE_PROJECT"] = project_name
+
+    try:
+        subprocess.run(
+            [sys.executable, str(script)],
+            env=env,
+            check=False,
+        )
+    except KeyboardInterrupt:
+        print("\n[specwright] Harness interrupted by user.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Resolve project
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _resolve_project(arg_project: str | None) -> str:
     from artifacts.paths import get_project_name  # type: ignore
     if arg_project:
@@ -355,6 +508,20 @@ def _resolve_project(arg_project: str | None) -> str:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Harness instructions
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _print_harness_instructions(project_name: str, spec_file: Path) -> None:
+    _print_banner("Spec saved — harness not activated")
+    print(f"  Spec:   {spec_file}")
+    print(f"\n  When ready to build:")
+    print(f"    PIPELINE_PROJECT={project_name!r} python harness.py")
+    print(f"\n  Or with flags:")
+    print(f"    PIPELINE_PROJECT={project_name!r} python harness.py --dry-run")
+    print(f"    PIPELINE_PROJECT={project_name!r} python harness.py --skip-judge\n")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -403,6 +570,13 @@ def main() -> None:
                 sys.exit(1)
             print(f"[specwright] Loaded requirement_synthesis from session.json as fallback ({len(enriched_prompt)} chars)")
 
+        # ── Load codebase map (optional) ──────────────────────────────────────────
+        codebase_map = _load_codebase_map()
+        if codebase_map:
+            print(f"[specwright] Loaded codebase_map.json ({len(codebase_map):,} chars)")
+        else:
+            print("[specwright] No codebase_map.json found — greenfield mode")
+
         # Load clarificator session for metadata (project context, decisions count, etc.)
         # This is a non-critical read — used for logging/diagnostics only.
         clarificator_session = _load_clarificator_session()
@@ -427,7 +601,7 @@ def main() -> None:
         print("[specwright] Calling spec model (this may take 30–60s for complex specs) ...")
 
         try:
-            raw_spec = _generate_spec(enriched_prompt)
+            raw_spec = _generate_spec(enriched_prompt, codebase_map)
         except Exception as exc:
             print(f"[specwright][error] Spec generation failed: {exc}")
             sys.exit(1)
@@ -453,6 +627,7 @@ def main() -> None:
 
         # ── Compute new version ───────────────────────────────────────────────────
         new_version = _next_version_regenerate(existing_version)
+        new_version_tuple = _parse_version(f"# Version: {new_version}")
         print(f"[specwright] Version: {('none' if existing_version is None else 'v' + '.'.join(str(x) for x in existing_version))} → v{new_version}")
 
         # ── Write spec file ───────────────────────────────────────────────────────
@@ -470,11 +645,45 @@ def main() -> None:
         # (one track_write per file per run, not one per write() call).
         print(f"[specwright] ✓ Spec written → {spec_file}")
 
-        # ── Done — track write, hand off to post_interactive ─────────────────────
-        track_write(spec_file)
-        lines = spec.strip().splitlines()
-        _print_banner(f"Spec ready — {len(lines)} lines | v{new_version}")
-        print(f"  File: {spec_file}")
+        # ── Review ────────────────────────────────────────────────────────────────
+        if args.no_review or args.no_harness:
+            track_write(spec_file)
+            lines = spec.strip().splitlines()
+            _print_banner(f"Spec ready — {len(lines)} lines")
+            print(f"  File:  {spec_file}")
+            if not args.no_harness:
+                launch_choice = input("\n  Launch harness now? [y/N]: ").strip().lower()
+                if launch_choice in ("y", "yes"):
+                    _launch_harness(project_name)
+                else:
+                    _print_harness_instructions(project_name, spec_file)
+            else:
+                _print_harness_instructions(project_name, spec_file)
+            return
+
+        # Full interactive review
+        final_spec_content, run_harness = _review_spec(spec, spec_file)
+
+        # If user edited in review, bump MINOR version and overwrite file.
+        if final_spec_content != spec:
+            edited_version = _next_version_edit(new_version_tuple)
+            edited_header = (
+                f"{_format_version_line(edited_version)}\n"
+                f"<!-- specwright_spec_{os.environ.get('PIPELINE_PROJECT', 'unknown')} — edited by user on {_now_iso()} -->\n"
+                f"<!-- project: {project_name} | model: {get_model(ROLE)} -->\n\n"
+            )
+            updated = edited_header + final_spec_content.strip() + "\n"
+            spec_file.write_text(updated, encoding="utf-8")
+            track_write(spec_file)
+            print(f"[specwright] ✓ Spec updated (v{new_version} → v{edited_version}) → {spec_file}")
+        else:
+            # No edit — track the initial write exactly once.
+            track_write(spec_file)
+
+        if run_harness:
+            _launch_harness(project_name)
+        else:
+            _print_harness_instructions(project_name, spec_file)
 
     finally:
         print_summary("[04]")
