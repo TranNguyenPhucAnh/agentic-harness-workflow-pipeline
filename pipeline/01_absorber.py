@@ -9,9 +9,18 @@ changes significantly enough to warrant a refresh.
 Phases:
   1. File tree scan        — apply absorber.ignored rules, build file inventory
   2. Content extraction    — full / key-only / signature-only per file
-  3. Semantic compression  — single LLM call → codebase_map.json field "map"
-  4. Git crawl             — git log → structured into codebase_map.json field "git"
-  5. Append codebase_log   — long-term audit trail
+  3. Semantic compression  — single LLM call → codebase_map.md (narrative)
+  4. Git crawl             — git log → structured into codebase_map.json["git"]
+  5. Write artifacts       — codebase_map.md + codebase_map.json
+  6. Append codebase_log   — long-term audit trail
+
+Artifact split:
+  codebase_map.md   — LLM-generated narrative (human/LLM readable)
+                       Sections: Project Overview, Module Inventory, Entry Points,
+                       Data Flow, Config, Git/Blame, Tech Debt, Absorber Notes
+  codebase_map.json — Structured machine-readable data
+                       Fields: meta, config (env vars, services), git (hotspots,
+                       contributors, module activity)
 
 External integrations optional, graceful fallback:
   - vfs CLI     — signature extraction
@@ -35,7 +44,8 @@ Usage:
   python 01_absorber.py --target /path/to/repo
 
 Writes, owner: absorber (01_absorber.py):
-  artifacts_<slug>/absorber/codebase_map.json        (short-term, overwrite)
+  artifacts_<slug>/absorber/codebase_map.md          (short-term, overwrite — LLM narrative)
+  artifacts_<slug>/absorber/codebase_map.json        (short-term, overwrite — structured data)
   artifacts_<slug>/absorber/codebase_log.json        (long-term, append)
   artifacts_<slug>/absorber/cache/codebase_snapshot.json  (internal cache)
 
@@ -68,7 +78,8 @@ from pathlib import Path
 from typing import Any
 
 # === WRITE AUTHORITY: absorber ===
-# OWNS  : artifacts_<slug>/absorber/codebase_map.json (short-term, overwrite)
+# OWNS  : artifacts_<slug>/absorber/codebase_map.md  (short-term, overwrite — LLM narrative)
+#         artifacts_<slug>/absorber/codebase_map.json (short-term, overwrite — structured data)
 #         artifacts_<slug>/absorber/codebase_log.json (long-term, append)
 #         artifacts_<slug>/absorber/cache/codebase_snapshot.json (cache - internal, overwrite)
 
@@ -79,6 +90,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from artifacts.paths import (  # noqa: E402
     ABSORBER_CODEBASE_LOG,
     ABSORBER_CODEBASE_MAP,
+    ABSORBER_CODEBASE_MD,
     ABSORBER_CODEBASE_SNAPSHOT,
     artifact_root,
     ensure_dirs,
@@ -91,16 +103,17 @@ from modules.post_interactive import prompt_next_step  # noqa: E402
 # Local aliases
 ABSORBER_CACHE = ABSORBER_CODEBASE_SNAPSHOT
 CODEBASE_MAP   = ABSORBER_CODEBASE_MAP
+CODEBASE_MD    = ABSORBER_CODEBASE_MD
 CODEBASE_LOG   = ABSORBER_CODEBASE_LOG
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-ROLE             = "absorber"
-_MAX_TOKENS_MAP  = 16384
+ROLE            = "absorber"
+_MAX_TOKENS_MAP = 16384
 _MAX_FILE_BYTES = 256 * 1024
-_IGNORED_FILE = "absorber.ignored"
+_IGNORED_FILE   = "absorber.ignored"
 
 _BUILTIN_SKIP_DIRS: frozenset[str] = frozenset({
     "node_modules",
@@ -126,7 +139,7 @@ _BUILTIN_SKIP_DIRS: frozenset[str] = frozenset({
     "temp",
 })
 
-# Pipeline-owned artifact subdirectories.
+# Pipeline-owned artifact subdirectories — skip when target == repo root.
 _ARTIFACT_CONTROL_DIRS: frozenset[str] = frozenset({
     "absorber",
     "clarificator",
@@ -233,7 +246,7 @@ class AbsorberIgnoreRules:
           *    — match any sequence within one path segment
           ?    — match any single character within one path segment
         """
-        pat = pattern.rstrip("/")
+        pat   = pattern.rstrip("/")
         parts = re.split(r"(\*\*|\*|\?)", pat)
 
         rx = ""
@@ -304,13 +317,10 @@ def _file_hash(path: Path) -> str:
 def _should_skip_dir(name: str, *, skip_artifact_control_dirs: bool = False) -> bool:
     if name.startswith("."):
         return True
-
     if name in _BUILTIN_SKIP_DIRS:
         return True
-
     if skip_artifact_control_dirs and name in _ARTIFACT_CONTROL_DIRS:
         return True
-
     return False
 
 
@@ -319,58 +329,33 @@ def _should_skip_file(name: str) -> bool:
 
 
 def _looks_like_config_file(rel_path: str, fname: str, ext: str) -> bool:
-    """
-    Heuristic to auto-promote likely config/manifest/infra files to key-only mode.
-    """
+    """Heuristic to auto-promote likely config/manifest/infra files to key-only mode."""
     if ext not in _KEY_ONLY_EXTENSIONS:
         return False
 
-    rel_lower = rel_path.lower()
+    rel_lower  = rel_path.lower()
     name_lower = fname.lower()
 
     if ext == ".env" or name_lower.startswith(".env"):
         return True
 
     if any(kw in name_lower for kw in (
-        "config",
-        "settings",
-        "secret",
-        "appsetting",
-        "credential",
-        "password",
-        "token",
-        "manifest",
-        "values",
-        "override",
+        "config", "settings", "secret", "appsetting",
+        "credential", "password", "token", "manifest", "values", "override",
     )):
         return True
 
     if name_lower in {
-        "package.json",
-        "package-lock.json",
-        "composer.json",
-        "pom.xml",
-        "launchsettings.json",
-        "tsconfig.json",
-        "tsconfig.app.json",
-        "tsconfig.spec.json",
-        "tsconfig.base.json",
-        "angular.json",
-        "dynamic-env.json",
-        "ecs-task-def.json",
-        "db-migrator-task-def.json",
+        "package.json", "package-lock.json", "composer.json", "pom.xml",
+        "launchsettings.json", "tsconfig.json", "tsconfig.app.json",
+        "tsconfig.spec.json", "tsconfig.base.json", "angular.json",
+        "dynamic-env.json", "ecs-task-def.json", "db-migrator-task-def.json",
     }:
         return True
 
     if any(token in rel_lower for token in (
-        "task-def",
-        "cloudformation",
-        "helm",
-        "k8s",
-        "kubernetes",
-        "deploy",
-        "deployment",
-        "docker-compose",
+        "task-def", "cloudformation", "helm", "k8s",
+        "kubernetes", "deploy", "deployment", "docker-compose",
     )):
         return True
 
@@ -378,20 +363,13 @@ def _looks_like_config_file(rel_path: str, fname: str, ext: str) -> bool:
 
 
 def _should_include_in_config_inventory(rel_path: str) -> bool:
-    """
-    Filter out pure build/tooling files from config inventory.
-    """
+    """Filter out pure build/tooling files from config inventory."""
     rel_lower = rel_path.lower()
-    name = Path(rel_path).name.lower()
+    name      = Path(rel_path).name.lower()
 
     if name in {
-        "package-lock.json",
-        "package.json",
-        "angular.json",
-        "tsconfig.json",
-        "tsconfig.app.json",
-        "tsconfig.spec.json",
-        "tsconfig.base.json",
+        "package-lock.json", "package.json", "angular.json",
+        "tsconfig.json", "tsconfig.app.json", "tsconfig.spec.json", "tsconfig.base.json",
     }:
         return False
 
@@ -410,18 +388,8 @@ def scan_files(
     """
     Walk target directory and build file inventory.
 
-    Returns:
-      [
-        {
-          "rel_path": str,
-          "abs_path": str,
-          "ext": str,
-          "size": int,
-          "mode": "full" | "key-only" | "signature-only",
-          "lang": str | None,
-        },
-        ...
-      ]
+    Returns list of dicts:
+      { rel_path, abs_path, ext, size, mode, lang }
     """
     inventory: list[dict[str, Any]] = []
 
@@ -430,10 +398,7 @@ def scan_files(
 
         dirs[:] = [
             d for d in dirs
-            if not _should_skip_dir(
-                d,
-                skip_artifact_control_dirs=skip_artifact_control_dirs,
-            )
+            if not _should_skip_dir(d, skip_artifact_control_dirs=skip_artifact_control_dirs)
         ]
 
         for fname in files:
@@ -447,9 +412,9 @@ def scan_files(
             except ValueError:
                 continue
 
-            ext = abs_path.suffix.lower()
-
+            ext  = abs_path.suffix.lower()
             mode = rules.mode_for(rel_path)
+
             if mode == "skip":
                 continue
 
@@ -471,10 +436,10 @@ def scan_files(
             inventory.append({
                 "rel_path": rel_path,
                 "abs_path": str(abs_path),
-                "ext": ext,
-                "size": size,
-                "mode": mode,
-                "lang": lang,
+                "ext":      ext,
+                "size":     size,
+                "mode":     mode,
+                "lang":     lang,
             })
 
     inventory.sort(key=lambda x: x["rel_path"])
@@ -482,45 +447,37 @@ def scan_files(
 
 
 def _detect_language(path: Path) -> str | None:
-    ext = path.suffix.lower()
+    ext  = path.suffix.lower()
     name = path.name.lower()
 
     if name == "dockerfile" or name.endswith(".dockerfile"):
         return "Dockerfile"
 
     mapping = {
-        ".ts": "TypeScript",
-        ".tsx": "TypeScript",
-        ".js": "JavaScript",
-        ".jsx": "JavaScript",
+        ".ts": "TypeScript", ".tsx": "TypeScript",
+        ".js": "JavaScript", ".jsx": "JavaScript",
         ".py": "Python",
         ".go": "Go",
         ".java": "Java",
         ".rs": "Rust",
         ".cs": "C#",
-        ".cpp": "C++",
-        ".c": "C",
-        ".h": "C/C++",
+        ".cpp": "C++", ".c": "C", ".h": "C/C++",
         ".rb": "Ruby",
         ".php": "PHP",
         ".kt": "Kotlin",
         ".swift": "Swift",
         ".sql": "SQL",
         ".json": "JSON",
-        ".yaml": "YAML",
-        ".yml": "YAML",
+        ".yaml": "YAML", ".yml": "YAML",
         ".toml": "TOML",
-        ".tf": "Terraform",
-        ".hcl": "HCL",
+        ".tf": "Terraform", ".hcl": "HCL",
         ".proto": "Protobuf",
         ".md": "Markdown",
-        ".sh": "Shell",
-        ".bash": "Shell",
+        ".sh": "Shell", ".bash": "Shell",
         ".xml": "XML",
         ".env": "ENV",
         ".ini": "INI",
-        ".cfg": "Config",
-        ".conf": "Config",
+        ".cfg": "Config", ".conf": "Config",
         ".properties": "Properties",
     }
     return mapping.get(ext)
@@ -543,10 +500,10 @@ def extract_content(
     """
     abs_path = Path(entry["abs_path"])
     rel_path = entry["rel_path"]
-    mode = entry["mode"]
+    mode     = entry["mode"]
 
     current_hash = _file_hash(abs_path)
-    cached = cache.get(rel_path, {})
+    cached       = cache.get(rel_path, {})
 
     if (
         not force
@@ -564,11 +521,11 @@ def extract_content(
         content = _extract_signature(abs_path, entry["ext"], entry["lang"])
 
     cache[rel_path] = {
-        "hash": current_hash,
-        "mode": mode,
+        "hash":    current_hash,
+        "mode":    mode,
         "content": content,
-        "lang": entry["lang"],
-        "size": entry["size"],
+        "lang":    entry["lang"],
+        "size":    entry["size"],
     }
     return content, False
 
@@ -586,16 +543,12 @@ def _extract_key_only(path: Path, ext: str) -> str:
 
     if ext == ".json":
         return _redact_json(raw)
-
     if ext in (".yaml", ".yml"):
         return _redact_yaml(raw)
-
     if ext == ".toml":
         return _redact_toml(raw)
-
     if ext == ".env" or path.name.startswith(".env"):
         return _redact_env(raw)
-
     return _redact_generic(raw)
 
 
@@ -631,67 +584,56 @@ def _redact_json(raw: str) -> str:
 
 def _redact_yaml(raw: str) -> str:
     lines_out: list[str] = []
-
     for line in raw.splitlines():
         stripped = line.strip()
         if stripped.startswith("#") or not stripped:
             lines_out.append(line)
             continue
-
         match = re.match(r"^(\s*[\w\-\.]+\s*:)\s*(.+)$", line)
         if match:
             lines_out.append(match.group(1) + " <redacted>")
         else:
             lines_out.append(line)
-
     return "\n".join(lines_out)
 
 
 def _redact_toml(raw: str) -> str:
     lines_out: list[str] = []
-
     for line in raw.splitlines():
         stripped = line.strip()
         if stripped.startswith("#") or stripped.startswith("[") or not stripped:
             lines_out.append(line)
             continue
-
         match = re.match(r"^(\s*[\w\-\.]+\s*=)\s*(.+)$", line)
         if match:
             lines_out.append(match.group(1) + " <redacted>")
         else:
             lines_out.append(line)
-
     return "\n".join(lines_out)
 
 
 def _redact_env(raw: str) -> str:
     lines_out: list[str] = []
-
     for line in raw.splitlines():
         stripped = line.strip()
         if stripped.startswith("#") or not stripped:
             lines_out.append(line)
             continue
-
         match = re.match(r"^([A-Z_][A-Z0-9_]*)\s*=\s*(.*)$", line, re.IGNORECASE)
         if match:
             lines_out.append(f"{match.group(1)}=<redacted>")
         else:
             lines_out.append(line)
-
     return "\n".join(lines_out)
 
 
 def _redact_generic(raw: str) -> str:
     lines_out: list[str] = []
-
     for line in raw.splitlines():
         stripped = line.strip()
         if stripped.startswith("#") or stripped.startswith("//") or not stripped:
             lines_out.append(line)
             continue
-
         for sep in ("=", ":"):
             match = re.match(rf"^(\s*[^{sep}\n]+{sep})\s*(.+)$", line)
             if match:
@@ -699,7 +641,6 @@ def _redact_generic(raw: str) -> str:
                 break
         else:
             lines_out.append(line)
-
     return "\n".join(lines_out)
 
 
@@ -712,9 +653,7 @@ def _extract_signature(path: Path, ext: str, lang: str | None) -> str:
         try:
             result = subprocess.run(
                 ["vfs", str(path)],
-                capture_output=True,
-                text=True,
-                timeout=15,
+                capture_output=True, text=True, timeout=15,
             )
             if result.returncode == 0 and result.stdout.strip():
                 return result.stdout
@@ -729,7 +668,7 @@ def _extract_signature(path: Path, ext: str, lang: str | None) -> str:
 
     try:
         track_read(path)
-        lines = path.read_text(errors="replace").splitlines()
+        lines   = path.read_text(errors="replace").splitlines()
         preview = "\n".join(lines[:50])
         if len(lines) > 50:
             preview += f"\n... ({len(lines) - 50} more lines)"
@@ -742,7 +681,7 @@ def _extract_python_signatures(path: Path) -> str:
     try:
         track_read(path)
         source = path.read_text(errors="replace")
-        tree = ast.parse(source)
+        tree   = ast.parse(source)
     except SyntaxError:
         return _extract_ts_signatures(path)
     except Exception:
@@ -753,17 +692,14 @@ def _extract_python_signatures(path: Path) -> str:
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
-            args = [a.arg for a in node.args.args]
-            sig = f"{prefix} {node.name}({', '.join(args)})"
-
+            args   = [a.arg for a in node.args.args]
+            sig    = f"{prefix} {node.name}({', '.join(args)})"
             if node.returns:
                 try:
                     sig += f" -> {ast.unparse(node.returns)}"
                 except Exception:
                     pass
-
             lines.append(sig)
-
             docstring = ast.get_docstring(node)
             if docstring:
                 lines.append(f'    """{docstring[:120]}"""')
@@ -773,12 +709,10 @@ def _extract_python_signatures(path: Path) -> str:
                 bases = [ast.unparse(b) for b in node.bases]
             except Exception:
                 bases = []
-
             sig = f"class {node.name}"
             if bases:
                 sig += f"({', '.join(bases)})"
             lines.append(sig + ":")
-
             docstring = ast.get_docstring(node)
             if docstring:
                 lines.append(f'    """{docstring[:120]}"""')
@@ -821,7 +755,6 @@ def _extract_ts_signatures(path: Path) -> str:
     return "\n".join(lines) if lines else source[:500]
 
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Config inventory helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -833,7 +766,7 @@ _SERVICE_PATTERNS: dict[str, re.Pattern] = {
     "email":      re.compile(r"(?i)(smtp|sendgrid|mailgun|ses|email|mailchimp)"),
     "storage":    re.compile(r"(?i)(s3|blob|minio|gcs|cloudinary|uploadcare)"),
     "monitoring": re.compile(r"(?i)(datadog|newrelic|prometheus|grafana|sentry|cloudwatch|loki|opentelemetry)"),
-    "messaging":  re.compile(r"(?i)(kafka|rabbitmq|sqs|sns|pubsub|nats|eventbridge)"),
+    "messaging":  re.compile(r"(?i)(kafka|rabbitmq|sqs|sns|pubsub|nats|eventbridge|signalr)"),
 }
 
 
@@ -849,10 +782,14 @@ def _parse_env_vars_from_text(raw: str) -> set[str]:
             env_vars.add(screaming)
     return env_vars
 
-def _build_config_structured(inventory: list[dict[str, Any]], cache: dict[str, Any]) -> dict[str, Any]:
+
+def _build_config_structured(
+    inventory: list[dict[str, Any]],
+    cache: dict[str, Any],
+) -> dict[str, Any]:
     """
     Build structured config inventory from key-only files.
-    Returns dict matching codebase_map.json "config" field schema.
+    Returns dict for codebase_map.json "config" field.
     """
     config_files_data: list[dict[str, Any]] = []
     all_env_vars: set[str] = set()
@@ -863,13 +800,13 @@ def _build_config_structured(inventory: list[dict[str, Any]], cache: dict[str, A
         if f["mode"] == "key-only" and _should_include_in_config_inventory(f["rel_path"])
     ]
 
-    for cf in eligible[:30]:
-        rel         = cf["rel_path"]
+    for cf in eligible[:30]:  # cap at 30 to avoid token explosion
+        rel          = cf["rel_path"]
         cached_entry = cache.get(rel, {})
-        redacted    = cached_entry.get("content", "")
+        redacted     = cached_entry.get("content", "")
 
         abs_path = Path(cf.get("abs_path", ""))
-        raw = ""
+        raw      = ""
         if abs_path.exists():
             try:
                 track_read(abs_path)
@@ -924,8 +861,33 @@ def _config_structured_to_prompt(config: dict[str, Any]) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Git crawl helpers
+# Phase 4 — Git crawl
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _resolve_git_scope(scope: str) -> list[str]:
+    """
+    Convert --git-scope value to git log arguments.
+
+    Accepts:
+      "6m"   → --since=6.months.ago
+      "3m"   → --since=3.months.ago
+      "500"  → -n 500
+      "all"  → no limit
+    """
+    if scope == "all":
+        return []
+
+    match = re.match(r"^(\d+)([mMwWdD])$", scope)
+    if match:
+        num, unit = match.group(1), match.group(2).lower()
+        unit_map  = {"m": "months", "w": "weeks", "d": "days"}
+        return [f"--since={num}.{unit_map.get(unit, 'months')}.ago"]
+
+    if scope.isdigit():
+        return ["-n", scope]
+
+    return ["--since=6.months.ago"]
+
 
 def _git_log_stats(target: Path, scope: str) -> dict[str, Any]:
     """
@@ -939,7 +901,7 @@ def _git_log_stats(target: Path, scope: str) -> dict[str, Any]:
     scope_args = _resolve_git_scope(scope)
 
     # File churn with per-file author tracking
-    file_counts: dict[str, int] = {}
+    file_counts:  dict[str, int]      = {}
     file_authors: dict[str, set[str]] = {}
     try:
         result = subprocess.run(
@@ -988,7 +950,7 @@ def _git_log_stats(target: Path, scope: str) -> dict[str, Any]:
 
     # Hotspots tiered
     all_sorted = sorted(file_counts.items(), key=lambda x: -x[1])
-    high   = [
+    high = [
         {"file": f, "changes": c, "authors": sorted(file_authors.get(f, set()))}
         for f, c in all_sorted if c >= 10
     ][:20]
@@ -998,15 +960,19 @@ def _git_log_stats(target: Path, scope: str) -> dict[str, Any]:
     ][:20]
 
     # Module activity
+    total_changes  = sum(file_counts.values())
     module_counts: dict[str, int] = {}
-    total_changes = sum(file_counts.values())
     for fname, count in file_counts.items():
-        parts = fname.split("/")
+        parts  = fname.split("/")
         module = parts[0] if len(parts) > 1 else "(root)"
         module_counts[module] = module_counts.get(module, 0) + count
 
     module_activity = [
-        {"module": mod, "changes": cnt, "pct": round(cnt / total_changes * 100, 1) if total_changes else 0}
+        {
+            "module":  mod,
+            "changes": cnt,
+            "pct":     round(cnt / total_changes * 100, 1) if total_changes else 0,
+        }
         for mod, cnt in sorted(module_counts.items(), key=lambda x: -x[1])[:10]
     ]
 
@@ -1024,7 +990,7 @@ def _git_structured_to_prompt(git: dict[str, Any]) -> str:
     if not git:
         return ""
     lines = [
-        f"Total commits (scope: {git.get('scope','?')}): {git.get('total_commits', '?')}",
+        f"Total commits (scope: {git.get('scope', '?')}): {git.get('total_commits', '?')}",
         "",
     ]
     high   = git.get("hotspots", {}).get("high", [])
@@ -1045,14 +1011,15 @@ def _git_structured_to_prompt(git: dict[str, Any]) -> str:
         lines += ["", "Contributors:"] + [f"  {a}" for a in git["authors"]]
     return "\n".join(lines)
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Phase 3 — Semantic compression → codebase_map.json["map"]
+# Phase 3 — Semantic compression → codebase_map.md
 # ─────────────────────────────────────────────────────────────────────────────
 
 _MAP_SYSTEM = textwrap.dedent("""
     You are a senior software architect performing a codebase intake.
     You will receive extracted signatures and structure of a codebase.
-    Your job is to produce a structured codebase map document (the "map" field).
+    Your job is to produce a structured codebase_map.md document.
 
     Output a SINGLE markdown document with these sections, no extra commentary:
 
@@ -1095,19 +1062,19 @@ _MAP_SYSTEM = textwrap.dedent("""
 
 
 def call_llm_for_map(
-    context: str,
+    context:     str,
     target_name: str,
-    config: dict[str, Any] | None = None,
-    git: dict[str, Any] | None = None,
+    config:      dict[str, Any] | None = None,
+    git:         dict[str, Any] | None = None,
 ) -> tuple[str, float]:
     """
-    Call LLM to produce the "map" field for codebase_map.json.
+    Call LLM to produce codebase_map.md content.
 
     Returns:
-      (content, call_cost)  — call_cost is 0.0 if usage unavailable or call failed.
+      (markdown_content, call_cost)
     """
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    system = _MAP_SYSTEM.replace("{date}", date_str)
+    system   = _MAP_SYSTEM.replace("{date}", date_str)
 
     user_parts = [f"Codebase: {target_name}\n\nExtracted content:\n\n{context}"]
 
@@ -1125,7 +1092,7 @@ def call_llm_for_map(
     print(f"[absorber] LLM call: {ROLE} | ~{tokens_est:,} input tokens")
 
     try:
-        resp = call_model(
+        resp  = call_model(
             ROLE,
             messages=[
                 {"role": "system", "content": system},
@@ -1134,15 +1101,16 @@ def call_llm_for_map(
             max_tokens=_MAX_TOKENS_MAP,
             temperature=0.2,
         )
-        choice = resp.choices[0]
-        usage  = getattr(resp, "usage", None)
+        choice    = resp.choices[0]
+        usage     = getattr(resp, "usage", None)
         call_cost = 0.0
         if usage:
             pt        = getattr(usage, "prompt_tokens",     0) or 0
             ct        = getattr(usage, "completion_tokens", 0) or 0
             call_cost = record_usage(usage, model=get_model(ROLE), provider=get_provider(ROLE))
             print_call(__file__, pt, ct, call_cost)
-        content = choice.message.content
+
+        content       = choice.message.content
         finish_reason = getattr(choice, "finish_reason", "unknown")
 
         if finish_reason == "length":
@@ -1162,14 +1130,14 @@ def call_llm_for_map(
 
 
 def _fallback_map(
-    context: str,
+    context:     str,
     target_name: str,
-    config: dict[str, Any] | None = None,
-    git: dict[str, Any] | None = None,
+    config:      dict[str, Any] | None = None,
+    git:         dict[str, Any] | None = None,
 ) -> str:
-    """Produce minimal map markdown without LLM when the call fails."""
+    """Produce minimal codebase_map.md without LLM when the call fails."""
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    parts = [
+    parts    = [
         "# Codebase Map",
         f"_Generated: {date_str} | Absorber v2 (fallback — LLM unavailable)_\n",
         "## Project Overview",
@@ -1192,79 +1160,46 @@ def _fallback_map(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Phase 4 — Git crawl
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _resolve_git_scope(scope: str) -> list[str]:
-    """
-    Convert --git-scope value to git log arguments.
-
-    Accepts:
-      "6m"   → --since=6.months.ago
-      "3m"   → --since=3.months.ago
-      "500"  → -n 500
-      "all"  → no limit
-    """
-    if scope == "all":
-        return []
-
-    match = re.match(r"^(\d+)([mMwWdD])$", scope)
-    if match:
-        num, unit = match.group(1), match.group(2).lower()
-        unit_map = {"m": "months", "w": "weeks", "d": "days"}
-        return [f"--since={num}.{unit_map.get(unit, 'months')}.ago"]
-
-    if scope.isdigit():
-        return ["-n", scope]
-
-    # Default: 6 months
-    return ["--since=6.months.ago"]
-
-
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Phase 5 — Append codebase_log.json (long-term audit trail)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _append_codebase_log(
-    target: Path,
-    inventory: list[dict[str, Any]],
-    cached_count: int,
+    target:          Path,
+    inventory:       list[dict[str, Any]],
+    cached_count:    int,
     extracted_count: int,
-    map_size: int,
+    map_size:        int,
     *,
-    call_cost: float = 0.0,
-    git_scope: str = "",
+    call_cost:       float                       = 0.0,
+    git_scope:       str                         = "",
     hotspot_summary: list[tuple[str, int]] | None = None,
 ) -> None:
     """
-    Append an entry to absorber/codebase_log.json for audit trail.
+    Append a terse entry to absorber/codebase_log.json for audit trail.
 
     Args:
-      call_cost        — USD cost returned by record_usage(); 0.0 if not available.
+      call_cost        — USD cost from record_usage(); 0.0 if unavailable.
       git_scope        — raw --git-scope flag value (e.g. "6m", "all").
-      hotspot_summary  — top-N [(file, change_count)] from _git_log_stats(); None if skipped.
+      hotspot_summary  — top-N [(file, change_count)]; None if git skipped.
     """
     entry = {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "target": str(target),
-        "total_files": len(inventory),
-        "cached_files": cached_count,
+        "generated_at":    datetime.now(timezone.utc).isoformat(),
+        "target":          str(target),
+        "total_files":     len(inventory),
+        "cached_files":    cached_count,
         "extracted_files": extracted_count,
         "modes": {
-            "full": sum(1 for f in inventory if f["mode"] == "full"),
-            "key_only": sum(1 for f in inventory if f["mode"] == "key-only"),
+            "full":           sum(1 for f in inventory if f["mode"] == "full"),
+            "key_only":       sum(1 for f in inventory if f["mode"] == "key-only"),
             "signature_only": sum(1 for f in inventory if f["mode"] == "signature-only"),
         },
-        "languages": _count_languages(inventory),
+        "languages":      _count_languages(inventory),
         "map_size_bytes": map_size,
-        "cost": round(call_cost or 0.0, 6),
-        "git_scope": git_scope or None,
+        "cost":           round(call_cost or 0.0, 6),
+        "git_scope":      git_scope or None,
         "hotspot_summary": (
             [{"file": f, "changes": c} for f, c in hotspot_summary]
-            if hotspot_summary
-            else None
+            if hotspot_summary else None
         ),
     }
 
@@ -1283,7 +1218,6 @@ def _append_codebase_log(
             pass
 
     existing.append(entry)
-
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.write_text(json.dumps({"entries": existing}, indent=2))
     track_write(log_path)
@@ -1300,11 +1234,8 @@ def _count_languages(inventory: list[dict[str, Any]]) -> dict[str, int]:
     return dict(sorted(counts.items(), key=lambda x: -x[1]))
 
 
-
-
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Context builder — assemble extraction results for LLM
+# Context builder — assemble extraction results for LLM prompt
 # ─────────────────────────────────────────────────────────────────────────────
 
 _MAX_PER_FILE      = 2_000    # chars per file — every file present, just capped
@@ -1313,38 +1244,38 @@ _MAX_CONTEXT_CHARS = 800_000  # ~200k tokens total budget
 
 def _build_context(
     inventory: list[dict[str, Any]],
-    cache: dict[str, Any],
-    force: bool,
+    cache:     dict[str, Any],
+    force:     bool,
 ) -> tuple[str, int, int]:
     """
-    Extract content from all files and build the context string for LLM.
+    Extract content from all files and build the context string for the LLM.
 
-    Strategy (ported from v1):
-    - Per-file cap _MAX_PER_FILE: every file is present, content truncated not dropped
-    - Group by top-level directory for structured context
-    - Total budget _MAX_CONTEXT_CHARS: drop whole groups only when exhausted
+    Strategy:
+      - Per-file cap _MAX_PER_FILE: every file present, content truncated not dropped
+      - Grouped by top-level directory for structured context
+      - Total budget _MAX_CONTEXT_CHARS: whole groups dropped only when exhausted
 
     Returns:
       (context_str, cached_count, extracted_count)
     """
-    cached_count = 0
+    cached_count    = 0
     extracted_count = 0
 
     # Group by top-level directory
     groups: dict[str, list[dict[str, Any]]] = {}
     for entry in inventory:
-        rel   = entry["rel_path"]
-        parts = rel.split("/")
-        group = parts[0] if len(parts) > 1 else "(root)"
+        rel    = entry["rel_path"]
+        parts  = rel.split("/")
+        group  = parts[0] if len(parts) > 1 else "(root)"
         groups.setdefault(group, []).append(entry)
 
-    sections: list[str] = []
-    total_chars = 0
+    sections:      list[str] = []
+    total_chars              = 0
     omitted_groups: list[str] = []
 
     for group, entries in groups.items():
         group_lines: list[str] = [f"\n## {group}/"]
-        group_chars = len(group_lines[0])
+        group_chars             = len(group_lines[0])
 
         for entry in entries:
             raw_content, from_cache = extract_content(entry, cache, force)
@@ -1388,7 +1319,6 @@ def _build_context(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _resolve_target(args: argparse.Namespace) -> Path:
-    """Resolve the target codebase directory."""
     if args.target:
         target = Path(args.target).resolve()
     else:
@@ -1405,27 +1335,26 @@ def run_absorber(args: argparse.Namespace) -> None:
     """Main entry point for the absorber step."""
     ensure_dirs()
 
-    target = _resolve_target(args)
+    target      = _resolve_target(args)
     target_name = target.name
 
-    print(f"[absorber] Target: {target}")
-    print(f"[absorber] Force: {args.force}")
+    print(f"[absorber] Target:    {target}")
+    print(f"[absorber] Force:     {args.force}")
     print(f"[absorber] Git scope: {args.git_scope}")
-    print(f"[absorber] Dry run: {args.dry_run}")
+    print(f"[absorber] Dry run:   {args.dry_run}")
     print()
 
-    # --- Phase 1: File tree scan ---
+    # ── Phase 1: File tree scan ───────────────────────────────────────────────
     rules_path = target / _IGNORED_FILE
-    rules = AbsorberIgnoreRules(rules_path)
+    rules      = AbsorberIgnoreRules(rules_path)
 
-    # Determine if target is inside artifact root (skip artifact dirs)
-    art_root = Path(str(artifact_root()))
+    art_root      = Path(str(artifact_root()))
     skip_artifact = target == art_root.parent or art_root.is_relative_to(target)
 
     inventory = scan_files(target, rules, skip_artifact_control_dirs=skip_artifact)
 
     print(f"[absorber] Phase 1 — Scanned: {len(inventory)} files")
-    mode_counts = {}
+    mode_counts: dict[str, int] = {}
     for f in inventory:
         mode_counts[f["mode"]] = mode_counts.get(f["mode"], 0) + 1
     for mode, count in sorted(mode_counts.items()):
@@ -1436,14 +1365,13 @@ def run_absorber(args: argparse.Namespace) -> None:
         print("[absorber][warn] No files found. Check target directory and absorber.ignored rules.")
         return
 
-    # --- Phase 2: Content extraction ---
-    cache = _load_cache()
+    # ── Phase 2: Content extraction ───────────────────────────────────────────
+    cache                               = _load_cache()
     context, cached_count, extracted_count = _build_context(inventory, cache, args.force)
 
     print(f"[absorber] Phase 2 — Extracted: {extracted_count} new, {cached_count} from cache")
     print()
 
-    # Save cache
     _save_cache(cache)
 
     if args.dry_run:
@@ -1452,7 +1380,7 @@ def run_absorber(args: argparse.Namespace) -> None:
         print_artifact_summary()
         return
 
-    # --- Phase 4: Git crawl (before LLM so we can include in prompt) ---
+    # ── Phase 4: Git crawl (before LLM — data injected into prompt) ──────────
     git_data: dict[str, Any] = {}
     print(f"[absorber] Phase 4 — Git crawl (scope: {args.git_scope})")
     git_data = _git_log_stats(target, args.git_scope)
@@ -1465,15 +1393,22 @@ def run_absorber(args: argparse.Namespace) -> None:
         print("  No git data (not a git repo or no history in scope)")
     print()
 
-    # --- Build structured config ---
+    # ── Build structured config ───────────────────────────────────────────────
     config_data = _build_config_structured(inventory, cache)
 
-    # --- Phase 3: Semantic compression → codebase_map.json["map"] ---
+    # ── Phase 3: LLM → codebase_map.md ───────────────────────────────────────
     print("[absorber] Phase 3 — LLM semantic compression")
     map_text, call_cost = call_llm_for_map(context, target_name, config_data, git_data)
 
-    # --- Assemble codebase_map.json ---
-    codebase_map = {
+    # ── Write codebase_map.md (LLM narrative — human/LLM readable) ───────────
+    md_path = Path(str(CODEBASE_MD))
+    md_path.parent.mkdir(parents=True, exist_ok=True)
+    md_path.write_text(map_text, encoding="utf-8")
+    track_write(md_path)
+    print(f"[absorber] Wrote: {md_path} ({md_path.stat().st_size:,} bytes)")
+
+    # ── Write codebase_map.json (structured data — machine readable) ──────────
+    codebase_map_json = {
         "meta": {
             "generated_at":     datetime.now(timezone.utc).isoformat(),
             "target":           str(target),
@@ -1482,6 +1417,7 @@ def run_absorber(args: argparse.Namespace) -> None:
             "total_files":      len(inventory),
             "cached_files":     cached_count,
             "extracted_files":  extracted_count,
+            "map_md":           str(md_path),
             "map_size_bytes":   len(map_text.encode()),
             "cost":             round(call_cost or 0.0, 6),
             "modes": {
@@ -1491,19 +1427,17 @@ def run_absorber(args: argparse.Namespace) -> None:
             },
             "languages": _count_languages(inventory),
         },
-        "map":    map_text,
         "config": config_data,
         "git":    git_data,
     }
 
-    # Write codebase_map.json
     map_path = Path(str(CODEBASE_MAP))
     map_path.parent.mkdir(parents=True, exist_ok=True)
-    map_path.write_text(json.dumps(codebase_map, indent=2, ensure_ascii=False))
+    map_path.write_text(json.dumps(codebase_map_json, indent=2, ensure_ascii=False))
     track_write(map_path)
     print(f"[absorber] Wrote: {map_path} ({map_path.stat().st_size:,} bytes)")
 
-    # --- Phase 5: Append codebase_log (terse audit trail) ---
+    # ── Phase 5: Append codebase_log ─────────────────────────────────────────
     hotspot_pairs = [
         (h["file"], h["changes"])
         for h in (
@@ -1511,6 +1445,7 @@ def run_absorber(args: argparse.Namespace) -> None:
             git_data.get("hotspots", {}).get("medium", [])
         )
     ] if git_data else None
+
     _append_codebase_log(
         target,
         inventory,
@@ -1522,7 +1457,7 @@ def run_absorber(args: argparse.Namespace) -> None:
         hotspot_summary=hotspot_pairs,
     )
 
-    # --- Summary ---
+    # ── Summary ───────────────────────────────────────────────────────────────
     print()
     print_summary()
     print()
