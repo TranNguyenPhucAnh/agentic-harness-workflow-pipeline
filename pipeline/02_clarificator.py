@@ -1407,7 +1407,7 @@ def _run_synth_only(args: argparse.Namespace) -> None:
     findings   = session.get("findings",   [])
     unresolved = session.get("unresolved", [])
     input_sources   = session.get("input_sources",   [])
-    attachment_only = session.get("attachment_only", False)
+    attachment_only = session.get("attachment_only_input", False)
     session_id      = session.get("session_id", _now_iso())
     req_hash        = session.get("req_hash",   "")
 
@@ -1417,6 +1417,18 @@ def _run_synth_only(args: argparse.Namespace) -> None:
         or session.get("original_requirement")
         or ""
     )
+    if not requirement_text:
+        # Fallback: đọc lại từ input_sources[].path nếu file vẫn còn tồn tại
+        for src in input_sources:
+            p = src.get("path", "")
+            if p and Path(p).exists():
+                try:
+                    requirement_text = Path(p).read_text(encoding="utf-8").strip()
+                    print(f"[clarificator] Recovered requirement_text from input_sources path: {p}")
+                    break
+                except Exception:
+                    continue
+
     if not requirement_text:
         # Last resort: extract from fallback synthesis header
         synth = session.get("requirement_synthesis", "")
