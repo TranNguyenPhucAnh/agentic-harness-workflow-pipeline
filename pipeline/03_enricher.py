@@ -341,85 +341,6 @@ Produce the enriched prompt document now."""
 # User review: show enriched prompt, ask to confirm / edit / abort
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _review_prompt(enriched: str) -> tuple[str, bool]:
-    """
-    Show enriched prompt to user, ask: confirm / edit / abort.
-    Returns (final_prompt_text, should_continue).
-    """
-    _print_banner("Enriched prompt — review before sending to spec agent")
-    print("\n" + "─" * 72)
-    print(enriched.strip())
-    print("─" * 72)
-
-    print("\n  [1] confirm — send this prompt to spec agent")
-    print("  [2] edit    — open $EDITOR to modify (writes to temp file)")
-    print("  [3] abort   — stop here, enriched_prompt.md saved for manual review\n")
-
-    while True:
-        choice = input("  → Choose 1 / 2 / 3: ").strip()
-        if choice in ("1", "confirm"):
-            return enriched, True
-        if choice in ("2", "edit"):
-            edited = _open_in_editor(enriched)
-            if edited and edited.strip():
-                print("\n[enricher] Updated prompt loaded.")
-                return edited, True
-            print("[enricher] Editor returned empty content — keeping original.")
-            return enriched, True
-        if choice in ("3", "abort"):
-            return enriched, False
-        print("  Please enter 1, 2, or 3.")
-
-
-def _open_in_editor(content: str) -> str:
-    """Write content to a temp file, open $EDITOR, return modified content."""
-    import tempfile
-    editor = os.environ.get("EDITOR", "nano")
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".md", prefix="enriched_prompt_",
-        delete=False, encoding="utf-8"
-    ) as tf:
-        tf.write(content)
-        tmp_path = tf.name
-
-    try:
-        subprocess.run([editor, tmp_path], check=True)
-        return Path(tmp_path).read_text(encoding="utf-8")
-    except FileNotFoundError:
-        print(f"[enricher][warn] Editor '{editor}' not found. Set $EDITOR env var.")
-        return content
-    except subprocess.CalledProcessError as exc:
-        print(f"[enricher][warn] Editor exited with error: {exc}")
-        return content
-    finally:
-        try:
-            Path(tmp_path).unlink()
-        except OSError:
-            pass
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Launch spec agent
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _launch_spec_agent(project_name: str) -> None:
-    script = Path(__file__).parent / "04_specwright.py"
-    if not script.exists():
-        print(f"\n[enricher][warn] 04_specwright.py not found at {script}")
-        print(f"[enricher]       Create it first, then run:")
-        print(f"           python 04_specwright.py --project {project_name!r}")
-        return
-
-    print(f"\n[enricher] Launching specwright → {script.name}")
-    try:
-        subprocess.run(
-            [sys.executable, str(script), "--project", project_name],
-            check=False,
-        )
-    except KeyboardInterrupt:
-        print("\n[enricher] Specwright interrupted.")
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Resolve project (same pattern as clarificator)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -456,8 +377,6 @@ def main() -> None:
                             help="Additional free-text context to include in the enriched prompt.")
         parser.add_argument("--dry-run",       action="store_true",
                             help="Run enrichment, print result, do not write files or launch spec agent.")
-        parser.add_argument("--no-review",     action="store_true",
-                            help="Skip interactive review — write and forward enriched prompt automatically.")
         args = parser.parse_args()
 
         # ── Resolve project ───────────────────────────────────────────────────────
@@ -528,42 +447,15 @@ def main() -> None:
         track_write(ENRICHER_OVERWRITE_PROMPT)
         print(f"[enricher] ✓ Enriched prompt → {ENRICHER_OVERWRITE_PROMPT}")
 
-        # ── Review ────────────────────────────────────────────────────────────────
-        if args.no_review:
-            should_continue = True
-            final_prompt = enriched
-        else:
-            final_prompt, should_continue = _review_prompt(enriched)
-            # If user edited, overwrite the written file with updated content
-            if final_prompt != enriched:
-                updated = apply_md_header(
-                    header + final_prompt.strip() + "\n",
-                    ENRICHER_OVERWRITE_PROMPT,
-                    owner="03_enricher.py",
-                    model=get_model(ROLE),
-                )
-                ENRICHER_OVERWRITE_PROMPT.write_text(updated, encoding="utf-8")
-                track_write(ENRICHER_OVERWRITE_PROMPT)
-                print(f"[enricher] ✓ Enriched prompt updated → {ENRICHER_OVERWRITE_PROMPT}")
-
         # ── Append to long-term log ──────────────────────────────────────────────
         _append_prompt_log(
             project_name  = project_name,
-            enriched_text = final_prompt,
+            enriched_text = enriched,
             session       = session,
             extra_context = args.extra_context,
             call_cost     = call_cost,
         )
         print(f"[enricher] ✓ Prompt log appended → {ENRICHER_PROMPT_LOG}")
-
-        if not should_continue:
-            _print_banner("Stopped — enricher/enriched_prompt.md saved for manual review")
-            print(f"  Review:   {ENRICHER_OVERWRITE_PROMPT}")
-            print(f"  Continue: python 04_specwright.py --project {project_name!r}\n")
-            return
-
-        # ── Launch spec agent ─────────────────────────────────────────────────────
-        _launch_spec_agent(project_name)
 
     finally:
         print_summary("[03]")
