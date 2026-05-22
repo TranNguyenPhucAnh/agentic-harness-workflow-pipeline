@@ -50,7 +50,6 @@ from artifacts.paths import (  # type: ignore
     ABSORBER_CODEBASE_MAP,
     ARCHIVIST_KNOWLEDGE_LOG,
     CLARIFICATOR_SESSION,
-    CLARIFICATOR_REQUIREMENT_SYNTHESIS,
     ENRICHER_OVERWRITE_PROMPT,
     ENRICHER_PROMPT_LOG,
     ensure_dirs,
@@ -65,7 +64,7 @@ from modules.post_interactive import prompt_next_step  # noqa: E402
 # === WRITE AUTHORITY: enricher ===
 # OWNS  : artifacts_<slug>/enricher/enriched_prompt.md (short-term - overwrite)
 #          artifacts_<slug>/enricher/prompt_log.json (long-term - append-only)
-# READS : artifacts_<slug>/clarificator/requirement_synthesis.md (upstream-aware - clarificator)
+# READS : artifacts_<slug>/clarificator/session.json (upstream-aware - clarificator)
 #          artifacts_<slug>/absorber/codebase_map.md (upstream-aware/codebase-aware - absorber)
 #          artifacts_<slug>/archivist/knowledge_log.md (knowledge-aware)
 
@@ -119,35 +118,15 @@ def _load_session() -> dict:
 
 
 def _load_requirement_synthesis() -> str:
-    """
-    Load clarificator/requirement_synthesis.md — primary synthesis document.
-
-    Priority:
-    1. Direct .md file (current format after clarificator split)
-    2. Path reference in session.json (requirement_synthesis_path)
-    3. Inline field in session.json (legacy pre-split sessions)
-    """
-    # Primary: direct .md file
-    if CLARIFICATOR_REQUIREMENT_SYNTHESIS.exists():
-        try:
-            track_read(CLARIFICATOR_REQUIREMENT_SYNTHESIS)
-            return CLARIFICATOR_REQUIREMENT_SYNTHESIS.read_text(encoding="utf-8").strip()
-        except Exception as exc:
-            print(f"[enricher][warn] Could not read requirement_synthesis.md: {exc}")
-
-    # Legacy: path ref or inline field in session.json
-    session = _load_session()
-    synth_path_str = session.get("requirement_synthesis_path", "")
-    if synth_path_str:
-        synth_path = Path(synth_path_str)
-        if synth_path.exists():
-            try:
-                track_read(synth_path)
-                return synth_path.read_text(encoding="utf-8").strip()
-            except Exception:
-                pass
-        print(f"[enricher][warn] requirement_synthesis_path missing: {synth_path_str}")
-    return session.get("requirement_synthesis", "")
+    """Load clarificator/requirement_synthesis.md directly."""
+    if not CLARIFICATOR_REQUIREMENT_SYNTHESIS.exists():
+        return ""
+    try:
+        track_read(CLARIFICATOR_REQUIREMENT_SYNTHESIS)
+        return CLARIFICATOR_REQUIREMENT_SYNTHESIS.read_text(encoding="utf-8").strip()
+    except Exception as exc:
+        print(f"[enricher][warn] Could not read requirement_synthesis.md: {exc}")
+        return ""
 
 
 def _load_knowledge_layer() -> str:
