@@ -58,12 +58,14 @@ from artifacts.paths import (  # type: ignore
 from artifacts.models import call_model, get_model, get_provider  # type: ignore
 from modules.artifact_tracking import track_read, track_write, print_summary as print_artifact_summary  # noqa: E402
 from modules.cost import print_call, print_summary, record_usage  # noqa: E402
+from modules.call_llm import call_llm
 from modules.post_interactive import prompt_next_step  # noqa: E402
 
 # === WRITE AUTHORITY: specwright ===
 # OWNS  : spec/specwright_spec_<slug>.md   (dynamic path via get_spec_path())
-# READS : enricher/enriched_prompt.md
-#         clarificator/session.json (fallback + metadata)
+# READS : enricher/enriched_prompt.md (upstream-aware, enricher)
+#         clarificator/session.json        (fallback + metadata)
+#         spec/specwright_spec_<slug>.md   (self-read: exists check + overwrite guard)
 
 
 # ── Model config ──────────────────────────────────────────────────────────────
@@ -178,44 +180,8 @@ def _format_version_line(version: str) -> str:
 # LLM call
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _call_llm(
-    system: str,
-    user: str,
-    max_tokens: int = _MAX_TOKENS_SPEC,
-) -> str:
-    """
-    Call the specwright model via the central model registry.
-    Model identity and provider are resolved from artifacts/models.py role "specwright".
-    Falls back to stdin mock when API key is missing (offline dev).
-    """
-    try:
-        print(f"[specwright] Using model: {get_model(ROLE)}")
-        resp = call_model(
-            ROLE,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user",   "content": user},
-            ],
-            max_tokens=max_tokens,
-        )
-        usage = getattr(resp, "usage", None)
-        if usage:
-            pt        = getattr(usage, "prompt_tokens",     0) or 0
-            ct        = getattr(usage, "completion_tokens", 0) or 0
-            call_cost = record_usage(usage, model=get_model(ROLE), provider=get_provider(ROLE))
-            print_call(__file__, pt, ct, call_cost)
-        content = resp.choices[0].message.content
-        if not content or not content.strip():
-            raise RuntimeError("Model returned empty content.")
-        return content
-    except RuntimeError as exc:
-        if "not set" in str(exc):
-            print("\n[specwright][offline] No API key found. Paste LLM response then EOF (Ctrl-D):")
-            return sys.stdin.read()
-        raise
-    except Exception as exc:
-        print(f"[specwright][error] LLM call failed: {exc}")
-        raise
+# _call_llm removed — use call_llm() from modules.call_llm
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -339,7 +305,9 @@ Follow all instructions in the prompt exactly.
 
 Write the specification now."""
 
-    return _call_llm(_SPEC_SYSTEM, user_msg)
+    print(f"[specwright] Using model: {get_model(ROLE)}")
+    content, _ = call_llm(ROLE, _SPEC_SYSTEM, user_msg, caller_file=__file__)
+    return content
 
 
 # ─────────────────────────────────────────────────────────────────────────────

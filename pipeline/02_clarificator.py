@@ -74,6 +74,7 @@ from artifacts.models import call_model, get_model, get_provider  # noqa: E402
 from modules.drag_and_drop import gather_text_file_bundle  # type: ignore  # noqa: E402
 from modules.artifact_tracking import track_read, track_write, print_summary as print_artifact_summary  # noqa: E402
 from modules.cost import print_call, print_summary, record_usage  # noqa: E402
+from modules.call_llm import call_llm
 from modules.post_interactive import prompt_next_step  # noqa: E402
 
 
@@ -335,44 +336,8 @@ def _list_projects() -> None:
 # LLM call
 # ════════════════════════════════════════════════════════════════════════════
 
-def _call_llm(
-    system: str,
-    user: str,
-    max_tokens: int = _MAX_TOKENS_ANALYZE,
-) -> str:
-    try:
-        resp = call_model(
-            ROLE,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            max_tokens=max_tokens,
-        )
-        usage = getattr(resp, "usage", None)
-        if usage:
-            pt        = getattr(usage, "prompt_tokens",     0) or 0
-            ct        = getattr(usage, "completion_tokens", 0) or 0
-            call_cost = record_usage(usage, model=get_model(ROLE), provider=get_provider(ROLE))
-            print_call(__file__, pt, ct, call_cost)
-        content = getattr(resp.choices[0].message, "content", None)
-        if isinstance(content, list):
-            content = "".join(
-                part.get("text", "") if isinstance(part, dict) else getattr(part, "text", "")
-                for part in content
-            )
-        content = (content or "").strip()
-        if not content:
-            raise RuntimeError("Model returned empty content.")
-        return content
-    except RuntimeError as exc:
-        if "not set" in str(exc):
-            print("\n[clarificator][offline] No API key found. Paste LLM response then EOF:")
-            return sys.stdin.read()
-        raise
-    except Exception as exc:
-        print(f"[clarificator][error] LLM call failed: {exc}", file=sys.stderr)
-        raise
+# _call_llm removed — use call_llm() from modules.call_llm
+
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -500,7 +465,7 @@ files or modules in findings where relevant — populate codebase_refs[] with
 repo-relative paths (e.g. ["src/auth/middleware.py"]).
 Output only the JSON object."""
 
-    raw = _call_llm(_ANALYZE_SYSTEM, user_msg)
+    raw, _ = call_llm(ROLE, _ANALYZE_SYSTEM, user_msg, caller_file=__file__)
     result = _parse_json_response(raw, "clarification analysis")
 
     findings = result.get("findings", [])
@@ -649,7 +614,7 @@ Given this answer, what new questions are revealed and which pending ones are mo
 Output only JSON."""
 
     try:
-        raw = _call_llm(_DELTA_SYSTEM, user_msg, max_tokens=_MAX_TOKENS_DELTA)
+        raw, _ = call_llm(ROLE, _DELTA_SYSTEM, user_msg, max_tokens=_MAX_TOKENS_DELTA, caller_file=__file__)
         result = _parse_json_response(raw, "delta analysis")
     except Exception as exc:
         print(f"  [clarificator][delta] Delta analysis failed ({exc}), continuing without update.")
@@ -786,7 +751,7 @@ def _derive_impact(question: str, answer: str, category: str) -> str:
             "implementation impact of this decision. No preamble."
         )
         user = f"Question: {question}\nAnswer: {answer}\nCategory: {category}"
-        raw = _call_llm(system, user, max_tokens=256).strip()
+        raw, _ = call_llm(ROLE, system, user, max_tokens=256, caller_file=__file__)
         return raw.splitlines()[0].strip().strip('"').strip("'")
     except Exception:
         return ""
@@ -995,7 +960,7 @@ Produce the clarified requirement document now."""
     last_exc: Exception | None = None
     for attempt in range(1, _MAX_SYNTH_RETRIES + 1):
         try:
-            result = _call_llm(_SYNTHESIS_SYSTEM, user_msg, max_tokens=_MAX_TOKENS_SYNTHESIS)
+            result, _ = call_llm(ROLE, _SYNTHESIS_SYSTEM, user_msg, max_tokens=_MAX_TOKENS_SYNTHESIS, caller_file=__file__, retries=1)
             return result, False
         except RuntimeError as exc:
             last_exc = exc

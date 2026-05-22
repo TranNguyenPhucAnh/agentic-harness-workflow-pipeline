@@ -75,7 +75,24 @@ from typing import Any, Callable
 #         artifacts_<slug>/debugger/test_log.json        (long-term, append)
 #         artifacts_<slug>/output/src/**                 repair patches
 #         artifacts_<slug>/output/tests/**               fragile-test patches
-# READS : see module docstring
+#
+# READS full:
+#   artifacts_<slug>/spec/specwright_spec_<slug>.md
+#   artifacts_<slug>/planner/full_plan.json              (field: global_notes)
+#   artifacts_<slug>/archivist/knowledge_log.md          (→ system prompt, repair models)
+#   artifacts_<slug>/patcher/attempt_log.json            (last entry → system prompt, qwen only)
+#   artifacts_<slug>/output/src/**                       (test targets)
+#   artifacts_<slug>/output/tests/**                     (test files)
+#
+# READS mini:
+#   artifacts_<slug>/clarificator/session.json           (field: requirement_synthesis)
+#   artifacts_<slug>/enricher/enriched_prompt.md
+#   artifacts_<slug>/planner/mini_plan.json
+#   artifacts_<slug>/executor/manifest.json
+#   artifacts_<slug>/archivist/knowledge_log.md          (→ system prompt, repair models)
+#   artifacts_<slug>/patcher/attempt_log.json            (last entry → system prompt, qwen only)
+#   artifacts_<slug>/output/src/**                       (test targets)
+#   artifacts_<slug>/output/tests/**                     (test files)
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from artifacts.paths import (  # noqa: E402
@@ -98,6 +115,7 @@ from artifacts.paths import (  # noqa: E402
 from artifacts.models import call_model, get_model, get_provider  # noqa: E402
 from modules.artifact_tracking import track_read, track_write, print_summary as print_artifact_summary  # noqa: E402
 from modules.cost import print_call, print_summary, record_usage  # noqa: E402
+from modules.call_llm import call_llm_messages
 from modules.post_interactive import prompt_next_step  # noqa: E402
 
 # Module-level model label constants — derived from models.py at import time.
@@ -444,43 +462,25 @@ def _parse_model_json(raw: str) -> dict[str, Any]:
     return parsed
 
 
-def _model_call(
-    role: str,
-    messages: list[dict[str, str]],
-    max_tokens: int = 32768,
-) -> str:
-    model_id = get_model(role)
-    for attempt in range(2):
-        resp = call_model(role, messages, max_tokens=max_tokens, temperature=0.1)
-        usage = getattr(resp, "usage", None)
-        if usage:
-            pt        = getattr(usage, "prompt_tokens",     0) or 0
-            ct        = getattr(usage, "completion_tokens", 0) or 0
-            call_cost = record_usage(usage, model=model_id, provider=get_provider(role))
-            print_call(__file__, pt, ct, call_cost, label=f"[09] {model_id}")
-
-        content = resp.choices[0].message.content
-        if content and content.strip():
-            return content
-
-        if attempt == 0:
-            print(
-                f"    [warn] {model_id} returned empty response, retrying in 3s …",
-                file=sys.stderr,
-            )
-            time.sleep(3)
-
-    return ""
-
-
 def call_qwen(messages: list[dict[str, str]]) -> str:
     """Surface/component repair — role: debugger."""
-    return _model_call("debugger", messages)
+    content, _ = call_llm_messages(
+        "debugger", messages,
+        retries=2, backoff=False,
+        caller_file=__file__, label=f"[09] {get_model('debugger')}",
+    )
+    return content
 
 
 def call_minimax(messages: list[dict[str, str]]) -> str:
     """Logic/hook/data repair — role: debugger_secondary."""
-    return _model_call("debugger_secondary", messages)
+    content, _ = call_llm_messages(
+        "debugger_secondary", messages,
+        retries=2, backoff=False,
+        caller_file=__file__, label=f"[09] {get_model('debugger_secondary')}",
+    )
+    return content
+
 
 
 # ════════════════════════════════════════════════════════════════════════════

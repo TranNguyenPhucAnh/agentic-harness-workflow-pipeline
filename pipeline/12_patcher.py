@@ -74,6 +74,7 @@ from typing import Any
 #         artifacts_<slug>/archivist/knowledge_log.md
 #         artifacts_<slug>/spec/specwright_spec_<slug>.md
 #         artifacts_<slug>/output/src/**
+#         artifacts_<slug>/patcher/attempt_log.json        (self-read: last entry → repair context)
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from artifacts.paths import (  # noqa: E402
@@ -98,6 +99,7 @@ from artifacts.models import call_model, get_model, get_provider  # noqa: E402
 from modules.artifact_tracking import track_read, track_write, print_summary as print_artifact_summary  # noqa: E402
 from modules.cost import print_call, print_summary, record_usage  # noqa: E402
 from modules.md_header import apply_header as apply_md_header  # noqa: E402
+from modules.call_llm import call_llm_messages
 from modules.post_interactive import prompt_next_step  # noqa: E402
 
 _PATCHER_MODEL           = get_model("patcher")            # surface fixes
@@ -388,34 +390,8 @@ def _is_test_path(rel: str) -> bool:
     return rel.startswith("tests/") or rel.startswith("output/tests/") or ".test." in lowered or ".spec." in lowered
 
 
-def _model_call(
-    role: str,
-    messages: list[dict[str, str]],
-    max_tokens: int = 32768,
-) -> str:
-    """
-    Thin wrapper around call_model() with retry and token logging.
-    role must be registered in artifacts/models.py ROLES.
-    """
-    model_id = get_model(role)
-    for attempt in range(2):
-        resp = call_model(role, messages, temperature=0.1, max_tokens=max_tokens)
-        usage = getattr(resp, "usage", None)
-        if usage:
-            pt        = getattr(usage, "prompt_tokens",     0) or 0
-            ct        = getattr(usage, "completion_tokens", 0) or 0
-            call_cost = record_usage(usage, model=model_id, provider=get_provider(role))
-            print_call(__file__, pt, ct, call_cost, label=f"[12] {model_id}")
+# _model_call removed — use call_llm_messages() from modules.call_llm
 
-        content = resp.choices[0].message.content
-        if content and content.strip():
-            return content.strip()
-
-        if attempt == 0:
-            print(f"    [warn] empty response from {model_id}, retrying in 3s …", file=sys.stderr)
-            time.sleep(3)
-
-    return ""
 
 
 def _strip_json_fences(raw: str) -> str:
@@ -913,13 +889,19 @@ def fix_finding(
         print(f"  [12]   scope: {scope}")
         print(f"  [12]   files: {allowed_files}")
 
-    raw = _model_call(
+    raw, _ = call_llm_messages(
         role,
         [
             {"role": "system", "content": system},
             {"role": "user", "content": user_content},
         ],
-    ).strip()
+        temperature=0.1,
+        retries=2,
+        backoff=False,
+        caller_file=__file__,
+        label=f"[12] {get_model(role)}",
+    )
+    raw = raw.strip()
 
     if not raw:
         return FixRecord(finding.description, finding.files, False, [], "model returned empty response")

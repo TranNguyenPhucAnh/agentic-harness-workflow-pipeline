@@ -95,15 +95,18 @@ from typing import Any
 #   artifacts_<slug>/scaffolder/blueprint.json
 #   artifacts_<slug>/planner/full_plan.json          (optional, with --use-planner-plan)
 #   artifacts_<slug>/spec/specwright_spec_<slug>.md  (only in single-call fallback)
+#   artifacts_<slug>/output/src/**                   (delta mode only — import context seeding, not tracked)
 #
 # READS mini:
 #   artifacts_<slug>/planner/mini_plan.json          (fields: plan + impact)
+
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from artifacts.models import call_model, get_model, get_provider  # noqa: E402
 from modules.artifact_tracking import track_read, track_write, print_summary as print_artifact_summary  # noqa: E402
 from modules.cost import print_call, print_summary, record_usage, summary as cost_summary  # noqa: E402
+from modules.call_llm import call_llm
 from modules.post_interactive import prompt_next_step  # noqa: E402
 from artifacts.paths import (  # noqa: E402
     EXECUTOR_MANIFEST_LOG,
@@ -622,64 +625,8 @@ def _build_mini_user_message(
 # Core model call
 # ════════════════════════════════════════════════════════════════════════════
 
-def _call_executor(system: str, user_message: str) -> str:
-    """
-    Call the executor role (config in artifacts/models.py).
+# _call_executor removed — use call_llm() from modules.call_llm
 
-    Retries once on transient failures. Returns raw text content.
-    """
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user_message},
-    ]
-
-    model    = get_model(ROLE)
-    provider = get_provider(ROLE)
-
-    last_error: Exception | None = None
-
-    for attempt in range(2):
-        try:
-            resp = call_model(
-                ROLE,
-                messages=messages,
-                temperature=0.15,
-                max_tokens=32768,
-            )
-
-            usage = getattr(resp, "usage", None)
-            if usage:
-                pt        = getattr(usage, "prompt_tokens",     0) or 0
-                ct        = getattr(usage, "completion_tokens", 0) or 0
-                call_cost = record_usage(usage, model=model, provider=provider)
-                print_call(__file__, pt, ct, call_cost)
-
-            choice     = resp.choices[0]
-            message    = choice.message
-            content    = message.content
-            tool_calls = getattr(message, "tool_calls", None)
-            finish_reason = getattr(choice, "finish_reason", None)
-
-            if tool_calls:
-                raise RuntimeError(f"Model returned tool_calls instead of text: {tool_calls}")
-
-            if not content or not content.strip():
-                raise RuntimeError(
-                    f"Model returned empty content. "
-                    f"finish_reason={finish_reason}, message={message}"
-                )
-
-            return content.strip()
-
-        except Exception as exc:
-            last_error = exc
-            print(f"[08] [{model}] {exc}", file=sys.stderr)
-
-            if attempt == 0:
-                print("[08] Retrying in 3s …", file=sys.stderr)
-                time.sleep(3)
-
-    raise RuntimeError(f"Executor call failed after retries: {last_error}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -897,7 +844,6 @@ def _build_context_block(
 # Per-file generation — full scope
 # ════════════════════════════════════════════════════════════════════════════
 
-```python
 def implement_file(
     stub: dict[str, Any],
     task: dict[str, Any] | None,
@@ -925,7 +871,17 @@ def implement_file(
         )
 
     print(f"[08]   → Implementing {file_path} …")
-    raw = _call_executor(build_system_prompt_per_file(stack=stack), user_msg)
+    raw, _ = call_llm(
+        ROLE,
+        build_system_prompt_per_file(stack=stack),
+        user_msg,
+        temperature=0.15,
+        max_tokens=32768,
+        retries=2,
+        backoff=False,
+        caller_file=__file__,
+        label=f"[08] {get_model(ROLE)}",
+    )
     result = _parse_json(raw, file_path)
 
     # Be tolerant if model accidentally returns the single-call shape.
@@ -983,9 +939,16 @@ def implement_all_single_call(
     provider = get_provider(ROLE)
     print(f"[08] Calling model: {model} (provider: {provider}), single-call mode …")
 
-    raw = _call_executor(
+    raw, _ = call_llm(
+        ROLE,
         build_system_prompt_single(instructions=instructions, stack=stack),
         user_msg,
+        temperature=0.15,
+        max_tokens=32768,
+        retries=2,
+        backoff=False,
+        caller_file=__file__,
+        label=f"[08] {get_model(ROLE)}",
     )
     result = _parse_json(raw, "single-call")
 
@@ -1218,7 +1181,17 @@ def _implement_mini_target(
         )
 
     print(f"[08]   → Mini patch {action:<6} {path} …")
-    raw = _call_executor(build_system_prompt_mini_file(), user_msg)
+    raw, _ = call_llm(
+        ROLE,
+        build_system_prompt_mini_file(),
+        user_msg,
+        temperature=0.15,
+        max_tokens=32768,
+        retries=2,
+        backoff=False,
+        caller_file=__file__,
+        label=f"[08] {get_model(ROLE)}",
+    )
     result = _parse_json(raw, f"mini target {path}")
 
     # Tolerate full-scope key names.

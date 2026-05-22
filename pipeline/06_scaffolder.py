@@ -43,15 +43,16 @@ from pathlib import Path
 from typing import Any
 
 # === WRITE AUTHORITY: scaffolder ===
-# OWNS  : artifacts_<slug>/scaffolder/blueprint.json
-#          artifacts_<slug>/scaffolder/skeleton_log.json
-#          artifacts_<slug>/output/tests/**
-# READS : artifacts_<slug>/spec/specwright_spec_<slug>.md
+# OWNS  : artifacts_<slug>/scaffolder/blueprint.json (short-term, overwrite)
+#          artifacts_<slug>/scaffolder/skeleton_log.json (long-term, append-only)
+#          artifacts_<slug>/output/tests/** (test stubs)
+# READS : artifacts_<slug>/spec/specwright_spec_<slug>.md (upstream-aware, specwright)
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from artifacts.models import call_model, get_model, get_provider  # noqa: E402
 from modules.artifact_tracking import track_read, track_write, print_summary as print_artifact_summary  # noqa: E402
 from modules.cost import print_call, print_summary, record_usage  # noqa: E402
+from modules.call_llm import call_llm_json
 from modules.post_interactive import prompt_next_step  # noqa: E402
 from artifacts.paths import (  # noqa: E402
     SCAFFOLD_JSON,
@@ -175,59 +176,8 @@ def _configure_project(
 # Model call
 # ─────────────────────────────────────────────────────────────────────────────
 
-def call_scaffolder(
-    spec_content: str,
-    *,
-    max_retries: int = 5,
-) -> dict[str, Any]:
-    """
-    Call the scaffolder role with the canonical spec.
-    Returns the parsed blueprint as a dict.
-    """
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": f"Here is the canonical spec:\n\n{spec_content}",
-        },
-    ]
+# call_scaffolder removed — use call_llm_json() from modules.call_llm
 
-    model = get_model(ROLE)
-    provider = get_provider(ROLE)
-    print(f"[06] Calling model: {model} (provider: {provider}) …")
-
-    last_exc: Exception | None = None
-
-    for attempt in range(1, max_retries + 1):
-        try:
-            resp = call_model(
-                ROLE,
-                messages=messages,
-                max_tokens=MAX_OUTPUT_TOKENS,
-                temperature=0.2,
-            )
-            text = resp.choices[0].message.content or ""
-            usage = getattr(resp, "usage", None)
-            if usage:
-                pt = getattr(usage, "prompt_tokens", 0) or 0
-                ct = getattr(usage, "completion_tokens", 0) or 0
-                call_cost = record_usage(usage, model=model, provider=provider)
-                print_call(__file__, pt, ct, call_cost)
-            return _parse_json(text)
-
-        except Exception as exc:  # noqa: BLE001
-            last_exc = exc
-            if attempt < max_retries:
-                wait = (2 ** (attempt - 1)) + random.uniform(0, 1)
-                print(
-                    f"[06][warn] Call failed (attempt {attempt}/{max_retries}), "
-                    f"retry in {wait:.1f}s: {exc}"
-                )
-                time.sleep(wait)
-            else:
-                print(f"[06][error] Model call failed: {exc}", file=sys.stderr)
-
-    raise RuntimeError(f"Scaffolder call failed after {max_retries} retries") from last_exc
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -609,7 +559,19 @@ def main() -> None:
         spec = spec_path.read_text(errors="replace")
         spec_version = _extract_spec_version(spec)
 
-        blueprint = call_scaffolder(spec, max_retries=args.max_retries)
+        _model = get_model(ROLE)
+        _prov  = get_provider(ROLE)
+        print(f"[06] Calling model: {_model} (provider: {_prov}) …")
+        blueprint, _ = call_llm_json(
+            ROLE,
+            SYSTEM_PROMPT,
+            f"Here is the canonical spec:\n\n{spec}",
+            max_tokens=MAX_OUTPUT_TOKENS,
+            temperature=0.2,
+            retries=args.max_retries,
+            caller_file=__file__,
+            label="[06] scaffold",
+        )
 
         # DEBUG
         if blueprint.get("modules"):
