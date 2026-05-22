@@ -118,7 +118,29 @@ def _load_session() -> dict:
 
 
 def _extract_requirement_synthesis(session: dict) -> str:
-    """Extract the requirement_synthesis text field from session.json."""
+    """
+    Extract requirement_synthesis text from session.json.
+
+    Supports both storage formats:
+    - Legacy: inline text field "requirement_synthesis" (pre-split)
+    - Current: path reference "requirement_synthesis_path" → read .md file
+    """
+    # Current format: path reference
+    synth_path_str = session.get("requirement_synthesis_path", "")
+    if synth_path_str:
+        synth_path = Path(synth_path_str)
+        if synth_path.exists():
+            try:
+                track_read(synth_path)
+                return synth_path.read_text(encoding="utf-8").strip()
+            except Exception:
+                pass
+        # Path recorded but file missing — warn and fall through
+        print(
+            f"[enricher][warn] requirement_synthesis_path points to missing file: {synth_path_str}"
+        )
+
+    # Legacy fallback: inline text field
     return session.get("requirement_synthesis", "")
 
 
