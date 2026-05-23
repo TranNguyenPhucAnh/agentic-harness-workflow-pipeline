@@ -8,8 +8,8 @@ Vị trí trong luồng:
     02_clarificator → [03_enricher] → 04_specwright → 05_spectracker → specwright_spec_<slug>.md → harness
 
 Inputs (đọc từ artifacts của project hiện tại):
-    clarificator/session.json                — output chính của clarificator (synthesis embedded)
-    absorber/codebase_map.md                 — knowledge base (nếu có)
+    clarificator/requirement_synthesis.md    — clarified requirement document (bắt buộc)
+    absorber/codebase_map.md                 — LLM-readable codebase narrative (nếu có)
     archivist/knowledge_log.md               — archivist knowledge (nếu có)
 
 Output (ghi vào artifacts của project):
@@ -37,39 +37,39 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import subprocess
 import sys
 import textwrap
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 # ── paths ─────────────────────────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from artifacts.paths import (  # type: ignore
-    ABSORBER_CODEBASE_MAP,
+    ABSORBER_CODEBASE_MD,
     ARCHIVIST_KNOWLEDGE_LOG,
-    CLARIFICATOR_SESSION,
+    ARCHIVIST_SPEC_GAPS,
+    CLARIFICATOR_REQUIREMENT_SYNTHESIS,
     ENRICHER_OVERWRITE_PROMPT,
     ENRICHER_PROMPT_LOG,
     ensure_dirs,
 )
-from artifacts.models import call_model, get_model, get_provider  # type: ignore
+from artifacts.models import get_model  # type: ignore
 from modules.artifact_tracking import track_read, track_write, print_summary as print_artifact_summary  # noqa: E402
-from modules.cost import print_call, print_summary, record_usage  # noqa: E402
+from modules.cost import print_summary  # noqa: E402
 from modules.md_header import apply_header as apply_md_header  # noqa: E402
 from modules.call_llm import call_llm
 from modules.post_interactive import prompt_next_step  # noqa: E402
 
 # === WRITE AUTHORITY: enricher ===
-# OWNS  : artifacts_<slug>/enricher/enriched_prompt.md (short-term - overwrite)
-#          artifacts_<slug>/enricher/prompt_log.json (long-term - append-only)
-# READS : artifacts_<slug>/clarificator/session.json (upstream-aware - clarificator)
-#          artifacts_<slug>/absorber/codebase_map.md (upstream-aware/codebase-aware - absorber)
-#          artifacts_<slug>/archivist/knowledge_log.md (knowledge-aware)
+# OWNS  : artifacts_<slug>/enricher/enriched_prompt.md            (short-term - overwrite)
+#         artifacts_<slug>/enricher/prompt_log.json               (long-term - append-only)
+# READS : artifacts_<slug>/clarificator/requirement_synthesis.md  (upstream-aware - clarificator)
+#         artifacts_<slug>/absorber/codebase_map.md               (upstream-aware/codebase-aware - absorber)
+#         artifacts_<slug>/archivist/knowledge_log.md             (knowledge-aware)
+#         archivist/spec_gaps.md                                  (spec gap awareness, optional)
 
 
-# ── Model config ──────────────────────────────────────────────────────────────
+# ── Model config ─────────────────────────────────────────────────────────────
 ROLE               = "enricher"
 _MAX_TOKENS_ENRICH = 4096
 
@@ -95,30 +95,11 @@ def _wrap(text: str, indent: int = 0) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LLM call — thin wrapper delegating to central model registry
-# ─────────────────────────────────────────────────────────────────────────────
-
-# _call_llm removed — use call_llm() from modules.call_llm
-
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Context loaders
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _load_session() -> dict:
-    """Load clarificator/session.json — decisions and conflicts metadata."""
-    if CLARIFICATOR_SESSION.exists():
-        track_read(CLARIFICATOR_SESSION)
-        try:
-            return json.loads(CLARIFICATOR_SESSION.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            return {}
-    return {}
-
-
 def _load_requirement_synthesis() -> str:
-    """Load clarificator/requirement_synthesis.md directly."""
+    """Load clarificator/requirement_synthesis.md — primary requirement input."""
     if not CLARIFICATOR_REQUIREMENT_SYNTHESIS.exists():
         return ""
     try:
@@ -130,35 +111,38 @@ def _load_requirement_synthesis() -> str:
 
 
 def _load_knowledge_layer() -> str:
-    """Load all available knowledge layer artifacts for the current project."""
+    """
+    Load available knowledge layer artifacts for the current project.
+
+    Reads:
+      - absorber/codebase_map.md  — LLM-generated narrative (direct markdown read)
+      - archivist/knowledge_log.md
+      - archivist/spec_gaps.md
+    """
     parts: list[str] = []
 
-    if ABSORBER_CODEBASE_MAP.exists():
-        track_read(ABSORBER_CODEBASE_MAP)
-        parts.append(f"=== absorber/codebase_map.md ===\n{ABSORBER_CODEBASE_MAP.read_text(encoding='utf-8')}")
+    if ABSORBER_CODEBASE_MD.exists():
+        track_read(ABSORBER_CODEBASE_MD)
+        parts.append(
+            f"=== absorber/codebase_map.md ===\n"
+            f"{ABSORBER_CODEBASE_MD.read_text(encoding='utf-8')}"
+        )
 
     if ARCHIVIST_KNOWLEDGE_LOG.exists():
         track_read(ARCHIVIST_KNOWLEDGE_LOG)
-        parts.append(f"=== archivist/knowledge_log.md ===\n{ARCHIVIST_KNOWLEDGE_LOG.read_text(encoding='utf-8')}")
+        parts.append(
+            f"=== archivist/knowledge_log.md ===\n"
+            f"{ARCHIVIST_KNOWLEDGE_LOG.read_text(encoding='utf-8')}"
+        )
+
+    if ARCHIVIST_SPEC_GAPS.exists():
+        track_read(ARCHIVIST_SPEC_GAPS)
+        parts.append(
+            f"=== archivist/spec_gaps.md ===\n"
+            f"{ARCHIVIST_SPEC_GAPS.read_text(encoding='utf-8')}"
+        )
 
     return "\n\n".join(parts)
-
-
-def _summarize_decisions(session: dict) -> str:
-    """Format decisions from session.json into a compact summary block."""
-    decisions = session.get("decisions", [])
-    if not decisions:
-        return "(no clarification decisions recorded)"
-
-    lines: list[str] = []
-    for d in decisions:
-        pri  = d.get("priority", "").upper()
-        tier = d.get("tier", "?")
-        lines.append(f"  [{d['id']}] T{tier} {pri}: {d['question']}")
-        lines.append(f"    → {d['answer']}")
-        if d.get("impact"):
-            lines.append(f"    impact: {d['impact']}")
-    return "\n".join(lines)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -168,7 +152,6 @@ def _summarize_decisions(session: dict) -> str:
 def _append_prompt_log(
     project_name: str,
     enriched_text: str,
-    session: dict,
     extra_context: str,
     call_cost: float = 0.0,
 ) -> None:
@@ -177,8 +160,6 @@ def _append_prompt_log(
         "generated_at": _now_iso(),
         "project": project_name,
         "model": get_model(ROLE),
-        "input_session_hash": session.get("req_hash", ""),
-        "decisions_count": len(session.get("decisions", [])),
         "extra_context": extra_context.strip() if extra_context.strip() else None,
         "enriched_prompt_length": len(enriched_text),
         "cost": round(call_cost, 6),
@@ -208,10 +189,10 @@ def _append_prompt_log(
 _ENRICH_SYSTEM = """
 You are a senior software architect and prompt engineer.
 
-Your task: given a clarified requirement document, its clarification decisions,
-and an optional knowledge layer of the existing codebase,
-produce ONE structured "Enriched Prompt" document that a spec-writing model can use
-directly to write a complete, unambiguous technical specification.
+Your task: given a clarified requirement document and an optional knowledge
+layer of the existing codebase, produce ONE structured "Enriched Prompt"
+document that a spec-writing model can use directly to write a complete,
+unambiguous technical specification.
 
 The Enriched Prompt is not the spec itself — it is the fully-loaded input prompt
 that will be sent to a spec model. Think of it as: "everything the spec model
@@ -244,13 +225,9 @@ If knowledge layer is available: summarize relevant existing structure —
 key files, modules, patterns, constraints the spec must respect.
 If not available: write "No existing codebase — greenfield project."
 
-## Context: Clarification Decisions
-List every clarification decision that shapes the spec.
-Format: "- **[CLR-XXX]** <decision summary in one line>"
-These are non-negotiable — the spec must incorporate all of them.
-
 ## Context: Warnings & Risks
-Pull from any conflicts in the clarification session. If none: "(none identified)"
+List any conflicts or risks surfaced in the clarified requirement.
+If none: "(none identified)"
 
 ## Constraints
 Technical, business, and process constraints the spec must respect.
@@ -270,7 +247,7 @@ Always include:
   3. Include: Overview, Goals, Non-Goals, Architecture, Data Models,
      API Contracts (if applicable), Workflow & State Machine (if applicable),
      Error Handling, NFRs, Out of Scope, Acceptance Criteria.
-  4. Incorporate every decision in the Clarification Decisions section above.
+  4. Incorporate every decision recorded in the Clarified Requirement above.
   5. Flag any remaining ambiguities as <!-- TODO: clarify --> inline comments.
 
 ---
@@ -288,28 +265,13 @@ RULES:
 def _enrich(
     project_name: str,
     requirement_synthesis: str,
-    session: dict,
     knowledge_layer: str,
     extra_context: str,
 ) -> tuple[str, float]:
-    decisions_block = _summarize_decisions(session)
-
-    conflicts = session.get("conflicts", [])
-    conflicts_block = (
-        "\n".join(f"  [{c['id']}] {c['description']}" for c in conflicts)
-        if conflicts else "(none detected)"
-    )
-
     user_msg = f"""PROJECT NAME: {project_name}
 
-CLARIFIED REQUIREMENT (requirement_synthesis):
+CLARIFIED REQUIREMENT (requirement_synthesis.md):
 {requirement_synthesis}
-
-CLARIFICATION DECISIONS:
-{decisions_block}
-
-CONFLICTS:
-{conflicts_block}
 
 KNOWLEDGE LAYER (existing codebase artifacts, if available):
 {knowledge_layer if knowledge_layer.strip() else "(not available — absorber has not run for this project)"}
@@ -321,10 +283,6 @@ Produce the enriched prompt document now."""
 
     return call_llm(ROLE, _ENRICH_SYSTEM, user_msg, caller_file=__file__)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# User review: show enriched prompt, ask to confirm / edit / abort
-# ─────────────────────────────────────────────────────────────────────────────
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Resolve project (same pattern as clarificator)
@@ -361,7 +319,7 @@ def main() -> None:
         parser.add_argument("--extra-context", metavar="TEXT", default="",
                             help="Additional free-text context to include in the enriched prompt.")
         parser.add_argument("--dry-run",       action="store_true",
-                            help="Run enrichment, print result, do not write files or launch spec agent.")
+                            help="Run enrichment, print result, do not write files.")
         args = parser.parse_args()
 
         # ── Resolve project ───────────────────────────────────────────────────────
@@ -380,16 +338,12 @@ def main() -> None:
             sys.exit(1)
         print(f"[enricher] Loaded requirement_synthesis.md ({len(requirement_synthesis):,} chars)")
 
-        session = _load_session()
-        n_decisions = len(session.get("decisions", []))
-        print(f"[enricher] Session: {n_decisions} decisions")
-
         knowledge_layer = _load_knowledge_layer()
         if knowledge_layer.strip():
-            parts = []
-            if ABSORBER_CODEBASE_MAP.exists():    parts.append("absorber/codebase_map")
-            if ARCHIVIST_KNOWLEDGE_LOG.exists():   parts.append("archivist/knowledge_log")
-            print(f"[enricher] Knowledge layer loaded: {', '.join(parts)}")
+            loaded: list[str] = []
+            if ABSORBER_CODEBASE_MD.exists():      loaded.append("absorber/codebase_map.md")
+            if ARCHIVIST_KNOWLEDGE_LOG.exists():   loaded.append("archivist/knowledge_log.md")
+            print(f"[enricher] Knowledge layer loaded: {', '.join(loaded)}")
         else:
             print("[enricher] No knowledge layer found — proceeding in greenfield mode")
 
@@ -401,7 +355,6 @@ def main() -> None:
             enriched, call_cost = _enrich(
                 project_name          = project_name,
                 requirement_synthesis = requirement_synthesis,
-                session               = session,
                 knowledge_layer       = knowledge_layer,
                 extra_context         = args.extra_context,
             )
@@ -415,7 +368,7 @@ def main() -> None:
             print(enriched.strip())
             return
 
-        # ── Write enricher/enriched_prompt.md (short-term, overwrite) ─────────────
+        # ── Write enricher/enriched_prompt.md (short-term, overwrite) ────────────
         header = (
             f"# Enriched Prompt — {project_name}\n"
             f"Generated: {_now_iso()}\n\n"
@@ -431,11 +384,10 @@ def main() -> None:
         track_write(ENRICHER_OVERWRITE_PROMPT)
         print(f"[enricher] ✓ Enriched prompt → {ENRICHER_OVERWRITE_PROMPT}")
 
-        # ── Append to long-term log ──────────────────────────────────────────────
+        # ── Append to long-term log ───────────────────────────────────────────────
         _append_prompt_log(
             project_name  = project_name,
             enriched_text = enriched,
-            session       = session,
             extra_context = args.extra_context,
             call_cost     = call_cost,
         )

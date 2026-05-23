@@ -74,14 +74,17 @@ from pathlib import Path
 from typing import Any
 
 # === WRITE AUTHORITY: spectracker ===
-# OWNS  : artifacts_<slug>/spectracker/version_delta.json   (short-term, overwrite)
+# OWNS  : artifacts_<slug>/spectracker/version_delta.json    (short-term, overwrite)
 #          artifacts_<slug>/spectracker/version_log.json     (long-term, append + update applied)
 # READS : artifacts_<slug>/spec/specwright_spec_<slug>.md
+#         artifacts_<slug>/archivist/spec_gaps.md          (awareness, optional)
 #          artifacts_<slug>/spectracker/version_log.json     (self-read for delta baseline)
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from artifacts.paths import (  # noqa: E402
+from artifacts.paths import (
+    ARCHIVIST_KNOWLEDGE_LOG,
+    ARCHIVIST_SPEC_GAPS,  # noqa: E402
     SPECTRACKER_VERSION_DELTA,
     SPECTRACKER_VERSION_LOG,
     ensure_dirs,
