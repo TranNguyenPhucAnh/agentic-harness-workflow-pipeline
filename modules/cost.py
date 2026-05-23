@@ -4,8 +4,11 @@ modules/cost.py — Cost tracking for agentic pipeline.
 Strategy
 ────────
 For OpenRouter calls  → read `resp.usage.cost` directly from the response.
-                        OpenRouter usually includes this field in credits
-                        (1 credit = $0.000001 USD → divide by 1_000_000).
+                        This field is in CREDITS (1 credit = $0.000001 USD).
+                        Multiply by _CREDITS_TO_USD = 1e-6 to get USD.
+                        NOTE: different from generation log `usage` field
+                        which is already in USD — do NOT apply _CREDITS_TO_USD
+                        to generation log values.
                         BUT: some routes return cost=0 even when tokens were
                         consumed (upstream accounting fail, certain provider
                         routings). In that case we fall through to the price
@@ -96,7 +99,9 @@ _PRICE_TABLE: list[tuple[str, float, float]] = [
 ]
 
 _MTOK           = 1_000_000   # tokens per pricing unit
-_CREDITS_TO_USD = 1 / _MTOK   # 1 credit = $0.000001 (OpenRouter unit)
+_CREDITS_TO_USD = 1 / _MTOK   # 1 credit = $0.000001 USD
+                               # Applies to: resp.usage.cost (response field)
+                               # Does NOT apply to: generation log 'usage' field (already USD)
 
 
 def _lookup_price(model: str) -> tuple[float, float] | None:
@@ -167,7 +172,9 @@ def record_usage(
     # ── Cost resolution ───────────────────────────────────────────────────────
 
     # Path 1: OpenRouter native cost (most accurate when present AND non-zero).
-    # usage.cost is in credits; 1 credit = $0.000001.
+    # resp.usage.cost is in CREDITS; multiply by _CREDITS_TO_USD (1e-6) → USD.
+    # This is the response-level field — different from the generation log
+    # 'usage' field which is already in USD (used in probe_model_caps.py).
     # Reflects real routed price including any caching/discounts applied.
     #
     # Some routes return cost=0 even when tokens were consumed (upstream

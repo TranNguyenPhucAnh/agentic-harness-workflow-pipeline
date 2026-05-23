@@ -1,83 +1,6 @@
 """
 modules/call_llm.py — Unified LLM call wrapper for all pipeline scripts.
-
-Replaces the duplicated _call_llm / _call_model / _model_call boilerplate
-found in every pipeline script with a single, consistent interface.
-
-Features
-────────
-  • Retry on empty content  — configurable count, exponential backoff
-  • Retry on tool_calls     — guard against model returning tool_calls instead of text
-  • Offline fallback        — stdin paste when API key is missing
-  • Cost tracking           — record_usage + print_call on every attempt
-  • JSON mode               — parse + retry on invalid/non-object JSON
-  • Consistent return type  — always (content: str, cost: float)
-
-────────────────────────────────────────────────────────────────────────
-Usage
-────────────────────────────────────────────────────────────────────────
-
-Plain text call (most scripts):
-
-    from modules.call_llm import call_llm
-
-    text, cost = call_llm(
-        role        = ROLE,
-        system      = SYSTEM_PROMPT,
-        user        = user_msg,
-        max_tokens  = 8192,
-        caller_file = __file__,
-    )
-
-JSON call (scaffolder, planner, executor, debugger, judge, patcher):
-
-    from modules.call_llm import call_llm_json
-
-    data, cost = call_llm_json(
-        role        = ROLE,
-        system      = SYSTEM_PROMPT,
-        user        = user_msg,
-        max_tokens  = 32768,
-        temperature = 0.1,
-        caller_file = __file__,
-        label       = "[07] full_plan",
-    )
-
-Multi-role scripts (debugger, patcher pass role as variable):
-
-    text, cost = call_llm(
-        role        = "debugger_secondary",
-        system      = SYSTEM_PROMPT,
-        user        = user_msg,
-        caller_file = __file__,
-        label       = "[09] secondary",
-    )
-
-────────────────────────────────────────────────────────────────────────
-Migration cheatsheet
-────────────────────────────────────────────────────────────────────────
-
-Old pattern → new pattern:
-
-  # enricher (returned tuple)
-  content, cost = _call_llm(system, user, max_tokens=N)
-  →
-  content, cost = call_llm(ROLE, system, user, max_tokens=N, caller_file=__file__)
-
-  # clarificator/specwright (returned str)
-  content = _call_llm(system, user, max_tokens=N)
-  →
-  content, _ = call_llm(ROLE, system, user, max_tokens=N, caller_file=__file__)
-
-  # debugger/patcher (role param, returned str)
-  content = _model_call(role, messages, max_tokens=N)
-  →
-  content, _ = call_llm(role, system, user, max_tokens=N, caller_file=__file__)
-
-  # scaffolder/planner/executor (JSON, inline retry)
-  data = _call_and_parse(system, user, max_tokens=N, max_retries=5)
-  →
-  data, cost = call_llm_json(ROLE, system, user, max_tokens=N, retries=5, caller_file=__file__)
+...
 """
 
 from __future__ import annotations
@@ -94,11 +17,18 @@ from modules.cost import print_call, record_usage
 
 # ─── Defaults ────────────────────────────────────────────────────────────────
 
-_DEFAULT_RETRIES     = 3
-_DEFAULT_TEMPERATURE = None   # None = use model default
-_BACKOFF_BASE        = 2.0    # seconds; actual wait = base^(attempt-1) + jitter
-_BACKOFF_JITTER      = 1.0    # max random jitter seconds
-_FLAT_RETRY_SLEEP    = 3.0    # used when backoff=False
+_DEFAULT_RETRIES        = 3
+_DEFAULT_TEMPERATURE    = None   # None = use model default
+_BACKOFF_BASE           = 2.0    # seconds; actual wait = base^(attempt-1) + jitter
+_BACKOFF_JITTER         = 1.0    # max random jitter seconds
+_FLAT_RETRY_SLEEP       = 3.0    # used when backoff=False
+_DEFAULT_CONTINUATIONS  = 5      # max continuation rounds for finish_reason=length
+_CONTINUE_PROMPT        = "continue from where you left off"
+_CONTINUE_JSON_PROMPT   = (
+    "Your previous response was cut off before the JSON was complete. "
+    "Please output the COMPLETE JSON object from the very beginning, "
+    "ensuring it is valid and fully closed."
+)
 
 
 # ─── Internal helpers ─────────────────────────────────────────────────────────
@@ -112,6 +42,11 @@ def _extract_text(resp: Any) -> str:
             for part in content
         )
     return (content or "").strip()
+
+
+def _get_finish_reason(resp: Any) -> str:
+    """Return the finish_reason string from the first choice, or '' if unavailable."""
+    return getattr(resp.choices[0], "finish_reason", None) or ""
 
 
 def _guard_tool_calls(resp: Any) -> None:
@@ -161,38 +96,158 @@ def _handle_offline(exc: Exception, role: str) -> str | None:
     return None
 
 
+def _sanitize_json_string(raw: str) -> str:
+    """
+    Remove or escape ASCII control characters (0x00–0x1F, 0x7F) that are
+    invalid inside JSON strings but sometimes appear in model output when
+    a response is truncated mid-string and then continued.
+
+    Only characters that are not valid JSON whitespace (\\t \\n \\r) are
+    replaced with a space so the overall structure is preserved.
+    """
+    def _replace(m: re.Match) -> str:
+        ch = m.group(0)
+        if ch in ("\t", "\n", "\r"):
+            return ch
+        return " "
+
+    return re.sub(r"[\x00-\x1f\x7f]", _replace, raw)
+
+
+def _try_ast_literal(s: str) -> dict[str, Any] | None:
+    """Parse Python dict literal (single-quoted) via ast.literal_eval (safe)."""
+    import ast
+    try:
+        parsed = ast.literal_eval(s.strip())
+        if isinstance(parsed, dict):
+            return json.loads(json.dumps(parsed))
+    except Exception:
+        pass
+    return None
+
+
 def _parse_json_object(raw: str) -> dict[str, Any]:
     """
     Parse a JSON object from model output.
-    Strips markdown fences if present, then tries direct parse.
-    Falls back to finding the outermost {...} block via regex.
-    Raises ValueError if no valid JSON object is found.
+
+    Pass 1 — direct json.loads ± control-char sanitization
+    Pass 2 — find outermost {...} then json.loads ± sanitization
+    Pass 3 — ast.literal_eval (Python dict with single-quoted keys/values)
+    Raises ValueError if all passes fail.
     """
     # Strip markdown fences
     text = re.sub(r"^```(?:json)?\s*", "", raw.strip(), flags=re.IGNORECASE)
     text = re.sub(r"\s*```$", "", text.strip())
 
-    # Direct parse
-    try:
-        parsed = json.loads(text)
-        if not isinstance(parsed, dict):
-            raise ValueError(f"Expected JSON object, got {type(parsed).__name__}")
-        return parsed
-    except json.JSONDecodeError:
-        pass
-
-    # Fallback: find outermost {...}
-    m = re.search(r"\{.*\}", text, re.DOTALL)
-    if m:
+    # Pass 1: direct parse
+    for candidate in (text, _sanitize_json_string(text)):
         try:
-            parsed = json.loads(m.group())
+            parsed = json.loads(candidate)
             if not isinstance(parsed, dict):
                 raise ValueError(f"Expected JSON object, got {type(parsed).__name__}")
             return parsed
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"No valid JSON object found in model output: {exc}") from exc
+        except json.JSONDecodeError:
+            pass
 
-    raise ValueError("No JSON object found in model output.")
+    # Pass 2: find outermost {...}
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if m:
+        block = m.group()
+        for candidate in (block, _sanitize_json_string(block)):
+            try:
+                parsed = json.loads(candidate)
+                if not isinstance(parsed, dict):
+                    raise ValueError(f"Expected JSON object, got {type(parsed).__name__}")
+                return parsed
+            except json.JSONDecodeError:
+                pass
+
+    # Pass 3: Python dict literal (single-quoted keys/values from some models)
+    for candidate in (text, m.group() if m else None):
+        if candidate is None:
+            continue
+        result = _try_ast_literal(candidate)
+        if result is not None:
+            return result
+
+    raise ValueError(
+        "No valid JSON object found in model output "
+        "(tried json.loads, regex extract, ast.literal_eval)."
+    )
+
+
+def _continue_on_length(
+    role: str,
+    messages: list[dict[str, str]],
+    first_resp: Any,
+    kwargs: dict[str, Any],
+    max_continuations: int,
+    caller_file: str,
+    label: str,
+    *,
+    json_mode: bool = False,
+) -> tuple[str, float]:
+    """
+    Given a response that hit finish_reason=length, keep calling the model
+    until finish_reason != length or max_continuations is exhausted.
+
+    json_mode=True changes the strategy: instead of appending the truncated
+    output and asking the model to continue (which produces broken JSON),
+    we ask the model to re-output the COMPLETE JSON from scratch.  The last
+    complete response replaces accumulated content rather than being appended.
+
+    Returns (full_content: str, total_cost: float).
+    The cost of the *first* call is NOT included — callers add it separately.
+    """
+    accumulated = _extract_text(first_resp)
+    total_cost  = 0.0
+    conv        = list(messages)  # local copy
+
+    for turn in range(1, max_continuations + 1):
+        print(
+            f"[call_llm][continue] {role} finish_reason=length "
+            f"— continuation {turn}/{max_continuations} …"
+        )
+
+        if json_mode:
+            # Don't append the broken partial JSON — just ask for a full redo.
+            # We keep the original system+user messages and add a single user
+            # follow-up so the model has full context.
+            conv_for_call = conv + [{"role": "user", "content": _CONTINUE_JSON_PROMPT}]
+        else:
+            # Plain-text mode: append what the model produced so far, then continue.
+            conv.append({"role": "assistant", "content": accumulated})
+            conv.append({"role": "user",      "content": _CONTINUE_PROMPT})
+            conv_for_call = conv
+
+        resp = call_model(role, conv_for_call, **kwargs)
+
+        cost        = _record_cost(resp, role, caller_file, label)
+        total_cost += cost
+        chunk       = _extract_text(resp)
+
+        if json_mode:
+            # Replace accumulated with the new (hopefully complete) response.
+            if chunk:
+                accumulated = chunk
+        else:
+            if chunk:
+                accumulated += chunk
+
+        finish = _get_finish_reason(resp)
+        if finish != "length":
+            break
+
+        if json_mode:
+            # Update conv so next iteration's follow-up has the latest attempt.
+            conv = list(messages)
+    else:
+        print(
+            f"[call_llm][warn] {role} still finish_reason=length after "
+            f"{max_continuations} continuations — returning accumulated content."
+        )
+
+    return accumulated, total_cost
 
 
 # ─── Public API ───────────────────────────────────────────────────────────────
@@ -209,55 +264,63 @@ def call_llm(
     label: str = "",
     caller_file: str = "",
     offline_fallback: bool = True,
+    max_continuations: int = _DEFAULT_CONTINUATIONS,
 ) -> tuple[str, float]:
     """
     Call an LLM model with automatic retry on empty content.
 
     Parameters
     ──────────
-    role             : Role key registered in artifacts/models.py (e.g. "enricher").
-    system           : System prompt string.
-    user             : User message string.
-    max_tokens       : Max completion tokens.
-    temperature      : Sampling temperature. None = model default.
-    retries          : Total attempts before giving up (default 3).
-    backoff          : If True, use exponential backoff between retries.
-                       If False, use flat 3s sleep (matches old debugger/patcher behaviour).
-    label            : Optional label appended to print_call output (e.g. "[09] secondary").
-    caller_file      : Pass __file__ from the calling script for accurate cost log paths.
-    offline_fallback : If True, prompt user to paste response when API key is missing.
+    role               : Role key registered in artifacts/models.py (e.g. "enricher").
+    system             : System prompt string.
+    user               : User message string.
+    max_tokens         : Max completion tokens.
+    temperature        : Sampling temperature. None = model default.
+    retries            : Total attempts before giving up (default 3).
+    backoff            : If True, use exponential backoff between retries.
+                         If False, use flat 3s sleep (matches old debugger/patcher behaviour).
+    label              : Optional label appended to print_call output (e.g. "[09] secondary").
+    caller_file        : Pass __file__ from the calling script for accurate cost log paths.
+    offline_fallback   : If True, prompt user to paste response when API key is missing.
+    max_continuations  : Max extra calls when finish_reason=length (default 5).
+                         Set to 0 to disable auto-continue.
 
     Returns
     ───────
     (content: str, cost: float)
-      content — model response text, stripped.
-      cost    — USD cost from record_usage(); 0.0 if unavailable.
+      content — model response text, stripped. Concatenated across continuations.
+      cost    — total USD cost across all calls; 0.0 if unavailable.
     """
     kwargs: dict[str, Any] = {"max_tokens": max_tokens}
     if temperature is not None:
         kwargs["temperature"] = temperature
 
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user",   "content": user},
+    ]
+
     last_exc: Exception | None = None
 
     for attempt in range(1, retries + 1):
         try:
-            resp = call_model(
-                role,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user",   "content": user},
-                ],
-                **kwargs,
-            )
+            resp = call_model(role, messages, **kwargs)
 
             cost    = _record_cost(resp, role, caller_file, label)
             content = _extract_text(resp)
 
-            # Guard: model must not return tool_calls when we expect text
             _guard_tool_calls(resp)
 
             if not content:
                 raise RuntimeError("Model returned empty content.")
+
+            # ── Auto-continue on truncation ───────────────────────────────────
+            if max_continuations > 0 and _get_finish_reason(resp) == "length":
+                extra_content, extra_cost = _continue_on_length(
+                    role, messages, resp, kwargs, max_continuations, caller_file, label,
+                    json_mode=False,
+                )
+                return extra_content, cost + extra_cost
 
             return content, cost
 
@@ -279,7 +342,6 @@ def call_llm(
                 print(f"[call_llm][warn] {role} attempt {attempt}/{retries} failed: {exc} — giving up.")
 
         except Exception as exc:
-            # Non-retryable: network error, auth, etc.
             print(f"[call_llm][error] {role} call failed: {exc}", file=sys.stderr)
             raise
 
@@ -297,12 +359,17 @@ def call_llm_json(
     backoff: bool = True,
     label: str = "",
     caller_file: str = "",
+    max_continuations: int = _DEFAULT_CONTINUATIONS,
 ) -> tuple[dict[str, Any], float]:
     """
     Call an LLM model and parse the response as a JSON object.
 
     Retries on both empty content AND invalid/non-object JSON.
     Does not support offline_fallback (JSON mode only used in automated steps).
+
+    When finish_reason=length, asks the model to re-output the COMPLETE JSON
+    from scratch rather than appending the truncated fragment (which would
+    produce invalid JSON with control characters or mismatched braces).
 
     Parameters
     ──────────
@@ -318,29 +385,35 @@ def call_llm_json(
     if temperature is not None:
         kwargs["temperature"] = temperature
 
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user",   "content": user},
+    ]
+
     last_exc: Exception | None = None
     total_cost = 0.0
 
     for attempt in range(1, retries + 1):
         try:
-            resp = call_model(
-                role,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user",   "content": user},
-                ],
-                **kwargs,
-            )
+            resp = call_model(role, messages, **kwargs)
 
             cost        = _record_cost(resp, role, caller_file, label)
             total_cost += cost
             content     = _extract_text(resp)
 
-            # Guard: model must not return tool_calls when we expect JSON text
             _guard_tool_calls(resp)
 
             if not content:
                 raise RuntimeError("Model returned empty content.")
+
+            # ── Auto-continue on truncation (JSON-aware) ──────────────────────
+            if max_continuations > 0 and _get_finish_reason(resp) == "length":
+                extra_content, extra_cost = _continue_on_length(
+                    role, messages, resp, kwargs, max_continuations, caller_file, label,
+                    json_mode=True,
+                )
+                total_cost += extra_cost
+                content     = extra_content
 
             data = _parse_json_object(content)
             return data, total_cost
@@ -374,6 +447,7 @@ def call_llm_messages(
     backoff: bool = True,
     label: str = "",
     caller_file: str = "",
+    max_continuations: int = _DEFAULT_CONTINUATIONS,
 ) -> tuple[str, float]:
     """
     Low-level variant: accepts a pre-built messages list instead of system+user strings.
@@ -398,11 +472,18 @@ def call_llm_messages(
             cost    = _record_cost(resp, role, caller_file, label)
             content = _extract_text(resp)
 
-            # Guard: model must not return tool_calls when we expect text
             _guard_tool_calls(resp)
 
             if not content:
                 raise RuntimeError("Model returned empty content.")
+
+            # ── Auto-continue on truncation ───────────────────────────────────
+            if max_continuations > 0 and _get_finish_reason(resp) == "length":
+                extra_content, extra_cost = _continue_on_length(
+                    role, messages, resp, kwargs, max_continuations, caller_file, label,
+                    json_mode=False,
+                )
+                return extra_content, cost + extra_cost
 
             return content, cost
 

@@ -437,9 +437,6 @@ def _maybe_commit_run_log(role: str, prefix: str = "[pipeline]") -> None:
         - N: remove the entry just appended and rewrite the file.
       - EOFError / KeyboardInterrupt → keep silently (non-interactive mode).
     """
-    import json
-    from datetime import datetime, timezone
-
     chain        = get_chain()
     current_info = chain.get(role)
     if current_info is None or current_info.long_term_artifact is None:
@@ -448,32 +445,18 @@ def _maybe_commit_run_log(role: str, prefix: str = "[pipeline]") -> None:
     artifact_path = Path(str(current_info.long_term_artifact))
     artifact_name = artifact_path.name
 
-    entry = {
-        "step":      role,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "status":    "completed",
-        "project":   os.environ.get("PIPELINE_PROJECT", "unknown"),
-    }
-
-    # Auto-append first
+    # Read what the script already wrote — do NOT append anything here
     entries = _load_json_entries(artifact_path)
-    entries.append(entry)
-    try:
-        _save_json_entries(artifact_path, entries)
-    except Exception as exc:
-        print(f"  {prefix}[warn] Could not write {artifact_name}: {exc}")
+    if not entries:
         return
 
-    # Ask user to keep or discard
     try:
         ans = input(f"  Keep this entry in {artifact_name}? [Y/n]: ").strip().lower()
     except (EOFError, KeyboardInterrupt):
-        # Non-interactive: keep silently
         print(f"  {prefix} Entry kept in {artifact_name} (non-interactive).")
         return
 
     if ans in ("n", "no"):
-        # Remove the last entry (the one we just appended)
         entries.pop()
         try:
             _save_json_entries(artifact_path, entries)

@@ -59,15 +59,16 @@ _REPO_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
 
 from artifacts.paths import (  # type: ignore  # noqa: E402
-    ABSORBER_CODEBASE_MAP,
     ABSORBER_CODEBASE_MD,
     ARCHIVIST_KNOWLEDGE_LOG,
+    ARCHIVIST_SPEC_GAPS,
     CLARIFICATOR_DECISION_LOG,
     CLARIFICATOR_REQUIREMENT_SYNTHESIS,
     CLARIFICATOR_SESSION,
     ensure_dirs,
     get_project_name,
 )
+
 from artifacts.models import call_model, get_model, get_provider  # noqa: E402
 
 # New shared interactive/drag-drop abstraction.
@@ -80,15 +81,17 @@ from modules.post_interactive import prompt_next_step  # noqa: E402
 
 # Local aliases
 KNOWLEDGE_BASE = ARCHIVIST_KNOWLEDGE_LOG
+SPEC_GAPS      = ARCHIVIST_SPEC_GAPS
 
 
 # === WRITE AUTHORITY: clarificator ===
-# OWNS  : clarificator/session.json         (short-term - overwrite)
+# OWNS  : clarificator/session.json             (short-term - overwrite)
 #         clarificator/requirement_synthesis.md (short-term - overwrite)
-#         clarificator/decision_log.json    (long-term - append only)
-# READS : archivist/knowledge_log.md        (knowledge-aware)
-#         absorber/codebase_map.md          (upstream-aware/codebase-aware - existing project only)
-#         clarificator/decision_log.json    (history-aware)
+#         clarificator/decision_log.json        (long-term - append only)
+# READS : archivist/knowledge_log.md            (knowledge-aware)
+#         archivist/spec_gaps.md                (spec gap awareness, optional)
+#         absorber/codebase_map.md              (upstream-aware/codebase-aware - existing project only)
+#         clarificator/decision_log.json        (history-aware)
 
 # ── Model config ─────────────────────────────────────────────────────────────
 
@@ -252,6 +255,10 @@ def _load_knowledge_context() -> str:
     if KNOWLEDGE_BASE.exists():
         track_read(KNOWLEDGE_BASE)
         parts.append(f"=== archivist/knowledge_log.md ===\n{KNOWLEDGE_BASE.read_text(encoding='utf-8')}")
+
+    if SPEC_GAPS.exists():
+        track_read(SPEC_GAPS)
+        parts.append(f"=== archivist/spec_gaps.md ===\n{SPEC_GAPS.read_text(encoding='utf-8')}")
 
     # Consume absorber artifacts:
     # - codebase_map.md: LLM-readable narrative (Project Overview, Module Inventory,

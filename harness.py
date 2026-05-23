@@ -1641,6 +1641,7 @@ def main() -> None:
                     "spectracker preflight",
                     STEP_SCRIPTS["spectracker"],
                     args,
+                    ["--preflight"],
                 )
                 _update_run_record(
                     run_id,

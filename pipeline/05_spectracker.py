@@ -77,14 +77,11 @@ from typing import Any
 # OWNS  : artifacts_<slug>/spectracker/version_delta.json    (short-term, overwrite)
 #          artifacts_<slug>/spectracker/version_log.json     (long-term, append + update applied)
 # READS : artifacts_<slug>/spec/specwright_spec_<slug>.md
-#         artifacts_<slug>/archivist/spec_gaps.md          (awareness, optional)
 #          artifacts_<slug>/spectracker/version_log.json     (self-read for delta baseline)
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from artifacts.paths import (
-    ARCHIVIST_KNOWLEDGE_LOG,
-    ARCHIVIST_SPEC_GAPS,  # noqa: E402
+from artifacts.paths import (  # noqa: E402
     SPECTRACKER_VERSION_DELTA,
     SPECTRACKER_VERSION_LOG,
     ensure_dirs,
@@ -582,6 +579,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "--preflight",
+        action="store_true",
+        help=(
+            "Run as a silent preflight check (called by harness before mid-pipeline steps). "
+            "Skips post-run prompts and long-term artifact commit."
+        ),
+    )
+    parser.add_argument(
         "--project",
         default=None,
         help=(
@@ -728,16 +733,30 @@ def main() -> None:
         print(f"[spectracker] Delta       → {DELTA_OUT}")
 
         # ── Append long-term: version_log.json (write-once per version) ──
-        appended = _append_version_log_entry(
-            delta=delta,
-            spec_content=current_text,
-            affected_files=[],  # populated by downstream consumers if needed
+        #
+        # Preflight mode: auto-append only if there is a real version bump
+        # (changed/new/removed sections). No prompt — silent.
+        # Normal mode: always append (post_interactive handles keep/discard prompt).
+        is_preflight    = getattr(args, "preflight", False)
+        has_version_bump = bool(
+            delta.changed_sections
+            or delta.new_sections
+            or delta.removed_sections
         )
 
-        if appended:
-            print(f"[spectracker] Version log → {VERSION_LOG} (new entry: {delta.to_version})")
+        if is_preflight and not has_version_bump:
+            print(f"[spectracker] Version log → skipped (preflight, no changes)")
         else:
-            print(f"[spectracker] Version log → {VERSION_LOG} (entry for {delta.to_version} already exists)")
+            appended = _append_version_log_entry(
+                delta=delta,
+                spec_content=current_text,
+                affected_files=[],  # populated by downstream consumers if needed
+            )
+            if appended:
+                label = " (auto-appended, preflight)" if is_preflight else f" (new entry: {delta.to_version})"
+                print(f"[spectracker] Version log → {VERSION_LOG}{label}")
+            else:
+                print(f"[spectracker] Version log → {VERSION_LOG} (entry for {delta.to_version} already exists)")
 
         # Summary
         has_section_delta = bool(
@@ -762,7 +781,8 @@ def main() -> None:
 
     finally:
         print_artifact_summary("[05]")
-        prompt_next_step(ROLE, prefix="[05]")
+        if not getattr(args, "preflight", False):
+            prompt_next_step(ROLE, prefix="[05]")
 
     sys.exit(exit_code)
 

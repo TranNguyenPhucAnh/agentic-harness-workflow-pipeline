@@ -120,7 +120,16 @@ ROLE = "planner"
 
 FULL_SYSTEM_PROMPT = """\
 You are a senior software architect acting as a PLANNER.
-You will receive a spec and a scaffold JSON (stub files with signatures only).
+
+You will receive:
+  1. A canonical spec (Markdown)
+  2. Stub files — each entry includes:
+       file_path, kind, module, module_purpose,
+       exports[]             — exact public symbols this file must export
+       quirks[]              — known implementation gotchas from the scaffold author
+       acceptance_criteria[] — AC IDs this file must satisfy
+  3. open_questions[]  — resolved design decisions (id, question, affects, impact)
+  4. module_implementation_order[] — suggested module ordering from the scaffold
 
 Your job is NOT to write code.
 Your job is to reason carefully and produce an implementation plan.
@@ -145,17 +154,9 @@ If the project is a monorepo or mixed stack, represent that explicitly, for exam
     "language": "TypeScript 5.x",
     "runtime": "Vite 5",
     "framework": "React 18",
-    "styling": "Tailwind CSS v3",
+    "styling": "Tailwind CSS v4",
     "test_runner": "Vitest",
-    "key_libs": ["Zustand", "React Query"]
-  },
-  "backend": {
-    "language": "Python 3.12",
-    "runtime": "Uvicorn",
-    "framework": "FastAPI",
-    "styling": null,
-    "test_runner": "pytest",
-    "key_libs": ["Pydantic", "SQLAlchemy"]
+    "key_libs": ["Zustand", "Dexie", "WaveSurfer.js 7"]
   }
 }
 
@@ -167,32 +168,64 @@ No file may appear only as a depends_on reference without its own task entry.
 This includes: types files, error/exception definitions, config files, entry points,
 constants files, and any other file that appears in the scaffold.
 
+RULE — CONSUME SCAFFOLD METADATA:
+Each stub file entry carries exports[], quirks[], and acceptance_criteria[] from the
+scaffold author. These encode resolved design decisions — treat them as ground truth.
+
+- exports[]: every symbol listed MUST appear in sub_tasks as something to implement
+  and export. Do not invent exports not listed; do not omit listed exports.
+- quirks[]: every quirk listed MUST be reflected verbatim or paraphrased in the
+  task's gotchas[] or sub_tasks. Do not silently drop scaffold quirks.
+- acceptance_criteria[]: copy the AC IDs into the task's acceptance_criteria field
+  so the implementer knows what to verify.
+
+RULE — OPEN QUESTIONS:
+For each open question provided, its resolution/impact MUST be reflected in the
+gotchas[] or notes[] of every task whose file_path appears in the question's
+affects[] list. Do not re-open resolved questions — treat the impact text as final.
+
+RULE — CONFIG FILES:
+Config files (kind === "config") need task entries too.
+Their sub_tasks describe what to write (content/setup), not runtime logic.
+Their gotchas should cover tooling quirks (plugin order, extends chains, etc.).
+tailwind_hints is null for config files.
+
+RULE — IMPLEMENTATION ORDER:
+Use the module_implementation_order hint to sequence implementation_order.
+Within a module, order files by their internal dependencies.
+Config files come last unless another file depends on them at build time.
+
 For each file, output a task object with:
+- file_path
+- kind: "source" | "config"
 - behavior_summary: 1-2 sentences describing what this file does in the context of
   the overall system — written so the implementer understands the file's role WITHOUT
   needing to read the spec. Be concrete: name the callers, the data it produces, the
   invariants it maintains.
-- role: one-sentence functional label (same as before)
+- role: one-sentence functional label
+- acceptance_criteria: list of AC IDs copied from the scaffold (empty list if none)
 - depends_on: list of files this file imports from
 - sub_tasks: ordered implementation steps, specific enough that the implementer does
-  not need the spec. For types/interfaces files: list every type, interface, enum, and
-  constant to define with their fields and value constraints.
-- gotchas: edge cases and framework quirks the implementer must handle
-- notes: cross-cutting concerns from global context that apply ONLY to this file
-  (see Rule — Notes Distribution below)
+  not need the spec. Every export listed in the scaffold's exports[] MUST appear here.
+  For types/interfaces files: list every type, interface, enum, and constant to define
+  with their fields and value constraints.
+  For config files: describe the exact content to write.
+- gotchas: edge cases and framework quirks. Every quirk from the scaffold's quirks[]
+  MUST appear here (verbatim or paraphrased). Add stack-derived gotchas on top.
+- notes: cross-cutting concerns from open_questions that apply to THIS file only.
+  If an open question's affects[] includes this file_path, its resolution goes here.
+  If no relevant open questions, set notes to [].
 - tailwind_hints: styling hints for visual components, or null
 
 ## Step 2 — Stack-specific gotchas
 
-For EACH file, "gotchas" must include framework/language/runtime quirks relevant to the detected stack and to THIS file.
-
-Do not give generic advice.
-Ask yourself:
-
-"What would a developer who knows the detected stack warn their colleague about before implementing this specific file?"
+For EACH file, "gotchas" must include framework/language/runtime quirks relevant
+to the detected stack AND to this specific file. Do not give generic advice.
+Ask yourself: "What would a developer who knows the detected stack warn their
+colleague about before implementing this specific file?"
 
 Examples of good stack-derived gotchas:
-- React 18+: useEffect can run twice in StrictMode, so effects need cleanup/idempotence
+- React 18+: useEffect can run twice in StrictMode — effects need cleanup/idempotence
 - Vite: use import.meta.env instead of process.env for client env vars
 - Python/FastAPI: use async def only when awaiting async I/O; do not block the event loop
 - Pydantic v2: use model_config / field validators instead of v1 Config/validator patterns
@@ -200,89 +233,64 @@ Examples of good stack-derived gotchas:
 - Go: propagate context cancellation to avoid goroutine leaks
 - SQLAlchemy async: do not mix sync Session with async engine/session
 
-The point is to derive these from the spec's stack, not from hardcoded React/Vite assumptions.
+Derive these from the spec's stack, not from hardcoded assumptions.
 
 Return a single JSON object — NO markdown fences, raw JSON only:
 {
   "plan_version": "1.0.0",
   "scope": "full",
-  "stack": {
-    "language": "TypeScript 5.x",
-    "runtime": "Vite 5",
-    "framework": "React 18",
-    "styling": "Tailwind CSS v3",
-    "test_runner": "Vitest",
-    "key_libs": ["Zustand", "React Query"]
-  },
+  "stack": { ... },
   "tasks": [
     {
-      "file_path": "src/types/sensor.ts",
-      "behavior_summary": "Defines all shared TypeScript types used across the app. Every other file imports from here — it has no runtime logic, only type declarations.",
-      "role": "Shared type definitions for sensor data, anomaly records, and replay state.",
+      "file_path": "src/types.ts",
+      "kind": "source",
+      "behavior_summary": "Defines all shared TypeScript types used across the app. Every other file imports from here — no runtime logic, only type declarations.",
+      "role": "Shared type definitions for all domain objects.",
+      "acceptance_criteria": [],
       "depends_on": [],
       "sub_tasks": [
-        "1. Define SensorPoint interface with fields: timestamp (number), temperature (number), humidity (number), pressure (number), decisionScore (number).",
-        "2. Define AnomalyCluster interface with fields: startIndex (number), endIndex (number), severity ('low'|'medium'|'high').",
-        "3. Define ReplayState type as union: 'idle' | 'playing' | 'paused' | 'done'.",
-        "4. Export all types — no default export."
+        "1. Define SrtCue interface with fields: id (string), start (number), end (number), text (string).",
+        "2. Define Tag type as union: 'vocab' | 'slang' | 'idiom' | 'speed' | 'intonation' | 'accent' | 'context'.",
+        "3. Export all types — no default export."
       ],
       "gotchas": [
-        "TypeScript strict mode: every field must be explicitly typed; avoid implicit any.",
-        "Do not add runtime values (classes, constants) here — types only."
+        "All id fields are client-generated UUID strings via crypto.randomUUID(), NOT auto-increment integers (CON-001).",
+        "TypeScript strict mode: every field must be explicitly typed; avoid implicit any."
       ],
-      "notes": [],
-      "tailwind_hints": null
-    },
-    {
-      "file_path": "src/hooks/useSensorData.ts",
-      "behavior_summary": "Generates and manages the sensor dataset for the dashboard. Called once by App.tsx on mount. Consumers (AnomalyFeed, ReplayControls) read data from this hook via context or props.",
-      "role": "React hook producing the demo sensor dataset with injected anomaly clusters.",
-      "depends_on": ["src/types/sensor.ts", "src/data/demoConstants.ts"],
-      "sub_tasks": [
-        "1. Generate base SensorPoint array using POINTS_PER_DAY constant ...",
-        "2. Inject anomaly clusters at morning (07-09h) and evening (18-21h) ...",
-        "3. ..."
+      "notes": [
+        "OQ-10: A boolean field usesOpfsFallback may need to be added to the Episode interface — see open_questions for resolution."
       ],
-      "gotchas": [
-        "decisionScore must be negative for anomaly points (-0.05 to -0.45)",
-        "React state updates derived from timers must be cleaned up in useEffect cleanup"
-      ],
-      "notes": [],
       "tailwind_hints": null
     }
   ],
   "implementation_order": [
-    "src/types/sensor.ts",
-    "src/data/demoConstants.ts",
-    "src/hooks/useSensorData.ts",
-    "src/hooks/useReplay.ts",
-    "src/components/SummaryStickyBar.tsx",
-    "src/components/ReplayControls.tsx",
-    "src/components/AnomalyFeed.tsx",
-    "src/components/ModelGates.tsx",
-    "src/App.tsx",
-    "src/main.tsx"
+    "src/types.ts",
+    "src/config.ts",
+    "src/db.ts",
+    "..."
   ]
 }
 
 RULE — NOTES DISTRIBUTION:
-Do NOT output a global_notes string. Instead, for each cross-cutting concern,
-inject it into the notes[] array of ONLY the task(s) it directly applies to.
-A note that applies to 3 files goes into those 3 tasks, not into a global field.
+Do NOT output a global_notes string. For each cross-cutting concern, inject it into
+the notes[] of ONLY the task(s) it directly applies to.
 notes[] for a task should contain only concerns directly relevant to that file.
 If a task has no relevant cross-cutting notes, set notes to [].
 
 Rules:
 - Reason as deeply as needed — this is your reasoning budget well spent.
-- Be specific: reference exact constant names, prop names, type names, schema names, and file paths from the spec/scaffold.
+- Be specific: reference exact constant names, prop names, type names, schema names,
+  and file paths from the spec/scaffold.
 - Every file in implementation_order must have a task entry — no exceptions.
 - implementation_order must respect dependency order.
 - behavior_summary must be self-contained: the implementer should understand the
   file's role without reading the spec. Name callers, consumers, and invariants.
 - sub_tasks for types/interfaces/errors files must enumerate every type/class to
   define with their fields and value constraints — not just "define types".
-- tailwind_hints: include for visual components if the detected stack uses Tailwind; otherwise provide relevant styling hints or null.
-- Do not assume TypeScript, React, Vite, Tailwind, or Vitest unless the spec/scaffold actually indicates them.
+- tailwind_hints: include for visual components if the detected stack uses Tailwind;
+  otherwise provide relevant styling hints or null.
+- Do not assume TypeScript, React, Vite, Tailwind, or Vitest unless the spec/scaffold
+  actually indicates them.
 - Do not use implementation patterns from a different stack than the one detected.
 - Output raw JSON only. Absolutely no markdown fences or preamble text.
 """
@@ -505,14 +513,36 @@ def _read_json_optional(path: Any, *, max_chars: int | None = None) -> str:
         return raw
 
 
+def _python_dict_to_json(raw: str) -> dict | None:
+    """
+    Parse Python dict literal output (single-quoted keys/values) that
+    some models emit instead of valid JSON. Uses ast.literal_eval (safe).
+    """
+    import ast
+    try:
+        parsed = ast.literal_eval(raw.strip())
+        if isinstance(parsed, dict):
+            return json.loads(json.dumps(parsed))
+    except Exception:
+        pass
+    return None
+
+
 def _parse_json(raw: str, label: str) -> dict:
-    """Extract JSON from model output robustly (handles accidental fences)."""
+    """
+    Extract JSON from model output robustly.
+
+    Pass 1 — direct json.loads (standard JSON)
+    Pass 2 — find outermost {...} then json.loads
+    Pass 3 — ast.literal_eval (Python dict with single quotes)
+    """
     raw = raw.strip()
 
-    # Strip common markdown fences if present.
+    # Strip markdown fences if present
     raw = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", raw)
     raw = re.sub(r"\n?```$", "", raw.strip())
 
+    # Pass 1: direct parse
     try:
         parsed = json.loads(raw)
         if not isinstance(parsed, dict):
@@ -521,7 +551,7 @@ def _parse_json(raw: str, label: str) -> dict:
     except json.JSONDecodeError:
         pass
 
-    # Fallback: find outermost JSON object.
+    # Pass 2: find outermost {...}
     match = re.search(r"\{.*\}", raw, re.DOTALL)
     if match:
         try:
@@ -529,14 +559,25 @@ def _parse_json(raw: str, label: str) -> dict:
             if not isinstance(parsed, dict):
                 raise RuntimeError(f"{label} parsed as {type(parsed).__name__}, expected object.")
             return parsed
-        except json.JSONDecodeError as exc:
-            print(f"[07] JSON parse failed for {label}: {exc}", file=sys.stderr)
-            print(f"[07] Raw output (first 1000 chars):\n{raw[:1000]}", file=sys.stderr)
-            raise RuntimeError(f"Could not parse JSON from {label}") from exc
+        except json.JSONDecodeError:
+            pass
 
-    print(f"[07] No JSON object found in {label}.", file=sys.stderr)
+    # Pass 3: Python dict literal (single-quoted keys/values)
+    result = _python_dict_to_json(raw)
+    if result is not None:
+        print(f"[07][warn] {label}: model returned Python dict syntax — parsed via ast.literal_eval.")
+        return result
+
+    # Also try pass 3 on the extracted {...} block
+    if match:
+        result = _python_dict_to_json(match.group())
+        if result is not None:
+            print(f"[07][warn] {label}: model returned Python dict syntax — parsed via ast.literal_eval.")
+            return result
+
+    print(f"[07] ERROR: Could not parse JSON from {label}", file=sys.stderr)
     print(f"[07] Raw output (first 1000 chars):\n{raw[:1000]}", file=sys.stderr)
-    raise RuntimeError(f"No JSON object found in {label}")
+    raise RuntimeError(f"Could not parse JSON from {label}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -578,19 +619,26 @@ def _load_scaffold() -> dict:
 
 def _extract_stub_files(scaffold: dict) -> list[dict]:
     """
-    Extract non-test files from the new module-centric blueprint schema.
+    Extract non-test files from the module-centric blueprint schema,
+    including top-level config_files.
 
-    blueprint.json schema:
-      { modules: [{ module, purpose, files: [{ path, kind }] }] }
+    blueprint.json schema (new):
+      {
+        modules: [{
+          module, purpose, depends_on,
+          files: [{ path, kind, exports, quirks, acceptance_criteria }]
+        }],
+        config_files: [{ path, kind, note }],
+        implementation_order: ["types", "config", ...],   # module-level
+        open_questions: [{ id, question, affects, impact }]
+      }
 
-    kind values: "source" | "test" | "config" | "migration"
-    Non-test = kind != "test".
-
-    Returns a flat list of { file_path, kind } dicts for the full planner prompt.
+    Returns a flat list of file dicts for the full planner prompt.
     """
     modules = scaffold.get("modules", [])
+
+    # ── Legacy flat-file schema fallback ──────────────────────────────────
     if not isinstance(modules, list):
-        # Legacy flat-file schema fallback (is_test field)
         files = scaffold.get("files", [])
         if not isinstance(files, list):
             raise RuntimeError(
@@ -604,27 +652,72 @@ def _extract_stub_files(scaffold: dict) -> list[dict]:
         ]
 
     stub_files: list[dict] = []
+
+    # ── Source/non-test files from modules ────────────────────────────────
     for mod in modules:
         if not isinstance(mod, dict):
             continue
         for file_entry in mod.get("files", []):
             if not isinstance(file_entry, dict):
                 continue
-            if file_entry.get("kind", "source") != "test":
-                stub_files.append({
-                    "file_path": file_entry.get("path", ""),
-                    "kind": file_entry.get("kind", "source"),
-                    "module": mod.get("module", ""),
-                    "module_purpose": mod.get("purpose", ""),
-                })
+            if file_entry.get("kind", "source") == "test":
+                continue
+            stub_files.append({
+                "file_path": file_entry.get("path", ""),
+                "kind": file_entry.get("kind", "source"),
+                "module": mod.get("module", ""),
+                "module_purpose": mod.get("purpose", ""),
+                "exports": file_entry.get("exports", []),
+                "quirks": file_entry.get("quirks", []),
+                "acceptance_criteria": file_entry.get("acceptance_criteria", []),
+            })
+
+    # ── Top-level config_files ─────────────────────────────────────────────
+    for cfg in scaffold.get("config_files", []):
+        if not isinstance(cfg, dict):
+            continue
+        path = cfg.get("path", "")
+        if not path:
+            continue
+        stub_files.append({
+            "file_path": path,
+            "kind": "config",
+            "module": "config_files",
+            "module_purpose": "Project configuration and tooling",
+            "exports": [],
+            "quirks": [cfg["note"]] if cfg.get("note") else [],
+            "acceptance_criteria": [],
+        })
+
     return stub_files
 
 
-def call_full_planner(spec: str, stub_files: list[dict]) -> dict:
+def call_full_planner(spec: str, stub_files: list[dict], scaffold: dict) -> dict:
+    # Build optional context sections from scaffold top-level fields
+    open_questions = scaffold.get("open_questions", [])
+    module_order = scaffold.get("implementation_order", [])
+
+    context_sections: list[str] = []
+
+    if module_order:
+        context_sections.append(
+            "### module_implementation_order\n"
+            + json.dumps(module_order, ensure_ascii=False)
+        )
+
+    if open_questions:
+        context_sections.append(
+            "### open_questions\n"
+            + json.dumps(open_questions, indent=2, ensure_ascii=False)
+        )
+
+    context_block = ("\n\n" + "\n\n".join(context_sections)) if context_sections else ""
+
     user_message = (
         f"### canonical spec\n\n{spec}\n\n"
         f"### scaffold stub files\n\n"
         f"{json.dumps(stub_files, indent=2, ensure_ascii=False)}"
+        f"{context_block}"
     )
 
     print(f"[07] Calling model: {get_model(ROLE)} (provider: {get_provider(ROLE)}) — full planner response …")
@@ -690,7 +783,7 @@ def run_full_scope() -> None:
     print("[07] Scope: full")
     print(f"[07] Planning {len(stub_files)} non-test stub file(s) …")
 
-    plan = call_full_planner(spec, stub_files)
+    plan = call_full_planner(spec, stub_files, scaffold)
     validate_full_plan(plan, stub_files)
 
     PLANNER_FULL_PLAN.parent.mkdir(parents=True, exist_ok=True)

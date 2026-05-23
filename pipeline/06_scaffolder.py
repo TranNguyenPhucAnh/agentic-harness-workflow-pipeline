@@ -69,48 +69,174 @@ MAX_OUTPUT_TOKENS = 65536
 
 # ─────────────────────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = textwrap.dedent("""
-    You are a senior software architect generating a module-centric blueprint
-    from a technical spec.
+    You are a senior software architect generating a comprehensive module-centric
+    blueprint from a technical spec. This blueprint is the ONLY artifact that has
+    full visibility of the entire spec before any code is written. Downstream
+    planner and executor agents work module-by-module and depend entirely on this
+    blueprint for context.
 
     You will receive the canonical spec. The spec is the source of truth. Follow
-    its stack, file tree, naming, testing framework, and acceptance criteria.
+    its stack, file tree, naming, testing framework, and acceptance criteria exactly.
 
     Your task:
-    1. Read the spec carefully, especially the file tree and module structure.
+    1. Read the spec carefully — file tree, module structure, constraints, open
+       questions, acceptance criteria, and stack-specific quirks.
     2. Produce a SINGLE valid JSON object matching the schema below.
     3. The JSON MUST be valid and parseable by json.loads.
 
+    ═══════════════════════════════════════════════════════════════
     OUTPUT SCHEMA (strict — no other top-level keys allowed):
+    ═══════════════════════════════════════════════════════════════
     {
       "modules": [
         {
           "module": "<module_name>",
           "purpose": "<one-line description of module responsibility>",
+          "depends_on": ["<other_module_name>", ...],
           "files": [
-            { "path": "src/auth/service.py", "kind": "source" },
-            { "path": "tests/auth/test_service.py", "kind": "test" }
+            {
+              "path": "src/auth/service.ts",
+              "kind": "source",
+              "exports": ["functionName", "ClassName", "TypeName"],
+              "quirks": [
+                "Stack-specific gotcha or non-obvious constraint for this file",
+                "Another constraint the executor must know before writing code"
+              ],
+              "acceptance_criteria": ["AC-01", "AC-02"]
+            },
+            {
+              "path": "tests/auth/service.test.ts",
+              "kind": "test",
+              "tests": ["AC-01", "AC-02"]
+            }
           ]
+        }
+      ],
+      "config_files": [
+        {
+          "path": "index.html",
+          "kind": "config",
+          "note": "Vite entry point — must exist at project root, not src/"
+        },
+        {
+          "path": "vite.config.ts",
+          "kind": "config",
+          "note": "Must include vite-plugin-pwa with workbox config"
+        }
+      ],
+      "implementation_order": ["types", "config", "db", "auth", "api", "ui"],
+      "open_questions": [
+        {
+          "id": "OQ-01",
+          "question": "Exact wording from spec",
+          "affects": ["module_name", "file_path"],
+          "impact": "Brief description of what changes depending on the answer"
         }
       ]
     }
 
-    RULES:
+    ═══════════════════════════════════════════════════════════════
+    RULES — FILES
+    ═══════════════════════════════════════════════════════════════
     - "kind" MUST be one of: "source", "test", "config", "migration"
     - "path" is relative from project root (e.g. src/..., tests/..., config/...)
-    - Group files by logical module. Each module has a clear single responsibility.
-    - Do NOT include a "code" field. This is a blueprint, not implementation.
-    - Do NOT add files not implied by the spec's file tree or architecture.
+    - Every source file implied by the spec's file tree MUST appear in exactly
+      one module.
+    - Every test file implied by the spec MUST appear in exactly one module.
+      If the spec does not list test files explicitly, infer them from the
+      testing framework and source files that have testable logic (lib/*, utils/*,
+      services/*, hooks/*). Pure config and entry-point files do not need tests.
+    - Config files (vite.config.ts, tsconfig.json, index.html, .env.example,
+      docker-compose.yml, vercel.json, netlify.toml, package.json, etc.) go in
+      "config_files", NOT in modules.
+    - Migration files go in a dedicated "migrations" module with kind "migration".
+    - Do NOT include a "code" field anywhere. This is a blueprint, not implementation.
     - Preserve file paths exactly as specified by the spec.
-    - Every source file in the spec MUST appear in exactly one module.
-    - Every test file in the spec MUST appear in exactly one module.
-    - If the spec defines config files (docker-compose, .env.example, etc.),
-      include them with kind "config".
-    - If the spec defines migrations, include them with kind "migration".
 
-    JSON requirements:
+    ═══════════════════════════════════════════════════════════════
+    RULES — EXPORTS
+    ═══════════════════════════════════════════════════════════════
+    - List every named export the spec defines for this file: functions, classes,
+      types, interfaces, constants, React components, hooks.
+    - Use exact names from the spec. If the spec does not name exports explicitly,
+      infer from context (e.g. a file named "srtParser.ts" exports "parseSrt").
+    - For test files, use "tests" key (list of AC IDs) instead of "exports".
+    - Omit "exports" for config and migration files.
+
+    ═══════════════════════════════════════════════════════════════
+    RULES — QUIRKS
+    ═══════════════════════════════════════════════════════════════
+    Include quirks for any file where the executor could make a wrong assumption.
+    Common categories:
+    - Stack version differences (e.g. "Tailwind v4 uses CSS-first config, no
+      tailwind.config.js")
+    - Import path differences between library versions
+    - Required browser APIs or headers (e.g. COOP/COEP for OPFS, SharedArrayBuffer)
+    - Non-obvious constraints from the spec (e.g. "primary keys are UUID strings,
+      NOT auto-increment")
+    - Fallback behavior that must be implemented (e.g. "if OPFS unavailable, store
+      blob in IndexedDB and set usesOpfsFallback=true")
+    - Deployment requirements (e.g. "vercel.json must set COOP/COEP headers for
+      OPFS to work in production")
+    - Omit quirks array entirely if there are no non-obvious constraints.
+
+    ═══════════════════════════════════════════════════════════════
+    RULES — ACCEPTANCE CRITERIA MAPPING
+    ═══════════════════════════════════════════════════════════════
+    - Map each AC from the spec to the source file most responsible for satisfying it.
+    - Map each AC to the test file that verifies it.
+    - An AC can appear in multiple files if multiple files contribute to it.
+    - Use exact AC IDs from the spec (e.g. "AC-01", "AC-07").
+    - If the spec has no AC IDs, omit acceptance_criteria and tests fields.
+
+    ═══════════════════════════════════════════════════════════════
+    RULES — DEPENDS_ON
+    ═══════════════════════════════════════════════════════════════
+    - List module names (not file paths) that must be fully implemented before
+      this module can be implemented.
+    - This defines the safe implementation order for the executor.
+    - Omit or use [] if the module has no dependencies.
+
+    ═══════════════════════════════════════════════════════════════
+    RULES — IMPLEMENTATION_ORDER
+    ═══════════════════════════════════════════════════════════════
+    - List module names in the order they should be implemented.
+    - Must be a valid topological sort of the depends_on graph.
+    - Config/infra modules (types, config, db schema) come first.
+    - UI/component modules come last.
+
+    ═══════════════════════════════════════════════════════════════
+    RULES — CONFIG_FILES
+    ═══════════════════════════════════════════════════════════════
+    Include ALL files needed for the project to start and build:
+    - Entry points: index.html (Vite), main.py, cmd/main.go, etc.
+    - Build config: vite.config.ts, webpack.config.js, Makefile, etc.
+    - TypeScript: tsconfig.json, tsconfig.app.json, tsconfig.node.json
+    - CSS framework config: tailwind.config.ts (v3), or note CSS-first for v4
+    - Package management: package.json, pnpm-lock.yaml, requirements.txt, go.mod
+    - Environment: .env.example (never .env with real values)
+    - PWA: public/manifest.json, public/sw.js or note if generated by plugin
+    - Deployment: vercel.json, netlify.toml, Dockerfile, docker-compose.yml
+    - Linting/formatting: .eslintrc, .prettierrc, biome.json
+    - shadcn/ui: components.json (if used)
+    - CI: .github/workflows/*.yml (if mentioned in spec)
+    Missing any of these for a project that needs them is an error.
+
+    ═══════════════════════════════════════════════════════════════
+    RULES — OPEN_QUESTIONS
+    ═══════════════════════════════════════════════════════════════
+    - Extract open questions directly from the spec (look for "OQ-", "TBD",
+      "open question", "unclear", "to be decided" markers).
+    - Only include questions that affect implementation decisions (not UX polish).
+    - For each question, identify which modules/files are blocked or affected.
+    - If the spec has no open questions, use an empty array [].
+
+    ═══════════════════════════════════════════════════════════════
+    JSON REQUIREMENTS
+    ═══════════════════════════════════════════════════════════════
     - Use double quotes for all strings.
     - Do NOT include comments, trailing commas, or markdown fences.
-    - Output raw JSON only.
+    - Output raw JSON only — no prose before or after.
 """).strip()
 
 
@@ -170,14 +296,6 @@ def _configure_project(
         "PIPELINE_PROJECT is not set. Use --project <name> or export "
         "PIPELINE_PROJECT=<name> before running 06_scaffolder.py directly."
     )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Model call
-# ─────────────────────────────────────────────────────────────────────────────
-
-# call_scaffolder removed — use call_llm_json() from modules.call_llm
-
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -246,19 +364,23 @@ _VALID_KINDS = {"source", "test", "config", "migration"}
 
 def _validate_blueprint(blueprint: dict[str, Any]) -> None:
     """
-    Validate blueprint against the module-centric schema.
+    Validate blueprint against the extended module-centric schema.
     Raises ValueError on any schema violation.
+    Attaches computed summary to blueprint in-place.
     """
+    # ── modules ──────────────────────────────────────────────────────────────
     modules = blueprint.get("modules")
     if not isinstance(modules, list):
         raise ValueError('blueprint must contain "modules" as a list')
-
     if not modules:
         raise ValueError("blueprint modules list is empty")
 
     total = 0
     source_count = 0
     test_count = 0
+    config_count = 0
+    migration_count = 0
+    seen_paths: set[str] = set()
 
     for idx, mod in enumerate(modules):
         if not isinstance(mod, dict):
@@ -272,12 +394,24 @@ def _validate_blueprint(blueprint: dict[str, Any]) -> None:
         if not isinstance(purpose, str) or not purpose.strip():
             raise ValueError(f"modules[{idx}].purpose must be a non-empty string")
 
+        # depends_on is optional but must be a list of strings if present
+        depends_on = mod.get("depends_on")
+        if depends_on is not None:
+            if not isinstance(depends_on, list):
+                raise ValueError(f"modules[{idx}].depends_on must be a list")
+            for didx, dep in enumerate(depends_on):
+                if not isinstance(dep, str) or not dep.strip():
+                    raise ValueError(
+                        f"modules[{idx}].depends_on[{didx}] must be a non-empty string"
+                    )
+
         files = mod.get("files")
         if not isinstance(files, list):
             raise ValueError(f"modules[{idx}].files must be a list")
-
         if not files:
-            raise ValueError(f"modules[{idx}].files is empty — each module needs at least one file")
+            raise ValueError(
+                f"modules[{idx}].files is empty — each module needs at least one file"
+            )
 
         for fidx, fentry in enumerate(files):
             if not isinstance(fentry, dict):
@@ -300,6 +434,15 @@ def _validate_blueprint(blueprint: dict[str, Any]) -> None:
                     f"modules[{idx}].files[{fidx}].path contains path traversal: {path}"
                 )
 
+            # Warn on duplicate paths (not a hard error — model may legitimately
+            # share a file across modules in edge cases, but flag it)
+            if normalized in seen_paths:
+                print(
+                    f"[06][warn] Duplicate path across modules: {path}",
+                    file=sys.stderr,
+                )
+            seen_paths.add(normalized)
+
             kind = fentry.get("kind")
             if kind not in _VALID_KINDS:
                 raise ValueError(
@@ -307,17 +450,131 @@ def _validate_blueprint(blueprint: dict[str, Any]) -> None:
                     f"{sorted(_VALID_KINDS)}, got: {kind!r}"
                 )
 
+            # exports: optional list of strings for source files
+            exports = fentry.get("exports")
+            if exports is not None:
+                if not isinstance(exports, list):
+                    raise ValueError(
+                        f"modules[{idx}].files[{fidx}].exports must be a list"
+                    )
+                for eidx, exp in enumerate(exports):
+                    if not isinstance(exp, str):
+                        raise ValueError(
+                            f"modules[{idx}].files[{fidx}].exports[{eidx}] must be a string"
+                        )
+
+            # quirks: optional list of strings
+            quirks = fentry.get("quirks")
+            if quirks is not None:
+                if not isinstance(quirks, list):
+                    raise ValueError(
+                        f"modules[{idx}].files[{fidx}].quirks must be a list"
+                    )
+                for qidx, q in enumerate(quirks):
+                    if not isinstance(q, str):
+                        raise ValueError(
+                            f"modules[{idx}].files[{fidx}].quirks[{qidx}] must be a string"
+                        )
+
+            # acceptance_criteria / tests: optional list of strings
+            for ac_key in ("acceptance_criteria", "tests"):
+                ac_val = fentry.get(ac_key)
+                if ac_val is not None:
+                    if not isinstance(ac_val, list):
+                        raise ValueError(
+                            f"modules[{idx}].files[{fidx}].{ac_key} must be a list"
+                        )
+                    for acidx, ac in enumerate(ac_val):
+                        if not isinstance(ac, str):
+                            raise ValueError(
+                                f"modules[{idx}].files[{fidx}].{ac_key}[{acidx}] "
+                                f"must be a string"
+                            )
+
             total += 1
             if kind == "source":
                 source_count += 1
             elif kind == "test":
                 test_count += 1
+            elif kind == "config":
+                config_count += 1
+            elif kind == "migration":
+                migration_count += 1
 
-    # Attach summary (computed, not model-provided)
+    # ── config_files ─────────────────────────────────────────────────────────
+    config_files = blueprint.get("config_files")
+    if config_files is not None:
+        if not isinstance(config_files, list):
+            raise ValueError('"config_files" must be a list')
+        for cidx, cf in enumerate(config_files):
+            if not isinstance(cf, dict):
+                raise ValueError(f"config_files[{cidx}] must be an object")
+            cf_path = cf.get("path")
+            if not isinstance(cf_path, str) or not cf_path.strip():
+                raise ValueError(f"config_files[{cidx}].path must be a non-empty string")
+            cf_kind = cf.get("kind")
+            if cf_kind not in _VALID_KINDS:
+                raise ValueError(
+                    f"config_files[{cidx}].kind must be one of {sorted(_VALID_KINDS)}, "
+                    f"got: {cf_kind!r}"
+                )
+            # note is optional but must be a string if present
+            cf_note = cf.get("note")
+            if cf_note is not None and not isinstance(cf_note, str):
+                raise ValueError(f"config_files[{cidx}].note must be a string")
+            config_count += 1
+            total += 1
+
+    # ── implementation_order ─────────────────────────────────────────────────
+    impl_order = blueprint.get("implementation_order")
+    if impl_order is not None:
+        if not isinstance(impl_order, list):
+            raise ValueError('"implementation_order" must be a list')
+        module_names = {m["module"] for m in modules}
+        for oidx, name in enumerate(impl_order):
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError(
+                    f"implementation_order[{oidx}] must be a non-empty string"
+                )
+            if name not in module_names:
+                print(
+                    f"[06][warn] implementation_order[{oidx}] '{name}' not found in modules",
+                    file=sys.stderr,
+                )
+
+    # ── open_questions ────────────────────────────────────────────────────────
+    open_questions = blueprint.get("open_questions")
+    if open_questions is not None:
+        if not isinstance(open_questions, list):
+            raise ValueError('"open_questions" must be a list')
+        for oqidx, oq in enumerate(open_questions):
+            if not isinstance(oq, dict):
+                raise ValueError(f"open_questions[{oqidx}] must be an object")
+            oq_id = oq.get("id")
+            if not isinstance(oq_id, str) or not oq_id.strip():
+                raise ValueError(
+                    f"open_questions[{oqidx}].id must be a non-empty string"
+                )
+            oq_q = oq.get("question")
+            if not isinstance(oq_q, str) or not oq_q.strip():
+                raise ValueError(
+                    f"open_questions[{oqidx}].question must be a non-empty string"
+                )
+            # affects and impact are optional but validated if present
+            oq_affects = oq.get("affects")
+            if oq_affects is not None and not isinstance(oq_affects, list):
+                raise ValueError(f"open_questions[{oqidx}].affects must be a list")
+            oq_impact = oq.get("impact")
+            if oq_impact is not None and not isinstance(oq_impact, str):
+                raise ValueError(f"open_questions[{oqidx}].impact must be a string")
+
+    # ── attach computed summary ───────────────────────────────────────────────
     blueprint["summary"] = {
         "total": total,
         "source": source_count,
         "test": test_count,
+        "config": config_count,
+        "migration": migration_count,
     }
 
 
@@ -345,15 +602,27 @@ def _append_skeleton_log(blueprint: dict[str, Any], spec_version: str) -> None:
     log_path = Path(str(SCAFFOLDER_SKELETON_LOG))
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Collect open question IDs for the log entry
+    oq_ids = [
+        oq.get("id", "?")
+        for oq in blueprint.get("open_questions") or []
+        if isinstance(oq, dict)
+    ]
+
     entry = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "spec_version": spec_version,
         "module_count": len(blueprint.get("modules", [])),
+        "config_file_count": len(blueprint.get("config_files") or []),
+        "open_question_count": len(oq_ids),
+        "open_question_ids": oq_ids,
+        "implementation_order": blueprint.get("implementation_order") or [],
         "summary": blueprint.get("summary", {}),
         "modules": [
             {
                 "module": m["module"],
                 "purpose": m["purpose"],
+                "depends_on": m.get("depends_on") or [],
                 "file_count": len(m.get("files", [])),
             }
             for m in blueprint.get("modules", [])
@@ -398,12 +667,21 @@ def _safe_relative_path(raw_path: str) -> Path:
     return rel
 
 
-def _generate_test_stub(path: str) -> str:
-    """Generate a minimal test stub based on file extension."""
+def _generate_test_stub(path: str, ac_ids: list[str] | None = None) -> str:
+    """
+    Generate a minimal test stub based on file extension.
+    Embeds AC IDs as comments so the executor knows which criteria to cover.
+    """
+    ac_comment = ""
+    if ac_ids:
+        ac_comment = f"  // Acceptance criteria: {', '.join(ac_ids)}\n"
+
     if path.endswith(".py"):
         module_hint = Path(path).stem.replace("test_", "")
+        ac_py = f"# Acceptance criteria: {', '.join(ac_ids)}\n" if ac_ids else ""
         return (
             f'"""Tests for {module_hint}."""\n'
+            f"{ac_py}"
             f"\n"
             f"import pytest\n"
             f"\n"
@@ -418,8 +696,8 @@ def _generate_test_stub(path: str) -> str:
         module_hint = Path(path).stem.replace(".test", "").replace(".spec", "")
         return (
             f'import {{ describe, it, expect }} from "vitest";\n'
-            f"\n"
             f'describe("{module_hint}", () => {{\n'
+            f"{ac_comment}"
             f'  it("should be implemented", () => {{\n'
             f'    throw new Error("not implemented");\n'
             f"  }});\n"
@@ -431,28 +709,33 @@ def _generate_test_stub(path: str) -> str:
             f'const {{ describe, it, expect }} = require("@jest/globals");\n'
             f"\n"
             f'describe("{module_hint}", () => {{\n'
+            f"{ac_comment}"
             f'  it("should be implemented", () => {{\n'
             f'    throw new Error("not implemented");\n'
             f"  }});\n"
             f"}});\n"
         )
     elif path.endswith(".go"):
+        ac_go = f"// Acceptance criteria: {', '.join(ac_ids)}\n" if ac_ids else ""
         return (
             f"package main\n"
             f"\n"
             f'import "testing"\n'
             f"\n"
+            f"{ac_go}"
             f"func TestPlaceholder(t *testing.T) {{\n"
             f'\tt.Fatal("not implemented")\n'
             f"}}\n"
         )
     else:
-        return f"// TODO: implement tests\n"
+        ac_generic = f"// Acceptance criteria: {', '.join(ac_ids)}\n" if ac_ids else ""
+        return f"{ac_generic}// TODO: implement tests\n"
 
 
 def _write_test_stubs(blueprint: dict[str, Any]) -> int:
     """
     Materialize test file stubs from blueprint.
+    Embeds AC IDs from the "tests" field into each stub.
     Returns count of test files written.
     """
     count = 0
@@ -462,6 +745,8 @@ def _write_test_stubs(blueprint: dict[str, Any]) -> int:
                 continue
 
             raw_path = fentry["path"]
+            ac_ids: list[str] = fentry.get("tests") or []
+
             rel = _safe_relative_path(raw_path)
 
             # Strip leading tests/ prefix since TESTS_DIR already points there
@@ -472,11 +757,12 @@ def _write_test_stubs(blueprint: dict[str, Any]) -> int:
             dest = Path(str(TESTS_DIR)) / rel
             dest.parent.mkdir(parents=True, exist_ok=True)
 
-            stub = _generate_test_stub(raw_path)
+            stub = _generate_test_stub(raw_path, ac_ids)
             dest.write_text(stub)
             track_write(dest)
 
-            print(f"[06] [TEST] {dest}")
+            ac_suffix = f" [{', '.join(ac_ids)}]" if ac_ids else ""
+            print(f"[06] [TEST] {dest}{ac_suffix}")
             count += 1
 
     return count
@@ -488,7 +774,6 @@ def _write_test_stubs(blueprint: dict[str, Any]) -> int:
 
 def write_blueprint(blueprint: dict[str, Any], spec_version: str) -> None:
     """Write blueprint.json and materialize test stubs."""
-    # Add metadata
     blueprint["generated_at"] = datetime.now(timezone.utc).isoformat()
     blueprint["spec_version"] = spec_version
 
@@ -506,28 +791,95 @@ def write_blueprint(blueprint: dict[str, Any], spec_version: str) -> None:
     # Append to long-term log
     _append_skeleton_log(blueprint, spec_version)
 
+    # Print summary
     summary = blueprint.get("summary", {})
+    config_files = blueprint.get("config_files") or []
+    open_questions = blueprint.get("open_questions") or []
+    impl_order = blueprint.get("implementation_order") or []
+
     print(
         f"[06] Done. Modules: {len(blueprint['modules'])}, "
         f"Files: {summary.get('total', 0)} "
-        f"(source: {summary.get('source', 0)}, test: {summary.get('test', 0)})"
+        f"(source: {summary.get('source', 0)}, "
+        f"test: {summary.get('test', 0)}, "
+        f"config: {summary.get('config', 0)}, "
+        f"migration: {summary.get('migration', 0)})"
     )
+    if config_files:
+        print(f"[06] Config files: {len(config_files)}")
+        for cf in config_files:
+            print(f"[06]   [CONFIG] {cf['path']}")
+            if cf.get("note"):
+                print(f"[06]           note: {cf['note']}")
+    if open_questions:
+        oq_ids = [oq.get("id", "?") for oq in open_questions if isinstance(oq, dict)]
+        print(f"[06] Open questions flagged: {', '.join(oq_ids)}")
+    if impl_order:
+        print(f"[06] Implementation order: {' → '.join(impl_order)}")
 
 
 def preview_blueprint(blueprint: dict[str, Any]) -> None:
     """Dry-run: show what would be written without writing."""
     print("[06] --dry-run: blueprint validated. No files written.")
     print(f"[06] Would write blueprint → {SCAFFOLD_JSON}")
+    print()
+
+    impl_order = blueprint.get("implementation_order") or []
+    if impl_order:
+        print(f"[06] Implementation order: {' → '.join(impl_order)}")
+        print()
 
     for mod in blueprint.get("modules", []):
-        print(f"[06]   Module: {mod['module']} — {mod['purpose']}")
+        deps = mod.get("depends_on") or []
+        dep_str = f" (depends: {', '.join(deps)})" if deps else ""
+        print(f"[06]   Module: {mod['module']}{dep_str} — {mod['purpose']}")
         for fentry in mod.get("files", []):
-            print(f"[06]     [{fentry['kind'].upper():6s}] {fentry['path']}")
+            kind_label = fentry["kind"].upper().ljust(9)
+            exports = fentry.get("exports") or []
+            tests = fentry.get("tests") or []
+            acs = fentry.get("acceptance_criteria") or []
+            quirks = fentry.get("quirks") or []
+
+            line = f"[06]     [{kind_label}] {fentry['path']}"
+            if exports:
+                line += f"  exports: {', '.join(exports)}"
+            if tests:
+                line += f"  tests: {', '.join(tests)}"
+            if acs:
+                line += f"  AC: {', '.join(acs)}"
+            print(line)
+            for q in quirks:
+                print(f"[06]              ⚠ {q}")
+        print()
+
+    config_files = blueprint.get("config_files") or []
+    if config_files:
+        print(f"[06]   Config files ({len(config_files)}):")
+        for cf in config_files:
+            print(f"[06]     [CONFIG   ] {cf['path']}")
+            if cf.get("note"):
+                print(f"[06]              note: {cf['note']}")
+        print()
+
+    open_questions = blueprint.get("open_questions") or []
+    if open_questions:
+        print(f"[06]   Open questions ({len(open_questions)}):")
+        for oq in open_questions:
+            affects = oq.get("affects") or []
+            print(f"[06]     {oq.get('id', '?')}: {oq.get('question', '')}")
+            if affects:
+                print(f"[06]       affects: {', '.join(affects)}")
+            if oq.get("impact"):
+                print(f"[06]       impact:  {oq['impact']}")
+        print()
 
     summary = blueprint.get("summary", {})
     print(
         f"[06] Total files: {summary.get('total', 0)} "
-        f"(source: {summary.get('source', 0)}, test: {summary.get('test', 0)})"
+        f"(source: {summary.get('source', 0)}, "
+        f"test: {summary.get('test', 0)}, "
+        f"config: {summary.get('config', 0)}, "
+        f"migration: {summary.get('migration', 0)})"
     )
 
 
@@ -562,6 +914,7 @@ def main() -> None:
         _model = get_model(ROLE)
         _prov  = get_provider(ROLE)
         print(f"[06] Calling model: {_model} (provider: {_prov}) …")
+
         blueprint, _ = call_llm_json(
             ROLE,
             SYSTEM_PROMPT,
@@ -573,7 +926,11 @@ def main() -> None:
             label="[06] scaffold",
         )
 
-        # DEBUG
+        # Debug: show top-level keys returned by model
+        print(
+            f"[06][debug] blueprint top-level keys: {list(blueprint.keys())}",
+            file=sys.stderr,
+        )
         if blueprint.get("modules"):
             print(
                 f"[06][debug] modules[0] keys: {list(blueprint['modules'][0].keys())}",
