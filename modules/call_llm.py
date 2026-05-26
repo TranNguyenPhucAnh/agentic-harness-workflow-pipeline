@@ -35,6 +35,12 @@ _CONTINUE_JSON_PROMPT   = (
 
 def _extract_text(resp: Any) -> str:
     """Extract text content from a call_model response object."""
+    # Guard: nếu resp không phải object hợp lệ (vd string từ bad provider response)
+    if not hasattr(resp, "choices"):
+        raise RuntimeError(
+            f"[_extract_text] Expected OpenAI response object, got {type(resp).__name__!r}. "
+            f"Value: {str(resp)[:200]!r}"
+        )
     content = getattr(resp.choices[0].message, "content", None)
     if isinstance(content, list):
         content = "".join(
@@ -114,6 +120,40 @@ def _sanitize_json_string(raw: str) -> str:
     return re.sub(r"[\x00-\x1f\x7f]", _replace, raw)
 
 
+def _escape_code_newlines(raw: str) -> str:
+    """
+    Escape literal newlines/tabs/carriage-returns inside JSON string values.
+    Models sometimes write actual newline chars inside "code": "..." instead
+    of the escaped \\n sequence, producing invalid JSON.
+    Walks the string tracking in-string state to only escape within quotes.
+    """
+    result = []
+    in_string = False
+    i = 0
+    while i < len(raw):
+        ch = raw[i]
+        if ch == '\\' and in_string:
+            # Escaped char — pass through both backslash and next char
+            result.append(ch)
+            i += 1
+            if i < len(raw):
+                result.append(raw[i])
+            i += 1
+            continue
+        if ch == '"':
+            in_string = not in_string
+        if in_string and ch == '\n':
+            result.append('\\n')
+        elif in_string and ch == '\t':
+            result.append('\\t')
+        elif in_string and ch == '\r':
+            result.append('\\r')
+        else:
+            result.append(ch)
+        i += 1
+    return ''.join(result)
+
+
 def _try_ast_literal(s: str) -> dict[str, Any] | None:
     """Parse Python dict literal (single-quoted) via ast.literal_eval (safe)."""
     import ast
@@ -130,6 +170,7 @@ def _parse_json_object(raw: str) -> dict[str, Any]:
     """
     Parse a JSON object from model output.
 
+    Pass 0 — escape literal newlines inside JSON strings (code fields)
     Pass 1 — direct json.loads ± control-char sanitization
     Pass 2 — find outermost {...} then json.loads ± sanitization
     Pass 3 — ast.literal_eval (Python dict with single-quoted keys/values)
@@ -139,8 +180,13 @@ def _parse_json_object(raw: str) -> dict[str, Any]:
     text = re.sub(r"^```(?:json)?\s*", "", raw.strip(), flags=re.IGNORECASE)
     text = re.sub(r"\s*```$", "", text.strip())
 
-    # Pass 1: direct parse
-    for candidate in (text, _sanitize_json_string(text)):
+    # Pass 1: direct parse (with escalating sanitization)
+    for candidate in (
+        text,
+        _sanitize_json_string(text),
+        _escape_code_newlines(text),
+        _escape_code_newlines(_sanitize_json_string(text)),
+    ):
         try:
             parsed = json.loads(candidate)
             if not isinstance(parsed, dict):
@@ -153,7 +199,12 @@ def _parse_json_object(raw: str) -> dict[str, Any]:
     m = re.search(r"\{.*\}", text, re.DOTALL)
     if m:
         block = m.group()
-        for candidate in (block, _sanitize_json_string(block)):
+        for candidate in (
+            block,
+            _sanitize_json_string(block),
+            _escape_code_newlines(block),
+            _escape_code_newlines(_sanitize_json_string(block)),
+        ):
             try:
                 parsed = json.loads(candidate)
                 if not isinstance(parsed, dict):
@@ -265,6 +316,7 @@ def call_llm(
     caller_file: str = "",
     offline_fallback: bool = True,
     max_continuations: int = _DEFAULT_CONTINUATIONS,
+    extra_kwargs: dict[str, Any] | None = None,
 ) -> tuple[str, float]:
     """
     Call an LLM model with automatic retry on empty content.
@@ -294,6 +346,8 @@ def call_llm(
     kwargs: dict[str, Any] = {"max_tokens": max_tokens}
     if temperature is not None:
         kwargs["temperature"] = temperature
+    if extra_kwargs:
+        kwargs.update(extra_kwargs)
 
     messages = [
         {"role": "system", "content": system},
@@ -360,6 +414,7 @@ def call_llm_json(
     label: str = "",
     caller_file: str = "",
     max_continuations: int = _DEFAULT_CONTINUATIONS,
+    extra_kwargs: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], float]:
     """
     Call an LLM model and parse the response as a JSON object.
@@ -384,6 +439,8 @@ def call_llm_json(
     kwargs: dict[str, Any] = {"max_tokens": max_tokens}
     if temperature is not None:
         kwargs["temperature"] = temperature
+    if extra_kwargs:
+        kwargs.update(extra_kwargs)
 
     messages = [
         {"role": "system", "content": system},

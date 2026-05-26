@@ -114,16 +114,24 @@ SYSTEM_PROMPT = textwrap.dedent("""
       ],
       "config_files": [
         {
-          "path": "index.html",
-          "kind": "config",
-          "note": "Vite entry point — must exist at project root, not src/"
-        },
-        {
-          "path": "vite.config.ts",
-          "kind": "config",
-          "note": "Must include vite-plugin-pwa with workbox config"
+            "path": "package.json",
+            "kind": "config",
+            "note": "pnpm 9.x is canonical package manager",
+            "dependencies": [
+                {
+                    "name": "react",
+                    "kind": "npm_package",
+                    "version": "18.x"
+                },
+                {
+                    "name": "regions",
+                    "kind": "bundled_plugin",
+                    "owner_package": "wavesurfer.js",
+                    "import_path": "wavesurfer.js/dist/plugins/regions.esm.js"
+                }
+            ]
         }
-      ],
+    ],
       "implementation_order": ["types", "config", "db", "auth", "api", "ui"],
       "open_questions": [
         {
@@ -179,6 +187,9 @@ SYSTEM_PROMPT = textwrap.dedent("""
     - Deployment requirements (e.g. "vercel.json must set COOP/COEP headers for
       OPFS to work in production")
     - Omit quirks array entirely if there are no non-obvious constraints.
+    - If a library version requires a non-obvious import path (for example bundled plugins imported via subpath), record that in both:
+        1. the file "quirks" where the import matters, and
+        2. the structured dependency entry for package.json.
 
     ═══════════════════════════════════════════════════════════════
     RULES — ACCEPTANCE CRITERIA MAPPING
@@ -196,7 +207,20 @@ SYSTEM_PROMPT = textwrap.dedent("""
       this module can be implemented.
     - This defines the safe implementation order for the executor.
     - Omit or use [] if the module has no dependencies.
-
+                                
+    ═══════════════════════════════════════════════════════════════
+    RULES — DEPENDENCY CLASSIFICATION
+    ═══════════════════════════════════════════════════════════════
+    - If package.json is included, prefer a structured "dependencies" array over free-text dependency lists in "note".
+    - Each dependency must have:
+    - "name": the canonical dependency or feature name
+    - "kind": one of "npm_package", "bundled_plugin", "subpath_import", "tooling", "ui_primitive"
+    - For bundled plugins, include:
+    - "owner_package": the npm package that provides the plugin
+    - "import_path": the exact import path if specified by the spec
+    - Do NOT represent bundled plugins as standalone npm packages unless the spec explicitly says they are installed separately.
+    - Use "note" only for human-readable context, not as the sole source of dependency truth.
+                                
     ═══════════════════════════════════════════════════════════════
     RULES — IMPLEMENTATION_ORDER
     ═══════════════════════════════════════════════════════════════
@@ -255,6 +279,7 @@ def _build_parser() -> argparse.ArgumentParser:
               PIPELINE_PROJECT=my-app python 06_scaffolder.py
 
               python 06_scaffolder.py --project my-app --dry-run
+              python 06_scaffolder.py --project my-app --only-tests
 
             Model/provider config: xem artifacts/models.py, role "scaffolder".
         """),
@@ -271,6 +296,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="Call model and validate blueprint, but do not write files.",
+    )
+    parser.add_argument(
+        "--only-tests",
+        action="store_true",
+        help=(
+            "Skip LLM call. Read existing blueprint.json and (re)write test stubs only. "
+            "Useful when you want to regenerate/fix test stubs without re-running the full scaffold."
+        ),
     )
     parser.add_argument(
         "--max-retries",
@@ -884,6 +917,42 @@ def preview_blueprint(blueprint: dict[str, Any]) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Only-tests mode (re-materialize stubs from existing blueprint)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def only_tests_run() -> None:
+    """
+    Read existing blueprint.json and (re)write test stubs only.
+    Does NOT call the LLM, does NOT touch blueprint.json or skeleton_log.json.
+    """
+    blueprint_path = Path(str(SCAFFOLD_JSON))
+    if not blueprint_path.exists():
+        print(
+            f"[06][error] --only-tests: blueprint not found at {blueprint_path}.\n"
+            "[06][hint]  Run without --only-tests first to generate the blueprint.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    track_read(SCAFFOLD_JSON)
+    try:
+        blueprint = json.loads(blueprint_path.read_text())
+    except json.JSONDecodeError as exc:
+        print(f"[06][error] --only-tests: failed to parse blueprint.json: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        _validate_blueprint(blueprint)
+    except ValueError as exc:
+        print(f"[06][error] --only-tests: invalid blueprint: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"[06] --only-tests: loaded blueprint from {blueprint_path}")
+    test_count = _write_test_stubs(blueprint)
+    print(f"[06] --only-tests: test stubs written: {test_count}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -896,6 +965,11 @@ def main() -> None:
 
         _configure_project(args.project, parser)
         ensure_dirs()
+
+        # ── --only-tests: skip LLM, regenerate test stubs from existing blueprint ──
+        if args.only_tests:
+            only_tests_run()
+            return
 
         spec_path = get_spec_path()
         if not spec_path.exists():

@@ -113,6 +113,142 @@ ROLE = "planner"
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# Dependency semantics / alias guards
+# ════════════════════════════════════════════════════════════════════════════
+
+KNOWN_BUNDLED_PLUGIN_ALIASES: dict[str, dict[str, str]] = {
+    "@wavesurfer/regions": {
+        "owner_package": "wavesurfer.js",
+        "canonical_feature": "Regions plugin",
+        "import_path": "wavesurfer.js/dist/plugins/regions.esm.js",
+    },
+    "wavesurferregions": {
+        "owner_package": "wavesurfer.js",
+        "canonical_feature": "Regions plugin",
+        "import_path": "wavesurfer.js/dist/plugins/regions.esm.js",
+    },
+}
+
+_PACKAGE_LIKE_RE = re.compile(r"^(?:@[a-z0-9._-]+/[a-z0-9._-]+|[a-z0-9._-]+)$", re.I)
+
+
+def _normalize_dep_name(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _collect_planned_text_fragments(plan: dict) -> list[str]:
+    fragments: list[str] = []
+
+    stack = plan.get("stack")
+    if isinstance(stack, dict):
+        for v in stack.values():
+            if isinstance(v, str):
+                fragments.append(v)
+            elif isinstance(v, list):
+                fragments.extend(str(x) for x in v)
+            elif isinstance(v, dict):
+                for vv in v.values():
+                    if isinstance(vv, str):
+                        fragments.append(vv)
+                    elif isinstance(vv, list):
+                        fragments.extend(str(x) for x in vv)
+
+    for task in plan.get("tasks", []):
+        if not isinstance(task, dict):
+            continue
+
+        for key in ("file_path", "behavior_summary", "role"):
+            val = task.get(key)
+            if isinstance(val, str):
+                fragments.append(val)
+
+        for key in ("sub_tasks", "gotchas", "notes", "tailwind_hints"):
+            val = task.get(key)
+            if isinstance(val, list):
+                fragments.extend(str(x) for x in val)
+            elif isinstance(val, str):
+                fragments.append(val)
+
+        dependency_hints = task.get("dependency_hints")
+        if isinstance(dependency_hints, list):
+            fragments.extend(str(x) for x in dependency_hints)
+        elif isinstance(dependency_hints, str):
+            fragments.append(dependency_hints)
+
+    return fragments
+
+
+def _validate_dependency_semantics(plan: dict, stub_files: list[dict]) -> None:
+    fragments = _collect_planned_text_fragments(plan)
+    lower_fragments = [f.lower() for f in fragments]
+
+    has_regions_plugin_semantics = any(
+        ("regionsplugin.create" in f)
+        or ("regions plugin" in f)
+        or ("regionsplugin" in f)
+        or ("wavesurfer.js/dist/plugins/regions.esm.js" in f)
+        for f in lower_fragments
+    )
+
+    promoted_aliases = []
+    for alias in KNOWN_BUNDLED_PLUGIN_ALIASES:
+        if any(alias.lower() in f for f in lower_fragments):
+            promoted_aliases.append(alias)
+
+    if has_regions_plugin_semantics and promoted_aliases:
+        aliases = ", ".join(sorted(set(promoted_aliases)))
+        print(
+            "[07] WARNING: planner appears to promote bundled plugin alias(es) "
+            f"to standalone dependency/package names: {aliases}",
+            file=sys.stderr,
+        )
+        print(
+            "[07] WARNING: expected canonical dependency is 'wavesurfer.js' and "
+            "Regions should stay a bundled plugin imported via "
+            "'wavesurfer.js/dist/plugins/regions.esm.js'.",
+            file=sys.stderr,
+        )
+
+
+def _rewrite_stub_semantics(stub_files: list[dict]) -> list[dict]:
+    rewritten: list[dict] = []
+
+    for stub in stub_files:
+        if not isinstance(stub, dict):
+            continue
+
+        item = dict(stub)
+        item.setdefault("dependency_hints", [])
+
+        if item.get("file_path") == "package.json":
+            hints = item.get("dependency_hints")
+            if not isinstance(hints, list):
+                hints = []
+
+            normalized_hints = []
+            for hint in hints:
+                if not isinstance(hint, dict):
+                    continue
+
+                h = dict(hint)
+                name = _normalize_dep_name(h.get("name"))
+                if name in KNOWN_BUNDLED_PLUGIN_ALIASES:
+                    alias_info = KNOWN_BUNDLED_PLUGIN_ALIASES[name]
+                    h["kind"] = "bundled_plugin"
+                    h["owner_package"] = alias_info["owner_package"]
+                    h["canonical_feature"] = alias_info["canonical_feature"]
+                    h["import_path"] = alias_info["import_path"]
+
+                normalized_hints.append(h)
+
+            item["dependency_hints"] = normalized_hints
+
+        rewritten.append(item)
+
+    return rewritten
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # Artifact access tracking
 # ════════════════════════════════════════════════════════════════════════════
 # Full-scope prompt
@@ -128,6 +264,14 @@ You will receive:
        exports[]             — exact public symbols this file must export
        quirks[]              — known implementation gotchas from the scaffold author
        acceptance_criteria[] — AC IDs this file must satisfy
+       dependency_hints[]    — optional structured dependency metadata from the scaffold
+
+Each dependency_hints entry may include:
+- name
+- kind: "npm_package" | "bundled_plugin" | "subpath_import" | "tooling" | "ui_primitive"
+- owner_package
+- canonical_feature
+- import_path
   3. open_questions[]  — resolved design decisions (id, question, affects, impact)
   4. module_implementation_order[] — suggested module ordering from the scaffold
 
@@ -147,6 +291,11 @@ The stack should include:
 - CSS / styling system if any, e.g. Tailwind CSS v3, CSS Modules, Styled Components
 - Test runner if any, e.g. Vitest, pytest, Jest, Go test
 - Key libraries that affect implementation patterns, e.g. Zustand, React Query, Pydantic, SQLAlchemy
+
+IMPORTANT:
+- Do NOT promote bundled plugins, subpath imports, or feature names into standalone npm packages.
+- If scaffold metadata says something is a bundled plugin of another package, record it under the owning package in stack.key_libs or mention it as a plugin detail, NOT as an independent installable library.
+- Example: the Wavesurfer Regions plugin belongs to "wavesurfer.js" and should be described as a bundled plugin imported via "wavesurfer.js/dist/plugins/regions.esm.js", not as "@wavesurfer/regions" or "wavesurferregions" dependency.
 
 If the project is a monorepo or mixed stack, represent that explicitly, for example:
 {
@@ -178,6 +327,10 @@ scaffold author. These encode resolved design decisions — treat them as ground
   task's gotchas[] or sub_tasks. Do not silently drop scaffold quirks.
 - acceptance_criteria[]: copy the AC IDs into the task's acceptance_criteria field
   so the implementer knows what to verify.
+- dependency_hints[]: treat these as dependency ground truth when present.
+  - "npm_package" means an actual installable dependency.
+  - "bundled_plugin" means a capability shipped inside another package; do NOT list it as a standalone dependency.
+  - "subpath_import" means import via the given import_path from the owning package; do NOT invent a package name from it.
 
 RULE — OPEN QUESTIONS:
 For each open question provided, its resolution/impact MUST be reflected in the
@@ -189,6 +342,11 @@ Config files (kind === "config") need task entries too.
 Their sub_tasks describe what to write (content/setup), not runtime logic.
 Their gotchas should cover tooling quirks (plugin order, extends chains, etc.).
 tailwind_hints is null for config files.
+
+For package.json specifically:
+- Only list actual installable npm packages in its dependency-related sub_tasks.
+- If a feature is provided by a bundled plugin, write it as an implementation/import note tied to the owning package, not as a separate dependency to install.
+- Never normalize or sanitize a plugin alias into a fake package name.
 
 RULE — IMPLEMENTATION ORDER:
 Use the module_implementation_order hint to sequence implementation_order.
@@ -205,6 +363,7 @@ For each file, output a task object with:
 - role: one-sentence functional label
 - acceptance_criteria: list of AC IDs copied from the scaffold (empty list if none)
 - depends_on: list of files this file imports from
+- dependency_hints: copy through any relevant structured dependency metadata for this file, especially package.json
 - sub_tasks: ordered implementation steps, specific enough that the implementer does
   not need the spec. Every export listed in the scaffold's exports[] MUST appear here.
   For types/interfaces files: list every type, interface, enum, and constant to define
@@ -292,6 +451,8 @@ Rules:
 - Do not assume TypeScript, React, Vite, Tailwind, or Vitest unless the spec/scaffold
   actually indicates them.
 - Do not use implementation patterns from a different stack than the one detected.
+- Never convert plugin aliases or import-path hints into invented package names.
+- If the scaffold/spec mentions Wavesurfer Regions as a plugin, keep it as a plugin of wavesurfer.js; never output "@wavesurfer/regions" or "wavesurferregions" as a package to install unless the scaffold explicitly marks it as an npm_package.
 - Output raw JSON only. Absolutely no markdown fences or preamble text.
 """
 
@@ -623,21 +784,33 @@ def _extract_stub_files(scaffold: dict) -> list[dict]:
     including top-level config_files.
 
     blueprint.json schema (new):
-      {
-        modules: [{
-          module, purpose, depends_on,
-          files: [{ path, kind, exports, quirks, acceptance_criteria }]
-        }],
-        config_files: [{ path, kind, note }],
-        implementation_order: ["types", "config", ...],   # module-level
-        open_questions: [{ id, question, affects, impact }]
-      }
+    {
+      "modules": [{
+        "module": "...",
+        "purpose": "...",
+        "depends_on": [...],
+        "files": [{
+          "path": "...",
+          "kind": "source" | "test" | "config" | "migration",
+          "exports": [...],
+          "quirks": [...],
+          "acceptance_criteria": [...]
+        }]
+      }],
+      "config_files": [{
+        "path": "...",
+        "kind": "config",
+        "note": "...",
+        "dependencies": [...]
+      }],
+      "implementation_order": [...],
+      "open_questions": [...]
+    }
 
     Returns a flat list of file dicts for the full planner prompt.
     """
     modules = scaffold.get("modules", [])
 
-    # ── Legacy flat-file schema fallback ──────────────────────────────────
     if not isinstance(modules, list):
         files = scaffold.get("files", [])
         if not isinstance(files, list):
@@ -653,15 +826,17 @@ def _extract_stub_files(scaffold: dict) -> list[dict]:
 
     stub_files: list[dict] = []
 
-    # ── Source/non-test files from modules ────────────────────────────────
     for mod in modules:
         if not isinstance(mod, dict):
             continue
+
         for file_entry in mod.get("files", []):
             if not isinstance(file_entry, dict):
                 continue
+
             if file_entry.get("kind", "source") == "test":
                 continue
+
             stub_files.append({
                 "file_path": file_entry.get("path", ""),
                 "kind": file_entry.get("kind", "source"),
@@ -670,15 +845,21 @@ def _extract_stub_files(scaffold: dict) -> list[dict]:
                 "exports": file_entry.get("exports", []),
                 "quirks": file_entry.get("quirks", []),
                 "acceptance_criteria": file_entry.get("acceptance_criteria", []),
+                "dependency_hints": file_entry.get("dependency_hints", []),
             })
 
-    # ── Top-level config_files ─────────────────────────────────────────────
     for cfg in scaffold.get("config_files", []):
         if not isinstance(cfg, dict):
             continue
+
         path = cfg.get("path", "")
         if not path:
             continue
+
+        dependency_hints = cfg.get("dependencies", [])
+        if not isinstance(dependency_hints, list):
+            dependency_hints = []
+
         stub_files.append({
             "file_path": path,
             "kind": "config",
@@ -687,9 +868,11 @@ def _extract_stub_files(scaffold: dict) -> list[dict]:
             "exports": [],
             "quirks": [cfg["note"]] if cfg.get("note") else [],
             "acceptance_criteria": [],
+            "dependency_hints": dependency_hints,
         })
 
-    return stub_files
+    return _rewrite_stub_semantics(stub_files)
+
 
 
 def call_full_planner(spec: str, stub_files: list[dict], scaffold: dict) -> dict:
@@ -713,10 +896,22 @@ def call_full_planner(spec: str, stub_files: list[dict], scaffold: dict) -> dict
 
     context_block = ("\n\n" + "\n\n".join(context_sections)) if context_sections else ""
 
+    semantic_guard = {
+        "dependency_rules": [
+            "Do not promote bundled plugins to standalone npm packages.",
+            "Do not invent package names from plugin aliases or import-path fragments.",
+            "For Wavesurfer v7 Regions, canonical owner package is wavesurfer.js.",
+            "Canonical import path for Regions plugin: wavesurfer.js/dist/plugins/regions.esm.js",
+        ],
+        "known_bundled_plugin_aliases": KNOWN_BUNDLED_PLUGIN_ALIASES,
+    }
+
     user_message = (
         f"### canonical spec\n\n{spec}\n\n"
         f"### scaffold stub files\n\n"
-        f"{json.dumps(stub_files, indent=2, ensure_ascii=False)}"
+        f"{json.dumps(stub_files, indent=2, ensure_ascii=False)}\n\n"
+        f"### semantic guardrails\n\n"
+        f"{json.dumps(semantic_guard, indent=2, ensure_ascii=False)}"
         f"{context_block}"
     )
 
@@ -737,7 +932,8 @@ def call_full_planner(spec: str, stub_files: list[dict], scaffold: dict) -> dict
 
 def validate_full_plan(plan: dict, stub_files: list[dict]) -> None:
     """
-    Warn if any stub file is missing from the plan and report detected stack.
+    Warn if any stub file is missing from the plan, report detected stack,
+    and run semantic validation against bundled-plugin/package confusion.
     """
     tasks = plan.get("tasks", [])
     if not isinstance(tasks, list):
@@ -767,6 +963,9 @@ def validate_full_plan(plan: dict, stub_files: list[dict]) -> None:
         print("[07] WARNING: plan missing 'stack' — framework quirks may be generic")
     else:
         print(f"[07] Stack detected: {json.dumps(plan['stack'], indent=2, ensure_ascii=False)}")
+
+    _validate_dependency_semantics(plan, stub_files)
+
 
 
 def run_full_scope() -> None:

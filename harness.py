@@ -169,12 +169,12 @@ STEP_ARTIFACT_READS: dict[str, list[str]] = {
         "clarificator/raw.json",
     ],
     "executor": [
-        "spec/specwright_spec_<slug>.md",
-        "scaffolder/blueprint.json",
+        #"spec/specwright_spec_<slug>.md",
+        #"scaffolder/blueprint.json",
         "planner/full_plan.json",
         "planner/mini_plan.json",
-        "absorber/codebase_map.md",
-        "archivist/knowledge_log.md",
+        #"absorber/codebase_map.md",
+        #"archivist/knowledge_log.md",
     ],
     "debugger": [
         "planner/full_plan.json",
@@ -1202,8 +1202,7 @@ def _run_step(
 
         executor_args = _scope_args_for_script(STEP_SCRIPTS[step], args.scope)
 
-        if plan_available:
-            executor_args.append("--use-planner-plan")
+        # --use-planner-plan removed: executor now always reads full_plan.json directly
 
         if args.retry_impl:
             retry_args = _retry_impl_args(executor_args)
@@ -1212,9 +1211,9 @@ def _run_step(
             executor_args = retry_args
 
         if args.scope == "mini":
-            mode = "mini-targeted+plan" if plan_available else "mini-targeted"
+            mode = "mini-targeted"
         else:
-            mode = "per-file+plan" if plan_available else "single-call"
+            mode = "per-file-with-planner-plan" if plan_available else "no-plan"
 
         ok = _run_step_with_trace(
             step,
@@ -1229,6 +1228,7 @@ def _run_step(
 
         return ok
 
+
     if step == "debugger":
         test_args = [
             "--impl", "primary",
@@ -1238,6 +1238,9 @@ def _run_step(
 
         if args.verbose:
             test_args.append("--verbose")
+
+        if args.bug_input:
+            test_args += ["--input", args.bug_input]
 
         return _run_step_with_trace(step, "debugger", STEP_SCRIPTS[step], args, test_args)
 
@@ -1480,6 +1483,9 @@ Examples:
     parser.add_argument("--fix-non-blocking",      dest="fix_non_blocking", action="store_true")
     parser.add_argument("--repair-from-judge",     dest="repair_from_judge", action="store_true")
     parser.add_argument("--clarify-input",         type=str, default=None, metavar="FILE")
+    parser.add_argument("--bug-input",             type=str, default=None, metavar="FILE",
+                        help="Bug report file passed to debugger via --input. "
+                             "Use when running debugger step non-interactively.")
 
     parser.add_argument(
         "--trace-artifacts",

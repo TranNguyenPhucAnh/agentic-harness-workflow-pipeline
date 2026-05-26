@@ -1,1881 +1,625 @@
 """
 pipeline/09_debugger.py
 =======================
-Step 9 — Test / verify / iterate.
+Step 9 — Interactive bug-fix assistant.
 
-FULL mode:
-  Clustered repair loop:
-    - Run Vitest.
-    - Parse failing clusters.
-    - Apply static fixes.
-    - Dispatch surface/component bugs to primary repair model (role: debugger).
-    - Dispatch hook/data/type/util logic bugs to secondary repair model (role: debugger_secondary).
-    - Write debugger/test_summary.json (short-term) and append debugger/test_log.json (long-term).
-
-MINI mode:
-  Safe targeted verification:
-    - Detect scope from executor/manifest.json.
-    - Do not require the canonical spec.
-    - Build context from clarificator/session.json (field: requirement_synthesis),
-      planner/mini_plan.json (fields: plan + impact), executor/manifest.json.
-    - Dispatch lightweight verifiers by target file extension:
-        .py                  → py_compile
-        .json                → json parse
-        .yaml/.yml           → yaml parse if PyYAML is installed, else basic check
-        .toml                → tomllib parse
-        .ts/.tsx/.js/.jsx    → vitest if package.json exists, otherwise syntax skipped
-    - For TS/Vitest projects, can still run the full Vitest repair loop.
+Flow:
+  Phase 1 — Intake:   gather_bug_report() → bug text (or Vitest output)
+  Phase 2 — Locate:   LLM call 1: bug report + codebase_map + blueprint
+                       → list of relevant files + reasoning
+  Phase 3 — Read:     read contents of those files
+  Phase 4 — Patch:    LLM call 2: bug + context + file contents
+                       → full rewrite per file
+  Phase 5 — Review:   print reasoning + diff preview + Y/N prompt
+  Phase 6 — Apply:    if Y → write files
 
 Writes:
   artifacts_<slug>/debugger/test_summary.json   (short-term, overwrite)
-  artifacts_<slug>/debugger/test_log.json       (long-term, append)
-  artifacts_<slug>/output/src/**                repair loop patches, if needed
-  artifacts_<slug>/output/tests/**              fragile-test repair, if auditor allows
+  artifacts_<slug>/output/src/**                patched files
+  artifacts_<slug>/output/tests/**              patched test files
 
 Reads:
-  artifacts_<slug>/spec/specwright_spec_<slug>.md
-  artifacts_<slug>/planner/full_plan.json
-  artifacts_<slug>/planner/mini_plan.json         (fields: plan + impact)
-  artifacts_<slug>/clarificator/session.json      (field: requirement_synthesis)
-  artifacts_<slug>/enricher/enriched_prompt.md
-  artifacts_<slug>/executor/manifest.json
-  artifacts_<slug>/patcher/attempt_log.json       (last entry only)
+  artifacts_<slug>/blueprint.json
+  artifacts_<slug>/absorber/codebase_map.md
+  artifacts_<slug>/executor/manifest.json       (scope detection only)
   artifacts_<slug>/archivist/knowledge_log.md
   artifacts_<slug>/output/src/**
   artifacts_<slug>/output/tests/**
 
 Direct execution:
   python 09_debugger.py --project my-app
+  python 09_debugger.py --project my-app --text "Button click crashes app"
+  python 09_debugger.py --project my-app --auto   # skip Y/N, apply directly
   PIPELINE_PROJECT=my-app python 09_debugger.py
-
-At the end of each run, prints:
-  - artifacts/files read
-  - artifacts/files created/updated/overwritten/appended
-
-For taxonomy details see artifacts/TAXONOMY.md
 """
 
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import os
-import py_compile
 import re
 import subprocess
 import sys
-import time
-from collections import Counter
-from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable
-
-# === WRITE AUTHORITY: debugger ===
-# OWNS  : artifacts_<slug>/debugger/test_summary.json   (short-term, overwrite)
-#         artifacts_<slug>/debugger/test_log.json        (long-term, append)
-#         artifacts_<slug>/output/src/**                 repair patches
-#         artifacts_<slug>/output/tests/**               fragile-test patches
-#
-# READS full:
-#   artifacts_<slug>/spec/specwright_spec_<slug>.md
-#   artifacts_<slug>/planner/full_plan.json              (field: global_notes)
-#   artifacts_<slug>/archivist/knowledge_log.md          (→ system prompt, repair models)
-#   artifacts_<slug>/patcher/attempt_log.json            (last entry → system prompt, qwen only)
-#   artifacts_<slug>/output/src/**                       (test targets)
-#   artifacts_<slug>/output/tests/**                     (test files)
-#
-# READS mini:
-#   artifacts_<slug>/clarificator/session.json           (field: requirement_synthesis)
-#   artifacts_<slug>/enricher/enriched_prompt.md
-#   artifacts_<slug>/planner/mini_plan.json
-#   artifacts_<slug>/executor/manifest.json
-#   artifacts_<slug>/archivist/knowledge_log.md          (→ system prompt, repair models)
-#   artifacts_<slug>/patcher/attempt_log.json            (last entry → system prompt, qwen only)
-#   artifacts_<slug>/output/src/**                       (test targets)
-#   artifacts_<slug>/output/tests/**                     (test files)
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from artifacts.paths import (  # noqa: E402
+    ABSORBER_CODEBASE_MD,
     ARCHIVIST_KNOWLEDGE_LOG,
-    CLARIFICATOR_SESSION,
-    CLARIFIED_REQ,
     DEBUGGER_OVERWRITE_TEST_SUMMARY,
-    DEBUGGER_TEST_LOG,
-    ENRICHER_OVERWRITE_PROMPT,
     EXECUTOR_OVERWRITE_MANIFEST,
-    PATCHER_ATTEMPT_LOG,
-    PLANNER_FULL_PLAN,
-    PLANNER_MINI_PLAN,
     SRC_DIR,
     TESTS_DIR,
     artifact_root,
     ensure_dirs,
-    get_spec_path,
 )
-from artifacts.models import call_model, get_model, get_provider  # noqa: E402
+from artifacts.models import get_model  # noqa: E402
 from modules.artifact_tracking import track_read, track_write, print_summary as print_artifact_summary  # noqa: E402
-from modules.cost import print_call, print_summary, record_usage  # noqa: E402
-from modules.call_llm import call_llm_messages
+from modules.cost import print_summary  # noqa: E402
+from modules.call_llm import call_llm_messages  # noqa: E402
+from modules.drag_and_drop import gather_text_file_bundle  # noqa: E402
 from modules.post_interactive import prompt_next_step  # noqa: E402
 
-# Module-level model label constants — derived from models.py at import time.
-_DEBUGGER_MODEL           = get_model("debugger")
-_DEBUGGER_SECONDARY_MODEL = get_model("debugger_secondary")
-
 ROLE = "debugger"
-
-
-_SRC_PREFIX = "src"
-
-MINIMAX_SCOPE_PATTERNS: list[re.Pattern[str]] = [
-    re.compile(r"^src/hooks/"),
-    re.compile(r"^src/data/"),
-    re.compile(r"^src/types/"),
-    re.compile(r"^src/utils/"),
-]
+_RE_ANSI = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Data structures
-# ════════════════════════════════════════════════════════════════════════════
-
-@dataclass
-class TestFailure:
-    test_file: str
-    test_name: str
-    error_snippet: str
-
-
-@dataclass
-class FailureCluster:
-    test_file: str
-    src_file: str
-    failures: list[TestFailure] = field(default_factory=list)
-
-    attempt_count: int = 0
-    last_fingerprint: str = ""
-    escalated: bool = False
-    is_transform_error: bool = False
-    owner: str = ""
-
-    @property
-    def key(self) -> str:
-        return self.test_file
-
-    def error_block(self) -> str:
-        return "\n\n".join(
-            f"  x {failure.test_name}\n{failure.error_snippet}"
-            for failure in self.failures
-        )
-
-    def fingerprint(self) -> str:
-        return re.sub(r"\s+", " ", self.error_block()).strip()[:400]
-
-    def is_minimax_scope(self) -> bool:
-        return any(pattern.match(self.src_file) for pattern in MINIMAX_SCOPE_PATTERNS)
-
-
-@dataclass
-class ClusterRepairRecord:
-    cluster: str
-    src_file: str
-    failures: int
-    repaired: bool
-    layer_used: str
-    escalated: bool
-    escalated_to: str
-    owner: str
-    note: str = ""
-    consistency_verdict: str = ""
-
-
-@dataclass
-class IterationRecord:
-    iteration: int
-    passed: bool
-    summary: str
-    clusters_found: int
-    clusters_repaired: int
-    cluster_details: list[dict[str, Any]]
-    log_snippet: str
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# CLI / project setup
+# CLI
 # ════════════════════════════════════════════════════════════════════════════
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="09_debugger.py",
-        description="Run tests/verifiers and optionally repair failing clusters.",
-    )
-    parser.add_argument(
-        "--project",
-        default=None,
-        help="Project name for direct execution. Sets PIPELINE_PROJECT.",
-    )
-    parser.add_argument("--max-iter", type=int, default=3)
-    parser.add_argument("--max-cluster-attempts", type=int, default=2)
-    parser.add_argument("--verbose", action="store_true")
-    parser.add_argument(
-        "--impl",
-        default="primary",
-        choices=["primary"],
-        help="Kept for harness.py compatibility — internally dispatches via model roles debugger + debugger_secondary.",
-    )
-    parser.add_argument(
-        "--no-repair",
-        action="store_true",
-        help="Run verifier/test only. Do not call LLM repair loop.",
-    )
-    return parser
+    p = argparse.ArgumentParser(prog="09_debugger.py", description="Interactive bug-fix assistant.")
+    p.add_argument("--project", default=None, help="Project name.")
+    p.add_argument("--text", default=None, metavar="TEXT", help="Bug description inline.")
+    p.add_argument("--input", metavar="FILE", nargs="+", help="Bug report file(s).")
+    p.add_argument("--auto", action="store_true", help="Skip Y/N review, apply patches directly.")
+    p.add_argument("--no-interactive", action="store_true", help="Disable TTY prompts.")
+    p.add_argument("--run-tests", action="store_true", help="Run Vitest first, use output as bug report.")
+    p.add_argument("--verbose", action="store_true")
+    # Legacy args from harness — accepted but ignored
+    p.add_argument("--impl", default="primary", help=argparse.SUPPRESS)
+    p.add_argument("--max-iter", type=int, default=3, help=argparse.SUPPRESS)
+    p.add_argument("--max-cluster-attempts", type=int, default=2, help=argparse.SUPPRESS)
+    p.add_argument("--no-repair", action="store_true", help=argparse.SUPPRESS)
+    return p
 
 
-def _configure_project(
-    project: str | None,
-    parser: argparse.ArgumentParser,
-) -> None:
+def _configure_project(project: str | None, parser: argparse.ArgumentParser) -> None:
     if project:
         os.environ["PIPELINE_PROJECT"] = project
         return
-
     if os.environ.get("PIPELINE_PROJECT"):
         return
-
-    parser.error(
-        "PIPELINE_PROJECT is not set. Use --project <name> or export "
-        "PIPELINE_PROJECT=<name> before running 09_debugger.py directly."
-    )
+    parser.error("PIPELINE_PROJECT is not set. Use --project <name>.")
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Scope / context loaders
+# Helpers
 # ════════════════════════════════════════════════════════════════════════════
 
-def _read_json(path: Any, default: Any) -> Any:
+def _read_text(path: Path) -> str:
     if not path.exists():
-        return default
+        return ""
+    track_read(path)
+    return path.read_text(errors="replace")
+
+
+def _read_json(path: Path) -> Any:
+    if not path.exists():
+        return {}
     try:
         track_read(path)
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        return default
+        return {}
 
 
-def _read_text_if_exists(path: Any, *, errors: str = "replace") -> str:
-    if not path.exists():
-        return ""
-    track_read(path)
-    return path.read_text(errors=errors)
+def _resolve_path(rel: str) -> Path:
+    """Resolve a relative path like src/foo.ts or tests/bar.test.ts to absolute."""
+    normalized = rel.replace("\\", "/").strip()
+    if normalized.startswith("src/"):
+        return SRC_DIR / normalized[len("src/"):]
+    if normalized.startswith("tests/"):
+        return TESTS_DIR / normalized[len("tests/"):]
+    return artifact_root() / normalized
 
 
-def _load_impl_record() -> dict[str, Any]:
-    data = _read_json(EXECUTOR_OVERWRITE_MANIFEST, {})
-    return data if isinstance(data, dict) else {}
+def _strip_ansi(text: str) -> str:
+    return _RE_ANSI.sub("", text)
 
 
-def _current_scope() -> str:
-    rec = _load_impl_record()
-    scope = rec.get("scope", "full")
-    return scope if scope in {"full", "mini"} else "full"
+def _call_llm(role: str, messages: list[dict[str, str]], max_tokens: int = 8192) -> str:
+    content, _ = call_llm_messages(
+        role, messages,
+        retries=2, backoff=False,
+        caller_file=__file__,
+        label=f"[09] {get_model(role)}",
+        max_tokens=max_tokens,
+    )
+    # === DEBUG LOG ===
+    import sys as _sys
+    print(f"[DEBUG debugger] _call_llm content ({len(content)} chars): {repr(content[:300])}", file=_sys.stderr)
+    # === END DEBUG ===
+
+    return content
 
 
-def _load_spec_or_full_context() -> str:
-    spec_path = get_spec_path()
-    if spec_path.exists():
-        track_read(spec_path)
-        return spec_path.read_text(errors="replace").strip()
-
-    return ""
-
-
-def _load_mini_context() -> str:
-    parts: list[str] = []
-
-    # clarificator/session.json — extract requirement_synthesis field
-    if CLARIFIED_REQ.exists():
-        try:
-            raw = CLARIFIED_REQ.read_text(encoding="utf-8")
-            track_read(CLARIFIED_REQ)
-            data = json.loads(raw)
-            synthesis = data.get("requirement_synthesis", "")
-            if isinstance(synthesis, str) and synthesis.strip():
-                parts.append(
-                    "## clarificator/session.json (requirement_synthesis)\n\n"
-                    + synthesis.strip()
-                )
-            else:
-                parts.append(
-                    "## clarificator/session.json\n\n```json\n"
-                    + raw.strip()
-                    + "\n```"
-                )
-        except Exception:
-            text = _read_text_if_exists(CLARIFIED_REQ).strip()
-            if text:
-                parts.append("## clarificator/session.json\n\n" + text)
-
-    if ENRICHER_OVERWRITE_PROMPT.exists():
-        parts.append(
-            "## enricher/enriched_prompt.md\n\n"
-            + _read_text_if_exists(ENRICHER_OVERWRITE_PROMPT).strip()
-        )
-
-    # planner/mini_plan.json — new merged format {plan, impact}
-    if PLANNER_MINI_PLAN.exists():
-        try:
-            raw = _read_text_if_exists(PLANNER_MINI_PLAN).strip()
-            merged = json.loads(raw)
-            if isinstance(merged, dict) and "plan" in merged:
-                plan_obj = merged["plan"]
-                impact_obj = merged.get("impact", {})
-                parts.append(
-                    "## planner/mini_plan.json (plan)\n\n```json\n"
-                    + json.dumps(plan_obj, indent=2, ensure_ascii=False)
-                    + "\n```"
-                )
-                if impact_obj:
-                    parts.append(
-                        "## planner/mini_plan.json (impact)\n\n```json\n"
-                        + json.dumps(impact_obj, indent=2, ensure_ascii=False)
-                        + "\n```"
-                    )
-            else:
-                parts.append(
-                    "## planner/mini_plan.json\n\n```json\n"
-                    + raw
-                    + "\n```"
-                )
-        except Exception:
-            parts.append(
-                "## planner/mini_plan.json\n\n```json\n"
-                + _read_text_if_exists(PLANNER_MINI_PLAN).strip()
-                + "\n```"
-            )
-
-    if EXECUTOR_OVERWRITE_MANIFEST.exists():
-        parts.append(
-            "## executor/manifest.json\n\n```json\n"
-            + _read_text_if_exists(EXECUTOR_OVERWRITE_MANIFEST).strip()
-            + "\n```"
-        )
-
-    if not parts:
-        return "(mini context unavailable)"
-
-    return "\n\n---\n\n".join(parts)
-
-
-def _load_run_context() -> str:
-    if _current_scope() == "mini":
-        return _load_mini_context()
-
-    ctx = _load_spec_or_full_context()
-    return ctx or "(spec context unavailable)"
-
-
-def _load_planner_global_notes() -> str:
-    parts: list[str] = []
-
-    if PLANNER_FULL_PLAN.exists():
-        try:
-            plan = _read_json(PLANNER_FULL_PLAN, {})
-            if isinstance(plan, dict):
-                note = plan.get("global_notes", "")
-                if note:
-                    parts.append(str(note))
-        except Exception:
-            pass
-
-    kb = _load_knowledge_base()
-    if kb:
-        parts.append("Accumulated knowledge:\n" + kb)
-
-    return "\n\n---\n\n".join(parts)
-
-
-def _load_judge_findings() -> str:
-    parts: list[str] = []
-
-    if PATCHER_ATTEMPT_LOG.exists():
-        try:
-            track_read(PATCHER_ATTEMPT_LOG)
-            raw = PATCHER_ATTEMPT_LOG.read_text(encoding="utf-8").strip()
-            if raw:
-                data = json.loads(raw)
-                entries = data.get("entries", data) if isinstance(data, dict) else data
-                if isinstance(entries, list) and entries:
-                    last_entry = json.dumps(entries[-1], indent=2, ensure_ascii=False)
-                    parts.append(last_entry)
-        except Exception as exc:
-            print(f"[09] WARNING: could not read patcher attempt log: {exc}", file=sys.stderr)
-
-    if ARCHIVIST_KNOWLEDGE_LOG.exists():
-        try:
-            text = _read_text_if_exists(ARCHIVIST_KNOWLEDGE_LOG).strip()
-            if text:
-                parts.append(text)
-        except Exception:
-            pass
-
-    return "\n\n---\n\n".join(parts)
-
-
-def _load_knowledge_base() -> str:
-    if not ARCHIVIST_KNOWLEDGE_LOG.exists():
-        return ""
-
-    content = _read_text_if_exists(ARCHIVIST_KNOWLEDGE_LOG).strip()
-    lines = content.splitlines()
-    body_lines = [
-        line
-        for line in lines
-        if not line.startswith("# ") and not line.startswith("_")
-    ]
-    return "\n".join(body_lines).strip()
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# API helpers
-# ════════════════════════════════════════════════════════════════════════════
-
-def _strip_json_fences(raw: str) -> str:
+def _parse_json_response(raw: str) -> dict[str, Any]:
     text = raw.strip()
+
+    # Strip markdown fences
     text = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", text)
     text = re.sub(r"\n?```$", "", text.strip())
-    return text
 
+    # Strip tool-call hallucination: model đôi khi tự viết <tool_call>...</tool_call>
+    # và <tool_response>...</tool_response> trước khi trả JSON thật.
+    # Bỏ hết mọi thứ trước dấu { đầu tiên.
+    brace_idx = text.find("{")
+    if brace_idx > 0:
+        text = text[brace_idx:]
 
-def _parse_model_json(raw: str) -> dict[str, Any]:
-    text = _strip_json_fences(raw)
+    # Nếu có nhiều JSON objects liên tiếp (tool_call JSON + response JSON),
+    # chỉ lấy object đầu tiên bằng cách tìm closing brace cân bằng.
     try:
-        parsed = json.loads(text)
+        return json.loads(text)
     except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        if not match:
-            raise
-        parsed = json.loads(match.group())
+        pass
 
-    if not isinstance(parsed, dict):
-        raise ValueError("model returned non-object JSON")
+    # Tìm outermost balanced { ... }
+    depth = 0
+    start = None
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start is not None:
+                candidate = text[start:i+1]
+                try:
+                    return json.loads(candidate)
+                except json.JSONDecodeError:
+                    # reset và tìm tiếp
+                    start = None
+                    continue
 
-    return parsed
+    raise json.JSONDecodeError("No valid JSON object found", text, 0)
 
-
-def call_qwen(messages: list[dict[str, str]]) -> str:
-    """Surface/component repair — role: debugger."""
-    content, _ = call_llm_messages(
-        "debugger", messages,
-        retries=2, backoff=False,
-        caller_file=__file__, label=f"[09] {get_model('debugger')}",
-    )
-    return content
-
-
-def call_minimax(messages: list[dict[str, str]]) -> str:
-    """Logic/hook/data repair — role: debugger_secondary."""
-    content, _ = call_llm_messages(
-        "debugger_secondary", messages,
-        retries=2, backoff=False,
-        caller_file=__file__, label=f"[09] {get_model('debugger_secondary')}",
-    )
-    return content
-
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# Path helpers
-# ════════════════════════════════════════════════════════════════════════════
-
-def _safe_rel_path(raw: str) -> Path:
-    normalized = raw.replace("\\", "/").strip()
-    rel = Path(normalized)
-
-    if not normalized:
-        raise ValueError("empty path")
-
-    if rel.is_absolute():
-        raise ValueError(f"absolute path rejected: {raw}")
-
-    if any(part == ".." for part in rel.parts):
-        raise ValueError(f"path traversal rejected: {raw}")
-
-    return rel
-
-
-def _resolve_artifact_path(rel: str) -> Path:
-    safe = _safe_rel_path(rel)
-    raw = safe.as_posix()
-
-    if raw.startswith("src/"):
-        return SRC_DIR / raw[len("src/"):]
-
-    if raw.startswith("tests/"):
-        return TESTS_DIR / raw[len("tests/"):]
-
-    return artifact_root() / safe
-
-
-def _is_under(path: Path, root: Path) -> bool:
-    try:
-        path.resolve().relative_to(root.resolve())
-        return True
-    except ValueError:
-        return False
-
-
-def _plan_mini_target_files() -> set[str]:
-    raw = _read_json(PLANNER_MINI_PLAN, {})
-    if not isinstance(raw, dict):
-        return set()
-
-    if "plan" in raw and isinstance(raw["plan"], dict):
-        plan = raw["plan"]
-    else:
-        plan = raw
-
-    targets = plan.get("target_files", [])
-    allowed: set[str] = set()
-
-    if isinstance(targets, list):
-        for entry in targets:
-            if isinstance(entry, str):
-                allowed.add(entry)
-            elif isinstance(entry, dict) and isinstance(entry.get("path"), str):
-                allowed.add(entry["path"])
-
-    return allowed
-
-
-def _mini_allowed_to_write(rel_path: str) -> bool:
-    if _current_scope() != "mini":
-        return True
-
-    allowed = _plan_mini_target_files()
-    if not allowed:
-        return False
-
-    return rel_path in allowed
-
-
-def _read_file_safe(path: Path) -> str:
-    if path.exists():
-        track_read(path)
-        return path.read_text(errors="replace")
-    return f"// FILE NOT FOUND: {path}\n"
+def _colored_diff(old: str, new: str, filename: str) -> str:
+    """Generate unified diff string."""
+    old_lines = old.splitlines(keepends=True)
+    new_lines = new.splitlines(keepends=True)
+    diff = difflib.unified_diff(old_lines, new_lines, fromfile=f"a/{filename}", tofile=f"b/{filename}", n=3)
+    return "".join(diff)
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Verifier dispatcher for mini mode
+# Phase 1 — Intake
 # ════════════════════════════════════════════════════════════════════════════
 
-def _implemented_files_from_record() -> list[str]:
-    rec = _load_impl_record()
-    files = rec.get("files", [])
-
-    out: list[str] = []
-    if isinstance(files, list):
-        for item in files:
-            if isinstance(item, str):
-                out.append(item)
-            elif isinstance(item, dict) and isinstance(item.get("path"), str):
-                out.append(item["path"])
-
-    return sorted(set(out))
-
-
-def _target_files_for_mini() -> list[str]:
-    files = set(_implemented_files_from_record())
-    files.update(_plan_mini_target_files())
-    return sorted(files)
-
-
-def _package_json_exists() -> bool:
-    return (artifact_root() / "package.json").exists()
-
-
-def _verify_python(path: Path) -> tuple[bool, str]:
-    try:
-        track_read(path)
-        py_compile.compile(str(path), doraise=True)
-        return True, "py_compile OK"
-    except Exception as exc:
-        return False, f"py_compile failed: {exc}"
-
-
-def _verify_json(path: Path) -> tuple[bool, str]:
-    try:
-        track_read(path)
-        json.loads(path.read_text(errors="replace"))
-        return True, "JSON parse OK"
-    except Exception as exc:
-        return False, f"JSON parse failed: {exc}"
-
-
-def _verify_toml(path: Path) -> tuple[bool, str]:
-    try:
-        import tomllib
-        track_read(path)
-        tomllib.loads(path.read_text(errors="replace"))
-        return True, "TOML parse OK"
-    except Exception as exc:
-        return False, f"TOML parse failed: {exc}"
-
-
-def _verify_yaml(path: Path) -> tuple[bool, str]:
-    track_read(path)
-
-    try:
-        import yaml  # type: ignore
-    except Exception:
-        text = path.read_text(errors="replace")
-        if "\t" in text:
-            return False, "YAML basic check failed: tabs found; install PyYAML for full parse"
-        return True, "YAML basic check OK; PyYAML not installed"
-
-    try:
-        yaml.safe_load(path.read_text(errors="replace"))
-        return True, "YAML parse OK"
-    except Exception as exc:
-        return False, f"YAML parse failed: {exc}"
-
-
-def _run_mini_verifiers(verbose: bool = False) -> tuple[bool, dict[str, Any]]:
-    files = _target_files_for_mini()
-
-    if not files:
-        return False, {
-            "summary": "No mini target/implemented files found",
-            "checks": [],
-        }
-
-    checks: list[dict[str, Any]] = []
-    ts_like = False
-
-    for rel in files:
-        try:
-            path = _resolve_artifact_path(rel)
-        except Exception as exc:
-            checks.append({
-                "file": rel,
-                "passed": False,
-                "kind": "path",
-                "message": str(exc),
-            })
-            continue
-
-        ext = path.suffix.lower()
-        kind = ext.lstrip(".") or "unknown"
-
-        if not path.exists():
-            checks.append({
-                "file": rel,
-                "passed": False,
-                "kind": kind,
-                "message": f"file not found: {path}",
-            })
-            continue
-
-        if ext == ".py":
-            ok, msg = _verify_python(path)
-        elif ext == ".json":
-            ok, msg = _verify_json(path)
-        elif ext in {".yaml", ".yml"}:
-            ok, msg = _verify_yaml(path)
-        elif ext == ".toml":
-            ok, msg = _verify_toml(path)
-        elif ext in {".ts", ".tsx", ".js", ".jsx"}:
-            ts_like = True
-            track_read(path)
-            ok, msg = True, "TS/JS file present; Vitest will run if package.json exists"
-        elif ext in {".sql", ".md", ".txt", ".cfg", ".conf", ".ini"}:
-            track_read(path)
-            ok, msg = True, "basic existence check OK"
-        else:
-            track_read(path)
-            ok, msg = True, "basic existence check OK"
-
-        checks.append({
-            "file": rel,
-            "passed": ok,
-            "kind": kind,
-            "message": msg,
-        })
-
-        if verbose:
-            status = "PASS" if ok else "FAIL"
-            print(f"[09][mini] {status} {rel} — {msg}")
-
-    all_basic_ok = all(c["passed"] for c in checks)
-
-    if ts_like and _package_json_exists():
-        print("[09][mini] TS/JS targets detected and package.json exists — running Vitest.")
-        vitest_ok, vitest_output = run_vitest()
-        checks.append({
-            "file": "(vitest)",
-            "passed": vitest_ok,
-            "kind": "vitest",
-            "message": _summarize_test_output(vitest_output),
-            "log_snippet": vitest_output[-2000:],
-        })
-        all_basic_ok = all_basic_ok and vitest_ok
-    elif ts_like:
-        checks.append({
-            "file": "(vitest)",
-            "passed": True,
-            "kind": "vitest",
-            "message": "skipped: package.json not found",
-        })
-
-    return all_basic_ok, {
-        "summary": "Mini verification complete",
-        "checks": checks,
-    }
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# Phase B — run Vitest + parse failures
-# ════════════════════════════════════════════════════════════════════════════
-
-def run_vitest() -> tuple[bool, str]:
-    result = subprocess.run(
-        ["npx", "vitest", "run", "--reporter=verbose"],
-        cwd=artifact_root(),
-        capture_output=True,
-        text=True,
-    )
-    return result.returncode == 0, result.stdout + "\n" + result.stderr
-
-
-_RE_TEST_FILE = re.compile(
-    r"^\s*(FAIL|PASS)\s+(tests/\S+\.test\.[tj]sx?)",
-    re.MULTILINE,
-)
-_RE_FAIL_TEST = re.compile(r"^\s+[x\u00d7\u2717\u274c]\s+(.+)$", re.MULTILINE)
-_RE_ERROR_BLOCK = re.compile(
-    r"(AssertionError|Error|TypeError|ReferenceError)[^\n]*\n(?:[ \t]+[^\n]*\n)*",
-    re.MULTILINE,
-)
-_RE_TRANSFORM_ERR = re.compile(
-    r"(Transform failed|ERROR: Expected|SyntaxError.*esbuild|error TS\d+)",
-    re.IGNORECASE,
-)
-
-
-def _summarize_test_output(output: str) -> str:
-    return next(
-        (
-            line.strip()
-            for line in output.splitlines()
-            if ("passed" in line or "failed" in line) and "test" in line.lower()
-        ),
-        output.strip().splitlines()[-1] if output.strip() else "no output",
-    )
-
-
-def _infer_src_file(test_file: str) -> str:
-    rel = test_file.replace("tests/", "", 1)
-    rel = re.sub(r"\.test\.(tsx?)$", r".\1", rel)
-    rel = re.sub(r"\.test\.(ts)$", r".\1", rel)
-    return f"{_SRC_PREFIX}/{rel}"
-
-
-def parse_failures(output: str) -> list[FailureCluster]:
-    clusters: dict[str, FailureCluster] = {}
-    file_matches = list(_RE_TEST_FILE.finditer(output))
-    sections: list[tuple[str, str, str]] = []
-
-    for index, match in enumerate(file_matches):
-        start = match.end()
-        end = file_matches[index + 1].start() if index + 1 < len(file_matches) else len(output)
-        sections.append((match.group(1), match.group(2), output[start:end]))
-
-    for status, test_file, section in sections:
-        if status != "FAIL":
-            continue
-
-        src_file = _infer_src_file(test_file)
-        cluster = clusters.setdefault(
-            test_file,
-            FailureCluster(test_file=test_file, src_file=src_file, owner=_DEBUGGER_MODEL),
-        )
-
-        if _RE_TRANSFORM_ERR.search(section):
-            cluster.is_transform_error = True
-
-        fail_names = _RE_FAIL_TEST.findall(section)
-        error_matches = list(_RE_ERROR_BLOCK.finditer(section))
-        errors = [m.group(0) for m in error_matches]
-
-        for index, name in enumerate(fail_names):
-            snippet = errors[index] if index < len(errors) else section[:500]
-            cluster.failures.append(
-                TestFailure(
-                    test_file=test_file,
-                    test_name=name.strip(),
-                    error_snippet=snippet.strip()[:600],
-                )
-            )
-
-        if not cluster.failures:
-            cluster.failures.append(
-                TestFailure(
-                    test_file=test_file,
-                    test_name="(parse fallback)",
-                    error_snippet=section[:800].strip(),
-                )
-            )
-
-    return list(clusters.values())
-
-
-def merge_cluster_state(
-    new_clusters: list[FailureCluster],
-    prev_state: dict[str, FailureCluster],
-) -> list[FailureCluster]:
-    for cluster in new_clusters:
-        if cluster.key in prev_state:
-            prev = prev_state[cluster.key]
-            cluster.attempt_count = prev.attempt_count
-            cluster.last_fingerprint = prev.last_fingerprint
-            cluster.escalated = prev.escalated
-            cluster.owner = prev.owner
-    return new_clusters
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# Early-exit and systemic error detection
-# ════════════════════════════════════════════════════════════════════════════
-
-def _detect_systemic_error(clusters: list[FailureCluster]) -> str | None:
-    """
-    If the same error message appears in > 50% of clusters, return it.
-    This indicates a systemic issue that looping won't fix.
-    """
-    if len(clusters) < 2:
-        return None
-
-    # Extract first error snippet from each cluster, normalized
-    snippets: list[str] = []
-    for cluster in clusters:
-        if cluster.failures:
-            # Take first line of first failure's error as the "signature"
-            first_err = cluster.failures[0].error_snippet.strip().splitlines()[0] if cluster.failures[0].error_snippet else ""
-            # Normalize: strip file paths and line numbers
-            normalized = re.sub(r"at .+:\d+:\d+", "", first_err).strip()
-            normalized = re.sub(r"\s+", " ", normalized)[:200]
-            if normalized:
-                snippets.append(normalized)
-
-    if not snippets:
-        return None
-
-    counts = Counter(snippets)
-    most_common_msg, most_common_count = counts.most_common(1)[0]
-
-    if most_common_count > len(clusters) * 0.5:
-        return most_common_msg
-
-    return None
-
-
-def _should_early_exit(cluster_counts: list[int]) -> bool:
-    """
-    If cluster count has not decreased over 2 consecutive iterations,
-    the repair loop is not making progress — break early.
-    """
-    if len(cluster_counts) < 3:
-        return False
-
-    # Check last 2 transitions: if count didn't decrease either time, bail
-    return (
-        cluster_counts[-1] >= cluster_counts[-2]
-        and cluster_counts[-2] >= cluster_counts[-3]
-    )
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# Layer 0 — Static pre-pass
-# ════════════════════════════════════════════════════════════════════════════
-
-_RE_JSX_GENERIC = re.compile(
-    r"(<\w[\w.]*)<(\w[\w,\s]*)>(\s*(?:events|data|items|props|value)\s*=)",
-)
-_RE_TEMPLATE_WIDTH = re.compile(r"(`\$\{)([^}]*\*\s*100)(\}%`)")
-_RE_FLOAT_WIDTH = re.compile(r"(width:\s*)(\d+\.\d+)(%)")
-
-
-def _static_fix_transform(path: Path) -> tuple[bool, str]:
-    if not path.exists():
-        return False, "file not found"
-
-    track_read(path)
-    original = path.read_text(errors="replace")
-    patched = _RE_JSX_GENERIC.sub(r"\1\3", original)
-
-    if patched != original:
-        path.write_text(patched)
-        track_write(path)
-        return True, "removed JSX generic type param causing esbuild parse error"
-
-    return False, "no static transform pattern matched"
-
-
-def _static_fix_src(path: Path) -> tuple[bool, str]:
-    if not path.exists():
-        return False, "file not found"
-
-    track_read(path)
-    original = path.read_text(errors="replace")
-    patched = _RE_TEMPLATE_WIDTH.sub(r"`${Math.round(\2)}\3", original)
-    patched = _RE_FLOAT_WIDTH.sub(
-        lambda m: f"{m.group(1)}{round(float(m.group(2)))}{m.group(3)}",
-        patched,
-    )
-
-    if patched != original:
-        path.write_text(patched)
-        track_write(path)
-        return True, "rounded floating-point percentage widths"
-
-    return False, "no static src pattern matched"
-
-
-def layer0_static_prepass(
-    cluster: FailureCluster,
-    verbose: bool,
-) -> tuple[bool, str]:
-    if verbose:
-        print(f"    [L0] Static pre-pass for {cluster.test_file} …")
-
-    if cluster.is_transform_error:
-        test_path = TESTS_DIR / cluster.test_file.replace("tests/", "", 1)
-        fixed, desc = _static_fix_transform(test_path)
-        if fixed:
-            print(f"    [L0] ✓ {desc}")
-            return True, desc
-
-    src_path = SRC_DIR / cluster.src_file.replace("src/", "", 1)
-    fixed, desc = _static_fix_src(src_path)
-    if fixed:
-        print(f"    [L0] ✓ {desc}")
-        return True, desc
-
-    if verbose:
-        print("    [L0] No static pattern matched.")
-
-    return False, "no static fix applicable"
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# Prompts
-# ════════════════════════════════════════════════════════════════════════════
-
-FIX_SYSTEM_QWEN = """\
-You are a senior TypeScript/React developer doing a SURFACE-LEVEL fix for ONE failing cluster.
-
-Your scope is LIMITED to surface bugs:
-- Wrong DOM selector or missing test-id attribute
-- Incorrect import path or missing export
-- Tailwind class typo or wrong state class
-- Floating-point precision in style values
-- Text content or badge label mismatch
-- Missing or wrong aria attribute
-
-DO NOT:
-- Rewrite hook logic, state machines, or data generation
-- Change public interfaces
-- Touch any file other than the one src file listed
-
-If the bug is logic/algorithmic, return the file unchanged and set:
-"explanation": "LOGIC_BUG — needs Minimax debugger"
-
-Return raw JSON only:
-{
-  "file_path": "src/components/SummaryStickyBar.tsx",
-  "code": "<full file content>",
-  "explanation": "what was fixed, or LOGIC_BUG"
-}
-"""
-
-
-def _build_qwen_system_with_findings(findings: str) -> str:
-    if not findings:
-        return FIX_SYSTEM_QWEN
-
-    return (
-        "## Previous judge/patcher/archivist findings — avoid regressions\n"
-        f"{findings[:6000]}\n\n---\n\n"
-        + FIX_SYSTEM_QWEN
-    )
-
-
-def _build_minimax_system(global_notes: str, judge_findings: str = "") -> str:
-    notes_block = (
-        f"\n## Planner global notes and accumulated knowledge\n{global_notes}\n"
-        if global_notes else ""
-    )
-
-    findings_block = (
-        f"\n## Judge/patcher findings from previous runs\n{judge_findings}\n"
-        if judge_findings else ""
-    )
-
-    kb_content = _load_knowledge_base()
-    kb_block = (
-        "\n## Accumulated knowledge from human fixes\n"
-        f"{kb_content}\n"
-        if kb_content else ""
-    )
-
-    return f"""\
-You are a senior TypeScript logic debugger specialising in hooks, data generation, types, and utilities.
-{notes_block}{findings_block}{kb_block}
-Fix the LOGIC — not UI styling.
-
-SCOPE:
-- You may ONLY write to src/hooks/, src/data/, src/types/, src/utils/
-- Never touch src/components/
-- Never change public interfaces unless they contradict run context + test
-
-Return raw JSON only:
-{{
-  "file_path": "src/hooks/useReplay.ts",
-  "code": "<full corrected file>",
-  "root_cause": "one sentence",
-  "explanation": "what changed and why"
-}}
-"""
-
-
-def _build_state_timeline(test_code: str, max_entries: int = 12) -> str:
-    timeline: list[str] = []
-
-    for line in test_code.splitlines():
-        stripped = line.strip()
-
-        if not stripped or stripped.startswith("//") or stripped.startswith("import"):
-            continue
-
-        if stripped.startswith(("describe(", "it(", "test(")):
-            timeline.append(f"TEST: {stripped[:100]}")
-        elif any(token in stripped for token in ("render(", "fireEvent", "userEvent", "act(")):
-            timeline.append(f"  ACTION: {stripped[:100]}")
-        elif stripped.startswith("expect("):
-            timeline.append(f"  ASSERT: {stripped[:100]}")
-
-        if len(timeline) >= max_entries * 3:
-            timeline.append("  … (truncated)")
+def _run_vitest_for_report() -> str:
+    """Run Vitest and return output as bug report text."""
+    artifact_dir = artifact_root()
+    output_dir = artifact_dir / "output"
+    project_dir = output_dir if (output_dir / "package.json").exists() else artifact_dir
+
+    config_candidates = [
+        project_dir / "vitest.config.ts",
+        project_dir / "vitest.config.js",
+        artifact_dir / "vitest.config.ts",
+        artifact_dir / "vitest.config.js",
+    ]
+    config_flag: list[str] = []
+    for c in config_candidates:
+        if c.exists():
+            config_flag = ["--config", str(c)]
             break
 
-    return "\n".join(timeline) if timeline else "(could not extract timeline)"
+    try:
+        result = subprocess.run(
+            ["npx", "vitest", "run", "--reporter=verbose"] + config_flag,
+            cwd=project_dir,
+            capture_output=True, text=True, timeout=300,
+            env={**os.environ, "CI": "true", "FORCE_COLOR": "0"},
+        )
+        combined = _strip_ansi(result.stdout + "\n" + result.stderr)
+        if result.returncode == 0:
+            print("[09] ✓ All tests pass — nothing to debug.")
+            return ""
+        return combined
+    except Exception as exc:
+        return f"Vitest failed to run: {exc}"
+
+
+def phase1_intake(args: argparse.Namespace) -> str:
+    """Gather bug report from CLI args, stdin, or Vitest output."""
+    # If --run-tests, use Vitest output as the bug report
+    if args.run_tests:
+        print("[09] Phase 1 — Running Vitest to gather failure report …")
+        report = _run_vitest_for_report()
+        if not report:
+            return ""
+        print(f"[09] Vitest failures captured ({len(report)} chars)")
+        return report
+
+    # Otherwise gather from user input
+    print("[09] Phase 1 — Gathering bug report …")
+    try:
+        bundle = gather_text_file_bundle(
+            cli_text=args.text,
+            cli_files=args.input or [],
+            read_file_fn=lambda p: (track_read(p) or "") or p.read_text(errors="replace"),
+            prompt_title="Bug report",
+            prompt_body=(
+                "Describe the bug: what you observed, steps to reproduce, expected behavior.\n"
+                "Or drag-and-drop a file with test output / error log.\n"
+                "Press Enter twice to submit."
+            ),
+            attachment_prompt="Attach files if needed",
+            default_attachment_only_prompt="Analyze the attached file(s).",
+            allow_interactive=not args.no_interactive,
+            ask_for_attachments_after_text=True,
+        )
+        text = bundle.text.strip()
+        if text:
+            print(f"[09] Bug report received ({len(text)} chars)")
+        return text
+    except RuntimeError:
+        return ""
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Consistency checker
+# Phase 2 — Locate (LLM call 1)
 # ════════════════════════════════════════════════════════════════════════════
 
-CONSISTENCY_SYSTEM = """\
-You are a test-vs-code consistency auditor. You do NOT fix code or tests.
-Classify who is wrong.
+LOCATE_SYSTEM = """\
+You are a senior developer analyzing a bug report against a codebase.
 
-Return raw JSON only:
+Given:
+- A bug report (test failures, error messages, or user description)
+- A codebase map showing all files and their structure
+- A blueprint showing module dependencies, exports, and behavioral quirks
+
+Your job: identify which files need to be read to understand and fix the bug.
+
+Return ONLY valid JSON (no markdown fences, no explanation, no tool calls):
 {
-  "verdict": "CODE_BUG" | "TEST_FRAGILE" | "SPEC_AMBIG" | "THRESHOLD_OK",
-  "confidence": "high" | "medium" | "low",
-  "reasoning": "one paragraph",
-  "test_patch_allowed": true | false,
-  "test_patch_rationale": "only if test_patch_allowed=true"
+  "reasoning": "1-3 sentences explaining your analysis",
+  "files_to_read": ["src/hooks/useLoopRecorder.ts", "tests/hooks/useLoopRecorder.test.ts", "src/types.ts"],
+  "likely_root_cause": "one sentence"
 }
 
-Never set test_patch_allowed=true for CODE_BUG.
+RULES:
+- Include BOTH the source file and its test file if relevant.
+- Include dependency files (types, utils) that the buggy file imports.
+- Maximum 8 files — focus on what's needed to fix the bug.
+- Paths must match exactly what appears in the codebase map / blueprint.
+- CRITICAL: Output ONLY the raw JSON object. No prose before it, no prose after it.
+- CRITICAL: Do NOT simulate reading files. Do NOT write <tool_call>, <tool_response>,
+  or any XML/function-call tags. You already have all the information you need in the
+  codebase map above. Your only output is the JSON object.
+- The JSON must start with {{ and end with }}. Nothing else.
 """
 
-TEST_REPAIR_SYSTEM = """\
-You are fixing a FRAGILE TEST or THRESHOLD.
-Allowed changes only:
-- DOM query selectors
-- async patterns
-- text-content matchers
-- numeric threshold relaxation when justified
+def phase2_locate(bug_report: str) -> dict[str, Any]:
+    """LLM call 1: identify which files are relevant to the bug."""
+    print("[09] Phase 2 — Locating relevant files …")
 
-Not allowed:
-- Changing intended behavior
-- Removing assertions
-- Touching src files
+    codebase_map = _read_text(ABSORBER_CODEBASE_MD)
 
-Return raw JSON only:
-{
-  "file_path": "tests/components/AnomalyFeed.test.tsx",
-  "code": "<full corrected test file>",
-  "changes_made": ["before → after"],
-  "explanation": "one sentence"
-}
-"""
+    # Load manifest for recently-changed files context
+    manifest_raw = ""
+    if EXECUTOR_OVERWRITE_MANIFEST.exists():
+        manifest_raw = _read_text(EXECUTOR_OVERWRITE_MANIFEST).strip()
 
+    blueprint_path = artifact_root() / "blueprint.json"
+    if not blueprint_path.exists():
+        blueprint_path = artifact_root() / "planner" / "blueprint.json"
+    blueprint_raw = _read_text(blueprint_path) if blueprint_path.exists() else ""
 
-def check_consistency(
-    cluster: FailureCluster,
-    run_context: str,
-    verbose: bool = False,
-) -> dict[str, Any]:
-    src_code = _read_file_safe(_resolve_artifact_path(cluster.src_file))
-    test_code = _read_file_safe(_resolve_artifact_path(cluster.test_file))
-    error_log = cluster.error_block()
+    # Build user prompt.
+    # - codebase_map: full structural overview, model needs it to locate files
+    # - manifest: only the file list (not full content) — enough for context
+    # - blueprint: skip — too large, not needed for file location
+    parts = [f"## Bug Report\n\n{bug_report}"]
 
-    user_content = (
-        f"### Run context\n\n{run_context}\n\n"
-        f"### Test file: {cluster.test_file}\n"
-        f"```typescript\n{test_code}\n```\n\n"
-        f"### Source file: {cluster.src_file}\n"
-        f"```typescript\n{src_code}\n```\n\n"
-        f"### Failing assertions\n```\n{error_log}\n```"
-    )
+    if codebase_map:
+        parts.append(f"## Codebase Map\n\n{codebase_map}")
+
+    if EXECUTOR_OVERWRITE_MANIFEST.exists():
+        try:
+            manifest_data = json.loads(manifest_raw) if manifest_raw else {}
+            file_list = (
+                manifest_data.get("files_written")
+                or manifest_data.get("written")
+                or []
+            )
+            if file_list:
+                lines = []
+                for f in file_list:
+                    lines.append(f"  - {f}" if isinstance(f, str) else f"  - {f.get('path', str(f))}")
+                parts.append("## Recently implemented files\n\n" + "\n".join(lines))
+        except Exception:
+            pass  # manifest unreadable — skip silently
+
+    user_content = "\n\n---\n\n".join(parts)
 
     messages = [
-        {"role": "system", "content": CONSISTENCY_SYSTEM},
+        {"role": "system", "content": LOCATE_SYSTEM},
         {"role": "user", "content": user_content},
     ]
 
-    if verbose:
-        print(f"    [P0] Consistency check → {_DEBUGGER_MODEL} ({cluster.test_file}) …")
+    raw = _call_llm("debugger", messages, max_tokens=8192)
+    result = _parse_json_response(raw)
 
-    try:
-        raw = call_qwen(messages)
-        result = _parse_model_json(raw)
-        verdict = result.get("verdict", "CODE_BUG")
-        confidence = result.get("confidence", "low")
-        print(f"    [P0] verdict={verdict} confidence={confidence}")
-        return result
-    except Exception as exc:
-        print(
-            f"    [P0] Check failed ({exc}), defaulting to CODE_BUG.",
-            file=sys.stderr,
-        )
-        return {
-            "verdict": "CODE_BUG",
-            "confidence": "low",
-            "test_patch_allowed": False,
-            "reasoning": f"consistency check error: {exc}",
-            "test_patch_rationale": "",
-        }
+    files = result.get("files_to_read", [])
+    reasoning = result.get("reasoning", "")
+    root_cause = result.get("likely_root_cause", "")
+
+    print(f"[09] Reasoning: {reasoning}")
+    print(f"[09] Likely root cause: {root_cause}")
+    print(f"[09] Files to read ({len(files)}):")
+    for f in files:
+        print(f"     • {f}")
+
+    return result
 
 
-def repair_test_file(
-    cluster: FailureCluster,
-    verdict: dict[str, Any],
-    run_context: str,
-    verbose: bool = False,
+# ════════════════════════════════════════════════════════════════════════════
+# Phase 3 — Read
+# ════════════════════════════════════════════════════════════════════════════
+
+def phase3_read(files: list[str]) -> dict[str, str]:
+    """Read the contents of identified files."""
+    print(f"[09] Phase 3 — Reading {len(files)} file(s) …")
+
+    contents: dict[str, str] = {}
+    for rel in files:
+        path = _resolve_path(rel)
+        if path.exists():
+            content = path.read_text(errors="replace")
+            track_read(path)
+            contents[rel] = content
+            lines = len(content.splitlines())
+            print(f"     ✓ {rel} ({lines} lines)")
+        else:
+            contents[rel] = f"// FILE NOT FOUND: {rel}"
+            print(f"     ✗ {rel} (not found)")
+
+    return contents
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Phase 4 — Patch (LLM call 2)
+# ════════════════════════════════════════════════════════════════════════════
+
+PATCH_SYSTEM = """\
+You are a senior TypeScript developer fixing a bug.
+
+Given:
+- A bug report describing the problem
+- The relevant source and test files
+- Analysis of the likely root cause
+
+Your job: produce corrected file contents that fix the bug.
+
+Return ONLY valid JSON (no markdown fences, no explanation, no tool calls):
+{
+  "reasoning": "explain what was wrong and what you changed",
+  "patches": [
+    {
+      "file_path": "src/hooks/useLoopRecorder.ts",
+      "action": "rewrite",
+      "code": "<full corrected file content>"
+    }
+  ]
+}
+
+RULES:
+- "code" must be the COMPLETE file content (not a diff, not a snippet).
+- Only include files you actually changed.
+- Do NOT change files unnecessarily — minimal fix only.
+- If a test is wrong (testing incorrect behavior), fix the test.
+- If source code is wrong, fix the source.
+- Maximum 4 files per response.
+- Do NOT use any tools. Do NOT output <tool_call> or <tool_response> tags. You have no tools available.
+- Output ONLY the JSON object, nothing else before or after it.
+"""
+
+
+def phase4_patch(bug_report: str, locate_result: dict[str, Any], file_contents: dict[str, str]) -> dict[str, Any]:
+    """LLM call 2: generate patches for the identified files."""
+    print("[09] Phase 4 — Generating patches …")
+
+    # Build file content block
+    file_blocks = []
+    for rel, content in file_contents.items():
+        file_blocks.append(f"### {rel}\n```typescript\n{content}\n```")
+
+    user_parts = [
+        f"## Bug Report\n\n{bug_report}",
+        f"## Analysis\n\nReasoning: {locate_result.get('reasoning', '')}\nLikely root cause: {locate_result.get('likely_root_cause', '')}",
+        "## File Contents\n\n" + "\n\n".join(file_blocks),
+    ]
+
+    # Load blueprint quirks for relevant modules
+    blueprint_path = artifact_root() / "blueprint.json"
+    if not blueprint_path.exists():
+        blueprint_path = artifact_root() / "planner" / "blueprint.json"
+    if blueprint_path.exists():
+        try:
+            bp = json.loads(blueprint_path.read_text(encoding="utf-8"))
+            # Find quirks for files being patched
+            quirks_block = _extract_relevant_quirks(bp, list(file_contents.keys()))
+            if quirks_block:
+                user_parts.append(f"## Blueprint Quirks (correct behavior)\n\n{quirks_block}")
+        except Exception:
+            pass
+
+    user_content = "\n\n---\n\n".join(user_parts)
+
+    messages = [
+        {"role": "system", "content": PATCH_SYSTEM},
+        {"role": "user", "content": user_content},
+    ]
+
+    raw = _call_llm("debugger", messages, max_tokens=16384)
+    result = _parse_json_response(raw)
+
+    patches = result.get("patches", [])
+    reasoning = result.get("reasoning", "")
+
+    print(f"[09] Patch reasoning: {reasoning}")
+    print(f"[09] Files to patch: {len(patches)}")
+    for p in patches:
+        print(f"     • {p.get('file_path', '?')}")
+
+    return result
+
+
+def _extract_relevant_quirks(bp: dict[str, Any], files: list[str]) -> str:
+    """Extract quirks from blueprint for the given files."""
+    parts: list[str] = []
+    modules = bp.get("modules", [])
+
+    for module in modules:
+        for f in module.get("files", []):
+            if f.get("path") in files:
+                quirks = f.get("quirks", [])
+                if quirks:
+                    parts.append(f"**{f['path']}**:")
+                    for q in quirks:
+                        parts.append(f"  - {q}")
+
+    return "\n".join(parts)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Phase 5 — Review
+# ════════════════════════════════════════════════════════════════════════════
+
+def phase5_review(
+    patch_result: dict[str, Any],
+    file_contents: dict[str, str],
+    auto: bool,
 ) -> bool:
-    test_code = _read_file_safe(_resolve_artifact_path(cluster.test_file))
-    src_code = _read_file_safe(_resolve_artifact_path(cluster.src_file))
-    error_log = cluster.error_block()
+    """Show diffs and ask for confirmation. Returns True if user approves."""
+    patches = patch_result.get("patches", [])
+    reasoning = patch_result.get("reasoning", "")
 
-    user_content = (
-        f"### Run context\n\n{run_context}\n\n"
-        f"### Source file (DO NOT MODIFY): {cluster.src_file}\n"
-        f"```typescript\n{src_code}\n```\n\n"
-        f"### Test file to fix: {cluster.test_file}\n"
-        f"```typescript\n{test_code}\n```\n\n"
-        f"### Failing assertions\n```\n{error_log}\n```\n\n"
-        f"### Auditor rationale\n{verdict.get('test_patch_rationale', '')}\n\n"
-        f"Verdict: {verdict.get('verdict')} — fix ONLY what rationale describes."
-    )
-
-    messages = [
-        {"role": "system", "content": TEST_REPAIR_SYSTEM},
-        {"role": "user", "content": user_content},
-    ]
-
-    if verbose:
-        print(f"    [P0-fix] Rewriting test: {cluster.test_file} …")
-
-    try:
-        patch = _parse_model_json(call_qwen(messages))
-    except Exception as exc:
-        print(f"    [P0-fix] Parse error: {exc}", file=sys.stderr)
+    if not patches:
+        print("[09] No patches generated.")
         return False
 
-    out_rel = patch.get("file_path", cluster.test_file)
-    out_path = _resolve_artifact_path(out_rel)
+    print("\n" + "═" * 70)
+    print("[09] Phase 5 — Review")
+    print("═" * 70)
+    print(f"\nReasoning: {reasoning}\n")
 
-    if not _is_under(out_path, TESTS_DIR):
-        print(
-            f"    [P0-fix] Scope violation: tried to write {out_path}. Rejected.",
-            file=sys.stderr,
-        )
-        return False
+    for patch in patches:
+        file_path = patch.get("file_path", "")
+        new_code = patch.get("code", "")
 
-    code = patch.get("code")
-    if not isinstance(code, str):
-        print("    [P0-fix] Invalid patch: missing code string.", file=sys.stderr)
-        return False
+        if not file_path or not new_code:
+            continue
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(code)
-    track_write(out_path)
+        old_code = file_contents.get(file_path, "")
+        diff = _colored_diff(old_code, new_code, file_path)
 
-    print(f"    [P0-fix] ✓ Test updated — {patch.get('explanation', '(no explanation)')}")
-    for change in patch.get("changes_made", []):
-        print(f"      • {change}")
+        if not diff:
+            print(f"  {file_path}: no changes")
+            continue
 
-    return True
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# Shared repair executor
-# ════════════════════════════════════════════════════════════════════════════
-
-def _call_repair(
-    cluster: FailureCluster,
-    call_api: Callable[[list[dict[str, str]]], str],
-    system: str,
-    run_context: str,
-    extra_ctx: str = "",
-    verbose: bool = False,
-    layer_name: str = "L1",
-    scope_check: bool = False,
-) -> tuple[bool, str]:
-    src_code = _read_file_safe(_resolve_artifact_path(cluster.src_file))
-    test_code = _read_file_safe(_resolve_artifact_path(cluster.test_file))
-    error_log = cluster.error_block()
-
-    user_content = (
-        f"### Run context\n\n{run_context}\n\n"
-        f"### Test file (read-only): {cluster.test_file}\n"
-        f"```typescript\n{test_code}\n```\n\n"
-        f"### Source file to fix: {cluster.src_file}\n"
-        f"```typescript\n{src_code}\n```\n\n"
-        f"### Failing tests\n```\n{error_log}\n```"
-        + (f"\n\n### Expected state timeline\n```\n{extra_ctx}\n```" if extra_ctx else "")
-    )
-
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user_content},
-    ]
-
-    model_label = _DEBUGGER_MODEL if layer_name == "L1" else _DEBUGGER_SECONDARY_MODEL
-    if verbose:
-        print(
-            f"    [{layer_name}] → {model_label} "
-            f"(attempt #{cluster.attempt_count + 1}, "
-            f"{len(cluster.failures)} failure(s)) …"
-        )
-
-    try:
-        patch = _parse_model_json(call_api(messages))
-    except Exception as exc:
-        print(f"    [{layer_name}] Parse error: {exc}", file=sys.stderr)
-        return False, f"parse error: {exc}"
-
-    explanation = str(patch.get("explanation", ""))
-
-    if layer_name == "L1" and "LOGIC_BUG" in explanation.upper():
-        print(f"    [L1] {_DEBUGGER_MODEL} signalled LOGIC_BUG — deferring to {_DEBUGGER_SECONDARY_MODEL}.")
-        return False, "LOGIC_BUG"
-
-    out_rel = str(patch.get("file_path", cluster.src_file))
-
-    if scope_check and not any(pattern.match(out_rel) for pattern in MINIMAX_SCOPE_PATTERNS):
-        print(
-            f"    [{layer_name}] Scope violation: tried to write {out_rel}. "
-            "Allowed: src/hooks/, src/data/, src/types/, src/utils/. Patch rejected.",
-            file=sys.stderr,
-        )
-        return False, f"scope violation: {out_rel}"
-
-    if _current_scope() == "mini" and not _mini_allowed_to_write(out_rel):
-        print(
-            f"    [{layer_name}] Mini scope violation: tried to write {out_rel}; "
-            "not in mini_plan target_files. Patch rejected.",
-            file=sys.stderr,
-        )
-        return False, f"mini scope violation: {out_rel}"
-
-    out_path = _resolve_artifact_path(out_rel)
-    code = patch.get("code")
-    if not isinstance(code, str):
-        return False, "invalid patch: missing code string"
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(code)
-    track_write(out_path)
-
-    root_cause = patch.get("root_cause", "")
-    summary = f"{root_cause} — {explanation}" if root_cause else explanation
-    print(f"    [{layer_name}] ✓ Patched {out_rel} — {summary or '(no explanation)'}")
-    return True, explanation
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# Phase C — cluster dispatch
-# ════════════════════════════════════════════════════════════════════════════
-
-def repair_cluster(
-    cluster: FailureCluster,
-    global_notes: str,
-    max_cluster_attempts: int,
-    judge_findings: str = "",
-    verbose: bool = False,
-) -> ClusterRepairRecord:
-    run_context = _load_run_context()
-
-    if cluster.escalated:
-        print(f"    [SKIP] {cluster.test_file} — ESCALATED→{cluster.owner}, skipping.")
-        return ClusterRepairRecord(
-            cluster=cluster.key,
-            src_file=cluster.src_file,
-            failures=len(cluster.failures),
-            repaired=False,
-            layer_used="skipped",
-            escalated=True,
-            escalated_to=cluster.owner,
-            owner=cluster.owner,
-            note="previously escalated",
-        )
-
-    if cluster.attempt_count == 0:
-        cv = check_consistency(cluster, run_context, verbose=verbose)
-        verdict = cv.get("verdict", "CODE_BUG")
-
-        if verdict == "SPEC_AMBIG":
-            cluster.escalated = True
-            return ClusterRepairRecord(
-                cluster=cluster.key,
-                src_file=cluster.src_file,
-                failures=len(cluster.failures),
-                repaired=False,
-                layer_used="skipped",
-                escalated=True,
-                escalated_to="human",
-                owner=cluster.owner,
-                note=f"spec ambiguous: {cv.get('reasoning', '')[:150]}",
-                consistency_verdict=verdict,
-            )
-
-        if verdict in {"TEST_FRAGILE", "THRESHOLD_OK"} and cv.get("test_patch_allowed"):
-            ok = repair_test_file(cluster, cv, run_context, verbose=verbose)
-            cluster.attempt_count += 1
-            cluster.last_fingerprint = cluster.fingerprint()
-            return ClusterRepairRecord(
-                cluster=cluster.key,
-                src_file=cluster.src_file,
-                failures=len(cluster.failures),
-                repaired=ok,
-                layer_used="test_rewrite",
-                escalated=not ok,
-                escalated_to="human" if not ok else "",
-                owner=cluster.owner,
-                note=cv.get("test_patch_rationale", "")[:150] if ok else "test rewrite failed",
-                consistency_verdict=verdict,
-            )
-
-        consistency_verdict_label = verdict
-    else:
-        consistency_verdict_label = ""
-
-    l0_fixed, l0_desc = layer0_static_prepass(cluster, verbose)
-    if l0_fixed:
-        cluster.attempt_count += 1
-        cluster.last_fingerprint = cluster.fingerprint()
-        return ClusterRepairRecord(
-            cluster=cluster.key,
-            src_file=cluster.src_file,
-            failures=len(cluster.failures),
-            repaired=True,
-            layer_used="static",
-            escalated=False,
-            escalated_to="",
-            owner=cluster.owner,
-            note=l0_desc,
-            consistency_verdict=consistency_verdict_label,
-        )
-
-    if cluster.attempt_count >= max_cluster_attempts:
-        cluster.escalated = True
-        print(
-            f"    [L3] Gave up on {cluster.test_file} after "
-            f"{cluster.attempt_count} attempt(s). ESCALATED→human."
-        )
-        return ClusterRepairRecord(
-            cluster=cluster.key,
-            src_file=cluster.src_file,
-            failures=len(cluster.failures),
-            repaired=False,
-            layer_used="skipped",
-            escalated=True,
-            escalated_to="human",
-            owner=cluster.owner,
-            note=f"gave up after {cluster.attempt_count} attempts",
-            consistency_verdict=consistency_verdict_label,
-        )
-
-    current_fp = cluster.fingerprint()
-    is_stale = cluster.attempt_count > 0 and cluster.last_fingerprint == current_fp
-
-    skip_qwen = (
-        cluster.owner == _DEBUGGER_SECONDARY_MODEL
-        or cluster.is_minimax_scope()
-        or is_stale
-    )
-
-    if not skip_qwen:
-        ok, note = _call_repair(
-            cluster,
-            call_qwen,
-            system=_build_qwen_system_with_findings(judge_findings),
-            run_context=run_context,
-            verbose=verbose,
-            layer_name="L1",
-        )
-
-        cluster.attempt_count += 1
-        cluster.last_fingerprint = current_fp
-
-        if ok:
-            return ClusterRepairRecord(
-                cluster=cluster.key,
-                src_file=cluster.src_file,
-                failures=len(cluster.failures),
-                repaired=True,
-                layer_used="qwen_targeted",
-                escalated=False,
-                escalated_to="",
-                owner=_DEBUGGER_MODEL,
-                consistency_verdict=consistency_verdict_label,
-            )
-
-        if cluster.is_minimax_scope():
-            print(f"    [L1→L2] Transferring {cluster.test_file} to {_DEBUGGER_SECONDARY_MODEL}.")
-            cluster.owner = _DEBUGGER_SECONDARY_MODEL
+        print(f"┌─ {file_path} ─────────────────────────────────")
+        # Show abbreviated diff (max 60 lines)
+        diff_lines = diff.splitlines()
+        if len(diff_lines) > 60:
+            for line in diff_lines[:50]:
+                print(f"│ {line}")
+            print(f"│ ... ({len(diff_lines) - 50} more lines)")
         else:
-            cluster.escalated = True
-            return ClusterRepairRecord(
-                cluster=cluster.key,
-                src_file=cluster.src_file,
-                failures=len(cluster.failures),
-                repaired=False,
-                layer_used="qwen_targeted",
-                escalated=True,
-                escalated_to="human",
-                owner=_DEBUGGER_MODEL,
-                note=f"{_DEBUGGER_MODEL} failed on component outside {_DEBUGGER_SECONDARY_MODEL} scope: {note}",
-                consistency_verdict=consistency_verdict_label,
-            )
+            for line in diff_lines:
+                print(f"│ {line}")
+        print(f"└{'─' * 50}")
+        print()
 
-    cluster.owner = _DEBUGGER_SECONDARY_MODEL
-    test_code = _read_file_safe(_resolve_artifact_path(cluster.test_file))
-    timeline = _build_state_timeline(test_code)
-    minimax_system = _build_minimax_system(global_notes, judge_findings)
+    if auto:
+        print("[09] --auto mode: applying patches without confirmation.")
+        return True
 
-    ok, note = _call_repair(
-        cluster,
-        call_minimax,
-        system=minimax_system,
-        run_context=run_context,
-        extra_ctx=timeline,
-        verbose=verbose,
-        layer_name="L2",
-        scope_check=True,
-    )
+    # Interactive confirmation
+    if not sys.stdin.isatty():
+        print("[09] Non-interactive mode: applying patches.")
+        return True
 
-    cluster.attempt_count += 1
-    cluster.last_fingerprint = current_fp
-
-    return ClusterRepairRecord(
-        cluster=cluster.key,
-        src_file=cluster.src_file,
-        failures=len(cluster.failures),
-        repaired=ok,
-        layer_used="minimax_logic",
-        escalated=False,
-        escalated_to="",
-        owner=_DEBUGGER_SECONDARY_MODEL,
-        note=note,
-        consistency_verdict=consistency_verdict_label,
-    )
+    try:
+        answer = input("[09] Apply these patches? [Y/n] ").strip().lower()
+        return answer in ("", "y", "yes")
+    except (EOFError, KeyboardInterrupt):
+        print("\n[09] Cancelled.")
+        return False
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Report writers
+# Phase 6 — Apply
 # ════════════════════════════════════════════════════════════════════════════
 
-def _trim_iteration_for_log(record: dict[str, Any], is_last: bool) -> dict[str, Any]:
-    trimmed = {
-        "iteration": record.get("iteration"),
-        "passed": record.get("passed"),
-        "clusters_found": record.get("clusters_found"),
-        "clusters_repaired": record.get("clusters_repaired"),
-        "summary": record.get("summary"),
-    }
-    if is_last:
-        trimmed["cluster_details"] = record.get("cluster_details", [])
-    return trimmed
+def phase6_apply(patch_result: dict[str, Any]) -> list[str]:
+    """Write patched files to disk. Returns list of written paths."""
+    patches = patch_result.get("patches", [])
+    written: list[str] = []
+
+    print("[09] Phase 6 — Applying patches …")
+
+    for patch in patches:
+        file_path = patch.get("file_path", "")
+        new_code = patch.get("code", "")
+
+        if not file_path or not new_code:
+            continue
+
+        out_path = _resolve_path(file_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(new_code)
+        track_write(out_path)
+        written.append(file_path)
+        print(f"     ✓ {file_path}")
+
+    return written
 
 
-def append_test_log(report: dict[str, Any]) -> None:
-    iterations = report.get("iterations", [])
-    trimmed_iterations = []
-    for i, rec in enumerate(iterations):
-        is_last = (i == len(iterations) - 1)
-        trimmed_iterations.append(_trim_iteration_for_log(rec, is_last=is_last))
+# ════════════════════════════════════════════════════════════════════════════
+# Report
+# ════════════════════════════════════════════════════════════════════════════
 
-    entry: dict[str, Any] = {
-        "scope": report.get("scope"),
-        "final_status": report.get("final_status"),
-        "total_iterations": report.get("total_iterations"),
-        "max_iter": report.get("max_iter"),
-        "max_cluster_attempts": report.get("max_cluster_attempts"),
-        "impl": report.get("impl"),
-        "escalated": report.get("escalated", []),
-        "iterations": trimmed_iterations,
+def _write_summary(
+    bug_report: str,
+    locate_result: dict[str, Any],
+    patch_result: dict[str, Any],
+    applied: bool,
+    written_files: list[str],
+) -> None:
+    summary = {
+        "status": "APPLIED" if applied else "REJECTED",
+        "bug_report_length": len(bug_report),
+        "files_analyzed": locate_result.get("files_to_read", []),
+        "likely_root_cause": locate_result.get("likely_root_cause", ""),
+        "patch_reasoning": patch_result.get("reasoning", ""),
+        "files_patched": written_files,
+        "patches_count": len(patch_result.get("patches", [])),
     }
 
-    log_path = DEBUGGER_TEST_LOG
-    try:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-
-        if log_path.exists():
-            raw = log_path.read_text(encoding="utf-8").strip()
-            try:
-                data = json.loads(raw)
-                entries = data.get("entries", []) if isinstance(data, dict) else data
-                if not isinstance(entries, list):
-                    entries = []
-            except Exception:
-                entries = []
-        else:
-            entries = []
-
-        entries.append(entry)
-        log_path.write_text(
-            json.dumps({"entries": entries}, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-        track_write(log_path)
-        print(f"[09] Test log appended ({len(entries)} entries) → {log_path}")
-    except Exception as exc:
-        print(f"[09] WARNING: could not append test log: {exc}", file=sys.stderr)
-
-
-def _write_report(report: dict[str, Any]) -> None:
     DEBUGGER_OVERWRITE_TEST_SUMMARY.parent.mkdir(parents=True, exist_ok=True)
     DEBUGGER_OVERWRITE_TEST_SUMMARY.write_text(
-        json.dumps(report, indent=2, ensure_ascii=False),
-        encoding="utf-8",
+        json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8",
     )
     track_write(DEBUGGER_OVERWRITE_TEST_SUMMARY)
-    print(f"\n[09] Debugger test summary → {DEBUGGER_OVERWRITE_TEST_SUMMARY}")
-
-    append_test_log(report)
-
-
-def _write_mini_report(passed: bool, details: dict[str, Any]) -> None:
-    report = {
-        "impl": "mini-verifier",
-        "scope": "mini",
-        "final_status": "PASS" if passed else "FAIL",
-        "total_iterations": 1,
-        "mini_verification": details,
-        "iterations": [
-            {
-                "iteration": 1,
-                "passed": passed,
-                "summary": details.get("summary", ""),
-                "clusters_found": 0,
-                "clusters_repaired": 0,
-                "cluster_details": details.get("checks", []),
-                "log_snippet": "",
-            }
-        ],
-        "escalated": [],
-    }
-    _write_report(report)
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# Full Vitest loop
-# ════════════════════════════════════════════════════════════════════════════
-
-def _run_full_vitest_loop(
-    *,
-    max_iter: int,
-    max_cluster_attempts: int,
-    verbose: bool,
-    no_repair: bool,
-) -> bool:
-    global_notes = _load_planner_global_notes()
-    if global_notes:
-        print(
-            f"[09] Planner/global knowledge loaded ({len(global_notes)} chars) "
-            f"— will be injected into {_DEBUGGER_SECONDARY_MODEL} prompts"
-        )
-
-    judge_findings = _load_judge_findings()
-    if judge_findings:
-        print(
-            f"[09] Patcher/archivist findings loaded ({len(judge_findings)} chars) "
-            "— injected into repair prompts"
-        )
-
-    iteration_records: list[IterationRecord] = []
-    cluster_state: dict[str, FailureCluster] = {}
-    escalated_log: list[dict[str, Any]] = []
-    cluster_counts: list[int] = []
-
-    for iteration in range(1, max_iter + 1):
-        tag = f"[09][{iteration}/{max_iter}]"
-
-        print(f"\n{tag} Phase B — running Vitest …")
-        passed, output = run_vitest()
-        summary_line = _summarize_test_output(output)
-        print(f"{tag} {summary_line}")
-
-        if passed:
-            print(f"{tag} ✓ All tests passed.")
-            iteration_records.append(
-                IterationRecord(
-                    iteration=iteration,
-                    passed=True,
-                    summary=summary_line,
-                    clusters_found=0,
-                    clusters_repaired=0,
-                    cluster_details=[],
-                    log_snippet="",
-                )
-            )
-            break
-
-        clusters = parse_failures(output)
-        clusters = merge_cluster_state(clusters, cluster_state)
-        cluster_counts.append(len(clusters))
-
-        print(f"{tag} {len(clusters)} failing cluster(s):")
-        for cluster in clusters:
-            markers: list[str] = []
-            if cluster.attempt_count > 0 and cluster.last_fingerprint == cluster.fingerprint():
-                markers.append("STALE")
-            if cluster.escalated:
-                markers.append("ESCALATED")
-            if cluster.owner == _DEBUGGER_SECONDARY_MODEL:
-                markers.append(_DEBUGGER_SECONDARY_MODEL.upper()[:12])
-
-            scope_label = "[hook/data/logic]" if cluster.is_minimax_scope() else "[component]"
-            marker_str = f"  [{', '.join(markers)}]" if markers else ""
-            print(
-                f"  * {scope_label} {cluster.test_file} "
-                f"({len(cluster.failures)} failure(s)){marker_str}"
-            )
-
-        if not clusters:
-            print(f"{tag} Could not parse clusters. Stopping.", file=sys.stderr)
-            iteration_records.append(
-                IterationRecord(
-                    iteration=iteration,
-                    passed=False,
-                    summary=summary_line,
-                    clusters_found=0,
-                    clusters_repaired=0,
-                    cluster_details=[],
-                    log_snippet=output[-1200:],
-                )
-            )
-            break
-
-        # Systemic error detection: if same error in >50% clusters, escalate immediately
-        systemic_msg = _detect_systemic_error(clusters)
-        if systemic_msg:
-            print(
-                f"{tag} ⚠ Systemic error detected in >{len(clusters)//2} clusters: "
-                f"{systemic_msg[:120]}"
-            )
-            print(f"{tag} Escalating all clusters — looping will not help.")
-            for cluster in clusters:
-                cluster.escalated = True
-                escalated_log.append({
-                    "iteration": iteration,
-                    "cluster": cluster.key,
-                    "src_file": cluster.src_file,
-                    "failures": len(cluster.failures),
-                    "repaired": False,
-                    "layer_used": "skipped",
-                    "escalated": True,
-                    "escalated_to": "human",
-                    "owner": cluster.owner,
-                    "note": f"systemic error: {systemic_msg[:200]}",
-                })
-            iteration_records.append(
-                IterationRecord(
-                    iteration=iteration,
-                    passed=False,
-                    summary=f"systemic error: {systemic_msg[:120]}",
-                    clusters_found=len(clusters),
-                    clusters_repaired=0,
-                    cluster_details=[
-                        {
-                            "cluster": c.key,
-                            "src_file": c.src_file,
-                            "failures": len(c.failures),
-                            "escalated": True,
-                            "escalated_to": "human",
-                            "owner": c.owner,
-                            "note": f"systemic: {systemic_msg[:100]}",
-                        }
-                        for c in clusters
-                    ],
-                    log_snippet=output[-1200:],
-                )
-            )
-            break
-
-        # Early-exit: if cluster count hasn't decreased over 2 consecutive iterations
-        if _should_early_exit(cluster_counts):
-            print(
-                f"{tag} ⚠ Cluster count not decreasing over last 3 iterations "
-                f"({cluster_counts[-3:]}). Breaking early."
-            )
-            iteration_records.append(
-                IterationRecord(
-                    iteration=iteration,
-                    passed=False,
-                    summary=f"early exit: no progress ({cluster_counts[-3:]})",
-                    clusters_found=len(clusters),
-                    clusters_repaired=0,
-                    cluster_details=[
-                        {
-                            "cluster": c.key,
-                            "src_file": c.src_file,
-                            "failures": len(c.failures),
-                            "escalated": c.escalated,
-                            "owner": c.owner,
-                            "attempts": c.attempt_count,
-                        }
-                        for c in clusters
-                    ],
-                    log_snippet=output[-1200:],
-                )
-            )
-            break
-
-        if no_repair:
-            print(f"{tag} --no-repair set; stopping after test run.")
-            iteration_records.append(
-                IterationRecord(
-                    iteration=iteration,
-                    passed=False,
-                    summary=summary_line,
-                    clusters_found=len(clusters),
-                    clusters_repaired=0,
-                    cluster_details=[
-                        {
-                            "cluster": c.key,
-                            "src_file": c.src_file,
-                            "failures": len(c.failures),
-                            "owner": c.owner,
-                            "attempts": c.attempt_count,
-                        }
-                        for c in clusters
-                    ],
-                    log_snippet=output[-1200:],
-                )
-            )
-            break
-
-        if iteration == max_iter:
-            print(f"{tag} Reached max_iter — {len(clusters)} cluster(s) remaining.")
-            iteration_records.append(
-                IterationRecord(
-                    iteration=iteration,
-                    passed=False,
-                    summary=summary_line,
-                    clusters_found=len(clusters),
-                    clusters_repaired=0,
-                    cluster_details=[
-                        {
-                            "cluster": c.key,
-                            "failures": len(c.failures),
-                            "escalated": c.escalated,
-                            "owner": c.owner,
-                            "attempts": c.attempt_count,
-                        }
-                        for c in clusters
-                    ],
-                    log_snippet=output[-1200:],
-                )
-            )
-            break
-
-        print(f"{tag} Phase C — dispatching {len(clusters)} cluster(s) …")
-        repaired = 0
-        cluster_details: list[dict[str, Any]] = []
-
-        for cluster in clusters:
-            print(
-                f"  -> {cluster.test_file} "
-                f"(owner={cluster.owner}, attempt #{cluster.attempt_count + 1})"
-            )
-
-            record = repair_cluster(
-                cluster,
-                global_notes,
-                max_cluster_attempts,
-                judge_findings=judge_findings,
-                verbose=verbose,
-            )
-
-            cluster_state[cluster.key] = cluster
-            repaired += int(record.repaired)
-
-            detail = {
-                "cluster": record.cluster,
-                "src_file": record.src_file,
-                "failures": record.failures,
-                "repaired": record.repaired,
-                "layer_used": record.layer_used,
-                "escalated": record.escalated,
-                "escalated_to": record.escalated_to,
-                "owner": record.owner,
-                "note": record.note,
-                "consistency_verdict": record.consistency_verdict,
-            }
-            cluster_details.append(detail)
-
-            if record.escalated:
-                escalated_log.append({"iteration": iteration, **detail})
-
-        print(f"{tag} Phase C done — {repaired}/{len(clusters)} patched.")
-        iteration_records.append(
-            IterationRecord(
-                iteration=iteration,
-                passed=False,
-                summary=summary_line,
-                clusters_found=len(clusters),
-                clusters_repaired=repaired,
-                cluster_details=cluster_details,
-                log_snippet=output[-1200:],
-            )
-        )
-
-    final_passed = bool(iteration_records and iteration_records[-1].passed)
-
-    report = {
-        "impl": f"primary:{get_model('debugger')}+secondary:{get_model('debugger_secondary')}",
-        "scope": _current_scope(),
-        "max_iter": max_iter,
-        "max_cluster_attempts": max_cluster_attempts,
-        "total_iterations": len(iteration_records),
-        "final_status": "PASS" if final_passed else "FAIL",
-        "iterations": [asdict(record) for record in iteration_records],
-        "escalated": escalated_log,
-    }
-
-    _write_report(report)
-
-    if escalated_log:
-        print(f"[09] ⚠ {len(escalated_log)} cluster(s) escalated")
-
-    return final_passed
+    print(f"[09] Summary → {DEBUGGER_OVERWRITE_TEST_SUMMARY}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1887,72 +631,50 @@ def main() -> None:
     args = parser.parse_args()
 
     _configure_project(args.project, parser)
-
-    # Important: PIPELINE_PROJECT must be configured before ensure_dirs().
     ensure_dirs()
 
     exit_code = 0
 
     try:
-        scope = _current_scope()
-        print(f"[09] Scope detected: {scope}")
+        # Phase 1 — Intake
+        bug_report = phase1_intake(args)
+        if not bug_report:
+            print("[09] No bug report provided and tests pass. Nothing to do.")
+            sys.exit(0)
 
-        if scope == "mini":
-            passed, mini_details = _run_mini_verifiers(verbose=args.verbose)
+        # Phase 2 — Locate
+        locate_result = phase2_locate(bug_report)
+        files_to_read = locate_result.get("files_to_read", [])
+        if not files_to_read:
+            print("[09] LLM could not identify relevant files. Exiting.")
+            sys.exit(1)
 
-            # If mini is TS/Vitest and failed, optionally allow the existing repair loop.
-            checks = mini_details.get("checks", [])
-            vitest_failed = any(
-                c.get("kind") == "vitest" and not c.get("passed")
-                for c in checks
-                if isinstance(c, dict)
-            )
+        # Phase 3 — Read
+        file_contents = phase3_read(files_to_read)
 
-            if vitest_failed and not args.no_repair:
-                print("[09][mini] Vitest failed; entering TS repair loop with mini context.")
-                final_passed = _run_full_vitest_loop(
-                    max_iter=args.max_iter,
-                    max_cluster_attempts=args.max_cluster_attempts,
-                    verbose=args.verbose,
-                    no_repair=args.no_repair,
-                )
-                if not final_passed:
-                    exit_code = 1
-            else:
-                _write_mini_report(passed, mini_details)
-                if not passed:
-                    exit_code = 1
-
+        # Phase 4 — Patch
+        patch_result = phase4_patch(bug_report, locate_result, file_contents)
+        if not patch_result.get("patches"):
+            print("[09] No patches generated. Exiting.")
+            exit_code = 1
         else:
-            final_passed = _run_full_vitest_loop(
-                max_iter=args.max_iter,
-                max_cluster_attempts=args.max_cluster_attempts,
-                verbose=args.verbose,
-                no_repair=args.no_repair,
-            )
+            # Phase 5 — Review
+            approved = phase5_review(patch_result, file_contents, auto=args.auto)
 
-            if not final_passed:
+            if approved:
+                # Phase 6 — Apply
+                written = phase6_apply(patch_result)
+                _write_summary(bug_report, locate_result, patch_result, applied=True, written_files=written)
+                print(f"\n[09] ✓ Done — {len(written)} file(s) patched.")
+            else:
+                _write_summary(bug_report, locate_result, patch_result, applied=False, written_files=[])
+                print("[09] Patches rejected. No files modified.")
                 exit_code = 1
 
     except Exception as exc:
         print(f"[09] ERROR: {exc}", file=sys.stderr)
-
-        # Best-effort failure report.
-        try:
-            _write_report(
-                {
-                    "impl": f"primary:{get_model('debugger')}+secondary:{get_model('debugger_secondary')}",
-                    "scope": "unknown",
-                    "final_status": "FAIL",
-                    "total_iterations": 0,
-                    "iterations": [],
-                    "escalated": [],
-                    "error": str(exc),
-                }
-            )
-        except Exception:
-            pass
-
+        import traceback
+        traceback.print_exc()
         exit_code = 1
 
     finally:
