@@ -3,67 +3,36 @@ pipeline/08_executor.py
 =======================
 Step 8 — EXECUTOR.
 
-This script supports two scopes:
-
 FULL SCOPE
 ──────────
-Spec/scaffold-driven implementation.
-
-Modes:
-    Default, no planner plan:
-        Single API call for all requested non-test stub files.
-
-    With planner plan (--use-planner-plan):
-        Reads artifacts_<slug>/state/planner_full_execution_plan.json produced
-        by 07_planner.py.
-        For each file, injects the matching planner task:
-            - role
-            - depends_on
-            - sub_tasks
-            - gotchas
-            - tailwind_hints / styling hints
-        Files are generated in implementation_order from the plan.
+Reads planner/full_plan.json exclusively.
+full_plan.json must contain: tasks[], implementation_order[], stack{}.
 
 Delta mode:
     --only-files src/foo.py,src/bar.ts
-        Only those files are regenerated.
-        Other restored files in src/ are used as import/context references.
 
 Reads:
-    artifacts_<slug>/specwright_spec_<slug>.md or cache/scaffolder_compressed_spec.md
-    artifacts_<slug>/state/scaffolder_codebase_skeleton.json
-    artifacts_<slug>/state/planner_full_execution_plan.json         optional, with --use-planner-plan
+    artifacts_<slug>/planner/full_plan.json
+    artifacts_<slug>/output/src/**   (delta mode only — context seeding, not tracked)
 
 Writes:
-    artifacts_<slug>/src/**                                        non-test files only
-    artifacts_<slug>/execution/executor_overwrite_manifest.json
+    artifacts_<slug>/output/src/**
+    artifacts_<slug>/executor/manifest.json        (short-term, overwrite)
+    artifacts_<slug>/executor/manifest_log.json    (long-term, append)
 
 
 MINI SCOPE
 ──────────
-Targeted implementation for small daily-driver tasks.
+Reads planner/mini_plan.json exclusively.
 
 Reads:
-    artifacts_<slug>/state/planner_mini_execution_plan.json
-    artifacts_<slug>/state/planner_mini_impact_analysis.json        optional
-    target files listed in planner_mini_execution_plan.json         optional existing content
+    artifacts_<slug>/planner/mini_plan.json
+    target files listed in mini_plan.json["plan"]["target_files"]
 
 Writes:
-    only files listed in state/planner_mini_execution_plan.json target_files
-    artifacts_<slug>/execution/executor_overwrite_manifest.json
-
-Rules:
-    - Does NOT read the canonical spec.
-    - Does NOT require scaffolder_codebase_skeleton.json.
-    - Does NOT do broad rewrites.
-    - Does NOT create/modify files outside planner_mini_execution_plan.target_files.
-    - Does NOT write artifact/state/cache/execution/run/knowledge/reports paths.
-
-At the end of each run, prints:
-    - artifacts read
-    - artifacts created/updated/overwritten/appended
-
-For taxonomy details see artifacts/TAXONOMY.md
+    only files listed in mini_plan.json target_files
+    artifacts_<slug>/executor/manifest.json        (short-term, overwrite)
+    artifacts_<slug>/executor/manifest_log.json    (long-term, append)
 """
 
 from __future__ import annotations
@@ -74,45 +43,47 @@ import json
 import os
 import re
 import sys
-import time
 from pathlib import Path
 from typing import Any
 
 
 # === WRITE AUTHORITY: executor ===
 # OWNS full:
-#   artifacts_<slug>/execution/executor_overwrite_manifest.json
-#   artifacts_<slug>/src/**
+#   artifacts_<slug>/executor/manifest.json          (short-term, overwrite)
+#   artifacts_<slug>/executor/manifest_log.json      (long-term, append)
+#   artifacts_<slug>/output/src/**
 #
 # OWNS mini:
-#   artifacts_<slug>/execution/executor_overwrite_manifest.json
-#   files explicitly listed in artifacts_<slug>/state/planner_mini_execution_plan.json target_files
+#   artifacts_<slug>/executor/manifest.json          (short-term, overwrite)
+#   artifacts_<slug>/executor/manifest_log.json      (long-term, append)
+#   files explicitly listed in mini_plan.json target_files
 #
 # READS full:
-#   artifacts_<slug>/specwright_spec_<slug>.md
-#   artifacts_<slug>/cache/scaffolder_compressed_spec.md
-#   artifacts_<slug>/state/scaffolder_codebase_skeleton.json
-#   artifacts_<slug>/state/planner_full_execution_plan.json
+#   artifacts_<slug>/planner/full_plan.json
+#   artifacts_<slug>/output/src/**                  (delta mode only — context seeding, not tracked)
 #
 # READS mini:
-#   artifacts_<slug>/state/planner_mini_execution_plan.json
-#   artifacts_<slug>/state/planner_mini_impact_analysis.json
-#   existing target files listed in planner_mini_execution_plan.json
+#   artifacts_<slug>/planner/mini_plan.json
+
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from artifacts.models import call_model, get_model, get_provider  # noqa: E402
-from artifacts.paths import (  # noqa: E402
+from artifacts.models import get_model, get_provider          # noqa: E402
+from modules.artifact_tracking import (                        # noqa: E402
+    track_read, track_write,
+    print_summary as print_artifact_summary,
+)
+from modules.cost import print_summary, summary as cost_summary  # noqa: E402
+from modules.call_llm import call_llm                          # noqa: E402
+from modules.post_interactive import prompt_next_step          # noqa: E402
+from artifacts.paths import (                                  # noqa: E402
+    EXECUTOR_MANIFEST_LOG,
     EXECUTOR_OVERWRITE_MANIFEST,
     PLANNER_FULL_PLAN,
-    PLANNER_MINI_IMPACT,
     PLANNER_MINI_PLAN,
-    SCAFFOLD_JSON,
-    SCAFFOLDER_COMPRESSED_SPEC,
     SRC_DIR,
     artifact_root,
     ensure_dirs,
-    get_spec_path,
 )
 
 
@@ -120,125 +91,39 @@ ROLE = "executor"
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Artifact access tracking
-# ════════════════════════════════════════════════════════════════════════════
-
-_ARTIFACTS_READ: set[str] = set()
-_ARTIFACTS_WRITTEN: set[str] = set()
-
-
-def _track_read(path: Any) -> None:
-    _ARTIFACTS_READ.add(str(path))
-
-
-def _track_write(path: Any) -> None:
-    _ARTIFACTS_WRITTEN.add(str(path))
-
-
-def _print_artifact_access_summary() -> None:
-    print("[08] Artifacts read:")
-    if _ARTIFACTS_READ:
-        for item in sorted(_ARTIFACTS_READ):
-            print(f"[08]   READ  {item}")
-    else:
-        print("[08]   READ  (none)")
-
-    print("[08] Artifacts created/updated/overwritten/appended:")
-    if _ARTIFACTS_WRITTEN:
-        for item in sorted(_ARTIFACTS_WRITTEN):
-            print(f"[08]   WRITE {item}")
-    else:
-        print("[08]   WRITE (none)")
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# Generic source helpers
+# Constants
 # ════════════════════════════════════════════════════════════════════════════
 
 SOURCE_EXTENSIONS = {
-    ".ts",
-    ".tsx",
-    ".js",
-    ".jsx",
-    ".mjs",
-    ".cjs",
-    ".py",
-    ".go",
-    ".java",
-    ".kt",
-    ".kts",
-    ".rs",
-    ".rb",
-    ".php",
-    ".cs",
-    ".cpp",
-    ".cc",
-    ".cxx",
-    ".c",
-    ".h",
-    ".hpp",
-    ".vue",
-    ".svelte",
-    ".html",
-    ".css",
-    ".scss",
-    ".sass",
-    ".less",
-    ".json",
-    ".yaml",
-    ".yml",
-    ".toml",
-    ".xml",
-    ".sql",
-    ".sh",
-    ".bash",
-    ".zsh",
-    ".fish",
-    ".md",
+    ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
+    ".py", ".go", ".java", ".kt", ".kts", ".rs", ".rb", ".php",
+    ".cs", ".cpp", ".cc", ".cxx", ".c", ".h", ".hpp",
+    ".vue", ".svelte", ".html", ".css", ".scss", ".sass", ".less",
+    ".json", ".yaml", ".yml", ".toml", ".xml", ".sql",
+    ".sh", ".bash", ".zsh", ".fish", ".md",
 }
 
 FENCE_LANGUAGE_BY_EXT = {
-    ".ts": "typescript",
-    ".tsx": "tsx",
-    ".js": "javascript",
-    ".jsx": "jsx",
-    ".mjs": "javascript",
-    ".cjs": "javascript",
-    ".py": "python",
-    ".go": "go",
-    ".java": "java",
-    ".kt": "kotlin",
-    ".kts": "kotlin",
-    ".rs": "rust",
-    ".rb": "ruby",
-    ".php": "php",
-    ".cs": "csharp",
-    ".cpp": "cpp",
-    ".cc": "cpp",
-    ".cxx": "cpp",
-    ".c": "c",
-    ".h": "c",
-    ".hpp": "cpp",
-    ".vue": "vue",
-    ".svelte": "svelte",
-    ".html": "html",
-    ".css": "css",
-    ".scss": "scss",
-    ".sass": "sass",
-    ".less": "less",
-    ".json": "json",
-    ".yaml": "yaml",
-    ".yml": "yaml",
-    ".toml": "toml",
-    ".xml": "xml",
-    ".sql": "sql",
-    ".sh": "bash",
-    ".bash": "bash",
-    ".zsh": "zsh",
-    ".fish": "fish",
+    ".ts": "typescript", ".tsx": "tsx",
+    ".js": "javascript", ".jsx": "jsx",
+    ".mjs": "javascript", ".cjs": "javascript",
+    ".py": "python", ".go": "go", ".java": "java",
+    ".kt": "kotlin", ".kts": "kotlin",
+    ".rs": "rust", ".rb": "ruby", ".php": "php", ".cs": "csharp",
+    ".cpp": "cpp", ".cc": "cpp", ".cxx": "cpp",
+    ".c": "c", ".h": "c", ".hpp": "cpp",
+    ".vue": "vue", ".svelte": "svelte", ".html": "html",
+    ".css": "css", ".scss": "scss", ".sass": "sass", ".less": "less",
+    ".json": "json", ".yaml": "yaml", ".yml": "yaml",
+    ".toml": "toml", ".xml": "xml", ".sql": "sql",
+    ".sh": "bash", ".bash": "bash", ".zsh": "zsh", ".fish": "fish",
     ".md": "markdown",
 }
 
+
+# ════════════════════════════════════════════════════════════════════════════
+# Utilities
+# ════════════════════════════════════════════════════════════════════════════
 
 def _utc_now_iso() -> str:
     return _dt.datetime.now(_dt.timezone.utc).isoformat()
@@ -250,9 +135,7 @@ def _fence_language(file_path: str) -> str:
 
 def _code_fence(file_path: str, code: str) -> str:
     lang = _fence_language(file_path)
-    if lang:
-        return f"```{lang}\n{code}\n```"
-    return f"```\n{code}\n```"
+    return f"```{lang}\n{code}\n```" if lang else f"```\n{code}\n```"
 
 
 def _is_probably_source_file(path: Path) -> bool:
@@ -262,48 +145,27 @@ def _is_probably_source_file(path: Path) -> bool:
 def _read_json_file(path: Any, label: str) -> dict[str, Any]:
     if not path.exists():
         raise FileNotFoundError(f"Missing {label}: {path}")
-    _track_read(path)
+    track_read(path)
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise RuntimeError(f"{label} must be a JSON object: {path}")
     return data
 
 
-def _read_optional_text(path: Any, *, max_chars: int | None = None) -> str:
-    try:
-        if not path.exists():
-            return ""
-        _track_read(path)
-        text = path.read_text(encoding="utf-8")
-        if max_chars is not None and len(text) > max_chars:
-            return text[:max_chars] + f"\n\n<!-- truncated at {max_chars} chars -->"
-        return text
-    except Exception as exc:
-        print(f"[08] WARNING: could not read {path}: {exc}", file=sys.stderr)
-        return ""
+def _normalize_repo_rel_path(path: str) -> str:
+    return path.replace("\\", "/").strip().lstrip("/")
 
 
 # ════════════════════════════════════════════════════════════════════════════
 # CLI / project setup
 # ════════════════════════════════════════════════════════════════════════════
 
-def _configure_project(
-    project: str | None,
-    parser: argparse.ArgumentParser,
-) -> None:
-    """
-    Configure project context for direct execution.
-
-    Harness normally sets PIPELINE_PROJECT before invoking this script.
-    Direct usage can pass --project.
-    """
+def _configure_project(project: str | None, parser: argparse.ArgumentParser) -> None:
     if project:
         os.environ["PIPELINE_PROJECT"] = project
         return
-
     if os.environ.get("PIPELINE_PROJECT"):
         return
-
     parser.error(
         "PIPELINE_PROJECT is not set. Use --project <name> or export "
         "PIPELINE_PROJECT=<name> before running 08_executor.py directly."
@@ -316,12 +178,8 @@ def _configure_project(
 
 def _safe_src_output_path(file_path: str) -> Path | None:
     """
-    Convert scaffold file_path into an output path under SRC_DIR.
-
-    Accepts:
-        src/foo/bar.ts  -> SRC_DIR/foo/bar.ts
-        foo/bar.ts      -> SRC_DIR/foo/bar.ts
-
+    src/foo/bar.ts  → SRC_DIR/foo/bar.ts
+    foo/bar.ts      → SRC_DIR/foo/bar.ts
     Rejects traversal/outside paths.
     """
     normalized = file_path.replace("\\", "/").strip().lstrip("/")
@@ -329,78 +187,39 @@ def _safe_src_output_path(file_path: str) -> Path | None:
     out_path = SRC_DIR / rel
 
     try:
-        src_root = SRC_DIR.resolve()
+        src_root = Path(SRC_DIR).resolve()
         resolved = out_path.resolve()
     except FileNotFoundError:
-        src_root = SRC_DIR.absolute()
+        src_root = Path(SRC_DIR).absolute()
         resolved = out_path.absolute()
 
     if resolved != src_root and src_root not in resolved.parents:
         return None
-
     return out_path
 
 
-def _normalize_repo_rel_path(path: str) -> str:
-    return path.replace("\\", "/").strip().lstrip("/")
-
-
 def _is_disallowed_artifact_rel_path(rel: str) -> bool:
-    """
-    Mini mode must not patch pipeline artifacts or state by accident.
-    """
     normalized = _normalize_repo_rel_path(rel)
-
     if not normalized:
         return True
-
     if normalized.startswith("../") or "/../" in f"/{normalized}/":
         return True
-
     if normalized == "spec.md":
         return True
-
     if normalized.startswith("specwright_spec_") and normalized.endswith(".md"):
         return True
-
     blocked_prefixes = (
         "artifacts_",
-        "state/",
-        "cache/",
-        "execution/",
-        "run/",       # legacy artifact dir, still blocked for safety
-        "knowledge/",
-        "reports/",
+        "executor/", "planner/", "debugger/", "reporter/", "judge/",
+        "patcher/", "archivist/", "absorber/", "clarificator/", "enricher/",
+        "spectracker/", "scaffolder/", "spec/",
+        "state/", "cache/", "execution/", "run/", "knowledge/", "reports/",
     )
     return normalized.startswith(blocked_prefixes)
 
 
 def _safe_artifact_output_path(rel_path: str) -> Path | None:
-    """
-    Convert a mini plan repo/project-relative path into a safe path under
-    artifact_root().
-
-    Accepts examples:
-        src/components/Header.tsx
-        tests/Header.test.tsx
-        dags/ingest.py
-        queries/daily.sql
-
-    Rejects:
-        ../x
-        /absolute/path
-        state/*
-        cache/*
-        execution/*
-        run/*
-        knowledge/*
-        reports/*
-        artifacts_*
-        spec.md
-        specwright_spec_<slug>.md
-    """
     rel = _normalize_repo_rel_path(rel_path)
-
     if _is_disallowed_artifact_rel_path(rel):
         return None
 
@@ -409,116 +228,44 @@ def _safe_artifact_output_path(rel_path: str) -> Path | None:
 
     try:
         root_resolved = root.resolve()
-        out_resolved = out_path.resolve()
+        out_resolved  = out_path.resolve()
     except FileNotFoundError:
         root_resolved = root.absolute()
-        out_resolved = out_path.absolute()
+        out_resolved  = out_path.absolute()
 
     if out_resolved != root_resolved and root_resolved not in out_resolved.parents:
         return None
-
     return out_path
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Spec / prompt helpers — full scope
+# Prompts — full scope
 # ════════════════════════════════════════════════════════════════════════════
-
-def _load_spec() -> str:
-    """
-    Use scaffolder compressed spec if available, fallback to canonical spec.
-    """
-    if SCAFFOLDER_COMPRESSED_SPEC.exists():
-        _track_read(SCAFFOLDER_COMPRESSED_SPEC)
-        return SCAFFOLDER_COMPRESSED_SPEC.read_text(encoding="utf-8")
-
-    spec_path = get_spec_path()
-    if not spec_path.exists():
-        raise FileNotFoundError(
-            f"Missing canonical spec: {spec_path}\n"
-            "Run specwright first."
-        )
-
-    _track_read(spec_path)
-    return spec_path.read_text(encoding="utf-8")
-
 
 def _format_stack_section(stack: dict[str, Any] | None) -> str:
     if not stack:
         return ""
-
     return f"""
 ## Project stack — follow exactly
-
-The architect detected this stack from the spec/scaffold:
 
 {json.dumps(stack, indent=2, ensure_ascii=False)}
 
 Rules:
-- Apply the idioms, imports, runtime APIs, framework conventions, and testing assumptions of this stack.
-- Do NOT assume TypeScript, React, Vite, Tailwind, Vitest, Python, FastAPI, Vue, Go, or any other stack unless present in this stack/spec/scaffold.
-- Do NOT use patterns from unrelated stacks.
-- If this is a mixed-stack or monorepo project, infer the correct sub-stack from the current file path.
-- Preserve the language, module system, file layout, public APIs, exported names, and dependency style implied by the scaffold.
+- Apply the idioms, imports, runtime APIs, and framework conventions of this stack.
+- Do NOT assume any stack element not listed above.
+- Preserve the language, module system, file layout, public APIs, and exported names implied by the plan.
 """
 
 
-def build_system_prompt_single(
-    instructions: str,
-    stack: dict[str, Any] | None = None,
-) -> str:
-    """
-    Single-call prompt used when no planner plan is available.
-    """
+def build_system_prompt_per_file(stack: dict[str, Any] | None = None) -> str:
     stack_section = _format_stack_section(stack)
-
-    return f"""\
-You are a senior software developer implementing source files.
-{stack_section}
-You will receive:
-1. A technical spec
-2. A scaffold JSON with stub files
-3. Model-specific implementation instructions
-
-Your task:
-- Implement ONLY the missing function bodies, component bodies, classes, modules, handlers, or source bodies in the non-test source files.
-- Return a JSON object with this exact schema:
-  {{
-    "files": [
-      {{
-        "file_path": "src/path/to/file.ext",
-        "code": "<complete file content>"
-      }}
-    ]
-  }}
-- Do NOT modify test files, where is_test is true.
-- Do NOT add new files beyond what is in the scaffold.
-- Follow the detected project stack strictly.
-- Preserve the scaffold's language, module system, imports style, public APIs, exported names, function signatures, and file paths.
-- The code field must contain the COMPLETE file content for each file.
-- Do not introduce libraries, frameworks, styling systems, runtime APIs, or test tools that are not in the spec/scaffold/stack.
-- Output raw JSON only. No markdown fences. No explanation text.
-
-Model-specific instructions:
-{instructions}"""
-
-
-def build_system_prompt_per_file(
-    stack: dict[str, Any] | None = None,
-) -> str:
-    """
-    Per-file generation prompt — one file per API call.
-    """
-    stack_section = _format_stack_section(stack)
-
     return f"""\
 You are a senior software developer implementing ONE source file.
 {stack_section}
 You will receive:
-1. The technical spec for full project context
-2. Optional dependency/context files that were already implemented
-3. Optional task plan produced by a senior architect — follow it carefully
-4. The stub for the SINGLE file you must implement
+1. A behavior summary and task plan from a senior architect — follow it carefully
+2. Optional dependency/context files already implemented — for import/API reference
+3. The file path you must implement
 
 Your task:
 - Implement this ONE file only.
@@ -527,17 +274,30 @@ Your task:
     "file_path": "src/path/to/file.ext",
     "code": "<complete file content>"
   }}
-- Follow the detected project stack strictly.
-- Preserve the scaffold's language, module system, imports style, public APIs, exported names, function signatures, and file path.
+- Follow the project stack strictly.
 - Keep compatibility with dependency/context files shown in the prompt.
-- Do not introduce libraries, frameworks, styling systems, runtime APIs, or test tools that are not in the spec/scaffold/stack.
+- Do not introduce libraries, frameworks, or tools not in the stack.
 - The code field must be the COMPLETE file content.
-- Output raw JSON only. Absolutely no markdown fences or explanation text.
+- Output raw JSON only. No markdown fences. No explanation text.
+
+FILE PLACEMENT RULES (critical — wrong placement breaks the build):
+- Source files (components, hooks, stores, lib, types) → file_path MUST start with "src/"
+  Example: "src/components/Button.tsx", "src/hooks/useStore.ts"
+- Root-level config files → file_path MUST NOT have "src/" prefix:
+  package.json, index.html, vite.config.ts, tsconfig.json, tsconfig.app.json,
+  tsconfig.node.json, components.json, .env.example, vercel.json
+  Example: "tsconfig.app.json" (NOT "src/tsconfig.app.json")
+
+TSCONFIG REQUIREMENTS (when implementing tsconfig.app.json or tsconfig.json):
+- compilerOptions.paths must include: {{"@/*": ["./src/*"]}}
+- compilerOptions.baseUrl must be: "."
+- exclude must include: "node_modules"
+- include must be: ["src/**/*"]
 """
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Prompt helpers — mini scope
+# Prompts — mini scope
 # ════════════════════════════════════════════════════════════════════════════
 
 def build_system_prompt_mini_file() -> str:
@@ -553,22 +313,18 @@ You will receive:
 Your task:
 - Patch ONLY the requested target file.
 - Do NOT modify, create, delete, rename, or mention unrelated files.
-- Do NOT perform a broad rewrite unless the target-file instructions explicitly require it.
-- Preserve existing public APIs, exports, imports, formatting style, and behavior unless the mini plan explicitly says to change them.
+- Do NOT perform a broad rewrite unless explicitly required.
+- Preserve existing public APIs, exports, imports, and behavior unless the plan says otherwise.
 - Keep the change as small and safe as possible.
-- If action is CREATE, return the complete new file content.
-- If action is MODIFY, return the complete updated file content.
-- If action is DELETE, return {"path": "...", "delete": true}.
-- If action is RENAME, return the complete content for the destination path only if a destination is explicitly provided by the plan.
 - Return raw JSON only. No markdown fences. No explanation text.
 
-For MODIFY/CREATE/RENAME, use this exact schema:
+For MODIFY/CREATE/RENAME:
 {
   "path": "repo/relative/path.ext",
   "content": "<complete file content>"
 }
 
-For DELETE, use this exact schema:
+For DELETE:
 {
   "path": "repo/relative/path.ext",
   "delete": true
@@ -577,30 +333,23 @@ For DELETE, use this exact schema:
 
 
 def _format_mini_target_instruction(target: dict[str, Any]) -> str:
-    lines: list[str] = []
-
-    lines.append(f"Path: {target.get('path')}")
-    lines.append(f"Action: {target.get('action', 'MODIFY')}")
-    lines.append(f"Risk: {target.get('risk', 'medium')}")
-
-    reason = target.get("reason")
-    if reason:
-        lines.append(f"Reason: {reason}")
-
+    lines: list[str] = [
+        f"Path: {target.get('path')}",
+        f"Action: {target.get('action', 'MODIFY')}",
+        f"Risk: {target.get('risk', 'medium')}",
+    ]
+    if target.get("reason"):
+        lines.append(f"Reason: {target['reason']}")
     instructions = target.get("instructions", [])
     if isinstance(instructions, str):
         instructions = [instructions]
-
     if instructions:
         lines.append("Instructions:")
         for item in instructions:
             lines.append(f"- {item}")
-
-    # Optional future-compatible fields.
     for key in ("to_path", "destination", "rename_to"):
         if target.get(key):
             lines.append(f"{key}: {target[key]}")
-
     return "\n".join(lines)
 
 
@@ -612,21 +361,16 @@ def _build_mini_user_message(
     existing_content: str | None,
 ) -> str:
     path = str(target.get("path", ""))
-
-    if existing_content is None:
-        existing_block = "### Existing target file\n\n*(file does not exist yet)*"
-    else:
-        existing_block = (
-            f"### Existing target file: {path}\n\n"
-            f"{_code_fence(path, existing_content)}"
-        )
-
-    analysis_block = (
-        f"\n\n### Mini impact analysis\n\n{json.dumps(analysis, indent=2, ensure_ascii=False)}"
-        if analysis
-        else ""
+    existing_block = (
+        "### Existing target file\n\n*(file does not exist yet)*"
+        if existing_content is None
+        else f"### Existing target file: {path}\n\n{_code_fence(path, existing_content)}"
     )
-
+    analysis_block = (
+        f"\n\n### Mini impact analysis\n\n"
+        f"{json.dumps(analysis, indent=2, ensure_ascii=False)}"
+        if analysis else ""
+    )
     return (
         f"### Mini execution plan\n\n"
         f"{json.dumps(plan, indent=2, ensure_ascii=False)}"
@@ -639,85 +383,23 @@ def _build_mini_user_message(
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Core model call
-# ════════════════════════════════════════════════════════════════════════════
-
-def _call_executor(system: str, user_message: str) -> str:
-    """
-    Call the executor role (config in artifacts/models.py).
-
-    Retries once on transient failures. Returns raw text content.
-    """
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user_message},
-    ]
-
-    model    = get_model(ROLE)
-    provider = get_provider(ROLE)
-
-    last_error: Exception | None = None
-
-    for attempt in range(2):
-        try:
-            resp = call_model(
-                ROLE,
-                messages=messages,
-                temperature=0.15,
-                max_tokens=32768,
-            )
-
-            usage = getattr(resp, "usage", None)
-            if usage:
-                print(
-                    f"[08] Tokens: prompt={getattr(usage, 'prompt_tokens', '?')}, "
-                    f"completion={getattr(usage, 'completion_tokens', '?')}"
-                )
-
-            choice     = resp.choices[0]
-            message    = choice.message
-            content    = message.content
-            tool_calls = getattr(message, "tool_calls", None)
-            finish_reason = getattr(choice, "finish_reason", None)
-
-            if tool_calls:
-                raise RuntimeError(f"Model returned tool_calls instead of text: {tool_calls}")
-
-            if not content or not content.strip():
-                raise RuntimeError(
-                    f"Model returned empty content. "
-                    f"finish_reason={finish_reason}, message={message}"
-                )
-
-            return content.strip()
-
-        except Exception as exc:
-            last_error = exc
-            print(f"[08] [{model}] {exc}", file=sys.stderr)
-
-            if attempt == 0:
-                print("[08] Retrying in 3s …", file=sys.stderr)
-                time.sleep(3)
-
-    raise RuntimeError(f"Executor call failed after retries: {last_error}")
-
-
-# ════════════════════════════════════════════════════════════════════════════
 # JSON extraction
 # ════════════════════════════════════════════════════════════════════════════
 
 def _parse_json(raw: str, label: str) -> dict[str, Any]:
     """
-    Parse JSON from model response.
-
-    Handles accidental markdown fences and accidental surrounding prose.
-    Raises RuntimeError on failure.
+    Extract JSON from model output.
+    Pass 1 — direct json.loads
+    Pass 2 — find outermost {...} then json.loads
+    Pass 3 — ast.literal_eval (Python dict with single-quoted keys/values)
     """
-    raw = raw.strip()
+    import ast as _ast
 
+    raw = raw.strip()
     raw = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", raw)
     raw = re.sub(r"\n?```$", "", raw.strip())
 
+    # Pass 1: direct parse
     try:
         parsed = json.loads(raw)
         if not isinstance(parsed, dict):
@@ -726,6 +408,7 @@ def _parse_json(raw: str, label: str) -> dict[str, Any]:
     except json.JSONDecodeError:
         pass
 
+    # Pass 2: find outermost {...}
     match = re.search(r"\{.*\}", raw, re.DOTALL)
     if match:
         try:
@@ -733,46 +416,71 @@ def _parse_json(raw: str, label: str) -> dict[str, Any]:
             if not isinstance(parsed, dict):
                 raise RuntimeError(f"Parsed JSON for {label} is not an object.")
             return parsed
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(
-                f"JSON parse failed for {label}: {exc}\n"
-                f"Raw, first 500 chars:\n{raw[:500]}"
-            ) from exc
+        except json.JSONDecodeError:
+            pass
 
-    raise RuntimeError(f"No JSON object found in response for {label}.")
+    # Pass 3: Python dict literal (single-quoted keys — some models emit this)
+    def _try_ast(s: str) -> dict[str, Any] | None:
+        try:
+            parsed = _ast.literal_eval(s.strip())
+            if isinstance(parsed, dict):
+                return json.loads(json.dumps(parsed))
+        except Exception:
+            pass
+        return None
+
+    for candidate in (raw, match.group() if match else None):
+        if candidate is None:
+            continue
+        result = _try_ast(candidate)
+        if result is not None:
+            print(f"[08][warn] {label}: model returned Python dict syntax — parsed via ast.literal_eval.")
+            return result
+
+    raise RuntimeError(
+        f"No JSON object found in response for {label}.\n"
+        f"Raw, first 500 chars:\n{raw[:500]}"
+    )
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Plan / task formatting — full scope
+# Task / context formatting — full scope
 # ════════════════════════════════════════════════════════════════════════════
 
 def _build_task_block(task: dict[str, Any] | None) -> str:
-    """Format planner task as a prompt section."""
     if not task:
         return ""
 
     lines: list[str] = ["### Implementation plan from architect\n"]
 
-    role = task.get("role")
-    if role:
-        lines.append(f"**Role:** {role}\n")
+    if task.get("behavior_summary"):
+        lines.append(f"**File purpose:** {task['behavior_summary']}\n")
+    if task.get("role"):
+        lines.append(f"**Role:** {task['role']}\n")
 
     deps = task.get("depends_on", [])
     if deps:
-        lines.append(f"**Depends on:** {', '.join(str(dep) for dep in deps)}\n")
+        lines.append(f"**Depends on:** {', '.join(str(d) for d in deps)}\n")
 
     sub_tasks = task.get("sub_tasks", [])
     if sub_tasks:
         lines.append("**Sub-tasks, implement in this order:**")
-        for sub_task in sub_tasks:
-            lines.append(f"  {sub_task}")
+        for st in sub_tasks:
+            lines.append(f"  {st}")
         lines.append("")
 
     gotchas = task.get("gotchas", [])
     if gotchas:
         lines.append("**Gotchas / edge cases:**")
-        for gotcha in gotchas:
-            lines.append(f"  - {gotcha}")
+        for g in gotchas:
+            lines.append(f"  - {g}")
+        lines.append("")
+
+    notes = task.get("notes", [])
+    if notes:
+        lines.append("**Cross-cutting notes:**")
+        for n in notes:
+            lines.append(f"  - {n}")
         lines.append("")
 
     tailwind_hints = task.get("tailwind_hints")
@@ -786,67 +494,30 @@ def _build_task_block(task: dict[str, Any] | None) -> str:
     return "\n".join(lines)
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# Context selection — full scope
-# ════════════════════════════════════════════════════════════════════════════
-
 def _compact_reference_code(code: str, max_chars: int = 1500) -> str:
-    """
-    Compact code when used as broad API reference.
-    """
-    compact_lines = []
-    for line in code.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if stripped.startswith("//") or stripped.startswith("#"):
-            continue
-        compact_lines.append(line)
-
-    compact = "\n".join(compact_lines)
-    return compact[:max_chars]
+    lines = [
+        line for line in code.splitlines()
+        if line.strip() and not line.strip().startswith(("//", "#"))
+    ]
+    return "\n".join(lines)[:max_chars]
 
 
 def _is_shared_reference_path(file_path: str) -> bool:
     markers = [
-        "types/",
-        "type/",
-        "models/",
-        "model/",
-        "schemas/",
-        "schema/",
-        "constants/",
-        "constant/",
-        "data/",
-        "config/",
-        "settings/",
-        "utils/",
-        "lib/",
+        "types/", "type/", "models/", "model/",
+        "schemas/", "schema/", "constants/", "constant/",
+        "data/", "config/", "settings/", "utils/", "lib/",
     ]
     normalized = file_path.replace("\\", "/")
-    return any(marker in normalized for marker in markers)
+    return any(m in normalized for m in markers)
 
 
 def _is_entrypoint_like(file_path: str) -> bool:
-    name = Path(file_path).name.lower()
-    return name in {
-        "app.tsx",
-        "app.jsx",
-        "app.vue",
-        "app.svelte",
-        "main.ts",
-        "main.tsx",
-        "main.js",
-        "main.jsx",
-        "index.ts",
-        "index.tsx",
-        "index.js",
-        "index.jsx",
-        "server.py",
-        "main.py",
-        "app.py",
-        "main.go",
-        "server.go",
+    return Path(file_path).name.lower() in {
+        "app.tsx", "app.jsx", "app.vue", "app.svelte",
+        "main.ts", "main.tsx", "main.js", "main.jsx",
+        "index.ts", "index.tsx", "index.js", "index.jsx",
+        "server.py", "main.py", "app.py", "main.go", "server.go",
     }
 
 
@@ -855,35 +526,26 @@ def _build_context_block(
     task: dict[str, Any] | None,
     already_written: dict[str, str],
 ) -> str:
-    """
-    Build dependency/context section for the current file.
-    """
     if not already_written:
         return ""
 
     deps = set(task.get("depends_on", [])) if task else set()
-    relevant: dict[str, str] = {}
-    label = "Dependencies already implemented — for import/API reference"
 
     if deps:
-        relevant = {
-            fp: code
-            for fp, code in already_written.items()
-            if fp in deps
-        }
-
-    if _is_entrypoint_like(file_path):
-        label = "API reference, compacted — full implementations omitted"
+        relevant = {fp: code for fp, code in already_written.items() if fp in deps}
+        label = "Dependencies already implemented — for import/API reference"
+    elif _is_entrypoint_like(file_path):
         relevant = {
             fp: _compact_reference_code(code)
             for fp, code in already_written.items()
             if _is_shared_reference_path(fp)
-            or "/hooks/" in fp.replace("\\", "/")
-            or "/services/" in fp.replace("\\", "/")
-            or "/routes/" in fp.replace("\\", "/")
+            or any(
+                seg in fp.replace("\\", "/")
+                for seg in ("/hooks/", "/services/", "/routes/")
+            )
         }
-
-    if not relevant:
+        label = "API reference, compacted — full implementations omitted"
+    else:
         relevant = {
             fp: code
             for fp, code in already_written.items()
@@ -894,12 +556,10 @@ def _build_context_block(
     if not relevant:
         return ""
 
-    context_block = f"### {label}\n"
-
+    block = f"### {label}\n"
     for fp, code in relevant.items():
-        context_block += f"\n#### {fp}\n{_code_fence(fp, code)}\n"
-
-    return context_block
+        block += f"\n#### {fp}\n{_code_fence(fp, code)}\n"
+    return block
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -907,23 +567,18 @@ def _build_context_block(
 # ════════════════════════════════════════════════════════════════════════════
 
 def implement_file(
-    spec: str,
-    stub: dict[str, Any],
+    file_path: str,
     task: dict[str, Any] | None,
     already_written: dict[str, str],
     stack: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    file_path = stub["file_path"]
-    task_block = _build_task_block(task)
+    task_block    = _build_task_block(task)
     context_block = _build_context_block(file_path, task, already_written)
 
-    stub_code = stub.get("code", "")
     user_msg = (
-        f"### canonical spec\n\n{spec}\n\n"
-        f"{context_block}\n"
         f"{task_block}\n"
-        f"### Stub file to implement: {file_path}\n"
-        f"{_code_fence(file_path, stub_code)}"
+        f"{context_block}\n"
+        f"### File to implement: {file_path}\n"
     )
 
     approx_tokens = len(user_msg) // 4
@@ -935,10 +590,20 @@ def implement_file(
         )
 
     print(f"[08]   → Implementing {file_path} …")
-    raw = _call_executor(build_system_prompt_per_file(stack=stack), user_msg)
+    raw, _ = call_llm(
+        ROLE,
+        build_system_prompt_per_file(stack=stack),
+        user_msg,
+        temperature=0.15,
+        max_tokens=32768,
+        retries=2,
+        backoff=False,
+        caller_file=__file__,
+        label=f"[08] {get_model(ROLE)}",
+    )
     result = _parse_json(raw, file_path)
 
-    # Be tolerant if model accidentally returns the single-call shape.
+    # Tolerate model accidentally returning multi-file shape
     if "files" in result and isinstance(result["files"], list):
         for entry in result["files"]:
             if isinstance(entry, dict) and entry.get("file_path") == file_path:
@@ -950,91 +615,25 @@ def implement_file(
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Ordering helpers — full scope
-# ════════════════════════════════════════════════════════════════════════════
-
-def order_stubs(
-    stub_files: list[dict[str, Any]],
-    plan: dict[str, Any] | None,
-) -> list[dict[str, Any]]:
-    """Sort stub files by implementation_order from plan, or keep scaffold order."""
-    if not plan:
-        return stub_files
-
-    order = plan.get("implementation_order", [])
-    order_map = {fp: i for i, fp in enumerate(order)}
-
-    return sorted(
-        stub_files,
-        key=lambda file_entry: order_map.get(file_entry["file_path"], 999_999),
-    )
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# Single-call fallback — full scope
-# ════════════════════════════════════════════════════════════════════════════
-
-def implement_all_single_call(
-    spec: str,
-    stub_files: list[dict[str, Any]],
-    instructions: str,
-    stack: dict[str, Any] | None = None,
-) -> list[dict[str, Any]]:
-    """
-    Single-call mode — all requested files in one request.
-    """
-    user_msg = (
-        f"### canonical spec\n\n{spec}\n\n"
-        f"### scaffold, stub files to implement\n\n"
-        f"{json.dumps(stub_files, indent=2, ensure_ascii=False)}"
-    )
-
-    model    = get_model(ROLE)
-    provider = get_provider(ROLE)
-    print(f"[08] Calling model: {model} (provider: {provider}), single-call mode …")
-
-    raw = _call_executor(
-        build_system_prompt_single(instructions=instructions, stack=stack),
-        user_msg,
-    )
-    result = _parse_json(raw, "single-call")
-
-    files = result.get("files", [])
-    if not isinstance(files, list):
-        raise RuntimeError("single-call result missing list field: files")
-
-    return [entry for entry in files if isinstance(entry, dict)]
-
-
-# ════════════════════════════════════════════════════════════════════════════
 # Delta mode restored context — full scope
 # ════════════════════════════════════════════════════════════════════════════
 
 def _load_restored_files(only_set: set[str]) -> dict[str, str]:
     """
-    Read already-restored src/ files into memory so they can be used as
-    import/reference context for the executor in delta mode.
-
-    These are build outputs, not pipeline artifacts, so they are not included
-    in the artifact access summary.
+    Read existing src/ files for import/reference context in delta mode.
+    Build outputs — not tracked in artifact summary.
     """
     restored: dict[str, str] = {}
-
     if not SRC_DIR.exists():
         return restored
 
-    all_paths = sorted(
-        path
-        for path in SRC_DIR.rglob("*")
-        if path.is_file() and _is_probably_source_file(path)
-    )
-
-    for path in all_paths:
+    for path in sorted(
+        p for p in SRC_DIR.rglob("*")
+        if p.is_file() and _is_probably_source_file(p)
+    ):
         rel = "src/" + str(path.relative_to(SRC_DIR)).replace("\\", "/")
-
         if rel in only_set:
             continue
-
         try:
             restored[rel] = path.read_text(encoding="utf-8")
         except Exception as exc:
@@ -1047,36 +646,185 @@ def _load_restored_files(only_set: set[str]) -> dict[str, str]:
 # Output writing — full scope
 # ════════════════════════════════════════════════════════════════════════════
 
-def _write_generated_entry(entry: dict[str, Any]) -> str | None:
-    """
-    Write one generated full-scope entry to SRC_DIR.
+# Files that belong at output/ root rather than output/src/
+_ROOT_LEVEL_FILES = {
+    "package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock",
+    "index.html", "vite.config.ts", "vite.config.js",
+    "tsconfig.json", "tsconfig.app.json", "tsconfig.node.json",
+    "tsconfig.base.json", "jest.config.ts", "jest.config.js",
+    "vitest.config.ts", "vitest.config.js",
+    "eslint.config.js", "eslint.config.ts", ".eslintrc.json", ".eslintrc.js",
+    "prettier.config.js", ".prettierrc", ".prettierrc.json",
+    "postcss.config.js", "postcss.config.cjs",
+    "tailwind.config.js", "tailwind.config.ts", "tailwind.config.cjs",
+    "components.json", "drizzle.config.ts",
+    ".env", ".env.example", ".env.local",
+    "README.md", "Dockerfile", "docker-compose.yml",
+    "nginx.conf",
+}
 
-    Returns written file_path, or None if skipped.
+
+def _resolve_output_path(fp: str) -> Path | None:
     """
-    fp = entry.get("file_path")
+    Resolve fp to an absolute output path.
+
+    Routing logic:
+    - Root-level config files (package.json, tsconfig.app.json, index.html, …)
+      → output/ root regardless of what prefix the model used
+    - Everything else → output/src/
+    """
+    normalized = _normalize_repo_rel_path(fp)
+    filename   = Path(normalized).name
+
+    # Root-level config files → always output/ root
+    if filename in _ROOT_LEVEL_FILES:
+        output_dir = SRC_DIR.parent   # artifacts_<slug>/output/
+        out_path   = output_dir / filename
+        # Safety check — must stay within output/
+        try:
+            if output_dir.resolve() not in out_path.resolve().parents and                out_path.resolve() != output_dir.resolve():
+                pass  # filename is just a name, always safe
+        except Exception:
+            pass
+        return out_path
+
+    # Everything else → output/src/
+    return _safe_src_output_path(fp)
+
+
+def _write_generated_entry(entry: dict[str, Any]) -> str | None:
+    fp   = entry.get("file_path")
     code = entry.get("code")
 
     if not fp or not isinstance(fp, str):
         print(f"[08] SKIP malformed entry without file_path: {entry}", file=sys.stderr)
         return None
-
     if code is None or not isinstance(code, str):
         print(f"[08] SKIP malformed entry without code: {fp}", file=sys.stderr)
         return None
 
-    out_path = _safe_src_output_path(fp)
+    out_path = _resolve_output_path(fp)
     if out_path is None:
-        print(f"[08] SKIP outside src/: {fp}", file=sys.stderr)
+        print(f"[08] SKIP unsafe output path: {fp}", file=sys.stderr)
         return None
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(code, encoding="utf-8")
-
-    # src/** is a build output owned by executor; include it in write summary.
-    _track_write(out_path)
-
+    track_write(out_path)
     print(f"[08] WROTE {out_path}")
     return fp
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Full scope
+# ════════════════════════════════════════════════════════════════════════════
+
+def _load_full_plan() -> dict[str, Any]:
+    if not PLANNER_FULL_PLAN.exists():
+        raise FileNotFoundError(
+            f"Missing full plan: {PLANNER_FULL_PLAN}\n"
+            "Run 07_planner.py --scope full first."
+        )
+    return _read_json_file(PLANNER_FULL_PLAN, "planner/full_plan.json")
+
+
+def run_full_scope(args: argparse.Namespace) -> tuple[list[str], list[str], dict[str, Any]]:
+    print("[08] Scope: full")
+
+    plan = _load_full_plan()
+
+    stack: dict[str, Any] | None = (
+        plan["stack"] if isinstance(plan.get("stack"), dict) else None
+    )
+    if stack:
+        print(f"[08] Stack:\n{json.dumps(stack, indent=2, ensure_ascii=False)}")
+    else:
+        print("[08] WARNING: full_plan.json has no 'stack' — using generic prompt.")
+
+    task_index: dict[str, dict[str, Any]] = {
+        task["file_path"]: task
+        for task in plan.get("tasks", [])
+        if isinstance(task, dict) and "file_path" in task
+    }
+
+    # implementation_order is the canonical file list
+    implementation_order: list[str] = plan.get("implementation_order", [])
+    all_file_paths: list[str] = implementation_order or sorted(task_index.keys())
+
+    if not all_file_paths:
+        raise RuntimeError(
+            "full_plan.json has no 'implementation_order' and no 'tasks' — "
+            "cannot determine which files to implement."
+        )
+
+    print(
+        f"[08] Full plan loaded — {len(task_index)} tasks, "
+        f"{len(all_file_paths)} files in order"
+    )
+
+    # ── Delta filtering ───────────────────────────────────────────────────────
+    only_set: set[str] = set()
+
+    if args.only_files.strip():
+        only_set   = {fp.strip() for fp in args.only_files.split(",") if fp.strip()}
+        file_paths = [fp for fp in all_file_paths if fp in only_set]
+        skipped    = [fp for fp in all_file_paths if fp not in only_set]
+
+        print(
+            f"[08] Delta mode — {len(file_paths)} file(s) to implement, "
+            f"{len(skipped)} skipped."
+        )
+        for fp in skipped:
+            print(f"[08]   SKIP unaffected: {fp}")
+        for fp in sorted(only_set - set(all_file_paths)):
+            print(f"[08] WARNING: --only-files path not in plan: {fp}")
+    else:
+        file_paths = all_file_paths
+
+    # ── Execute ───────────────────────────────────────────────────────────────
+    already_written: dict[str, str] = (
+        _load_restored_files(only_set) if only_set else {}
+    )
+    if already_written:
+        print(f"[08] Import context seeded with {len(already_written)} restored file(s).")
+
+    written:      list[str] = []
+    failed_files: list[str] = []
+
+    for fp in file_paths:
+        task = task_index.get(fp)
+        if task is None:
+            print(f"[08] WARNING: no task found for {fp} — implementing with no guidance.")
+
+        try:
+            entry = implement_file(
+                file_path=fp,
+                task=task,
+                already_written=already_written,
+                stack=stack,
+            )
+        except Exception as exc:
+            print(f"[08] FAILED to implement {fp}: {exc}", file=sys.stderr)
+            failed_files.append(fp)
+            continue
+
+        written_fp = _write_generated_entry(entry)
+        if written_fp:
+            already_written[written_fp] = entry["code"]
+            written.append(written_fp)
+        else:
+            failed_files.append(fp)
+
+    skipped_delta = sorted(set(all_file_paths) - only_set) if only_set else []
+    mode = "per-file-with-planner-plan" + ("-delta" if only_set else "")
+
+    return written, failed_files, {
+        "scope": "full",
+        "mode": mode,
+        "skipped_delta": skipped_delta,
+        "stack": stack,
+        "plan": "planner/full_plan.json",
+    }
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1087,33 +835,36 @@ def _load_mini_plan() -> dict[str, Any]:
     if not PLANNER_MINI_PLAN.exists():
         raise FileNotFoundError(
             f"Missing mini plan: {PLANNER_MINI_PLAN}\n"
-            "Run planner first:\n"
-            "  python harness.py --project <name> --scope mini --plan"
+            "Run planner first: python harness.py --project <name> --scope mini --plan"
         )
+    merged = _read_json_file(PLANNER_MINI_PLAN, "planner/mini_plan.json")
 
-    plan = _read_json_file(PLANNER_MINI_PLAN, "planner_mini_execution_plan.json")
+    if "plan" in merged and isinstance(merged["plan"], dict):
+        plan = merged["plan"]
+    else:
+        print("[08] WARNING: mini_plan.json has no 'plan' key — assuming legacy flat format.")
+        plan = merged
+
     if plan.get("scope") != "mini":
-        print("[08] WARNING: planner_mini_execution_plan.json has no scope='mini'. Continuing.")
+        print("[08] WARNING: mini_plan plan has no scope='mini'. Continuing.")
 
-    targets = plan.get("target_files", [])
-    if not isinstance(targets, list):
-        raise RuntimeError("planner_mini_execution_plan.target_files must be a list.")
+    if not isinstance(plan.get("target_files"), list):
+        raise RuntimeError("mini_plan target_files must be a list.")
 
     return plan
 
 
 def _load_mini_analysis() -> dict[str, Any] | None:
-    if not PLANNER_MINI_IMPACT.exists():
+    if not PLANNER_MINI_PLAN.exists():
         return None
     try:
-        _track_read(PLANNER_MINI_IMPACT)
-        data = json.loads(PLANNER_MINI_IMPACT.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else None
+        merged = json.loads(PLANNER_MINI_PLAN.read_text(encoding="utf-8"))
+        if not isinstance(merged, dict):
+            return None
+        impact = merged.get("impact")
+        return impact if isinstance(impact, dict) else None
     except Exception as exc:
-        print(
-            f"[08] WARNING: could not read planner_mini_impact_analysis.json: {exc}",
-            file=sys.stderr,
-        )
+        print(f"[08] WARNING: could not read impact from mini_plan.json: {exc}", file=sys.stderr)
         return None
 
 
@@ -1135,7 +886,6 @@ def _normalize_mini_target(entry: dict[str, Any]) -> dict[str, Any] | None:
     if not path:
         print(f"[08] WARNING: skipping mini target without path: {entry}", file=sys.stderr)
         return None
-
     if _is_disallowed_artifact_rel_path(path):
         print(f"[08] WARNING: skipping disallowed mini target: {path}", file=sys.stderr)
         return None
@@ -1145,22 +895,15 @@ def _normalize_mini_target(entry: dict[str, Any]) -> dict[str, Any] | None:
         action = "MODIFY"
 
     normalized = dict(entry)
-    normalized["path"] = path
+    normalized["path"]   = path
     normalized["action"] = action
-    normalized["risk"] = str(entry.get("risk", "medium")).strip().lower() or "medium"
-
+    normalized["risk"]   = str(entry.get("risk", "medium")).strip().lower() or "medium"
     return normalized
 
 
 def _read_existing_target(path: str) -> str | None:
-    """
-    Reads target source/build-output file, not a pipeline artifact. It is not
-    tracked in artifact read summary.
-    """
     out_path = _safe_artifact_output_path(path)
-    if out_path is None:
-        return None
-    if not out_path.exists():
+    if out_path is None or not out_path.exists():
         return None
     try:
         return out_path.read_text(encoding="utf-8")
@@ -1178,11 +921,10 @@ def _implement_mini_target(
     analysis: dict[str, Any] | None,
     target: dict[str, Any],
 ) -> dict[str, Any]:
-    path = str(target["path"])
+    path   = str(target["path"])
     action = str(target.get("action", "MODIFY")).upper()
 
     existing = _read_existing_target(path)
-
     if action == "MODIFY" and existing is None:
         print(
             f"[08] WARNING: MODIFY target does not exist yet; treating as CREATE: {path}",
@@ -1205,10 +947,20 @@ def _implement_mini_target(
         )
 
     print(f"[08]   → Mini patch {action:<6} {path} …")
-    raw = _call_executor(build_system_prompt_mini_file(), user_msg)
+    raw, _ = call_llm(
+        ROLE,
+        build_system_prompt_mini_file(),
+        user_msg,
+        temperature=0.15,
+        max_tokens=32768,
+        retries=2,
+        backoff=False,
+        caller_file=__file__,
+        label=f"[08] {get_model(ROLE)}",
+    )
     result = _parse_json(raw, f"mini target {path}")
 
-    # Tolerate full-scope key names.
+    # Tolerate full-scope key names
     if "file_path" in result and "path" not in result:
         result["path"] = result["file_path"]
     if "code" in result and "content" not in result:
@@ -1223,19 +975,11 @@ def _write_mini_result(
     target: dict[str, Any],
     allowed_paths: set[str],
 ) -> str | None:
-    """
-    Write one mini result.
-
-    Returns written/deleted/renamed path marker, or None if skipped.
-    """
     requested_path = _normalize_repo_rel_path(str(target.get("path", "")))
-    result_path = _normalize_repo_rel_path(str(result.get("path", requested_path)))
+    result_path    = _normalize_repo_rel_path(str(result.get("path", requested_path)))
 
     if result_path not in allowed_paths:
-        print(
-            f"[08] SKIP mini result outside plan target set: {result_path}",
-            file=sys.stderr,
-        )
+        print(f"[08] SKIP mini result outside plan target set: {result_path}", file=sys.stderr)
         return None
 
     out_path = _safe_artifact_output_path(result_path)
@@ -1251,8 +995,7 @@ def _write_mini_result(
             print(f"[08] DELETED {result_path}")
         else:
             print(f"[08] DELETE no-op, file not found: {result_path}")
-
-        _track_write(out_path)
+        track_write(out_path)
         return result_path
 
     content = result.get("content")
@@ -1262,27 +1005,19 @@ def _write_mini_result(
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(content, encoding="utf-8")
-    _track_write(out_path)
-
+    track_write(out_path)
     print(f"[08] WROTE {result_path}")
     return result_path
 
 
 def run_mini_scope(args: argparse.Namespace) -> tuple[list[str], list[str], dict[str, Any]]:
-    """
-    Execute targeted mini implementation from planner_mini_execution_plan.json.
-
-    Returns (written, failed_files, record_extra).
-    """
     print("[08] Scope: mini")
 
-    plan = _load_mini_plan()
+    plan     = _load_mini_plan()
     analysis = _load_mini_analysis()
 
-    raw_targets = plan.get("target_files", [])
     targets: list[dict[str, Any]] = []
-
-    for raw in raw_targets:
+    for raw in plan.get("target_files", []):
         if not isinstance(raw, dict):
             print(f"[08] WARNING: skipping invalid target entry: {raw!r}", file=sys.stderr)
             continue
@@ -1292,254 +1027,96 @@ def run_mini_scope(args: argparse.Namespace) -> tuple[list[str], list[str], dict
 
     if args.only_files.strip():
         only_set = {
-            _normalize_repo_rel_path(path)
-            for path in args.only_files.split(",")
-            if path.strip()
+            _normalize_repo_rel_path(p)
+            for p in args.only_files.split(",")
+            if p.strip()
         }
-        before = len(targets)
-        targets = [target for target in targets if target["path"] in only_set]
+        before  = len(targets)
+        targets = [t for t in targets if t["path"] in only_set]
         print(f"[08] Mini --only-files: {len(targets)}/{before} target(s) selected.")
 
     print(f"[08] Mini targets: {len(targets)}")
-    for target in targets:
-        print(
-            f"[08]   {target.get('action', 'MODIFY'):<6} "
-            f"{target.get('path')}  risk={target.get('risk', 'medium')}"
-        )
+    for t in targets:
+        print(f"[08]   {t.get('action', 'MODIFY'):<6} {t.get('path')}  risk={t.get('risk', 'medium')}")
 
     allowed_paths = _mini_allowed_target_paths(plan)
-
-    written: list[str] = []
+    written:      list[str] = []
     failed_files: list[str] = []
 
     for target in targets:
         fp = str(target["path"])
-
         try:
-            result = _implement_mini_target(
-                plan=plan,
-                analysis=analysis,
-                target=target,
-            )
-            written_fp = _write_mini_result(
-                result,
-                target=target,
-                allowed_paths=allowed_paths,
-            )
+            result     = _implement_mini_target(plan=plan, analysis=analysis, target=target)
+            written_fp = _write_mini_result(result, target=target, allowed_paths=allowed_paths)
             if written_fp:
                 written.append(written_fp)
             else:
                 failed_files.append(fp)
-
         except Exception as exc:
             print(f"[08] FAILED mini target {fp}: {exc}", file=sys.stderr)
             failed_files.append(fp)
 
-    record_extra = {
-        "scope": "mini",
-        "plan": "state/planner_mini_execution_plan.json",
-        "impact_analysis": (
-            "state/planner_mini_impact_analysis.json"
-            if PLANNER_MINI_IMPACT.exists()
-            else None
-        ),
+    return written, failed_files, {
+        "scope":        "mini",
+        "plan":         "planner/mini_plan.json",
         "task_summary": plan.get("task_summary", ""),
-        "target_files": [target.get("path") for target in targets],
+        "target_files": [t.get("path") for t in targets],
     }
 
-    return written, failed_files, record_extra
-
 
 # ════════════════════════════════════════════════════════════════════════════
-# Full scope
+# Manifest writing
 # ════════════════════════════════════════════════════════════════════════════
 
-def run_full_scope(args: argparse.Namespace) -> tuple[list[str], list[str], dict[str, Any]]:
-    print("[08] Scope: full")
+def _append_manifest_log(
+    *,
+    scope: str,
+    mode: str,
+    written: list[str],
+    failed_files: list[str],
+    extra: dict[str, Any],
+) -> None:
+    token_sum  = cost_summary()
+    cost_total = token_sum.get("total_cost_usd") if isinstance(token_sum, dict) else None
 
-    spec = _load_spec()
-    scaffold = _read_json_file(SCAFFOLD_JSON, "scaffolder_codebase_skeleton.json")
+    entry: dict[str, Any] = {
+        "scope":          scope,
+        "mode":           mode,
+        "generated_at":   _utc_now_iso(),
+        "files_written":  len(written),
+        "failed_count":   len(failed_files),
+        "cost":           cost_total,
+    }
+    if extra.get("task_summary"):
+        entry["task_summary"] = extra["task_summary"]
+    if extra.get("stack"):
+        entry["stack"] = extra["stack"]
 
-    instrs = scaffold.get("implementation_instructions", {}).get("for_executor", "")
-    scaffold_stack = scaffold.get("stack")
+    log_path = EXECUTOR_MANIFEST_LOG
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
 
-    files = scaffold.get("files", [])
-    if not isinstance(files, list):
-        raise RuntimeError("scaffolder_codebase_skeleton.json must contain a list field: files")
-
-    all_stubs: list[dict[str, Any]] = [
-        file_entry
-        for file_entry in files
-        if isinstance(file_entry, dict) and not file_entry.get("is_test")
-    ]
-
-    # ── Delta filtering ───────────────────────────────────────────────────────
-    only_set: set[str] = set()
-
-    if args.only_files.strip():
-        only_set = {
-            fp.strip()
-            for fp in args.only_files.split(",")
-            if fp.strip()
-        }
-
-        stub_files = [
-            file_entry
-            for file_entry in all_stubs
-            if file_entry.get("file_path") in only_set
-        ]
-
-        skipped = [
-            file_entry["file_path"]
-            for file_entry in all_stubs
-            if file_entry.get("file_path") not in only_set
-        ]
-
-        print(
-            f"[08] Delta mode — {len(stub_files)} file(s) to implement, "
-            f"{len(skipped)} unaffected skipped."
-        )
-
-        for fp in skipped:
-            print(f"[08]   SKIP unaffected: {fp}")
-
-        requested_missing = sorted(
-            only_set - {file_entry["file_path"] for file_entry in all_stubs}
-        )
-        for fp in requested_missing:
-            print(f"[08] WARNING: --only-files path not found in scaffold: {fp}")
-
-    else:
-        stub_files = all_stubs
-
-    # ── Load planner plan if requested ────────────────────────────────────────
-    plan: dict[str, Any] | None = None
-    task_index: dict[str, dict[str, Any]] = {}
-    stack: dict[str, Any] | None = scaffold_stack if isinstance(scaffold_stack, dict) else None
-
-    if args.use_planner_plan:
-        if not PLANNER_FULL_PLAN.exists():
-            raise FileNotFoundError(
-                f"ERROR: --use-planner-plan set but full planner plan not found: {PLANNER_FULL_PLAN}\n"
-                "Run 07_planner.py --scope full first."
-            )
-
-        plan = _read_json_file(PLANNER_FULL_PLAN, "planner_full_execution_plan.json")
-        task_index = {
-            task["file_path"]: task
-            for task in plan.get("tasks", [])
-            if isinstance(task, dict) and "file_path" in task
-        }
-
-        plan_stack = plan.get("stack")
-        if isinstance(plan_stack, dict):
-            stack = plan_stack
-
-        print(
-            f"[08] Planner full plan loaded — {len(task_index)} tasks, "
-            f"order: {plan.get('implementation_order', [])}"
-        )
-
-        if stack:
-            print(f"[08] Stack in use:\n{json.dumps(stack, indent=2, ensure_ascii=False)}")
-        else:
-            print("[08] WARNING: planner plan has no 'stack'; executor will use generic prompt.")
-
-    else:
-        print("[08] No planner plan — using single-call mode.")
-
-        if stack:
-            print(
-                f"[08] Stack from scaffold in use:\n"
-                f"{json.dumps(stack, indent=2, ensure_ascii=False)}"
-            )
-
-    # ── Execute ───────────────────────────────────────────────────────────────
-    written: list[str] = []
-    failed_files: list[str] = []
-
-    if plan:
-        ordered = order_stubs(stub_files, plan)
-
-        already_written: dict[str, str] = (
-            _load_restored_files(only_set)
-            if only_set
-            else {}
-        )
-
-        if already_written:
-            print(
-                f"[08] Import context seeded with "
-                f"{len(already_written)} restored file(s)."
-            )
-
-        for stub in ordered:
-            fp = stub["file_path"]
-            task = task_index.get(fp)
-
+        entries: list[Any] = []
+        if log_path.exists():
+            track_read(log_path)
             try:
-                entry = implement_file(
-                    spec=spec,
-                    stub=stub,
-                    task=task,
-                    already_written=already_written,
-                    stack=stack,
-                )
-            except Exception as exc:
-                print(f"[08] FAILED to implement {fp}: {exc}", file=sys.stderr)
-                failed_files.append(fp)
-                continue
+                data    = json.loads(log_path.read_text(encoding="utf-8").strip())
+                entries = data.get("entries", []) if isinstance(data, dict) else data
+                if not isinstance(entries, list):
+                    entries = []
+            except Exception:
+                entries = []
 
-            written_fp = _write_generated_entry(entry)
+        entries.append(entry)
+        log_path.write_text(
+            json.dumps({"entries": entries}, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        track_write(log_path)
+        print(f"[08] Manifest log appended ({len(entries)} entries) → {log_path}")
+    except Exception as exc:
+        print(f"[08] WARNING: could not append manifest log: {exc}", file=sys.stderr)
 
-            if written_fp:
-                already_written[written_fp] = entry["code"]
-                written.append(written_fp)
-            else:
-                failed_files.append(fp)
-
-    else:
-        try:
-            entries = implement_all_single_call(
-                spec=spec,
-                stub_files=stub_files,
-                instructions=instrs,
-                stack=stack,
-            )
-        except Exception as exc:
-            print(f"[08] FAILED single-call generation: {exc}", file=sys.stderr)
-            failed_files.extend([file_entry["file_path"] for file_entry in stub_files])
-            entries = []
-
-        for entry in entries:
-            written_fp = _write_generated_entry(entry)
-            if written_fp:
-                written.append(written_fp)
-
-    skipped_delta = (
-        sorted({file_entry["file_path"] for file_entry in all_stubs} - only_set)
-        if only_set
-        else []
-    )
-
-    mode = "per-file-with-planner-plan" if plan else "single-call"
-    if only_set:
-        mode += "-delta"
-
-    record_extra = {
-        "scope": "full",
-        "mode": mode,
-        "skipped_delta": skipped_delta,
-        "stack": stack,
-        "plan": "state/planner_full_execution_plan.json" if plan else None,
-    }
-
-    return written, failed_files, record_extra
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# Run record
-# ════════════════════════════════════════════════════════════════════════════
 
 def _write_impl_record(
     *,
@@ -1549,14 +1126,19 @@ def _write_impl_record(
     failed_files: list[str],
     extra: dict[str, Any],
 ) -> None:
-    record = {
-        "executor_role": ROLE,
+    token_sum  = cost_summary()
+    cost_total = token_sum.get("total_cost_usd") if isinstance(token_sum, dict) else None
+
+    record: dict[str, Any] = {
+        "executor_role":  ROLE,
         "executor_model": get_model(ROLE),
-        "scope": scope,
-        "mode": mode,
-        "generated_at": _utc_now_iso(),
-        "files": written,
-        "failed_files": failed_files,
+        "scope":          scope,
+        "mode":           mode,
+        "generated_at":   _utc_now_iso(),
+        "files":          written,
+        "failed_files":   failed_files,
+        "token_summary":  token_sum,
+        "cost":           cost_total,
     }
     record.update(extra)
 
@@ -1565,9 +1147,16 @@ def _write_impl_record(
         json.dumps(record, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
-    _track_write(EXECUTOR_OVERWRITE_MANIFEST)
-
+    track_write(EXECUTOR_OVERWRITE_MANIFEST)
     print(f"[08] Executor manifest → {EXECUTOR_OVERWRITE_MANIFEST}")
+
+    _append_manifest_log(
+        scope=scope,
+        mode=mode,
+        written=written,
+        failed_files=failed_files,
+        extra=extra,
+    )
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1577,56 +1166,35 @@ def _write_impl_record(
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="08_executor.py",
-        description="Executor. Implements full scaffold plan or mini targeted plan.",
+        description="Executor. Full scope reads full_plan.json only. Mini scope reads mini_plan.json only.",
     )
-
     parser.add_argument(
         "--project",
         default=None,
-        help=(
-            "Project name for direct execution. Sets PIPELINE_PROJECT before "
-            "resolving artifact paths."
-        ),
+        help="Project name. Sets PIPELINE_PROJECT before resolving artifact paths.",
     )
-
     parser.add_argument(
         "--scope",
         choices=["full", "mini"],
         default="full",
-        help="Executor scope. full uses scaffold/spec; mini uses planner_mini_execution_plan.json.",
+        help="full: reads planner/full_plan.json. mini: reads planner/mini_plan.json.",
     )
-
-    parser.add_argument(
-        "--use-planner-plan",
-        action="store_true",
-        help=(
-            "Full scope: inject state/planner_full_execution_plan.json as per-file "
-            "implementation guidance. Mini scope: accepted for harness compatibility; "
-            "mini always uses planner_mini_execution_plan.json."
-        ),
-    )
-
     parser.add_argument(
         "--only-files",
         default="",
         help=(
             "Comma-separated paths to implement. "
-            "Full scope: delta mode against scaffold. "
-            "Mini scope: filters planner_mini_execution_plan.target_files."
+            "Full scope: delta mode. Mini scope: filters target_files."
         ),
     )
-
     return parser
 
 
 def main() -> None:
     parser = _build_parser()
-    args = parser.parse_args()
+    args   = parser.parse_args()
 
     _configure_project(args.project, parser)
-
-    # Important: do not call ensure_dirs() at import-time.
-    # PIPELINE_PROJECT must be available before artifact paths are resolved.
     ensure_dirs()
 
     exit_code = 0
@@ -1634,9 +1202,7 @@ def main() -> None:
     try:
         if args.scope == "mini":
             written, failed_files, extra = run_mini_scope(args)
-            mode = "mini-targeted"
-            if args.only_files.strip():
-                mode += "-filtered"
+            mode = "mini-targeted" + ("-filtered" if args.only_files.strip() else "")
             extra["mode"] = mode
             _write_impl_record(
                 scope="mini",
@@ -1645,10 +1211,9 @@ def main() -> None:
                 failed_files=failed_files,
                 extra=extra,
             )
-
         else:
             written, failed_files, extra = run_full_scope(args)
-            mode = str(extra.get("mode", "single-call"))
+            mode = str(extra.get("mode", "per-file-with-planner-plan"))
             _write_impl_record(
                 scope="full",
                 mode=mode,
@@ -1659,8 +1224,6 @@ def main() -> None:
 
     except Exception as exc:
         print(f"[08] ERROR: {exc}", file=sys.stderr)
-
-        # Best-effort failure record.
         try:
             _write_impl_record(
                 scope=args.scope,
@@ -1671,7 +1234,6 @@ def main() -> None:
             )
         except Exception:
             pass
-
         exit_code = 1
 
     else:
@@ -1686,7 +1248,9 @@ def main() -> None:
             print(f"[08] Done — {len(written)} file(s) written.")
 
     finally:
-        _print_artifact_access_summary()
+        print_summary("[08]")
+        print_artifact_summary("[08]")
+        prompt_next_step(ROLE, prefix="[08]")
 
     sys.exit(exit_code)
 

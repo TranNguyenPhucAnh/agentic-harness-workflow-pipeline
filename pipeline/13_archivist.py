@@ -6,36 +6,28 @@ Step 13 — Long-term knowledge distillation after human review.
 Two modes:
 
   A) JUDGE-DRIVEN:
-     Run after reviewing judge_verdict_summary.md / judge_overwrite_verdict_raw.json.
+     Run after reviewing judge/verdict_summary.md / judge/verdict_raw.json.
      Processes judge findings and writes/updates:
-       - archivist_knowledge_log.md
-       - archivist_spec_gaps.md
-       - archivist_curation_log.json
+       - archivist/knowledge_log.md
+       - archivist/spec_gaps.md
+       - archivist/curation_log.json
 
   B) HUMAN-FIX CAPTURE:
      Run after you manually fix code that AI couldn't fix.
      Uses `git diff` to capture what you changed, links it to escalated clusters,
-     and distills a Pattern entry into archivist_knowledge_log.md.
-     On next run, archivist_knowledge_log.md is injected into downstream prompts.
+     and distills a Pattern entry into archivist/knowledge_log.md.
+     On next run, knowledge_log.md is injected into downstream prompts.
 
 Mini-aware behaviour:
-  - Reads planner_mini_execution_plan.json, planner_mini_impact_analysis.json,
-    executor_overwrite_manifest.json.
-  - Human-fix capture diffs mini target files instead of hardcoding src/.
+  - Reads planner/mini_plan.json (includes impact field),
+    executor/manifest.json.
+  - Human-fix capture diffs mini target files instead of hardcoding output/src/.
   - Knowledge patterns include mini scope/context where available.
-
-Session model:
-  Session-local artifacts resolve under:
-    artifacts_<slug>/sessions/<NNN>/
-
-  Project-global knowledge artifacts remain under:
-    artifacts_<slug>/knowledge/
 
 Usage
 ─────
   # After judge review:
   python pipeline/13_archivist.py --project my-app
-  python pipeline/13_archivist.py --project my-app --session 1
   python pipeline/13_archivist.py --project my-app --accept-all
   python pipeline/13_archivist.py --project my-app --dry-run
 
@@ -48,25 +40,24 @@ Usage
 
 Writes
 ──────
-  artifacts_<slug>/knowledge/current/archivist_knowledge_log.md
-  artifacts_<slug>/knowledge/current/archivist_spec_gaps.md
-  artifacts_<slug>/knowledge/history/archivist_curation_log.json
+  artifacts_<slug>/archivist/knowledge_log.md     (append)
+  artifacts_<slug>/archivist/spec_gaps.md         (append)
+  artifacts_<slug>/archivist/curation_log.json    (append)
 
 Reads
 ─────
-  artifacts_<slug>/sessions/<NNN>/execution/judge_overwrite_verdict_raw.json
-  artifacts_<slug>/sessions/<NNN>/reports/judge_verdict_summary.md
-  artifacts_<slug>/sessions/<NNN>/state/planner_full_execution_plan.json
-  artifacts_<slug>/sessions/<NNN>/state/planner_mini_execution_plan.json
-  artifacts_<slug>/sessions/<NNN>/state/planner_mini_impact_analysis.json
-  artifacts_<slug>/sessions/<NNN>/execution/executor_overwrite_manifest.json
-  artifacts_<slug>/sessions/<NNN>/execution/debugger_overwrite_test_summary.json
-  artifacts_<slug>/sessions/<NNN>/state/clarificator_requirement_synthesis.md
-  artifacts_<slug>/sessions/<NNN>/execution/enricher_overwrite_enriched_prompt.md
-  artifacts_<slug>/knowledge/current/patcher_findings_snapshot.md
-  artifacts_<slug>/knowledge/current/archivist_knowledge_log.md
-  artifacts_<slug>/knowledge/current/archivist_spec_gaps.md
-  artifacts_<slug>/specwright_spec_<slug>.md
+  artifacts_<slug>/judge/verdict_raw.json
+  artifacts_<slug>/judge/verdict_summary.md
+  artifacts_<slug>/planner/full_plan.json
+  artifacts_<slug>/planner/mini_plan.json
+  artifacts_<slug>/executor/manifest.json
+  artifacts_<slug>/debugger/test_summary.json
+  artifacts_<slug>/clarificator/session.json
+  artifacts_<slug>/enricher/enriched_prompt.md
+  artifacts_<slug>/patcher/attempt_log.json       (last entry, replaces snapshot)
+  artifacts_<slug>/archivist/knowledge_log.md
+  artifacts_<slug>/archivist/spec_gaps.md
+  artifacts_<slug>/spec/specwright_spec_<slug>.md
 
 At the end of each run, prints:
   - artifacts/files read
@@ -90,22 +81,21 @@ from textwrap import indent
 from typing import Any
 
 # === WRITE AUTHORITY: archivist ===
-# OWNS  : artifacts_<slug>/knowledge/current/archivist_knowledge_log.md
-#         artifacts_<slug>/knowledge/current/archivist_spec_gaps.md
-#         artifacts_<slug>/knowledge/history/archivist_curation_log.json
-# READS : artifacts_<slug>/sessions/<NNN>/execution/judge_overwrite_verdict_raw.json
-#         artifacts_<slug>/sessions/<NNN>/reports/judge_verdict_summary.md
-#         artifacts_<slug>/sessions/<NNN>/state/planner_full_execution_plan.json
-#         artifacts_<slug>/sessions/<NNN>/state/planner_mini_execution_plan.json
-#         artifacts_<slug>/sessions/<NNN>/state/planner_mini_impact_analysis.json
-#         artifacts_<slug>/sessions/<NNN>/execution/executor_overwrite_manifest.json
-#         artifacts_<slug>/sessions/<NNN>/execution/debugger_overwrite_test_summary.json
-#         artifacts_<slug>/sessions/<NNN>/state/clarificator_requirement_synthesis.md
-#         artifacts_<slug>/sessions/<NNN>/execution/enricher_overwrite_enriched_prompt.md
-#         artifacts_<slug>/knowledge/current/patcher_findings_snapshot.md
-#         artifacts_<slug>/knowledge/current/archivist_knowledge_log.md
-#         artifacts_<slug>/knowledge/current/archivist_spec_gaps.md
-#         artifacts_<slug>/specwright_spec_<slug>.md
+# OWNS  : artifacts_<slug>/archivist/knowledge_log.md
+#         artifacts_<slug>/archivist/spec_gaps.md
+#         artifacts_<slug>/archivist/curation_log.json
+# READS : artifacts_<slug>/judge/verdict_raw.json
+#         artifacts_<slug>/judge/verdict_summary.md
+#         artifacts_<slug>/planner/full_plan.json
+#         artifacts_<slug>/planner/mini_plan.json
+#         artifacts_<slug>/executor/manifest.json
+#         artifacts_<slug>/debugger/test_summary.json
+#         artifacts_<slug>/clarificator/session.json
+#         artifacts_<slug>/enricher/enriched_prompt.md
+#         artifacts_<slug>/patcher/attempt_log.json
+#         artifacts_<slug>/archivist/knowledge_log.md
+#         artifacts_<slug>/archivist/spec_gaps.md
+#         artifacts_<slug>/spec/specwright_spec_<slug>.md
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -119,54 +109,24 @@ from artifacts.paths import (  # noqa: E402
     EXECUTOR_OVERWRITE_MANIFEST,
     JUDGE_OVERWRITE_VERDICT_RAW,
     JUDGE_VERDICT_SUMMARY,
-    PATCHER_FINDINGS_SNAPSHOT,
+    PATCHER_ATTEMPT_LOG,
     PLANNER_FULL_PLAN,
-    PLANNER_MINI_IMPACT,
     PLANNER_MINI_PLAN,
     artifact_root,
     ensure_dirs,
     get_project_name,
     get_project_slug,
-    get_session_id,
     get_spec_path,
 )
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# Artifact/file access tracking
-# ════════════════════════════════════════════════════════════════════════════
-
-_ARTIFACTS_READ: set[str] = set()
-_ARTIFACTS_WRITTEN: set[str] = set()
-
-
-def _track_read(path: Any) -> None:
-    _ARTIFACTS_READ.add(str(path))
-
-
-def _track_write(path: Any) -> None:
-    _ARTIFACTS_WRITTEN.add(str(path))
-
-
-def _print_artifact_access_summary() -> None:
-    print("[13] Artifacts/files read:")
-    if _ARTIFACTS_READ:
-        for item in sorted(_ARTIFACTS_READ):
-            print(f"[13]   READ  {item}")
-    else:
-        print("[13]   READ  (none)")
-
-    print("[13] Artifacts/files created/updated/overwritten/appended:")
-    if _ARTIFACTS_WRITTEN:
-        for item in sorted(_ARTIFACTS_WRITTEN):
-            print(f"[13]   WRITE {item}")
-    else:
-        print("[13]   WRITE (none)")
+from modules.artifact_tracking import track_read, track_write, print_summary as print_artifact_summary  # noqa: E402
+from modules.post_interactive import prompt_next_step  # noqa: E402
 
 
 # ════════════════════════════════════════════════════════════════════════════
 # Data structures
 # ════════════════════════════════════════════════════════════════════════════
+
+ROLE = "archivist"
 
 @dataclass
 class KnowledgeAction:
@@ -204,14 +164,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Project name for direct execution. Sets PIPELINE_PROJECT.",
     )
     parser.add_argument(
-        "--session",
-        default=None,
-        help=(
-            "Optional session id for direct execution. Sets PIPELINE_SESSION. "
-            "Example: --session 1 resolves to sessions/001."
-        ),
-    )
-    parser.add_argument(
         "--capture-human-fix",
         action="store_true",
         help="Capture manual human fix via git diff → archivist_knowledge_log.md",
@@ -247,20 +199,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _configure_project(
     project: str | None,
-    session: str | None,
     parser: argparse.ArgumentParser,
 ) -> None:
     if project:
         os.environ["PIPELINE_PROJECT"] = project
-
-    if session is not None:
-        raw = str(session).strip()
-        if not raw:
-            parser.error("--session cannot be empty.")
-        try:
-            os.environ["PIPELINE_SESSION"] = f"{int(raw):03d}"
-        except ValueError:
-            parser.error("--session must be an integer, e.g. --session 1.")
 
     if os.environ.get("PIPELINE_PROJECT"):
         return
@@ -279,7 +221,7 @@ def _load_json(path: Any, default: Any) -> Any:
     if not path.exists():
         return default
     try:
-        _track_read(path)
+        track_read(path)
         return json.loads(path.read_text(encoding="utf-8", errors="replace"))
     except Exception as exc:
         print(f"[13][warn] Could not parse JSON {path}: {exc}", file=sys.stderr)
@@ -290,7 +232,7 @@ def _load_text(path: Any, default: str = "") -> str:
     if not path.exists():
         return default
     try:
-        _track_read(path)
+        track_read(path)
         return path.read_text(encoding="utf-8", errors="replace")
     except Exception as exc:
         print(f"[13][warn] Could not read {path}: {exc}", file=sys.stderr)
@@ -318,7 +260,7 @@ def _current_scope() -> str:
     if scope in {"full", "mini"}:
         return str(scope)
 
-    if PLANNER_MINI_PLAN.exists() or PLANNER_MINI_IMPACT.exists():
+    if PLANNER_MINI_PLAN.exists():
         return "mini"
 
     return "full"
@@ -352,15 +294,19 @@ def _extract_file_list(value: Any) -> list[str]:
 def _load_mini_context() -> dict[str, Any]:
     """Load mini planning/analysis/implementation context if present."""
     plan_mini = _load_json(PLANNER_MINI_PLAN, {})
-    analysis_mini = _load_json(PLANNER_MINI_IMPACT, {})
+    if not isinstance(plan_mini, dict):
+        plan_mini = {}
+    analysis_mini = plan_mini.get("impact", {})
+    if not isinstance(analysis_mini, dict):
+        analysis_mini = {}
     impl_record = _load_impl_record()
 
     return {
         "scope": _current_scope(),
         "clarified_requirement": _load_text(CLARIFIED_REQ).strip(),
         "enriched_prompt": _load_text(ENRICHER_OVERWRITE_PROMPT).strip(),
-        "plan_mini": plan_mini if isinstance(plan_mini, dict) else {},
-        "analysis_mini": analysis_mini if isinstance(analysis_mini, dict) else {},
+        "plan_mini": plan_mini,
+        "analysis_mini": analysis_mini,
         "impl_record": impl_record,
     }
 
@@ -466,7 +412,7 @@ def _git_diff_for_paths(paths: list[str]) -> str:
     """
     try:
         root = artifact_root()
-        args_paths = paths or ["src/"]
+        args_paths = paths or ["output/src/"]
 
         staged = subprocess.run(
             ["git", "diff", "--cached", "--", *args_paths],
@@ -566,7 +512,6 @@ def _build_knowledge_pattern(
         f"## Pattern — {now} (spec {spec_version})\n\n"
         f"**Source:** Human fix capture\n\n"
         f"**Project:** {get_project_name()} (`{get_project_slug()}`)\n\n"
-        f"**Session:** {get_session_id() or 'legacy/no-session'}\n\n"
         f"**Run context:** {run_context}\n\n"
         f"**Files changed by human:**\n{files_str}\n\n"
         + (f"**Root cause:** {root_cause}\n\n" if root_cause else "")
@@ -587,14 +532,14 @@ def _append_knowledge_log(entry: str, dry_run: bool) -> None:
     header = "# Archivist Knowledge Log\n\n"
     if not ARCHIVIST_KNOWLEDGE_LOG.exists():
         ARCHIVIST_KNOWLEDGE_LOG.write_text(header, encoding="utf-8")
-        _track_write(ARCHIVIST_KNOWLEDGE_LOG)
+        track_write(ARCHIVIST_KNOWLEDGE_LOG)
 
     existing = _load_text(ARCHIVIST_KNOWLEDGE_LOG)
     ARCHIVIST_KNOWLEDGE_LOG.write_text(
         existing.rstrip() + "\n\n" + entry,
         encoding="utf-8",
     )
-    _track_write(ARCHIVIST_KNOWLEDGE_LOG)
+    track_write(ARCHIVIST_KNOWLEDGE_LOG)
 
     print(f"  ✓ Appended pattern to {ARCHIVIST_KNOWLEDGE_LOG}")
 
@@ -606,7 +551,7 @@ def capture_human_fix(dry_run: bool) -> None:
     ctx = _load_mini_context()
     scope = ctx.get("scope", "full")
 
-    diff_paths = ["src/"]
+    diff_paths = ["output/src/"]
 
     if scope == "mini":
         mini_files = _mini_target_files(ctx)
@@ -614,7 +559,6 @@ def capture_human_fix(dry_run: bool) -> None:
             diff_paths = mini_files
 
     print(f"[13] Project: {get_project_name()} ({get_project_slug()})")
-    print(f"[13] Session: {get_session_id() or 'legacy/no-session'}")
     print(f"[13] Scope: {scope}")
     print(f"[13] Scanning git diff for: {', '.join(diff_paths)}")
 
@@ -705,7 +649,6 @@ def capture_human_fix(dry_run: bool) -> None:
             "mode": "human_fix_capture",
             "project": get_project_name(),
             "project_slug": get_project_slug(),
-            "session_id": get_session_id(),
             "scope": scope,
             "run_context": _run_context_summary(ctx),
             "spec_version": spec_version,
@@ -734,7 +677,6 @@ def _blocking_to_knowledge_pattern(
         f"## Pattern — {now} (spec {spec_version})\n\n"
         f"**Source:** Judge blocking issue\n\n"
         f"**Project:** {get_project_name()} (`{get_project_slug()}`)\n\n"
-        f"**Session:** {get_session_id() or 'legacy/no-session'}\n\n"
         f"**Run context:** {run_context}\n\n"
         f"**Finding:** {finding}\n\n"
         f"**Inject into:** downstream planning / implementation / debugging prompts "
@@ -786,11 +728,15 @@ def _load_previous_curation_summary() -> dict[str, Any]:
     if not ARCHIVIST_CURATION_LOG.exists():
         return {}
 
-    logs = _load_json(ARCHIVIST_CURATION_LOG, [])
-    if isinstance(logs, list):
-        return {"total_records": len(logs)}
+    loaded = _load_json(ARCHIVIST_CURATION_LOG, {})
+    if isinstance(loaded, dict):
+        entries = loaded.get("entries", [])
+    elif isinstance(loaded, list):
+        entries = loaded
+    else:
+        entries = []
 
-    return {}
+    return {"total_records": len(entries)}
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -856,7 +802,7 @@ def _suggest_action(
         )
         return (
             ACTION_SPEC_GAP,
-            "artifacts_<slug>/knowledge/current/archivist_spec_gaps.md",
+            "archivist/spec_gaps.md",
             content,
         )
 
@@ -864,14 +810,14 @@ def _suggest_action(
         content = finding
         return (
             ACTION_ARCHITECTURE_PATTERN,
-            "artifacts_<slug>/knowledge/current/archivist_knowledge_log.md",
+            "archivist/knowledge_log.md",
             content,
         )
 
     content = f"- {finding}"
     return (
         ACTION_FINDING_PATTERN,
-        "artifacts_<slug>/knowledge/current/archivist_knowledge_log.md",
+        "archivist/knowledge_log.md",
         content,
     )
 
@@ -897,14 +843,14 @@ def _apply_spec_gap(content: str, dry_run: bool) -> None:
 
     if not ARCHIVIST_SPEC_GAPS.exists():
         ARCHIVIST_SPEC_GAPS.write_text(header, encoding="utf-8")
-        _track_write(ARCHIVIST_SPEC_GAPS)
+        track_write(ARCHIVIST_SPEC_GAPS)
 
     existing = _load_text(ARCHIVIST_SPEC_GAPS)
     ARCHIVIST_SPEC_GAPS.write_text(
         existing.rstrip() + "\n\n" + content + "\n",
         encoding="utf-8",
     )
-    _track_write(ARCHIVIST_SPEC_GAPS)
+    track_write(ARCHIVIST_SPEC_GAPS)
 
     print(f"  ✓ Appended to {ARCHIVIST_SPEC_GAPS}")
 
@@ -924,14 +870,14 @@ def _apply_knowledge_log(content: str, dry_run: bool) -> None:
     header = "# Archivist Knowledge Log\n_Accumulated architecture decisions, bug patterns, and lessons learned._\n"
     if not ARCHIVIST_KNOWLEDGE_LOG.exists():
         ARCHIVIST_KNOWLEDGE_LOG.write_text(header, encoding="utf-8")
-        _track_write(ARCHIVIST_KNOWLEDGE_LOG)
+        track_write(ARCHIVIST_KNOWLEDGE_LOG)
 
     existing = _load_text(ARCHIVIST_KNOWLEDGE_LOG)
     ARCHIVIST_KNOWLEDGE_LOG.write_text(
         existing.rstrip() + "\n\n" + block.strip() + "\n",
         encoding="utf-8",
     )
-    _track_write(ARCHIVIST_KNOWLEDGE_LOG)
+    track_write(ARCHIVIST_KNOWLEDGE_LOG)
 
     print(f"  ✓ Appended to {ARCHIVIST_KNOWLEDGE_LOG}")
 
@@ -1003,7 +949,6 @@ def _prompt_action(
 
 def show_knowledge() -> None:
     print(f"[13] Project: {get_project_name()} ({get_project_slug()})")
-    print(f"[13] Session: {get_session_id() or 'legacy/no-session'}")
 
     if not ARCHIVIST_KNOWLEDGE_LOG.exists():
         print("[13] No archivist knowledge log yet.")
@@ -1015,8 +960,12 @@ def show_knowledge() -> None:
         print(_load_text(ARCHIVIST_SPEC_GAPS))
 
     if ARCHIVIST_CURATION_LOG.exists():
-        logs = _load_json(ARCHIVIST_CURATION_LOG, [])
-        if not isinstance(logs, list):
+        log_data = _load_json(ARCHIVIST_CURATION_LOG, {})
+        if isinstance(log_data, dict):
+            logs = log_data.get("entries", [])
+        elif isinstance(log_data, list):
+            logs = log_data  # migrate legacy bare-list
+        else:
             logs = []
 
         print(f"\n── Curation log: {len(logs)} total records ──")
@@ -1028,17 +977,16 @@ def show_knowledge() -> None:
             mode = record.get("mode", "unknown")
             ts = record.get("timestamp", "")[:10] if "timestamp" in record else "?"
             scope = record.get("scope", "?")
-            session_id = record.get("session_id") or "—"
 
             if mode == "human_fix_capture":
                 print(
-                    f"  {ts}  {mode}  session={session_id}  scope={scope}  "
+                    f"  {ts}  {mode}  scope={scope}  "
                     f"{len(record.get('changed_files', []))} file(s)  "
                     f"{str(record.get('root_cause', ''))[:60]}"
                 )
             else:
                 print(
-                    f"  {ts}  {mode}  session={session_id}  scope={scope}  "
+                    f"  {ts}  {mode}  scope={scope}  "
                     f"{record.get('judge_verdict', '?')}"
                 )
 
@@ -1050,18 +998,21 @@ def show_knowledge() -> None:
 def append_curation_log(record: dict[str, Any]) -> None:
     ARCHIVIST_CURATION_LOG.parent.mkdir(parents=True, exist_ok=True)
 
-    existing_log: list[Any] = []
+    existing_entries: list[Any] = []
     if ARCHIVIST_CURATION_LOG.exists():
-        loaded = _load_json(ARCHIVIST_CURATION_LOG, [])
-        if isinstance(loaded, list):
-            existing_log = loaded
+        loaded = _load_json(ARCHIVIST_CURATION_LOG, {})
+        if isinstance(loaded, dict):
+            existing_entries = loaded.get("entries", [])
+        elif isinstance(loaded, list):
+            # migrate legacy bare-list format
+            existing_entries = loaded
 
-    existing_log.append(record)
+    existing_entries.append(record)
     ARCHIVIST_CURATION_LOG.write_text(
-        json.dumps(existing_log, indent=2, ensure_ascii=False),
+        json.dumps({"entries": existing_entries}, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
-    _track_write(ARCHIVIST_CURATION_LOG)
+    track_write(ARCHIVIST_CURATION_LOG)
 
     print(f"\n[13] Curation log appended to {ARCHIVIST_CURATION_LOG}")
 
@@ -1079,7 +1030,11 @@ def run_judge_driven(args: argparse.Namespace) -> int:
     # Optional context reads for richer access trace and future extension.
     _ = _load_text(JUDGE_VERDICT_SUMMARY)
     _ = _load_json(PLANNER_FULL_PLAN, {})
-    _ = _load_text(PATCHER_FINDINGS_SNAPSHOT)
+
+    # Read last entry of patcher attempt log (replaces removed snapshot file).
+    _patcher_log = _load_json(PATCHER_ATTEMPT_LOG, {})
+    _patcher_entries = _patcher_log.get("entries", []) if isinstance(_patcher_log, dict) else []
+    _ = _patcher_entries[-1] if _patcher_entries else {}
 
     run_ctx = _load_mini_context()
     scope = run_ctx.get("scope", "full")
@@ -1093,7 +1048,6 @@ def run_judge_driven(args: argparse.Namespace) -> int:
         return 0
 
     print(f"[13] Project: {get_project_name()} ({get_project_slug()})")
-    print(f"[13] Session: {get_session_id() or 'legacy/no-session'}")
     print(f"[13] Knowledge update for verdict: {verdict['verdict']}")
     print(f"[13] Run context: {run_summary}")
     print(f"[13] Dry-run: {args.dry_run}  |  Interactive: {interactive}")
@@ -1210,7 +1164,6 @@ def run_judge_driven(args: argparse.Namespace) -> int:
             "mode": "judge_driven",
             "project": get_project_name(),
             "project_slug": get_project_slug(),
-            "session_id": get_session_id(),
             "scope": scope,
             "run_context": run_summary,
             "judge_verdict": verdict.get("verdict"),
@@ -1238,7 +1191,6 @@ def run_judge_driven(args: argparse.Namespace) -> int:
     print("  KNOWLEDGE UPDATE SUMMARY")
     print(f"{'=' * 50}")
     print(f"  Project            : {get_project_name()} ({get_project_slug()})")
-    print(f"  Session            : {get_session_id() or 'legacy/no-session'}")
     print(f"  Scope              : {scope}")
     print(f"  Findings processed : {len(all_findings)}")
     print(f"  Actions applied    : {applied}")
@@ -1259,9 +1211,9 @@ def main() -> None:
     parser = _build_parser()
     args = parser.parse_args()
 
-    _configure_project(args.project, args.session, parser)
+    _configure_project(args.project, parser)
 
-    # Important: project/session env must be configured before ensure_dirs().
+    # Important: project env must be configured before ensure_dirs().
     ensure_dirs()
 
     exit_code = 0
@@ -1282,7 +1234,8 @@ def main() -> None:
         exit_code = 1
 
     finally:
-        _print_artifact_access_summary()
+        print_artifact_summary("[13]")
+        prompt_next_step(ROLE, prefix="[13]")
 
     sys.exit(exit_code)
 

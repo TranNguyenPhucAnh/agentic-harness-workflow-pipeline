@@ -1,7 +1,10 @@
 """
 pipeline/05_spectracker.py
 ==========================
-Spec diff engine — detect what changed between spec versions and map to affected files.
+Spec diff engine — detect what changed between spec versions.
+
+Single responsibility: version tracking and section-level diff.
+Does NOT know about file structure, pipeline topology, or project conventions.
 
 Canonical position in full flow:
     01_absorber
@@ -19,23 +22,20 @@ Canonical position in full flow:
     13_archivist
 
 Reads:
-    artifacts_<slug>/specwright_spec_<slug>.md
-    artifacts_<slug>/state/spectracker_applied_version.json
-    artifacts_<slug>/knowledge/history/<version>.md
-    artifacts_<slug>/knowledge/history/spectracker_version_log.md
+    artifacts_<slug>/spec/specwright_spec_<slug>.md
+    artifacts_<slug>/spectracker/version_log.json
 
 Writes:
-    artifacts_<slug>/cache/spectracker_overwrite_version_delta.json
-    artifacts_<slug>/knowledge/history/<version>.md                    ← write-once
-    artifacts_<slug>/knowledge/history/<version>.changelog.md          ← write-once
-    artifacts_<slug>/knowledge/history/spectracker_version_log.md      ← append-only
+    artifacts_<slug>/spectracker/version_delta.json   ← short-term, overwrite per run
+    artifacts_<slug>/spectracker/version_log.json     ← long-term, append-only
+                                                        (snapshot + applied state merged)
 
-Finalization write:
-    artifacts_<slug>/state/spectracker_applied_version.json
+Finalization write (called by harness only, after successful full-scope run):
+    Updates applied=true on the relevant entry in version_log.json.
 
 Important lifecycle note:
     Normal spectracker runs compute a proposed delta but DO NOT mark the version
-    as applied. The harness should call write_applied() only after the downstream
+    as applied. The harness calls write_applied() only after the downstream
     full-scope pipeline succeeds. This prevents a spec version from being marked
     applied before implementation/test/judge completion.
 
@@ -51,7 +51,7 @@ History:
     python 05_spectracker.py --project my-app --history --last 3
 
 Manual applied-state recovery/fallback:
-    python 05_spectracker.py --project my-app --mark-applied --status PASS --steps scaffolder,planner,executor,debugger,reporter,judge
+    python 05_spectracker.py --project my-app --mark-applied --status PASS
 
 Default missing-spec behavior:
     If specwright_spec_<slug>.md does not exist, spectracker skips cleanly and
@@ -69,71 +69,35 @@ import os
 import re
 import sys
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 # === WRITE AUTHORITY: spectracker ===
-# OWNS  : artifacts_<slug>/cache/spectracker_overwrite_version_delta.json
-#         artifacts_<slug>/state/spectracker_applied_version.json
-#         artifacts_<slug>/knowledge/history/spectracker_version_log.md
-#         artifacts_<slug>/knowledge/history/<version>.md            (dynamic, write-once)
-#         artifacts_<slug>/knowledge/history/<version>.changelog.md  (dynamic, write-once)
-# READS : artifacts_<slug>/specwright_spec_<slug>.md
-#         artifacts_<slug>/state/spectracker_applied_version.json
-#         artifacts_<slug>/knowledge/history/<version>.md            (dynamic snapshots)
-#         artifacts_<slug>/knowledge/history/spectracker_version_log.md
+# OWNS  : artifacts_<slug>/spectracker/version_delta.json    (short-term, overwrite)
+#          artifacts_<slug>/spectracker/version_log.json     (long-term, append + update applied)
+# READS : artifacts_<slug>/spec/specwright_spec_<slug>.md
+#          artifacts_<slug>/spectracker/version_log.json     (self-read for delta baseline)
 
-import sys as _sys
-
-_sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from artifacts.paths import (  # noqa: E402
-    HISTORY_DIR,
-    SPECTRACKER_APPLIED,
     SPECTRACKER_VERSION_DELTA,
     SPECTRACKER_VERSION_LOG,
     ensure_dirs,
     get_spec_path,
 )
+from modules.artifact_tracking import track_read, track_write, print_summary as print_artifact_summary  # noqa: E402
+from modules.post_interactive import prompt_next_step  # noqa: E402
 
 
-# Local aliases — map canonical constants to short internal names.
-KNOWLEDGE_HISTORY_DIR = HISTORY_DIR
-CHANGELOG = SPECTRACKER_VERSION_LOG
+# ════════════════════════════════════════════════════════════════════════════
+# Constants
+# ════════════════════════════════════════════════════════════════════════════
+
+ROLE = "spectracker"
 DELTA_OUT = SPECTRACKER_VERSION_DELTA
-APPLIED_PATH = SPECTRACKER_APPLIED
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# Artifact access tracking
-# ════════════════════════════════════════════════════════════════════════════
-
-_ARTIFACTS_READ: set[str] = set()
-_ARTIFACTS_WRITTEN: set[str] = set()
-
-
-def _track_read(path: Any) -> None:
-    _ARTIFACTS_READ.add(str(path))
-
-
-def _track_write(path: Any) -> None:
-    _ARTIFACTS_WRITTEN.add(str(path))
-
-
-def _print_artifact_access_summary() -> None:
-    print("[spectracker] Artifacts read:")
-    if _ARTIFACTS_READ:
-        for item in sorted(_ARTIFACTS_READ):
-            print(f"[spectracker]   READ  {item}")
-    else:
-        print("[spectracker]   READ  (none)")
-
-    print("[spectracker] Artifacts created/updated/overwritten/appended:")
-    if _ARTIFACTS_WRITTEN:
-        for item in sorted(_ARTIFACTS_WRITTEN):
-            print(f"[spectracker]   WRITE {item}")
-    else:
-        print("[spectracker]   WRITE (none)")
+VERSION_LOG = SPECTRACKER_VERSION_LOG
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -144,12 +108,6 @@ def _configure_project(
     project: str | None,
     parser: argparse.ArgumentParser,
 ) -> None:
-    """
-    Configure project context for direct execution.
-
-    Harness normally sets PIPELINE_PROJECT before invoking this script.
-    Direct usage can pass --project.
-    """
     if project:
         os.environ["PIPELINE_PROJECT"] = project
         return
@@ -163,18 +121,6 @@ def _configure_project(
     )
 
 
-def _safe_version_filename(version: str) -> str:
-    """
-    Keep version-based dynamic filenames safe.
-
-    Allows common semver-ish/version characters while replacing path separators
-    and other unsafe chars with '-'.
-    """
-    cleaned = re.sub(r"[^A-Za-z0-9._+-]+", "-", version.strip())
-    cleaned = cleaned.strip("-")
-    return cleaned or "unknown"
-
-
 # ════════════════════════════════════════════════════════════════════════════
 # Section parser
 # ════════════════════════════════════════════════════════════════════════════
@@ -182,7 +128,7 @@ def _safe_version_filename(version: str) -> str:
 @dataclass
 class SpecSection:
     key: str      # "4.3", "10", "0" etc.
-    title: str    # "4.3 `AnomalyFeed`"
+    title: str    # "4.3 Some Title"
     content: str  # full text of the section: header + body
     hash: str     # sha256 of content for change detection
 
@@ -239,534 +185,6 @@ def parse_sections(text: str) -> dict[str, SpecSection]:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# File → section mapping
-# ════════════════════════════════════════════════════════════════════════════
-
-_STATIC_SECTION_FILE_MAP: dict[str, list[str]] = {
-    "3": [
-        "src/App.tsx",
-        "src/main.tsx",
-    ],
-    "4.1": [
-        "src/components/SummaryStickyBar.tsx",
-        "tests/components/SummaryStickyBar.test.tsx",
-    ],
-    "4.2": [
-        "src/components/ReplayControls.tsx",
-        "tests/components/ReplayControls.test.tsx",
-    ],
-    "4.3": [
-        "src/components/AnomalyFeed.tsx",
-        "tests/components/AnomalyFeed.test.tsx",
-    ],
-    "4.4": [
-        "src/components/ModelGates.tsx",
-        "tests/components/ModelGates.test.tsx",
-    ],
-    "4.5": [
-        "src/hooks/useSensorData.ts",
-        "tests/hooks/useSensorData.test.ts",
-    ],
-    "4.6": [
-        "src/hooks/useReplay.ts",
-        "tests/hooks/useReplay.test.ts",
-    ],
-    "5": [
-        "src/types/sensor.ts",
-    ],
-    "6": [
-        "src/data/demoConstants.ts",
-    ],
-    "7": [],
-    "10": [],
-}
-
-_SCAFFOLDER_TRIGGER_SECTIONS = {"7", "8"}
-_TEST_ONLY_TRIGGER_SECTIONS = {"10"}
-_IGNORED_SECTIONS = {"0", "1", "2", "9", "11"}
-
-
-def _test_file_for_src(fp: str) -> str:
-    """
-    Derive a test file path from a src/ file path.
-
-    Examples:
-        src/hooks/useReplay.ts       → tests/hooks/useReplay.test.ts
-        src/components/Card.tsx      → tests/components/Card.test.tsx
-    """
-    test_fp = fp.replace("src/", "tests/", 1)
-    test_fp = re.sub(r"\.(tsx?)$", r".test.\1", test_fp)
-    return test_fp
-
-
-def _dedupe_sorted(items: list[str]) -> list[str]:
-    return sorted(dict.fromkeys(items))
-
-
-def _extract_file_map_from_spec(
-    sections: dict[str, SpecSection],
-) -> dict[str, list[str]]:
-    """
-    Build section → files map.
-
-    Starts with the static known mapping, then augments it with explicit spec
-    declarations of the form:
-
-        **File:** `src/foo/bar.ts`
-    """
-    file_map = {k: list(v) for k, v in _STATIC_SECTION_FILE_MAP.items()}
-
-    file_re = re.compile(r"\*\*File:\*\*\s+`(src/[^`]+)`")
-
-    for key, section in sections.items():
-        found = file_re.findall(section.content)
-        for fp in found:
-            existing = file_map.setdefault(key, [])
-
-            if fp not in existing:
-                existing.append(fp)
-
-            test_fp = _test_file_for_src(fp)
-            if test_fp not in existing:
-                existing.append(test_fp)
-
-    return {key: _dedupe_sorted(files) for key, files in file_map.items()}
-
-
-def _merge_file_maps(*maps: dict[str, list[str]]) -> dict[str, list[str]]:
-    merged: dict[str, list[str]] = {}
-
-    for fmap in maps:
-        for key, files in fmap.items():
-            bucket = merged.setdefault(key, [])
-            for fp in files:
-                if fp not in bucket:
-                    bucket.append(fp)
-
-    return {key: _dedupe_sorted(files) for key, files in merged.items()}
-
-
-def _all_files_from_map(file_map: dict[str, list[str]]) -> list[str]:
-    files: list[str] = []
-
-    for mapped in file_map.values():
-        for fp in mapped:
-            if fp not in files:
-                files.append(fp)
-
-    return sorted(files)
-
-
-def _files_for_changed_sections(
-    impacted_sections: list[str],
-    file_map: dict[str, list[str]],
-    all_known_files: list[str],
-) -> tuple[list[str], list[str]]:
-    affected: set[str] = set()
-
-    for key in impacted_sections:
-        if key in _IGNORED_SECTIONS or key in _SCAFFOLDER_TRIGGER_SECTIONS:
-            continue
-
-        for fp in file_map.get(key, []):
-            affected.add(fp)
-
-    # Type contract changes affect hooks/components and their tests.
-    if "5" in impacted_sections:
-        for fp in all_known_files:
-            if fp.startswith("src/hooks/") or fp.startswith("src/components/"):
-                affected.add(fp)
-                affected.add(_test_file_for_src(fp))
-
-    # Demo constants/data changes affect hooks and their tests.
-    if "6" in impacted_sections:
-        for fp in all_known_files:
-            if fp.startswith("src/hooks/"):
-                affected.add(fp)
-                affected.add(_test_file_for_src(fp))
-
-    unaffected = [f for f in all_known_files if f not in affected]
-    return sorted(affected), sorted(unaffected)
-
-
-def _decide_rerun_steps(
-    impacted_sections: list[str],
-    affected_files: list[str],
-    is_first_run: bool,
-) -> dict[str, bool]:
-    """
-    Decide downstream harness steps.
-
-    Canonical keys intentionally match harness step names:
-      - scaffolder
-      - planner
-      - executor
-      - debugger
-      - reporter
-      - judge
-    """
-    if is_first_run:
-        return {
-            "scaffolder": True,
-            "planner": True,
-            "executor": True,
-            "debugger": True,
-            "reporter": True,
-            "judge": True,
-        }
-
-    scaffolder = bool(affected_files) or any(
-        key in _SCAFFOLDER_TRIGGER_SECTIONS for key in impacted_sections
-    )
-
-    planner = bool(affected_files)
-    executor = bool(affected_files)
-
-    debugger = executor or any(
-        key in _TEST_ONLY_TRIGGER_SECTIONS for key in impacted_sections
-    )
-
-    reporter = any((scaffolder, planner, executor, debugger))
-    judge = debugger
-
-    return {
-        "scaffolder": scaffolder,
-        "planner": planner,
-        "executor": executor,
-        "debugger": debugger,
-        "reporter": reporter,
-        "judge": judge,
-    }
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# History management
-# ════════════════════════════════════════════════════════════════════════════
-
-def _snapshot_path(version: str) -> Path:
-    return KNOWLEDGE_HISTORY_DIR / f"{_safe_version_filename(version)}.md"
-
-
-def _per_version_changelog_path(version: str) -> Path:
-    return KNOWLEDGE_HISTORY_DIR / f"{_safe_version_filename(version)}.changelog.md"
-
-
-def _save_snapshot_write_once(version: str, text: str) -> tuple[Path, bool]:
-    """
-    Save raw spec snapshot to knowledge/history/<ver>.md.
-
-    Write-once semantics:
-      - If absent, create it.
-      - If present, leave untouched.
-    Returns:
-      (path, created)
-    """
-    KNOWLEDGE_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
-    path = _snapshot_path(version)
-
-    if path.exists():
-        _track_read(path)
-        return path, False
-
-    path.write_text(text)
-    _track_write(path)
-    return path, True
-
-
-def _load_latest_snapshot(exclude_version: str) -> tuple[str | None, str | None]:
-    """Return (version, text) of the most recent snapshot != exclude_version."""
-    if not KNOWLEDGE_HISTORY_DIR.exists():
-        return None, None
-
-    exclude_stem = _safe_version_filename(exclude_version)
-
-    snapshots = sorted(
-        [
-            p
-            for p in KNOWLEDGE_HISTORY_DIR.glob("*.md")
-            if not p.name.endswith(".changelog.md")
-            and p.name != "spectracker_version_log.md"
-        ],
-        key=lambda p: p.stem,
-    )
-
-    for snap in reversed(snapshots):
-        ver = snap.stem
-        if ver != exclude_stem:
-            _track_read(snap)
-            return ver, snap.read_text()
-
-    return None, None
-
-
-def _load_snapshot(version: str) -> str | None:
-    path = _snapshot_path(version)
-
-    if not path.exists():
-        return None
-
-    _track_read(path)
-    return path.read_text()
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# Applied state
-# ════════════════════════════════════════════════════════════════════════════
-
-def load_applied() -> dict | None:
-    if not APPLIED_PATH.exists():
-        return None
-
-    try:
-        _track_read(APPLIED_PATH)
-        return json.loads(APPLIED_PATH.read_text())
-    except Exception:
-        return None
-
-
-def get_last_applied_version() -> str | None:
-    applied = load_applied()
-    return applied.get("last_applied_version") if applied else None
-
-
-def write_applied(
-    version: str,
-    steps: list[str] | None = None,
-    status: str = "PASS",
-) -> None:
-    """
-    Mark a spec version as applied.
-
-    Intended caller:
-        harness.py finalization, after downstream full-scope pipeline success.
-
-    This function owns writes to:
-        state/spectracker_applied_version.json
-
-    Lifecycle:
-        hybrid — top-level fields overwrite; run_history[] appends.
-    """
-    from datetime import datetime, timezone
-
-    status = status.upper().strip()
-    steps = steps or []
-
-    now = datetime.now(timezone.utc).isoformat()
-
-    applied = load_applied() or {"run_history": []}
-
-    applied["last_applied_version"] = version
-    applied["applied_at"] = now
-    applied["applied_steps"] = steps
-    applied["final_status"] = status
-
-    run_history: list[dict[str, Any]] = applied.get("run_history", [])
-    run_history.append(
-        {
-            "version": version,
-            "applied_at": now,
-            "status": status,
-            "steps": steps,
-        }
-    )
-    applied["run_history"] = run_history
-
-    APPLIED_PATH.parent.mkdir(parents=True, exist_ok=True)
-    APPLIED_PATH.write_text(json.dumps(applied, indent=2))
-    _track_write(APPLIED_PATH)
-
-
-def print_run_history() -> None:
-    applied = load_applied()
-
-    if not applied:
-        print("[spectracker] No run history yet.")
-        return
-
-    history = applied.get("run_history", [])
-    print(f"\n[spectracker] Run history ({len(history)} run(s)):")
-
-    for entry in history:
-        icon = "✅" if entry.get("status") == "PASS" else "❌"
-        steps = ", ".join(entry.get("steps", []))
-        version = entry.get("version", "?")
-        applied_at = entry.get("applied_at", "?")[:19]
-        print(f"  {icon} {version}  {applied_at}  [{steps}]")
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# Changelog management
-# ════════════════════════════════════════════════════════════════════════════
-
-def _changelog_has_version(version: str) -> bool:
-    if not CHANGELOG.exists():
-        return False
-
-    _track_read(CHANGELOG)
-    content = CHANGELOG.read_text()
-    pattern = rf"^## \[{re.escape(version)}\]\s+—"
-    return bool(re.search(pattern, content, flags=re.MULTILINE))
-
-
-def _build_changelog_entry(delta: "SpecDelta") -> str:
-    from datetime import datetime, timezone
-
-    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-    lines: list[str] = [
-        f"## [{delta.to_version}] — {date_str}",
-        f"_(from {delta.from_version or 'initial'})_",
-        "",
-    ]
-
-    if delta.changed_sections or delta.new_sections or delta.removed_sections:
-        if delta.new_sections:
-            lines.append("### Added")
-            for sec in delta.new_sections:
-                note = delta.section_summaries.get(sec, "new section")
-                lines.append(f"- §{sec}: {note}")
-            lines.append("")
-
-        if delta.changed_sections:
-            lines.append("### Changed")
-            for sec in delta.changed_sections:
-                note = delta.section_summaries.get(sec, "")
-                lines.append(f"- §{sec}{': ' + note if note else ''}")
-            lines.append("")
-
-        if delta.removed_sections:
-            lines.append("### Removed")
-            for sec in delta.removed_sections:
-                note = delta.section_summaries.get(sec, "section removed")
-                lines.append(f"- §{sec}: {note}")
-            lines.append("")
-    else:
-        lines += ["### No section changes detected", ""]
-
-    if delta.affected_files:
-        lines.append("### Affected files")
-        for fp in delta.affected_files:
-            lines.append(f"- `{fp}`")
-        lines.append("")
-
-    rerun = [k for k, v in delta.rerun_steps.items() if v]
-    if rerun:
-        lines.append(f"### Steps re-run: {', '.join(rerun)}")
-        lines.append("")
-    else:
-        lines.append("### Steps re-run: none")
-        lines.append("")
-
-    lines.append("---")
-    lines.append("")
-
-    return "\n".join(lines)
-
-
-def _append_changelog_write_once(delta: "SpecDelta") -> tuple[bool, bool]:
-    """
-    Append aggregate changelog entry and create per-version changelog.
-
-    Write-once semantics:
-      - Aggregate log appends entry only if this version is not already present.
-      - Per-version changelog is created only if absent.
-
-    Returns:
-      (aggregate_appended, per_version_created)
-    """
-    entry = _build_changelog_entry(delta)
-
-    aggregate_appended = False
-    per_version_created = False
-
-    CHANGELOG.parent.mkdir(parents=True, exist_ok=True)
-    if not _changelog_has_version(delta.to_version):
-        existing = ""
-        if CHANGELOG.exists():
-            _track_read(CHANGELOG)
-            existing = CHANGELOG.read_text()
-
-        CHANGELOG.write_text(existing + entry)
-        _track_write(CHANGELOG)
-        aggregate_appended = True
-
-    KNOWLEDGE_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
-    cl_path = _per_version_changelog_path(delta.to_version)
-
-    if cl_path.exists():
-        _track_read(cl_path)
-    else:
-        cl_path.write_text(entry)
-        _track_write(cl_path)
-        per_version_created = True
-
-    return aggregate_appended, per_version_created
-
-
-def print_changelog(n: int = 0) -> None:
-    if not CHANGELOG.exists():
-        print("[spectracker] No changelog yet.")
-        return
-
-    _track_read(CHANGELOG)
-    content = CHANGELOG.read_text()
-
-    if not n:
-        print(content)
-        return
-
-    entries = re.split(r"(?=^## \[)", content, flags=re.MULTILINE)
-    entries = [e for e in entries if e.strip()]
-
-    for entry in entries[-n:]:
-        print(entry)
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# Section summary generator
-# ════════════════════════════════════════════════════════════════════════════
-
-def _summarise_change(key: str, old_content: str, new_content: str) -> str:
-    _ = key
-
-    old_lines = set(old_content.splitlines())
-    new_lines = set(new_content.splitlines())
-
-    added = [line.strip() for line in (new_lines - old_lines) if line.strip()]
-    removed = [line.strip() for line in (old_lines - new_lines) if line.strip()]
-
-    prop_added = [
-        line
-        for line in added
-        if line.startswith(("export ", "interface ", "type ", "  ")) and ":" in line
-    ]
-    prop_removed = [
-        line
-        for line in removed
-        if line.startswith(("export ", "interface ", "type ", "  ")) and ":" in line
-    ]
-
-    parts: list[str] = []
-
-    if prop_added:
-        parts.append(f"added: {prop_added[0][:80]}")
-
-    if prop_removed:
-        parts.append(f"removed: {prop_removed[0][:80]}")
-
-    if not parts and added:
-        parts.append(f"+{len(added)} line(s)")
-
-    if not parts and removed:
-        parts.append(f"-{len(removed)} line(s)")
-
-    if not parts:
-        parts.append("content changed")
-
-    return "; ".join(parts)
-
-
-# ════════════════════════════════════════════════════════════════════════════
 # Core diff logic
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -779,17 +197,47 @@ class SpecDelta:
     unchanged_sections: list[str]
     new_sections: list[str]
     removed_sections: list[str]
-    affected_files: list[str]
-    unaffected_files: list[str]
-    rerun_steps: dict[str, bool]
     section_summaries: dict[str, str]
     baseline_source: str | None = None
+
+
+def _summarise_change(key: str, old_content: str, new_content: str) -> str:
+    _ = key
+
+    old_lines = set(old_content.splitlines())
+    new_lines = set(new_content.splitlines())
+
+    added = [line.strip() for line in (new_lines - old_lines) if line.strip()]
+    removed = [line.strip() for line in (old_lines - new_lines) if line.strip()]
+
+    prop_added = [
+        line for line in added
+        if line.startswith(("export ", "interface ", "type ", "  ")) and ":" in line
+    ]
+    prop_removed = [
+        line for line in removed
+        if line.startswith(("export ", "interface ", "type ", "  ")) and ":" in line
+    ]
+
+    parts: list[str] = []
+
+    if prop_added:
+        parts.append(f"added: {prop_added[0][:80]}")
+    if prop_removed:
+        parts.append(f"removed: {prop_removed[0][:80]}")
+    if not parts and added:
+        parts.append(f"+{len(added)} line(s)")
+    if not parts and removed:
+        parts.append(f"-{len(removed)} line(s)")
+    if not parts:
+        parts.append("content changed")
+
+    return "; ".join(parts)
 
 
 def compute_delta(
     current_text: str,
     previous_text: str | None,
-    all_known_files: list[str] | None = None,
     baseline_source: str | None = None,
 ) -> SpecDelta:
     current_ver = parse_spec_version(current_text)
@@ -807,10 +255,6 @@ def compute_delta(
 
     if is_first_run:
         changed = sorted(current_secs.keys(), key=_section_sort_key)
-        unchanged = []
-        new_secs = []
-        removed = []
-
         for key in changed:
             summaries[key] = "initial section"
     else:
@@ -833,30 +277,6 @@ def compute_delta(
             else:
                 unchanged.append(key)
 
-    current_file_map = _extract_file_map_from_spec(current_secs)
-    previous_file_map = _extract_file_map_from_spec(prev_secs) if prev_secs else {}
-    file_map = _merge_file_maps(previous_file_map, current_file_map)
-
-    if all_known_files is None:
-        all_known_files = _all_files_from_map(file_map)
-
-    impacted_sections = sorted(
-        set(changed + new_secs + removed),
-        key=_section_sort_key,
-    )
-
-    affected, unaffected = _files_for_changed_sections(
-        impacted_sections,
-        file_map,
-        all_known_files,
-    )
-
-    rerun = _decide_rerun_steps(
-        impacted_sections,
-        affected,
-        is_first_run,
-    )
-
     return SpecDelta(
         from_version=prev_ver,
         to_version=current_ver,
@@ -865,9 +285,6 @@ def compute_delta(
         unchanged_sections=unchanged,
         new_sections=new_secs,
         removed_sections=removed,
-        affected_files=affected,
-        unaffected_files=unaffected,
-        rerun_steps=rerun,
         section_summaries=summaries,
         baseline_source=baseline_source,
     )
@@ -886,16 +303,189 @@ def _print_delta_summary(delta: SpecDelta) -> None:
         print(f"[spectracker] New      §: {delta.new_sections or '(none)'}")
         print(f"[spectracker] Removed  §: {delta.removed_sections or '(none)'}")
 
-    print(f"[spectracker] Affected files   : {len(delta.affected_files)}")
-    for fp in delta.affected_files:
-        print(f"    {fp}")
+        for sec in delta.changed_sections:
+            if sec in delta.section_summaries:
+                print(f"    §{sec}: {delta.section_summaries[sec]}")
 
-    print(f"[spectracker] Unaffected files : {len(delta.unaffected_files)}")
-    print(
-        "[spectracker] Re-run steps     : "
-        f"{[k for k, v in delta.rerun_steps.items() if v] or '(none)'}"
+
+# ════════════════════════════════════════════════════════════════════════════
+# version_log.json management
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Schema: { "entries": [ <VersionLogEntry>, ... ] }
+#
+# Each entry:
+# {
+#   "version": "v1.3",
+#   "generated_at": "2026-05-16T08:00:00Z",
+#   "applied": false,
+#   "applied_at": null,
+#   "changed_sections": ["2", "4"],
+#   "affected_files": ["src/auth/service.py"],
+#   "spec_content": "..."   ← full spec text at this version (replaces per-file snapshots)
+# }
+# ════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class VersionLogEntry:
+    version: str
+    generated_at: str
+    applied: bool
+    applied_at: str | None
+    changed_sections: list[str]
+    affected_files: list[str]
+    spec_content: str
+
+
+def _load_version_log() -> list[dict[str, Any]]:
+    """Load version_log.json entries. Returns [] if file missing or corrupt."""
+    if not VERSION_LOG.exists():
+        return []
+
+    try:
+        track_read(VERSION_LOG)
+        data = json.loads(Path(VERSION_LOG).read_text())
+        if isinstance(data, dict):
+            return data.get("entries", [])
+        if isinstance(data, list):
+            return data
+        return []
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def _save_version_log(entries: list[dict[str, Any]]) -> None:
+    """Write version_log.json atomically."""
+    VERSION_LOG.parent.mkdir(parents=True, exist_ok=True)
+    Path(VERSION_LOG).write_text(json.dumps({"entries": entries}, indent=2))
+    track_write(VERSION_LOG)
+
+
+def _find_entry_by_version(
+    entries: list[dict[str, Any]],
+    version: str,
+) -> dict[str, Any] | None:
+    """Find the latest entry matching a version string."""
+    for entry in reversed(entries):
+        if entry.get("version") == version:
+            return entry
+    return None
+
+
+def _append_version_log_entry(
+    delta: SpecDelta,
+    spec_content: str,
+    affected_files: list[str] | None = None,
+) -> bool:
+    """
+    Append a new entry to version_log.json for the current version.
+
+    Returns True if appended, False if this version already has an entry
+    (write-once per version semantics for the snapshot).
+    """
+    entries = _load_version_log()
+
+    # Write-once: don't duplicate if version already logged
+    if _find_entry_by_version(entries, delta.to_version) is not None:
+        return False
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Merge changed + new sections as the "changed" set for downstream consumers
+    all_changed = sorted(
+        set(delta.changed_sections + delta.new_sections),
+        key=_section_sort_key,
     )
 
+    entry: dict[str, Any] = {
+        "version": delta.to_version,
+        "generated_at": now,
+        "applied": False,
+        "applied_at": None,
+        "changed_sections": all_changed,
+        "affected_files": affected_files or [],
+        "spec_content": spec_content,
+    }
+
+    entries.append(entry)
+    _save_version_log(entries)
+    return True
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Applied state (merged into version_log.json)
+# ════════════════════════════════════════════════════════════════════════════
+
+def get_last_applied_version() -> str | None:
+    """Return the version string of the most recently applied entry, or None."""
+    entries = _load_version_log()
+
+    for entry in reversed(entries):
+        if entry.get("applied"):
+            return entry.get("version")
+
+    return None
+
+
+def load_applied() -> dict[str, Any] | None:
+    """
+    Backward-compatible: return a dict resembling the old applied state.
+    Returns None if no version has been applied yet.
+    """
+    entries = _load_version_log()
+
+    for entry in reversed(entries):
+        if entry.get("applied"):
+            return {
+                "last_applied_version": entry["version"],
+                "applied_at": entry.get("applied_at"),
+                "final_status": "PASS",
+            }
+
+    return None
+
+
+def write_applied(
+    version: str,
+    status: str = "PASS",
+) -> None:
+    """
+    Mark a spec version as applied by updating its entry in version_log.json.
+
+    Intended caller:
+        harness.py finalization, after downstream full-scope pipeline success.
+
+    If the version entry doesn't exist yet (edge case: manual --mark-applied
+    before a normal run), creates a minimal entry.
+    """
+    status = status.upper().strip()
+    now = datetime.now(timezone.utc).isoformat()
+
+    entries = _load_version_log()
+    entry = _find_entry_by_version(entries, version)
+
+    if entry is not None:
+        entry["applied"] = True
+        entry["applied_at"] = now
+    else:
+        # Create minimal entry for manual mark-applied
+        entries.append({
+            "version": version,
+            "generated_at": now,
+            "applied": True,
+            "applied_at": now,
+            "changed_sections": [],
+            "affected_files": [],
+            "spec_content": "",
+        })
+
+    _save_version_log(entries)
+    print(f"[spectracker] Applied: {version} ({status}) at {now}")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Baseline resolution (replaces old snapshot file approach)
+# ════════════════════════════════════════════════════════════════════════════
 
 def _determine_baseline(
     current_ver: str,
@@ -903,34 +493,79 @@ def _determine_baseline(
 ) -> tuple[str | None, str]:
     """
     Return (previous_text, baseline_source).
+
+    Priority:
+      1. --from <version>  (explicit override) — lookup in version_log.json
+      2. last applied version's spec_content from version_log.json
+      3. latest entry in version_log.json != current version
+      4. None (first run)
     """
+    entries = _load_version_log()
+
     if from_version:
-        prev_text = _load_snapshot(from_version)
+        entry = _find_entry_by_version(entries, from_version)
+        if entry is None or not entry.get("spec_content"):
+            raise FileNotFoundError(
+                f"Version '{from_version}' not found in version_log.json "
+                f"or has empty spec_content."
+            )
+        return entry["spec_content"], f"--from {from_version}"
 
-        if prev_text is None:
-            raise FileNotFoundError(f"snapshot {from_version} not found")
-
-        return prev_text, f"--from {from_version}"
-
+    # Try last applied version
     last_applied = get_last_applied_version()
-
     if last_applied and last_applied != current_ver:
-        prev_text = _load_snapshot(last_applied)
+        entry = _find_entry_by_version(entries, last_applied)
+        if entry and entry.get("spec_content"):
+            return entry["spec_content"], f"last applied ({last_applied})"
 
-        if prev_text is not None:
-            return prev_text, f"last applied ({last_applied})"
-
+        # Fallback: latest entry != current
         print(
-            f"[spectracker] WARN: last applied snapshot {last_applied} not found; "
-            "falling back to latest snapshot.",
+            f"[spectracker] WARN: last applied version {last_applied} has no "
+            "spec_content; falling back to latest entry.",
             file=sys.stderr,
         )
 
-        _, fallback_text = _load_latest_snapshot(exclude_version=current_ver)
-        return fallback_text, "latest snapshot"
+    # Fallback: latest entry with spec_content != current version
+    for entry in reversed(entries):
+        if entry.get("version") != current_ver and entry.get("spec_content"):
+            return entry["spec_content"], f"latest logged ({entry['version']})"
 
-    _, prev_text = _load_latest_snapshot(exclude_version=current_ver)
-    return prev_text, "latest snapshot"
+    # No baseline found — first run
+    return None, "first run (no baseline)"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# History display
+# ════════════════════════════════════════════════════════════════════════════
+
+def print_history(n: int = 0) -> None:
+    """Print version_log.json entries in human-readable format."""
+    entries = _load_version_log()
+
+    if not entries:
+        print("[spectracker] No version history yet.")
+        return
+
+    display = entries[-n:] if n > 0 else entries
+
+    print(f"\n[spectracker] Version history ({len(entries)} total, showing {len(display)}):")
+    print("-" * 60)
+
+    for entry in display:
+        version = entry.get("version", "?")
+        generated = entry.get("generated_at", "?")[:19]
+        applied = entry.get("applied", False)
+        applied_at = (entry.get("applied_at") or "")[:19]
+        changed = entry.get("changed_sections", [])
+
+        icon = "✅" if applied else "⏳"
+        applied_str = f"  applied {applied_at}" if applied else "  (pending)"
+
+        print(f"  {icon} {version}  generated {generated}{applied_str}")
+        if changed:
+            print(f"      changed §: {changed}")
+
+    print()
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -940,9 +575,17 @@ def _determine_baseline(
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="05_spectracker.py",
-        description="Spec diff engine",
+        description="Spec diff engine — section-level version tracking.",
     )
 
+    parser.add_argument(
+        "--preflight",
+        action="store_true",
+        help=(
+            "Run as a silent preflight check (called by harness before mid-pipeline steps). "
+            "Skips post-run prompts and long-term artifact commit."
+        ),
+    )
     parser.add_argument(
         "--project",
         default=None,
@@ -964,29 +607,27 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--history",
         action="store_true",
-        help="Print spectracker_version_log.md and run history, then exit.",
+        help="Print version history and applied state, then exit.",
     )
     parser.add_argument(
         "--last",
         type=int,
         default=0,
         metavar="N",
-        help="With --history: show only last N changelog entries. 0 = all.",
+        help="With --history: show only last N entries. 0 = all.",
     )
     parser.add_argument(
         "--strict",
         action="store_true",
         help="Treat missing canonical spec as an error instead of a clean skip.",
     )
-
-    # Applied-state finalization / recovery.
     parser.add_argument(
         "--mark-applied",
         action="store_true",
         help=(
             "Mark the current or supplied spec version as applied. Intended as "
-            "manual fallback; harness should normally call write_applied() "
-            "after successful full-scope completion."
+            "manual fallback; harness calls write_applied() automatically after "
+            "successful full-scope completion."
         ),
     )
     parser.add_argument(
@@ -1003,14 +644,6 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=["PASS", "FAIL"],
         help="Status to record with --mark-applied.",
     )
-    parser.add_argument(
-        "--steps",
-        default="",
-        help=(
-            "Comma-separated applied steps for --mark-applied, e.g. "
-            "scaffolder,planner,executor,debugger,reporter,judge"
-        ),
-    )
 
     return parser
 
@@ -1021,28 +654,17 @@ def _handle_mark_applied(args: argparse.Namespace) -> None:
     if not version:
         spec_path = get_spec_path()
         if not spec_path.exists():
-            msg = (
+            print(
                 f"[spectracker] ERROR: cannot infer version because "
-                f"{spec_path} does not exist. Pass --version explicitly."
+                f"{spec_path} does not exist. Pass --version explicitly.",
+                file=sys.stderr,
             )
-            print(msg, file=sys.stderr)
             sys.exit(1)
 
-        _track_read(spec_path)
+        track_read(spec_path)
         version = parse_spec_version(spec_path.read_text())
 
-    steps = [s.strip() for s in args.steps.split(",") if s.strip()]
-
-    write_applied(
-        version=version,
-        steps=steps,
-        status=args.status,
-    )
-
-    print(
-        f"[spectracker] Applied version updated → {APPLIED_PATH} "
-        f"({version}, {args.status})"
-    )
+    write_applied(version=version, status=args.status)
 
 
 def main() -> None:
@@ -1059,8 +681,7 @@ def main() -> None:
         ensure_dirs()
 
         if args.history:
-            print_changelog(n=args.last)
-            print_run_history()
+            print_history(n=args.last)
             return
 
         if args.mark_applied:
@@ -1081,7 +702,7 @@ def main() -> None:
             print(msg)
             return
 
-        _track_read(spec_path)
+        track_read(spec_path)
         current_text = spec_path.read_text()
         current_ver = parse_spec_version(current_text)
 
@@ -1105,23 +726,39 @@ def main() -> None:
         if args.show:
             return
 
-        # Write session delta.
+        # ── Write short-term: version_delta.json (overwrite per run) ──
         DELTA_OUT.parent.mkdir(parents=True, exist_ok=True)
-        DELTA_OUT.write_text(json.dumps(asdict(delta), indent=2))
-        _track_write(DELTA_OUT)
-        print(f"[spectracker] Delta     → {DELTA_OUT}")
+        Path(DELTA_OUT).write_text(json.dumps(asdict(delta), indent=2))
+        track_write(DELTA_OUT)
+        print(f"[spectracker] Delta       → {DELTA_OUT}")
 
-        # Write-once raw spec snapshot.
-        snapshot_path, snapshot_created = _save_snapshot_write_once(
-            current_ver,
-            current_text,
+        # ── Append long-term: version_log.json (write-once per version) ──
+        #
+        # Preflight mode: auto-append only if there is a real version bump
+        # (changed/new/removed sections). No prompt — silent.
+        # Normal mode: always append (post_interactive handles keep/discard prompt).
+        is_preflight    = getattr(args, "preflight", False)
+        has_version_bump = bool(
+            delta.changed_sections
+            or delta.new_sections
+            or delta.removed_sections
         )
-        if snapshot_created:
-            print(f"[spectracker] Snapshot  → {snapshot_path}")
-        else:
-            print(f"[spectracker] Snapshot  → {snapshot_path} (exists; write-once)")
 
-        # Changelog only if this is an initial run, a new version, or there are changes.
+        if is_preflight and not has_version_bump:
+            print(f"[spectracker] Version log → skipped (preflight, no changes)")
+        else:
+            appended = _append_version_log_entry(
+                delta=delta,
+                spec_content=current_text,
+                affected_files=[],  # populated by downstream consumers if needed
+            )
+            if appended:
+                label = " (auto-appended, preflight)" if is_preflight else f" (new entry: {delta.to_version})"
+                print(f"[spectracker] Version log → {VERSION_LOG}{label}")
+            else:
+                print(f"[spectracker] Version log → {VERSION_LOG} (entry for {delta.to_version} already exists)")
+
+        # Summary
         has_section_delta = bool(
             delta.is_first_run
             or delta.changed_sections
@@ -1130,26 +767,9 @@ def main() -> None:
         )
 
         if has_section_delta:
-            aggregate_appended, per_version_created = _append_changelog_write_once(delta)
-
-            if aggregate_appended:
-                print(
-                    f"[spectracker] Changelog → {CHANGELOG} "
-                    f"(entry for {delta.to_version})"
-                )
-            else:
-                print(
-                    f"[spectracker] Changelog → {CHANGELOG} "
-                    f"(entry for {delta.to_version} already exists)"
-                )
-
-            cl_path = _per_version_changelog_path(delta.to_version)
-            if per_version_created:
-                print(f"[spectracker] Per-version changelog → {cl_path}")
-            else:
-                print(f"[spectracker] Per-version changelog → {cl_path} (exists; write-once)")
+            print(f"[spectracker] Section changes detected — downstream rerun required.")
         else:
-            print("[spectracker] No section changes detected; changelog unchanged.")
+            print("[spectracker] No section changes detected; downstream can skip.")
 
     except SystemExit as exc:
         code = exc.code
@@ -1160,7 +780,9 @@ def main() -> None:
         exit_code = 1
 
     finally:
-        _print_artifact_access_summary()
+        print_artifact_summary("[05]")
+        if not getattr(args, "preflight", False):
+            prompt_next_step(ROLE, prefix="[05]")
 
     sys.exit(exit_code)
 

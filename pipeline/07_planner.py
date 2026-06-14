@@ -10,12 +10,12 @@ FULL SCOPE
 Spec-driven planner for the full pipeline.
 
 Reads:
-    artifacts_<slug>/specwright_spec_<slug>.md
-    artifacts_<slug>/cache/scaffolder_compressed_spec.md          optional preferred spec source
-    artifacts_<slug>/state/scaffolder_codebase_skeleton.json
+    artifacts_<slug>/spec/specwright_spec_<slug>.md
+    artifacts_<slug>/scaffolder/blueprint.json
 
 Writes:
-    artifacts_<slug>/state/planner_full_execution_plan.json
+    artifacts_<slug>/planner/full_plan.json        (short-term, overwrite)
+    artifacts_<slug>/planner/plan_log.json         (long-term, append)
 
 Consumed by:
     pipeline/08_executor.py --scope full --use-planner-plan
@@ -26,19 +26,17 @@ MINI SCOPE
 Targeted planner for small daily-driver tasks.
 
 Reads:
-    artifacts_<slug>/state/clarificator_requirement_synthesis.md
-    artifacts_<slug>/execution/enricher_overwrite_enriched_prompt.md        optional
-    artifacts_<slug>/execution/clarificator_overwrite_raw.json              optional
-    artifacts_<slug>/knowledge/current/archivist_knowledge_log.md           optional
-    artifacts_<slug>/knowledge/current/absorber_codebase_map.md             optional
-    artifacts_<slug>/knowledge/current/absorber_config_map.json             optional
-    artifacts_<slug>/knowledge/current/absorber_blame_map.md                optional
-    artifacts_<slug>/knowledge/current/patcher_findings_snapshot.md         optional
-    artifacts_<slug>/knowledge/current/archivist_spec_gaps.md               optional
+    artifacts_<slug>/clarificator/session.json             (field: requirement_synthesis)
+    artifacts_<slug>/enricher/enriched_prompt.md           optional
+    artifacts_<slug>/clarificator/session.json             optional (full object as context)
+    artifacts_<slug>/archivist/knowledge_log.md            optional
+    artifacts_<slug>/absorber/codebase_map.md              optional
+    artifacts_<slug>/patcher/attempt_log.json              optional (last entry)
+    artifacts_<slug>/archivist/spec_gaps.md                optional
 
 Writes:
-    artifacts_<slug>/state/planner_mini_execution_plan.json
-    artifacts_<slug>/state/planner_mini_impact_analysis.json
+    artifacts_<slug>/planner/mini_plan.json        (short-term, overwrite — { "plan": {...}, "impact": {...} })
+    artifacts_<slug>/planner/plan_log.json         (long-term, append)
 
 Consumed by:
     pipeline/08_executor.py --scope mini --use-planner-plan
@@ -67,46 +65,45 @@ from typing import Any
 
 # === WRITE AUTHORITY: planner ===
 # OWNS full:
-#   artifacts_<slug>/state/planner_full_execution_plan.json
+#   artifacts_<slug>/planner/full_plan.json          (short-term, overwrite)
+#   artifacts_<slug>/planner/plan_log.json           (long-term, append)
 #
 # OWNS mini:
-#   artifacts_<slug>/state/planner_mini_execution_plan.json
-#   artifacts_<slug>/state/planner_mini_impact_analysis.json
+#   artifacts_<slug>/planner/mini_plan.json          (short-term, overwrite — {plan, impact})
+#   artifacts_<slug>/planner/plan_log.json           (long-term, append — shared with full)
 #
 # READS full:
-#   artifacts_<slug>/specwright_spec_<slug>.md
-#   artifacts_<slug>/cache/scaffolder_compressed_spec.md
-#   artifacts_<slug>/state/scaffolder_codebase_skeleton.json
+#   artifacts_<slug>/spec/specwright_spec_<slug>.md  (upstream-aware, specwright)
+#   artifacts_<slug>/scaffolder/blueprint.json       (upstream-aware, scaffolder)
 #
 # READS mini:
-#   artifacts_<slug>/state/clarificator_requirement_synthesis.md
-#   artifacts_<slug>/execution/enricher_overwrite_enriched_prompt.md
-#   artifacts_<slug>/execution/clarificator_overwrite_raw.json
-#   artifacts_<slug>/knowledge/current/archivist_knowledge_log.md
-#   artifacts_<slug>/knowledge/current/absorber_codebase_map.md
-#   artifacts_<slug>/knowledge/current/absorber_config_map.json
-#   artifacts_<slug>/knowledge/current/absorber_blame_map.md
-#   artifacts_<slug>/knowledge/current/patcher_findings_snapshot.md
-#   artifacts_<slug>/knowledge/current/archivist_spec_gaps.md
+#   artifacts_<slug>/clarificator/session.json       (upstream-aware, clarificator, field: requirement_synthesis + full object as context bundle)
+#   artifacts_<slug>/enricher/enriched_prompt.md     (upstream-aware, enricher, optional)
+#   artifacts_<slug>/absorber/codebase_map.md        (upstream-aware, absorber)
+#   artifacts_<slug>/archivist/knowledge_log.md      (knowledge-aware, archivist)
+#   artifacts_<slug>/archivist/spec_gaps.md          (knowledge-aware, archivist)
+#   artifacts_<slug>/patcher/attempt_log.json        (last entry only)
+
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from artifacts.models import call_model, get_model, get_provider  # noqa: E402
+from modules.artifact_tracking import track_read, track_write, print_summary as print_artifact_summary  # noqa: E402
+from modules.cost import print_call, print_summary, record_usage, summary as cost_summary  # noqa: E402
+from modules.call_llm import call_llm_json
+from modules.post_interactive import prompt_next_step  # noqa: E402
 from artifacts.paths import (  # noqa: E402
-    ABSORBER_BLAME_MAP,
     ABSORBER_CODEBASE_MAP,
-    ABSORBER_CONFIG_MAP,
     ARCHIVIST_KNOWLEDGE_LOG,
     ARCHIVIST_SPEC_GAPS,
-    CLARIFICATOR_OVERWRITE_RAW,
+    CLARIFICATOR_SESSION,
     CLARIFIED_REQ,
     ENRICHER_OVERWRITE_PROMPT,
-    PATCHER_FINDINGS_SNAPSHOT,
+    PATCHER_ATTEMPT_LOG,
     PLANNER_FULL_PLAN,
-    PLANNER_MINI_IMPACT,
     PLANNER_MINI_PLAN,
+    PLANNER_PLAN_LOG,
     SCAFFOLD_JSON,
-    SCAFFOLDER_COMPRESSED_SPEC,
     ensure_dirs,
     get_spec_path,
 )
@@ -116,44 +113,167 @@ ROLE = "planner"
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Artifact access tracking
+# Dependency semantics / alias guards
 # ════════════════════════════════════════════════════════════════════════════
 
-_ARTIFACTS_READ: set[str] = set()
-_ARTIFACTS_WRITTEN: set[str] = set()
+KNOWN_BUNDLED_PLUGIN_ALIASES: dict[str, dict[str, str]] = {
+    "@wavesurfer/regions": {
+        "owner_package": "wavesurfer.js",
+        "canonical_feature": "Regions plugin",
+        "import_path": "wavesurfer.js/dist/plugins/regions.esm.js",
+    },
+    "wavesurferregions": {
+        "owner_package": "wavesurfer.js",
+        "canonical_feature": "Regions plugin",
+        "import_path": "wavesurfer.js/dist/plugins/regions.esm.js",
+    },
+}
+
+_PACKAGE_LIKE_RE = re.compile(r"^(?:@[a-z0-9._-]+/[a-z0-9._-]+|[a-z0-9._-]+)$", re.I)
 
 
-def _track_read(path: Any) -> None:
-    _ARTIFACTS_READ.add(str(path))
+def _normalize_dep_name(value: Any) -> str:
+    return str(value or "").strip()
 
 
-def _track_write(path: Any) -> None:
-    _ARTIFACTS_WRITTEN.add(str(path))
+def _collect_planned_text_fragments(plan: dict) -> list[str]:
+    fragments: list[str] = []
+
+    stack = plan.get("stack")
+    if isinstance(stack, dict):
+        for v in stack.values():
+            if isinstance(v, str):
+                fragments.append(v)
+            elif isinstance(v, list):
+                fragments.extend(str(x) for x in v)
+            elif isinstance(v, dict):
+                for vv in v.values():
+                    if isinstance(vv, str):
+                        fragments.append(vv)
+                    elif isinstance(vv, list):
+                        fragments.extend(str(x) for x in vv)
+
+    for task in plan.get("tasks", []):
+        if not isinstance(task, dict):
+            continue
+
+        for key in ("file_path", "behavior_summary", "role"):
+            val = task.get(key)
+            if isinstance(val, str):
+                fragments.append(val)
+
+        for key in ("sub_tasks", "gotchas", "notes", "tailwind_hints"):
+            val = task.get(key)
+            if isinstance(val, list):
+                fragments.extend(str(x) for x in val)
+            elif isinstance(val, str):
+                fragments.append(val)
+
+        dependency_hints = task.get("dependency_hints")
+        if isinstance(dependency_hints, list):
+            fragments.extend(str(x) for x in dependency_hints)
+        elif isinstance(dependency_hints, str):
+            fragments.append(dependency_hints)
+
+    return fragments
 
 
-def _print_artifact_access_summary() -> None:
-    print("[07] Artifacts read:")
-    if _ARTIFACTS_READ:
-        for item in sorted(_ARTIFACTS_READ):
-            print(f"[07]   READ  {item}")
-    else:
-        print("[07]   READ  (none)")
+def _validate_dependency_semantics(plan: dict, stub_files: list[dict]) -> None:
+    fragments = _collect_planned_text_fragments(plan)
+    lower_fragments = [f.lower() for f in fragments]
 
-    print("[07] Artifacts created/updated/overwritten/appended:")
-    if _ARTIFACTS_WRITTEN:
-        for item in sorted(_ARTIFACTS_WRITTEN):
-            print(f"[07]   WRITE {item}")
-    else:
-        print("[07]   WRITE (none)")
+    has_regions_plugin_semantics = any(
+        ("regionsplugin.create" in f)
+        or ("regions plugin" in f)
+        or ("regionsplugin" in f)
+        or ("wavesurfer.js/dist/plugins/regions.esm.js" in f)
+        for f in lower_fragments
+    )
+
+    promoted_aliases = []
+    for alias in KNOWN_BUNDLED_PLUGIN_ALIASES:
+        if any(alias.lower() in f for f in lower_fragments):
+            promoted_aliases.append(alias)
+
+    if has_regions_plugin_semantics and promoted_aliases:
+        aliases = ", ".join(sorted(set(promoted_aliases)))
+        print(
+            "[07] WARNING: planner appears to promote bundled plugin alias(es) "
+            f"to standalone dependency/package names: {aliases}",
+            file=sys.stderr,
+        )
+        print(
+            "[07] WARNING: expected canonical dependency is 'wavesurfer.js' and "
+            "Regions should stay a bundled plugin imported via "
+            "'wavesurfer.js/dist/plugins/regions.esm.js'.",
+            file=sys.stderr,
+        )
 
 
+def _rewrite_stub_semantics(stub_files: list[dict]) -> list[dict]:
+    rewritten: list[dict] = []
+
+    for stub in stub_files:
+        if not isinstance(stub, dict):
+            continue
+
+        item = dict(stub)
+        item.setdefault("dependency_hints", [])
+
+        if item.get("file_path") == "package.json":
+            hints = item.get("dependency_hints")
+            if not isinstance(hints, list):
+                hints = []
+
+            normalized_hints = []
+            for hint in hints:
+                if not isinstance(hint, dict):
+                    continue
+
+                h = dict(hint)
+                name = _normalize_dep_name(h.get("name"))
+                if name in KNOWN_BUNDLED_PLUGIN_ALIASES:
+                    alias_info = KNOWN_BUNDLED_PLUGIN_ALIASES[name]
+                    h["kind"] = "bundled_plugin"
+                    h["owner_package"] = alias_info["owner_package"]
+                    h["canonical_feature"] = alias_info["canonical_feature"]
+                    h["import_path"] = alias_info["import_path"]
+
+                normalized_hints.append(h)
+
+            item["dependency_hints"] = normalized_hints
+
+        rewritten.append(item)
+
+    return rewritten
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Artifact access tracking
 # ════════════════════════════════════════════════════════════════════════════
 # Full-scope prompt
 # ════════════════════════════════════════════════════════════════════════════
 
 FULL_SYSTEM_PROMPT = """\
 You are a senior software architect acting as a PLANNER.
-You will receive a spec and a scaffold JSON (stub files with signatures only).
+
+You will receive:
+  1. A canonical spec (Markdown)
+  2. Stub files — each entry includes:
+       file_path, kind, module, module_purpose,
+       exports[]             — exact public symbols this file must export
+       quirks[]              — known implementation gotchas from the scaffold author
+       acceptance_criteria[] — AC IDs this file must satisfy
+       dependency_hints[]    — optional structured dependency metadata from the scaffold
+
+Each dependency_hints entry may include:
+- name
+- kind: "npm_package" | "bundled_plugin" | "subpath_import" | "tooling" | "ui_primitive"
+- owner_package
+- canonical_feature
+- import_path
+  3. open_questions[]  — resolved design decisions (id, question, affects, impact)
+  4. module_implementation_order[] — suggested module ordering from the scaffold
 
 Your job is NOT to write code.
 Your job is to reason carefully and produce an implementation plan.
@@ -172,46 +292,99 @@ The stack should include:
 - Test runner if any, e.g. Vitest, pytest, Jest, Go test
 - Key libraries that affect implementation patterns, e.g. Zustand, React Query, Pydantic, SQLAlchemy
 
+IMPORTANT:
+- Do NOT promote bundled plugins, subpath imports, or feature names into standalone npm packages.
+- If scaffold metadata says something is a bundled plugin of another package, record it under the owning package in stack.key_libs or mention it as a plugin detail, NOT as an independent installable library.
+- Example: the Wavesurfer Regions plugin belongs to "wavesurfer.js" and should be described as a bundled plugin imported via "wavesurfer.js/dist/plugins/regions.esm.js", not as "@wavesurfer/regions" or "wavesurferregions" dependency.
+
 If the project is a monorepo or mixed stack, represent that explicitly, for example:
 {
   "frontend": {
     "language": "TypeScript 5.x",
     "runtime": "Vite 5",
     "framework": "React 18",
-    "styling": "Tailwind CSS v3",
+    "styling": "Tailwind CSS v4",
     "test_runner": "Vitest",
-    "key_libs": ["Zustand", "React Query"]
-  },
-  "backend": {
-    "language": "Python 3.12",
-    "runtime": "Uvicorn",
-    "framework": "FastAPI",
-    "styling": null,
-    "test_runner": "pytest",
-    "key_libs": ["Pydantic", "SQLAlchemy"]
+    "key_libs": ["Zustand", "Dexie", "WaveSurfer.js 7"]
   }
 }
 
-## Step 1 — Plan each non-test stub file
+## Step 1 — Plan EVERY file in the scaffold
 
-For each non-test stub file, output a task object describing:
-- What the file does and its role in the system
-- Ordered list of implementation sub-tasks, in dependency-aware order
-- Key types / interfaces / schemas / models this file depends on, with source file
-- Gotchas or edge cases the implementer must handle
-- Styling hints for visual/UI components if applicable
+RULE — FULL COVERAGE:
+Every file listed in implementation_order MUST have a task entry with sub_tasks.
+No file may appear only as a depends_on reference without its own task entry.
+This includes: types files, error/exception definitions, config files, entry points,
+constants files, and any other file that appears in the scaffold.
+
+RULE — CONSUME SCAFFOLD METADATA:
+Each stub file entry carries exports[], quirks[], and acceptance_criteria[] from the
+scaffold author. These encode resolved design decisions — treat them as ground truth.
+
+- exports[]: every symbol listed MUST appear in sub_tasks as something to implement
+  and export. Do not invent exports not listed; do not omit listed exports.
+- quirks[]: every quirk listed MUST be reflected verbatim or paraphrased in the
+  task's gotchas[] or sub_tasks. Do not silently drop scaffold quirks.
+- acceptance_criteria[]: copy the AC IDs into the task's acceptance_criteria field
+  so the implementer knows what to verify.
+- dependency_hints[]: treat these as dependency ground truth when present.
+  - "npm_package" means an actual installable dependency.
+  - "bundled_plugin" means a capability shipped inside another package; do NOT list it as a standalone dependency.
+  - "subpath_import" means import via the given import_path from the owning package; do NOT invent a package name from it.
+
+RULE — OPEN QUESTIONS:
+For each open question provided, its resolution/impact MUST be reflected in the
+gotchas[] or notes[] of every task whose file_path appears in the question's
+affects[] list. Do not re-open resolved questions — treat the impact text as final.
+
+RULE — CONFIG FILES:
+Config files (kind === "config") need task entries too.
+Their sub_tasks describe what to write (content/setup), not runtime logic.
+Their gotchas should cover tooling quirks (plugin order, extends chains, etc.).
+tailwind_hints is null for config files.
+
+For package.json specifically:
+- Only list actual installable npm packages in its dependency-related sub_tasks.
+- If a feature is provided by a bundled plugin, write it as an implementation/import note tied to the owning package, not as a separate dependency to install.
+- Never normalize or sanitize a plugin alias into a fake package name.
+
+RULE — IMPLEMENTATION ORDER:
+Use the module_implementation_order hint to sequence implementation_order.
+Within a module, order files by their internal dependencies.
+Config files come last unless another file depends on them at build time.
+
+For each file, output a task object with:
+- file_path
+- kind: "source" | "config"
+- behavior_summary: 1-2 sentences describing what this file does in the context of
+  the overall system — written so the implementer understands the file's role WITHOUT
+  needing to read the spec. Be concrete: name the callers, the data it produces, the
+  invariants it maintains.
+- role: one-sentence functional label
+- acceptance_criteria: list of AC IDs copied from the scaffold (empty list if none)
+- depends_on: list of files this file imports from
+- dependency_hints: copy through any relevant structured dependency metadata for this file, especially package.json
+- sub_tasks: ordered implementation steps, specific enough that the implementer does
+  not need the spec. Every export listed in the scaffold's exports[] MUST appear here.
+  For types/interfaces files: list every type, interface, enum, and constant to define
+  with their fields and value constraints.
+  For config files: describe the exact content to write.
+- gotchas: edge cases and framework quirks. Every quirk from the scaffold's quirks[]
+  MUST appear here (verbatim or paraphrased). Add stack-derived gotchas on top.
+- notes: cross-cutting concerns from open_questions that apply to THIS file only.
+  If an open question's affects[] includes this file_path, its resolution goes here.
+  If no relevant open questions, set notes to [].
+- tailwind_hints: styling hints for visual components, or null
 
 ## Step 2 — Stack-specific gotchas
 
-For EACH file, "gotchas" must include framework/language/runtime quirks relevant to the detected stack and to THIS file.
-
-Do not give generic advice.
-Ask yourself:
-
-"What would a developer who knows the detected stack warn their colleague about before implementing this specific file?"
+For EACH file, "gotchas" must include framework/language/runtime quirks relevant
+to the detected stack AND to this specific file. Do not give generic advice.
+Ask yourself: "What would a developer who knows the detected stack warn their
+colleague about before implementing this specific file?"
 
 Examples of good stack-derived gotchas:
-- React 18+: useEffect can run twice in StrictMode, so effects need cleanup/idempotence
+- React 18+: useEffect can run twice in StrictMode — effects need cleanup/idempotence
 - Vite: use import.meta.env instead of process.env for client env vars
 - Python/FastAPI: use async def only when awaiting async I/O; do not block the event loop
 - Pydantic v2: use model_config / field validators instead of v1 Config/validator patterns
@@ -219,59 +392,67 @@ Examples of good stack-derived gotchas:
 - Go: propagate context cancellation to avoid goroutine leaks
 - SQLAlchemy async: do not mix sync Session with async engine/session
 
-The point is to derive these from the spec's stack, not from hardcoded React/Vite assumptions.
+Derive these from the spec's stack, not from hardcoded assumptions.
 
 Return a single JSON object — NO markdown fences, raw JSON only:
 {
   "plan_version": "1.0.0",
   "scope": "full",
-  "stack": {
-    "language": "TypeScript 5.x",
-    "runtime": "Vite 5",
-    "framework": "React 18",
-    "styling": "Tailwind CSS v3",
-    "test_runner": "Vitest",
-    "key_libs": ["Zustand", "React Query"]
-  },
+  "stack": { ... },
   "tasks": [
     {
-      "file_path": "src/hooks/useSensorData.ts",
-      "role": "one-sentence role description",
-      "depends_on": ["src/types/sensor.ts", "src/data/demoConstants.ts"],
+      "file_path": "src/types.ts",
+      "kind": "source",
+      "behavior_summary": "Defines all shared TypeScript types used across the app. Every other file imports from here — no runtime logic, only type declarations.",
+      "role": "Shared type definitions for all domain objects.",
+      "acceptance_criteria": [],
+      "depends_on": [],
       "sub_tasks": [
-        "1. Generate base SensorPoint array using POINTS_PER_DAY constant ...",
-        "2. Inject anomaly clusters at morning (07-09h) and evening (18-21h) ...",
-        "3. ..."
+        "1. Define SrtCue interface with fields: id (string), start (number), end (number), text (string).",
+        "2. Define Tag type as union: 'vocab' | 'slang' | 'idiom' | 'speed' | 'intonation' | 'accent' | 'context'.",
+        "3. Export all types — no default export."
       ],
       "gotchas": [
-        "decisionScore must be negative for anomaly points (-0.05 to -0.45)",
-        "React state updates derived from timers must be cleaned up in useEffect cleanup"
+        "All id fields are client-generated UUID strings via crypto.randomUUID(), NOT auto-increment integers (CON-001).",
+        "TypeScript strict mode: every field must be explicitly typed; avoid implicit any."
+      ],
+      "notes": [
+        "OQ-10: A boolean field usesOpfsFallback may need to be added to the Episode interface — see open_questions for resolution."
       ],
       "tailwind_hints": null
     }
   ],
   "implementation_order": [
-    "src/types/sensor.ts",
-    "src/data/demoConstants.ts",
-    "src/hooks/useSensorData.ts",
-    "src/hooks/useReplay.ts",
-    "src/components/SummaryStickyBar.tsx",
-    "src/components/ReplayControls.tsx",
-    "src/components/AnomalyFeed.tsx",
-    "src/components/ModelGates.tsx",
-    "src/App.tsx",
-    "src/main.tsx"
-  ],
-  "global_notes": "any cross-cutting concerns the implementer should know"
+    "src/types.ts",
+    "src/config.ts",
+    "src/db.ts",
+    "..."
+  ]
 }
+
+RULE — NOTES DISTRIBUTION:
+Do NOT output a global_notes string. For each cross-cutting concern, inject it into
+the notes[] of ONLY the task(s) it directly applies to.
+notes[] for a task should contain only concerns directly relevant to that file.
+If a task has no relevant cross-cutting notes, set notes to [].
 
 Rules:
 - Reason as deeply as needed — this is your reasoning budget well spent.
-- Be specific: reference exact constant names, prop names, type names, schema names, and file paths from the spec/scaffold.
+- Be specific: reference exact constant names, prop names, type names, schema names,
+  and file paths from the spec/scaffold.
+- Every file in implementation_order must have a task entry — no exceptions.
 - implementation_order must respect dependency order.
-- tailwind_hints: include for visual components if the detected stack uses Tailwind; otherwise provide relevant styling hints or null.
-- Do not assume TypeScript, React, Vite, Tailwind, or Vitest unless the spec/scaffold actually indicates them.
+- behavior_summary must be self-contained: the implementer should understand the
+  file's role without reading the spec. Name callers, consumers, and invariants.
+- sub_tasks for types/interfaces/errors files must enumerate every type/class to
+  define with their fields and value constraints — not just "define types".
+- tailwind_hints: include for visual components if the detected stack uses Tailwind;
+  otherwise provide relevant styling hints or null.
+- Do not assume TypeScript, React, Vite, Tailwind, or Vitest unless the spec/scaffold
+  actually indicates them.
 - Do not use implementation patterns from a different stack than the one detected.
+- Never convert plugin aliases or import-path hints into invented package names.
+- If the scaffold/spec mentions Wavesurfer Regions as a plugin, keep it as a plugin of wavesurfer.js; never output "@wavesurfer/regions" or "wavesurferregions" as a package to install unless the scaffold explicitly marks it as an npm_package.
 - Output raw JSON only. Absolutely no markdown fences or preamble text.
 """
 
@@ -381,7 +562,7 @@ Allowed risk values:
 Rules:
 - target_files must contain only files that should be changed by the implementer.
 - Use repo-relative paths only.
-- Do not include artifact paths such as artifacts_*/, state/*, execution/*, run/*, cache/*, knowledge/*, reports/*.
+- Do not include artifact paths such as artifacts_*/, planner/*, executor/*, debugger/*, judge/*, patcher/*, archivist/*, absorber/*, clarificator/*, enricher/*, spectracker/*, scaffolder/*, spec/*, or legacy paths state/*, execution/*, run/*, cache/*, knowledge/*, reports/*.
 - Do not include spec.md or specwright_spec_<slug>.md unless the user explicitly asks to update the canonical spec.
 - If a test file should be added/updated, include it either in target_files or test_suggestions depending on whether implementation should patch it.
 - Keep instructions concrete and actionable.
@@ -398,8 +579,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="07_planner.py",
         description=(
-            "Planner step. Writes planner_full_execution_plan.json "
-            "or planner_mini_execution_plan.json + planner_mini_impact_analysis.json."
+            "Planner step. Writes planner/full_plan.json "
+            "or planner/mini_plan.json (with impact merged). "
+            "Appends to planner/plan_log.json in both modes."
         ),
     )
     parser.add_argument(
@@ -415,9 +597,9 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=["full", "mini"],
         default="full",
         help=(
-            "Planner scope. full writes state/planner_full_execution_plan.json; "
-            "mini writes state/planner_mini_execution_plan.json and "
-            "state/planner_mini_impact_analysis.json."
+            "Planner scope. full writes planner/full_plan.json; "
+            "mini writes planner/mini_plan.json ({plan, impact} merged). "
+            "Both modes append to planner/plan_log.json."
         ),
     )
     return parser
@@ -462,7 +644,7 @@ def _read_optional(path: Any, *, max_chars: int | None = None) -> str:
         if not path.exists():
             return ""
 
-        _track_read(path)
+        track_read(path)
 
         if hasattr(path, "read_text"):
             text = path.read_text(encoding="utf-8")
@@ -492,14 +674,36 @@ def _read_json_optional(path: Any, *, max_chars: int | None = None) -> str:
         return raw
 
 
+def _python_dict_to_json(raw: str) -> dict | None:
+    """
+    Parse Python dict literal output (single-quoted keys/values) that
+    some models emit instead of valid JSON. Uses ast.literal_eval (safe).
+    """
+    import ast
+    try:
+        parsed = ast.literal_eval(raw.strip())
+        if isinstance(parsed, dict):
+            return json.loads(json.dumps(parsed))
+    except Exception:
+        pass
+    return None
+
+
 def _parse_json(raw: str, label: str) -> dict:
-    """Extract JSON from model output robustly (handles accidental fences)."""
+    """
+    Extract JSON from model output robustly.
+
+    Pass 1 — direct json.loads (standard JSON)
+    Pass 2 — find outermost {...} then json.loads
+    Pass 3 — ast.literal_eval (Python dict with single quotes)
+    """
     raw = raw.strip()
 
-    # Strip common markdown fences if present.
+    # Strip markdown fences if present
     raw = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", raw)
     raw = re.sub(r"\n?```$", "", raw.strip())
 
+    # Pass 1: direct parse
     try:
         parsed = json.loads(raw)
         if not isinstance(parsed, dict):
@@ -508,7 +712,7 @@ def _parse_json(raw: str, label: str) -> dict:
     except json.JSONDecodeError:
         pass
 
-    # Fallback: find outermost JSON object.
+    # Pass 2: find outermost {...}
     match = re.search(r"\{.*\}", raw, re.DOTALL)
     if match:
         try:
@@ -516,86 +720,33 @@ def _parse_json(raw: str, label: str) -> dict:
             if not isinstance(parsed, dict):
                 raise RuntimeError(f"{label} parsed as {type(parsed).__name__}, expected object.")
             return parsed
-        except json.JSONDecodeError as exc:
-            print(f"[07] JSON parse failed for {label}: {exc}", file=sys.stderr)
-            print(f"[07] Raw output (first 1000 chars):\n{raw[:1000]}", file=sys.stderr)
-            raise RuntimeError(f"Could not parse JSON from {label}") from exc
+        except json.JSONDecodeError:
+            pass
 
-    print(f"[07] No JSON object found in {label}.", file=sys.stderr)
+    # Pass 3: Python dict literal (single-quoted keys/values)
+    result = _python_dict_to_json(raw)
+    if result is not None:
+        print(f"[07][warn] {label}: model returned Python dict syntax — parsed via ast.literal_eval.")
+        return result
+
+    # Also try pass 3 on the extracted {...} block
+    if match:
+        result = _python_dict_to_json(match.group())
+        if result is not None:
+            print(f"[07][warn] {label}: model returned Python dict syntax — parsed via ast.literal_eval.")
+            return result
+
+    print(f"[07] ERROR: Could not parse JSON from {label}", file=sys.stderr)
     print(f"[07] Raw output (first 1000 chars):\n{raw[:1000]}", file=sys.stderr)
-    raise RuntimeError(f"No JSON object found in {label}")
+    raise RuntimeError(f"Could not parse JSON from {label}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
 # Core model call
 # ════════════════════════════════════════════════════════════════════════════
 
-def _call_planner_json(
-    *,
-    system_prompt: str,
-    user_message: str,
-    label: str,
-    temperature: float = 0.2,
-    max_tokens: int = 32768,
-) -> dict:
-    """
-    Call the planner role (config in artifacts/models.py) and return parsed JSON.
+# _call_planner_json removed — use call_llm_json() from modules.call_llm
 
-    Retries once on transient failures.
-    """
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_message},
-    ]
-
-    model    = get_model(ROLE)
-    provider = get_provider(ROLE)
-    print(f"[07] Calling model: {model} (provider: {provider}) — {label} …")
-
-    last_error: Exception | None = None
-
-    for attempt in range(2):
-        try:
-            resp = call_model(
-                ROLE,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-
-            usage = getattr(resp, "usage", None)
-            if usage:
-                print(
-                    f"[07] Tokens: prompt={getattr(usage, 'prompt_tokens', '?')}, "
-                    f"completion={getattr(usage, 'completion_tokens', '?')}"
-                )
-
-            choice  = resp.choices[0]
-            message = choice.message
-            content = message.content
-            tool_calls = getattr(message, "tool_calls", None)
-            finish_reason = getattr(choice, "finish_reason", None)
-
-            if tool_calls:
-                raise RuntimeError(f"Model returned tool_calls instead of text: {tool_calls}")
-
-            if not content or not content.strip():
-                raise RuntimeError(
-                    f"Model returned empty content. finish_reason={finish_reason}, "
-                    f"message={message}"
-                )
-
-            return _parse_json(content.strip(), label=label)
-
-        except Exception as exc:
-            last_error = exc
-            print(f"[07] {label} failed: {exc}", file=sys.stderr)
-
-            if attempt == 0:
-                print("[07] Retrying in 3s …", file=sys.stderr)
-                time.sleep(3)
-
-    raise RuntimeError(f"{label} failed after retries: {last_error}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -603,13 +754,6 @@ def _call_planner_json(
 # ════════════════════════════════════════════════════════════════════════════
 
 def _load_full_spec() -> str:
-    """
-    Use scaffolder compressed spec if available, fallback to canonical spec.
-    """
-    if SCAFFOLDER_COMPRESSED_SPEC.exists():
-        _track_read(SCAFFOLDER_COMPRESSED_SPEC)
-        return SCAFFOLDER_COMPRESSED_SPEC.read_text(encoding="utf-8")
-
     spec_path = get_spec_path()
     if not spec_path.exists():
         raise FileNotFoundError(
@@ -618,7 +762,7 @@ def _load_full_spec() -> str:
             "  python harness.py --project <name> --scope full"
         )
 
-    _track_read(spec_path)
+    track_read(spec_path)
     return spec_path.read_text(encoding="utf-8")
 
 
@@ -630,29 +774,166 @@ def _load_scaffold() -> dict:
             "  python harness.py --project <name> --scope full --scaffold"
         )
 
-    _track_read(SCAFFOLD_JSON)
+    track_read(SCAFFOLD_JSON)
     return json.loads(SCAFFOLD_JSON.read_text(encoding="utf-8"))
 
 
-def call_full_planner(spec: str, stub_files: list[dict]) -> dict:
+def _extract_stub_files(scaffold: dict) -> list[dict]:
+    """
+    Extract non-test files from the module-centric blueprint schema,
+    including top-level config_files.
+
+    blueprint.json schema (new):
+    {
+      "modules": [{
+        "module": "...",
+        "purpose": "...",
+        "depends_on": [...],
+        "files": [{
+          "path": "...",
+          "kind": "source" | "test" | "config" | "migration",
+          "exports": [...],
+          "quirks": [...],
+          "acceptance_criteria": [...]
+        }]
+      }],
+      "config_files": [{
+        "path": "...",
+        "kind": "config",
+        "note": "...",
+        "dependencies": [...]
+      }],
+      "implementation_order": [...],
+      "open_questions": [...]
+    }
+
+    Returns a flat list of file dicts for the full planner prompt.
+    """
+    modules = scaffold.get("modules", [])
+
+    if not isinstance(modules, list):
+        files = scaffold.get("files", [])
+        if not isinstance(files, list):
+            raise RuntimeError(
+                "Invalid scaffold: expected top-level 'modules' list "
+                "(new schema) or 'files' list (legacy schema)."
+            )
+        print("[07] WARNING: scaffold uses legacy flat-file schema — consider regenerating.")
+        return [
+            f for f in files
+            if isinstance(f, dict) and not f.get("is_test")
+        ]
+
+    stub_files: list[dict] = []
+
+    for mod in modules:
+        if not isinstance(mod, dict):
+            continue
+
+        for file_entry in mod.get("files", []):
+            if not isinstance(file_entry, dict):
+                continue
+
+            if file_entry.get("kind", "source") == "test":
+                continue
+
+            stub_files.append({
+                "file_path": file_entry.get("path", ""),
+                "kind": file_entry.get("kind", "source"),
+                "module": mod.get("module", ""),
+                "module_purpose": mod.get("purpose", ""),
+                "exports": file_entry.get("exports", []),
+                "quirks": file_entry.get("quirks", []),
+                "acceptance_criteria": file_entry.get("acceptance_criteria", []),
+                "dependency_hints": file_entry.get("dependency_hints", []),
+            })
+
+    for cfg in scaffold.get("config_files", []):
+        if not isinstance(cfg, dict):
+            continue
+
+        path = cfg.get("path", "")
+        if not path:
+            continue
+
+        dependency_hints = cfg.get("dependencies", [])
+        if not isinstance(dependency_hints, list):
+            dependency_hints = []
+
+        stub_files.append({
+            "file_path": path,
+            "kind": "config",
+            "module": "config_files",
+            "module_purpose": "Project configuration and tooling",
+            "exports": [],
+            "quirks": [cfg["note"]] if cfg.get("note") else [],
+            "acceptance_criteria": [],
+            "dependency_hints": dependency_hints,
+        })
+
+    return _rewrite_stub_semantics(stub_files)
+
+
+
+def call_full_planner(spec: str, stub_files: list[dict], scaffold: dict) -> dict:
+    # Build optional context sections from scaffold top-level fields
+    open_questions = scaffold.get("open_questions", [])
+    module_order = scaffold.get("implementation_order", [])
+
+    context_sections: list[str] = []
+
+    if module_order:
+        context_sections.append(
+            "### module_implementation_order\n"
+            + json.dumps(module_order, ensure_ascii=False)
+        )
+
+    if open_questions:
+        context_sections.append(
+            "### open_questions\n"
+            + json.dumps(open_questions, indent=2, ensure_ascii=False)
+        )
+
+    context_block = ("\n\n" + "\n\n".join(context_sections)) if context_sections else ""
+
+    semantic_guard = {
+        "dependency_rules": [
+            "Do not promote bundled plugins to standalone npm packages.",
+            "Do not invent package names from plugin aliases or import-path fragments.",
+            "For Wavesurfer v7 Regions, canonical owner package is wavesurfer.js.",
+            "Canonical import path for Regions plugin: wavesurfer.js/dist/plugins/regions.esm.js",
+        ],
+        "known_bundled_plugin_aliases": KNOWN_BUNDLED_PLUGIN_ALIASES,
+    }
+
     user_message = (
         f"### canonical spec\n\n{spec}\n\n"
         f"### scaffold stub files\n\n"
-        f"{json.dumps(stub_files, indent=2, ensure_ascii=False)}"
+        f"{json.dumps(stub_files, indent=2, ensure_ascii=False)}\n\n"
+        f"### semantic guardrails\n\n"
+        f"{json.dumps(semantic_guard, indent=2, ensure_ascii=False)}"
+        f"{context_block}"
     )
 
-    return _call_planner_json(
-        system_prompt=FULL_SYSTEM_PROMPT,
-        user_message=user_message,
-        label="full planner response",
+    print(f"[07] Calling model: {get_model(ROLE)} (provider: {get_provider(ROLE)}) — full planner response …")
+    result, _ = call_llm_json(
+        ROLE,
+        FULL_SYSTEM_PROMPT,
+        user_message,
         temperature=0.2,
         max_tokens=32768,
+        retries=2,
+        backoff=False,
+        caller_file=__file__,
+        label="[07] full planner response",
     )
+    return _parse_json(str(result), label="full planner response")
 
 
 def validate_full_plan(plan: dict, stub_files: list[dict]) -> None:
     """
-    Warn if any stub file is missing from the plan and report detected stack.
+    Warn if any stub file is missing from the plan, report detected stack,
+    and run semantic validation against bundled-plugin/package confusion.
     """
     tasks = plan.get("tasks", [])
     if not isinstance(tasks, list):
@@ -683,28 +964,25 @@ def validate_full_plan(plan: dict, stub_files: list[dict]) -> None:
     else:
         print(f"[07] Stack detected: {json.dumps(plan['stack'], indent=2, ensure_ascii=False)}")
 
+    _validate_dependency_semantics(plan, stub_files)
+
+
 
 def run_full_scope() -> None:
     spec = _load_full_spec()
     scaffold = _load_scaffold()
 
-    files = scaffold.get("files", [])
-    if not isinstance(files, list):
+    stub_files = _extract_stub_files(scaffold)
+    if not stub_files:
         raise RuntimeError(
-            "Invalid scaffolder_codebase_skeleton.json: expected top-level key "
-            "'files' to be a list."
+            "No non-test files found in scaffold blueprint. "
+            "Ensure scaffolder/blueprint.json has modules with source files."
         )
-
-    stub_files = [
-        file_entry
-        for file_entry in files
-        if isinstance(file_entry, dict) and not file_entry.get("is_test")
-    ]
 
     print("[07] Scope: full")
     print(f"[07] Planning {len(stub_files)} non-test stub file(s) …")
 
-    plan = call_full_planner(spec, stub_files)
+    plan = call_full_planner(spec, stub_files, scaffold)
     validate_full_plan(plan, stub_files)
 
     PLANNER_FULL_PLAN.parent.mkdir(parents=True, exist_ok=True)
@@ -712,13 +990,85 @@ def run_full_scope() -> None:
         json.dumps(plan, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
-    _track_write(PLANNER_FULL_PLAN)
+    track_write(PLANNER_FULL_PLAN)
+
+    append_plan_log(scope="full", plan=plan, impact=None)
 
     print(f"[07] Full plan written → {PLANNER_FULL_PLAN}")
     print(f"[07] Tasks in plan: {len(plan.get('tasks', []))}")
     print(f"[07] Implementation order: {plan.get('implementation_order', [])}")
     print("[07] Done. Pass --use-planner-plan to 08_executor.py to use this plan.")
 
+
+# ════════════════════════════════════════════════════════════════════════════
+# Plan log (long-term, shared by full + mini)
+# ════════════════════════════════════════════════════════════════════════════
+
+def append_plan_log(*, scope: str, plan: dict, impact: dict | None) -> None:
+    """
+    Append one entry to planner/plan_log.json (long-term audit trail).
+    Called at the end of both full and mini runs.
+
+    Entry schema:
+      {
+        "scope": "full" | "mini",
+        "generated_at": "<iso>",
+        "plan_version": "...",
+        "model": "...",
+        "cost": ...,
+        "task_summary": "..." (mini only),
+        "task_count": N (full) | target_file_count (mini),
+        "impact_warnings": [...] (mini only),
+      }
+    """
+    
+    token_sum = cost_summary()
+    cost_total = token_sum.get("total_cost_usd") if isinstance(token_sum, dict) else None
+
+    entry: dict = {
+        "scope": scope,
+        "generated_at": _utc_now_iso(),
+        "plan_version": plan.get("plan_version", "1.0.0"),
+        "model": get_model(ROLE),
+        "cost": cost_total,
+    }
+
+    if scope == "full":
+        entry["task_count"] = len(plan.get("tasks", []))
+        entry["implementation_order"] = plan.get("implementation_order", [])
+    else:
+        entry["task_summary"] = plan.get("task_summary", "")
+        entry["task_count"] = len(plan.get("target_files", []))
+        if impact:
+            entry["impact_warnings"] = impact.get("warnings", [])
+            entry["impact_conflicts"] = impact.get("conflicts", [])
+
+    log_path = PLANNER_PLAN_LOG
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if log_path.exists():
+            track_read(log_path)
+            raw = log_path.read_text(encoding="utf-8").strip()
+            try:
+                data = json.loads(raw)
+                entries = data.get("entries", []) if isinstance(data, dict) else data
+                if not isinstance(entries, list):
+                    entries = []
+            except Exception:
+                entries = []
+        else:
+            entries = []
+
+        entries.append(entry)
+        log_path.write_text(
+            json.dumps({"entries": entries}, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        track_write(log_path)
+        print(f"[07] Plan log appended ({len(entries)} entries) → {log_path}")
+    except Exception as exc:
+        print(f"[07] WARNING: could not append plan log: {exc}", file=sys.stderr)
 
 # ════════════════════════════════════════════════════════════════════════════
 # Mini-scope planner
@@ -729,15 +1079,13 @@ def _load_mini_request() -> str:
     Load the mini request.
 
     Preferred:
-      1. execution/enricher_overwrite_enriched_prompt.md
-      2. state/clarificator_requirement_synthesis.md
+      1. enricher/enriched_prompt.md  (richer context from enricher)
+      2. clarificator/session.json    (field: requirement_synthesis)
 
-    enricher_overwrite_enriched_prompt is optional and may include richer context
-    generated by the enricher. clarificator_requirement_synthesis is the
-    canonical minimum input for mini planning.
+    Both are tried; if both exist, both are included.
     """
     enriched = _read_optional(ENRICHER_OVERWRITE_PROMPT, max_chars=20_000)
-    clarified = _read_optional(CLARIFIED_REQ, max_chars=20_000)
+    clarified = _read_clarificator_synthesis(max_chars=20_000)
 
     if enriched and clarified:
         return (
@@ -757,75 +1105,107 @@ def _load_mini_request() -> str:
         "Mini planner requires a clarified request.\n"
         f"Missing both:\n"
         f"  - {ENRICHER_OVERWRITE_PROMPT}\n"
-        f"  - {CLARIFIED_REQ}\n\n"
+        f"  - {CLARIFIED_REQ} (field: requirement_synthesis)\n\n"
         "Run clarificator/enricher first, for example:\n"
         "  python harness.py --project <name> --scope mini --clarify\n"
-        "or provide/create state/clarificator_requirement_synthesis.md."
+        "or provide clarificator/session.json with requirement_synthesis field."
     )
+
+
+def _read_clarificator_synthesis(*, max_chars: int | None = None) -> str:
+    """
+    Extract requirement_synthesis field from clarificator/session.json.
+    Falls back to full JSON text if field is absent.
+    Returns empty string if file missing or unreadable.
+    """
+    try:
+        if not CLARIFIED_REQ.exists():
+            return ""
+        track_read(CLARIFIED_REQ)
+        raw = CLARIFIED_REQ.read_text(encoding="utf-8").strip()
+        if not raw:
+            return ""
+        data = json.loads(raw)
+        synthesis = data.get("requirement_synthesis", "")
+        text = synthesis.strip() if isinstance(synthesis, str) else ""
+        if not text:
+            # Fallback: whole session as context
+            text = raw
+        if max_chars is not None and len(text) > max_chars:
+            return text[:max_chars] + f"\n\n<!-- truncated at {max_chars} chars -->"
+        return text
+    except Exception as exc:
+        print(f"[07] WARNING: could not read clarificator session: {exc}", file=sys.stderr)
+        return ""
 
 
 def _load_mini_context_bundle() -> str:
     """
     Load optional knowledge/context files for mini planning.
     Missing files are ignored.
+
+    Sources (new layout):
+      clarificator/session.json     — full session object (decisions, conflicts, tier_counts …)
+      archivist/knowledge_log.md    — accumulated knowledge
+      absorber/codebase_map.md      — merged codebase + config + blame map
+      patcher/attempt_log.json      — last entry only (replaces PATCHER_FINDINGS_SNAPSHOT)
+      archivist/spec_gaps.md        — known spec gaps
     """
     sections: list[str] = []
 
-    sources: list[tuple[str, Any, str, int]] = [
-        (
-            "execution/clarificator_overwrite_raw.json",
-            CLARIFICATOR_OVERWRITE_RAW,
-            "json",
-            20_000,
-        ),
-        (
-            "knowledge/current/archivist_knowledge_log.md",
-            ARCHIVIST_KNOWLEDGE_LOG,
-            "text",
-            30_000,
-        ),
-        (
-            "knowledge/current/absorber_codebase_map.md",
-            ABSORBER_CODEBASE_MAP,
-            "text",
-            35_000,
-        ),
-        (
-            "knowledge/current/absorber_config_map.json",
-            ABSORBER_CONFIG_MAP,
-            "json",
-            20_000,
-        ),
-        (
-            "knowledge/current/absorber_blame_map.md",
-            ABSORBER_BLAME_MAP,
-            "text",
-            20_000,
-        ),
-        (
-            "knowledge/current/patcher_findings_snapshot.md",
-            PATCHER_FINDINGS_SNAPSHOT,
-            "text",
-            20_000,
-        ),
-        (
-            "knowledge/current/archivist_spec_gaps.md",
-            ARCHIVIST_SPEC_GAPS,
-            "text",
-            15_000,
-        ),
-    ]
+    # ── clarificator full session (context only — synthesis already in request) ──
+    session_text = _read_json_optional(CLARIFICATOR_SESSION, max_chars=20_000)
+    if session_text:
+        sections.append("### clarificator/session.json\n" + session_text)
 
-    for label, path, kind, cap in sources:
-        text = (
-            _read_json_optional(path, max_chars=cap)
-            if kind == "json"
-            else _read_optional(path, max_chars=cap)
-        )
-        if text:
-            sections.append(f"### {label}\n{text}")
+    # ── archivist knowledge log ──
+    knowledge = _read_optional(ARCHIVIST_KNOWLEDGE_LOG, max_chars=30_000)
+    if knowledge:
+        sections.append("### archivist/knowledge_log.md\n" + knowledge)
+
+    # ── absorber codebase map (merged config + blame) ──
+    codebase = _read_optional(ABSORBER_CODEBASE_MAP, max_chars=35_000)
+    if codebase:
+        sections.append("### absorber/codebase_map.md\n" + codebase)
+
+    # ── patcher last attempt entry ──
+    patcher_last = _read_patcher_last_entry(max_chars=20_000)
+    if patcher_last:
+        sections.append("### patcher/attempt_log.json (last entry)\n" + patcher_last)
+
+    # ── spec gaps ──
+    spec_gaps = _read_optional(ARCHIVIST_SPEC_GAPS, max_chars=15_000)
+    if spec_gaps:
+        sections.append("### archivist/spec_gaps.md\n" + spec_gaps)
 
     return "\n\n".join(sections)
+
+
+def _read_patcher_last_entry(*, max_chars: int | None = None) -> str:
+    """
+    Read the last entry from patcher/attempt_log.json.
+    Returns empty string if file missing, empty, or unreadable.
+    Replaces the removed PATCHER_FINDINGS_SNAPSHOT.
+    """
+    try:
+        if not PATCHER_ATTEMPT_LOG.exists():
+            return ""
+        track_read(PATCHER_ATTEMPT_LOG)
+        raw = PATCHER_ATTEMPT_LOG.read_text(encoding="utf-8").strip()
+        if not raw:
+            return ""
+        data = json.loads(raw)
+        entries = data.get("entries", data) if isinstance(data, dict) else data
+        if not isinstance(entries, list) or not entries:
+            return ""
+        last = entries[-1]
+        text = json.dumps(last, indent=2, ensure_ascii=False)
+        if max_chars is not None and len(text) > max_chars:
+            return text[:max_chars] + f"\n\n<!-- truncated at {max_chars} chars -->"
+        return text
+    except Exception as exc:
+        print(f"[07] WARNING: could not read patcher attempt log: {exc}", file=sys.stderr)
+        return ""
 
 
 def call_mini_planner(request: str, context_bundle: str) -> dict:
@@ -841,13 +1221,19 @@ def call_mini_planner(request: str, context_bundle: str) -> dict:
         f"{context_block}"
     )
 
-    return _call_planner_json(
-        system_prompt=MINI_SYSTEM_PROMPT,
-        user_message=user_message,
-        label="mini planner response",
+    print(f"[07] Calling model: {get_model(ROLE)} (provider: {get_provider(ROLE)}) — mini planner response …")
+    result, _ = call_llm_json(
+        ROLE,
+        MINI_SYSTEM_PROMPT,
+        user_message,
         temperature=0.15,
         max_tokens=32768,
+        retries=2,
+        backoff=False,
+        caller_file=__file__,
+        label="[07] mini planner response",
     )
+    return _parse_json(str(result), label="mini planner response")
 
 
 def _normalize_target_action(action: Any) -> str:
@@ -867,12 +1253,27 @@ def _is_disallowed_target_path(path: str) -> bool:
     if not normalized:
         return True
 
+    # Artifact folder prefixes — implementer must never touch these
     blocked_prefixes = (
         "artifacts_",
+        "planner/",
+        "executor/",
+        "debugger/",
+        "reporter/",
+        "judge/",
+        "patcher/",
+        "archivist/",
+        "absorber/",
+        "clarificator/",
+        "enricher/",
+        "spectracker/",
+        "scaffolder/",
+        "spec/",
+        # Legacy dirs — still blocked for safety
         "state/",
         "cache/",
         "execution/",
-        "run/",       # legacy artifact dir, still blocked for safety
+        "run/",
         "knowledge/",
         "reports/",
     )
@@ -890,8 +1291,9 @@ def _is_disallowed_target_path(path: str) -> bool:
 
 def validate_and_normalize_mini_result(result: dict) -> tuple[dict, dict]:
     """
-    Validate and normalize model output into
-    (planner_mini_execution_plan, planner_mini_impact_analysis).
+    Validate and normalize model output into (plan, impact).
+
+    The caller merges these into mini_plan.json as {"plan": plan, "impact": impact}.
 
     Backward compatibility:
     - Accepts old top-level keys "plan_mini" and "analysis_mini".
@@ -1002,23 +1404,22 @@ def run_mini_scope() -> None:
     result = call_mini_planner(request, context_bundle)
     plan_mini, impact_analysis = validate_and_normalize_mini_result(result)
 
+    # Merge plan + impact into single mini_plan.json  { "plan": {...}, "impact": {...} }
+    mini_plan_merged = {
+        "plan": plan_mini,
+        "impact": impact_analysis,
+    }
+
     PLANNER_MINI_PLAN.parent.mkdir(parents=True, exist_ok=True)
-    PLANNER_MINI_IMPACT.parent.mkdir(parents=True, exist_ok=True)
-
     PLANNER_MINI_PLAN.write_text(
-        json.dumps(plan_mini, indent=2, ensure_ascii=False),
+        json.dumps(mini_plan_merged, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
-    _track_write(PLANNER_MINI_PLAN)
+    track_write(PLANNER_MINI_PLAN)
 
-    PLANNER_MINI_IMPACT.write_text(
-        json.dumps(impact_analysis, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
-    _track_write(PLANNER_MINI_IMPACT)
+    append_plan_log(scope="mini", plan=plan_mini, impact=impact_analysis)
 
-    print(f"[07] Mini plan written            → {PLANNER_MINI_PLAN}")
-    print(f"[07] Mini impact analysis written → {PLANNER_MINI_IMPACT}")
+    print(f"[07] Mini plan written → {PLANNER_MINI_PLAN}")
     print(f"[07] Target files: {len(plan_mini.get('target_files', []))}")
     for entry in plan_mini.get("target_files", []):
         print(
@@ -1059,7 +1460,9 @@ def main() -> None:
         exit_code = 1
 
     finally:
-        _print_artifact_access_summary()
+        print_summary("[07]")
+        print_artifact_summary("[07]")
+        prompt_next_step(ROLE, prefix="[07]")
 
     sys.exit(exit_code)
 
