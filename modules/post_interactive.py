@@ -95,6 +95,8 @@ def _build_chain() -> dict[str, StepInfo]:
         PLANNER_PLAN_LOG,
         EXECUTOR_OVERWRITE_MANIFEST,
         EXECUTOR_MANIFEST_LOG,
+        DONE_CHECKER_RESULT,
+        DONE_CHECKER_LOG,
         DEBUGGER_OVERWRITE_TEST_SUMMARY,
         DEBUGGER_TEST_LOG,
         REPORTER_EXECUTION_SUMMARY,
@@ -109,6 +111,7 @@ def _build_chain() -> dict[str, StepInfo]:
         ARCHIVIST_CURATION_LOG,
         SPECTRACKER_VERSION_DELTA,
         SPECTRACKER_VERSION_LOG,
+        ABSORBER_CODEBASE_MD,
         get_spec_path,
     )
 
@@ -271,6 +274,27 @@ def _build_chain() -> dict[str, StepInfo]:
             next_step           = None,
             suggest_after_run   = "spectracker",
             long_term_artifact  = None,   # ngoại lệ: archivist là pure accumulation — skip commit prompt
+        ),
+        # ── Standalone tools (not in main linear chain) ───────────────────────
+        "done_checker": StepInfo(
+            script             = "done_checker.py",
+            consumes           = [
+                SPEC,
+                ABSORBER_CODEBASE_MD,
+            ],
+            produces           = [DONE_CHECKER_RESULT, DONE_CHECKER_LOG],
+            next_step          = None,
+            suggest_after_run  = "spectracker",  # PASSED → prompt mark-applied
+            long_term_artifact = DONE_CHECKER_LOG,
+        ),
+        "error_fixer": StepInfo(
+            script             = "9e_error_fixer.py",
+            consumes           = [
+                ABSORBER_CODEBASE_MD,
+            ],
+            produces           = [],     # writes error_fixer/ internally
+            next_step          = None,   # standalone — on-demand DevOps/MLOps Q&A
+            long_term_artifact = None,
         ),
     }
 

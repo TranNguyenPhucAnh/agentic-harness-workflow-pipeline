@@ -448,6 +448,43 @@ EXECUTOR_OVERWRITE_MANIFEST = _LazyPath("executor/manifest.json")
 EXECUTOR_MANIFEST_LOG = _LazyPath("executor/manifest_log.json")
 
 
+# ── compile_fixer/ ───────────────────────────────────────────────────────────
+ 
+# owner:     9c_compile_fixer_loop.py
+# consumers: harness, human review
+# lifecycle: short-term — overwrite per compile_fixer session
+# purpose:   machine-readable state of current session: round, remaining errors,
+#            pending commands, per-round history. Harness có thể đọc để biết
+#            compile còn lỗi không trước khi chạy debugger.
+COMPILE_FIXER_LOOP = _LazyPath("compile_fixer/loop.json")
+ 
+# owner:     9c_compile_fixer_loop.py
+# consumers: human review
+# lifecycle: long-term — append-only across sessions
+# purpose:   human-readable history: mỗi session một section, ghi lại
+#            round count, errors còn lại, feedback của user, commands đã suggest.
+COMPILE_FIXER_LOG = _LazyPath("compile_fixer/fixer_log.md")
+ 
+
+
+# ── done_checker/ ────────────────────────────────────────────────────────────
+
+# owner:     done_checker.py
+# consumers: human review; downstream debugger/patcher (reads failed items)
+# lifecycle: short-term — overwrite per done_checker run
+# purpose:   structured PASS/FAIL result: summary, failed items with fix hints,
+#            passed items, requirement ID findings, open questions.
+#            Each failed item includes file/symbol/line_hint/fix for agent use.
+DONE_CHECKER_RESULT = _LazyPath("done_checker/done_checker_result.md")
+
+# owner:     done_checker.py
+# consumers: human review
+# lifecycle: long-term — append-only
+# purpose:   per-run history: timestamp, spec_version, overall verdict,
+#            passed/total counts, failed item IDs, diff_base used.
+DONE_CHECKER_LOG = _LazyPath("done_checker/done_checker_log.json")
+
+
 # ── debugger/ ────────────────────────────────────────────────────────────────
 
 # owner:     debugger (09_debugger.py)
@@ -550,6 +587,22 @@ ARCHIVIST_SPEC_GAPS = _LazyPath("archivist/spec_gaps.md")
 #            judge findings: applied / skipped / escalated to spec bump.
 ARCHIVIST_CURATION_LOG = _LazyPath("archivist/curation_log.json")
 
+# ── error_fixer/ ─────────────────────────────────────────────────────────────
+ 
+# owner:     9e_error_fixer.py
+# consumers: human review; next session (context injection)
+# lifecycle: short-term — overwrite per session
+# purpose:   full Q&A transcript of the current/last session.
+#            Overwritten at session start (in_progress) and on exit (final).
+ERROR_FIXER_QA = _LazyPath("error_fixer/error_qa.md")
+ 
+# owner:     9e_error_fixer.py
+# consumers: 9e_error_fixer.py (knowledge injection at session start)
+# lifecycle: long-term — append-only across sessions
+# purpose:   LLM-generated summaries of each session, timestamped.
+#            Injected into system prompt context (last ~3000 chars) to give
+#            the model memory of previous debugging patterns and solutions.
+ERROR_FIXER_QA_LOG = _LazyPath("error_fixer/error_qa_log.md")
 
 # ── harness/ (project root) ──────────────────────────────────────────────────
 
@@ -572,6 +625,7 @@ KNOWLEDGE_SOURCES: list = [
     SCAFFOLDER_SKELETON_LOG,
     PLANNER_PLAN_LOG,
     EXECUTOR_MANIFEST_LOG,
+    DONE_CHECKER_LOG,
     DEBUGGER_TEST_LOG,
     REPORTER_EXECUTION_LOG,
     JUDGE_VERDICT_LOG,
@@ -581,6 +635,184 @@ KNOWLEDGE_SOURCES: list = [
     ARCHIVIST_CURATION_LOG,
 ]
 
+
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# DevOps / MLOps toolkit paths
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Artifact root cho DevOps/MLOps toolkit — tách khỏi SWE artifacts.
+# Có thể override bằng env var DEVOPS_ARTIFACT_ROOT.
+# Default: <repo_root>/../outputs/devops_mlops/artifacts_<slug>/
+#
+# Tất cả modules trong toolkits/devops_mlops/ phải import paths từ đây
+# thay vì tự define _devops_artifact_root() local.
+
+
+def devops_artifact_root() -> Path:
+    """
+    Return the DevOps/MLOps artifact root for the current project.
+    Override: set DEVOPS_ARTIFACT_ROOT env var.
+    Default:  <repo_root>/../outputs/devops_mlops/artifacts_<slug>/
+    """
+    override = os.environ.get("DEVOPS_ARTIFACT_ROOT")
+    base     = Path(override) if override else REPO_ROOT.parent / "outputs" / "devops_mlops"
+    return base / f"artifacts_{get_project_slug()}"
+
+
+class _DevOpsLazyPath:
+    """
+    Like _LazyPath but rooted at devops_artifact_root() instead of artifact_root().
+    """
+    __slots__ = ("_rel",)
+
+    def __init__(self, rel: str) -> None:
+        self._rel = rel
+
+    def _resolve(self) -> Path:
+        return devops_artifact_root() / self._rel
+
+    def __fspath__(self)          -> str:  return str(self._resolve())
+    def __str__(self)             -> str:  return str(self._resolve())
+    def __repr__(self)            -> str:  return f"DevOpsLazyPath({self._rel!r} → {self._resolve()})"
+    def __eq__(self, other)       -> bool: return self._resolve() == Path(other) if other else False
+    def __hash__(self)            -> int:  return hash(self._resolve())
+    def __truediv__(self, other)  -> Path: return self._resolve() / other
+
+    @property
+    def parent(self) -> Path:
+        return self._resolve().parent
+
+    def exists(self)   -> bool: return self._resolve().exists()
+    def is_file(self)  -> bool: return self._resolve().is_file()
+    def is_dir(self)   -> bool: return self._resolve().is_dir()
+
+    def read_text(self, **kw)           -> str:  return self._resolve().read_text(**kw)
+    def write_text(self, data, **kw)    -> None: self._resolve().write_text(data, **kw)
+    def open(self, *a, **kw):                    return self._resolve().open(*a, **kw)
+    def mkdir(self, **kw)               -> None: self._resolve().mkdir(**kw)
+
+
+# ── infra_absorber/ ──────────────────────────────────────────────────────────
+
+# owner:     infra_absorber.py
+# consumers: config_consistency_checker, incident_clarificator
+# lifecycle: short-term — overwrite per run
+INFRA_MAP_JSON = _DevOpsLazyPath("infra_absorber/infra_map.json")
+INFRA_MAP_MD   = _DevOpsLazyPath("infra_absorber/infra_map.md")
+
+# owner:     infra_absorber.py
+# lifecycle: long-term — append-only
+INFRA_ABSORBER_LOG = _DevOpsLazyPath("infra_absorber/infra_absorber_log.json")
+
+
+# ── live_discovery/ ──────────────────────────────────────────────────────────
+
+# owner:     live_discovery.py
+# consumers: config_consistency_checker
+# lifecycle: short-term — overwrite per run
+DISCOVERY_MAP_JSON = _DevOpsLazyPath("live_discovery/discovery_map.json")
+DISCOVERY_MAP_MD   = _DevOpsLazyPath("live_discovery/discovery_map.md")
+
+# owner:     live_discovery.py
+# lifecycle: long-term — append-only
+LIVE_DISCOVERY_LOG = _DevOpsLazyPath("live_discovery/discovery_log.json")
+
+
+# ── doc_absorber/ ────────────────────────────────────────────────────────────
+
+# owner:     doc_absorber.py
+# consumers: config_consistency_checker (LOW confidence source)
+# lifecycle: short-term — overwrite per run
+DOC_MAP_JSON = _DevOpsLazyPath("doc_absorber/doc_map.json")
+DOC_MAP_MD   = _DevOpsLazyPath("doc_absorber/doc_map.md")
+
+# owner:     doc_absorber.py
+# lifecycle: long-term — append-only
+DOC_ABSORBER_LOG = _DevOpsLazyPath("doc_absorber/doc_log.json")
+
+# Redacted previews (written by redactor.py, consumed by doc_absorber human gate)
+DOC_REDACTED_DIR = _DevOpsLazyPath("doc_absorber/redacted")
+
+
+# ── config_consistency/ ──────────────────────────────────────────────────────
+
+# owner:     config_consistency_checker.py
+# consumers: incident_clarificator (context injection), infra_judge
+# lifecycle: short-term — overwrite per run
+CONSISTENCY_REPORT_MD  = _DevOpsLazyPath("consistency/consistency_report.md")
+
+# owner:     config_consistency_checker.py
+# lifecycle: long-term — append-only
+# purpose:   run history with sources_used, risk_level, finding count.
+#            incident_clarificator reads last 3 HIGH entries for context.
+CONSISTENCY_LOG = _DevOpsLazyPath("consistency/consistency_log.json")
+
+
+# ── postmortem/ ──────────────────────────────────────────────────────────────
+
+# owner:     postmortem_archivist.py
+# consumers: incident_clarificator (get_relevant_context), infra_judge
+# lifecycle: short-term — overwrite (full KB, rewritten on each save)
+POSTMORTEM_KB = _DevOpsLazyPath("postmortem/postmortem_kb.json")
+
+# owner:     postmortem_archivist.py
+# lifecycle: long-term — append-only
+POSTMORTEM_LOG = _DevOpsLazyPath("postmortem/postmortem_log.md")
+
+# Internal idempotency cache for ingest
+POSTMORTEM_INGEST_CACHE = _DevOpsLazyPath("postmortem/ingest_cache.json")
+
+
+# ── incident_clarificator/ ───────────────────────────────────────────────────
+
+# owner:     incident_clarificator.py
+# consumers: human review
+# lifecycle: short-term — overwrite per session
+INCIDENT_SESSION_JSON = _DevOpsLazyPath("incident_clarificator/incident_session.json")
+
+# owner:     incident_clarificator.py
+# lifecycle: long-term — append-only
+INCIDENT_LOG = _DevOpsLazyPath("incident_clarificator/incident_log.md")
+
+
+# ── metrics_reporter/ ────────────────────────────────────────────────────────
+
+# owner:     metrics_reporter.py
+# consumers: infra_judge
+# lifecycle: short-term — overwrite per run
+METRICS_REPORT_JSON = _DevOpsLazyPath("metrics_reporter/metrics_report.json")
+
+# owner:     metrics_reporter.py
+# lifecycle: long-term — append-only, compact summary entries
+METRICS_LOG = _DevOpsLazyPath("metrics_reporter/metrics_log.json")
+
+# owner:     metrics_reporter.py
+# lifecycle: permanent append — full summary per run for trend analysis
+# purpose:   infra_judge reads this for week-over-week comparison.
+#            Unlike metrics_log (compact), history keeps full by_service, flags.
+METRICS_HISTORY = _DevOpsLazyPath("metrics_reporter/metrics_history.json")
+
+
+def ensure_devops_dirs() -> None:
+    """
+    Create all DevOps/MLOps artifact directories for current project.
+    Call once at the start of any DevOps/MLOps script.
+    """
+    root = devops_artifact_root()
+    for rel in (
+        "infra_absorber",
+        "live_discovery",
+        "doc_absorber/redacted",
+        "doc_absorber/images",
+        "consistency",
+        "postmortem",
+        "incident_clarificator",
+        "metrics_reporter",
+        "infra_judge",
+    ):
+        (root / rel).mkdir(parents=True, exist_ok=True)
 
 # ── Backward-compatible aliases ──────────────────────────────────────────────
 # Kept so in-flight callers don't break during migration. New code should
@@ -656,6 +888,9 @@ def ensure_dirs() -> None:
         "scaffolder",
         "planner",
         "executor",
+        "compile_fixer",
+        "done_checker",
+        "error_fixer",
         "debugger",
         "reporter",
         "judge",

@@ -3,61 +3,281 @@ pipeline/01_absorber.py
 =======================
 Step 1 — Absorb an existing codebase into the knowledge layer.
 
-Runs once when taking over a legacy project, and on-demand when the codebase
-changes significantly enough to warrant a refresh.
+Design goal: always-fresh agent-ready artifacts. codebase_map.md and
+codebase_map.json must reflect the current repo state so every downstream
+pipeline step operates on accurate context.
 
-Phases:
-  1. File tree scan        — apply absorber.ignored rules, build file inventory
-  2. Content extraction    — full / key-only / signature-only per file
-  3. Semantic compression  — single LLM call → codebase_map.md (narrative)
-  4. Git crawl             — git log → structured into codebase_map.json["git"]
-  5. Write artifacts       — codebase_map.md + codebase_map.json
-  6. Append codebase_log   — long-term audit trail
+────────────────────────────────────────────────────────────────
+Artifacts produced
+────────────────────────────────────────────────────────────────
 
-Artifact split:
-  codebase_map.md   — LLM-generated narrative (human/LLM readable)
-                       Sections: Project Overview, Module Inventory, Entry Points,
-                       Data Flow, Config, Git/Blame, Tech Debt, Absorber Notes
-  codebase_map.json — Structured machine-readable data
-                       Fields: meta, config (env vars, services), git (hotspots,
-                       contributors, module activity)
+  codebase_map.md        LLM-generated narrative. Sections:
+                           Project Overview · Module Inventory · Entry Points
+                           Data Flow · Config · ## Git/Blame · Tech Debt · Absorber Notes
+                         Written once per full run. ## Git/Blame section can be
+                         updated in-place by patch mode without touching other sections.
 
-External integrations optional, graceful fallback:
-  - vfs CLI     — signature extraction
-  - Serena MCP  — symbol-level call graph, future via subprocess
+  codebase_map.json      Structured machine-readable data. Top-level keys:
+                           meta   — run provenance (generated_at, patched_at, run_mode,
+                                    total_files, cost, stale_since, …)
+                           config — env vars (keys only, values redacted), detected services
+                           git    — hotspots, contributors, module activity
+                           staleness — written by --check-stale (stale, days_old, …)
+                         Fully overwritten on full runs. Keys updated in-place on patch.
 
-Change detection:
-  - absorber/cache/codebase_snapshot.json tracks file hashes
-  - Only re-extracts files that changed since last run
-  - --force flag bypasses cache
+  codebase_log.json      Append-only audit trail. One entry per run (full or patch).
 
-Usage:
+  cache/codebase_snapshot.json
+                         Internal SHA256 per-file cache. Read+written every run.
+                         Not consumed by downstream agents.
+
+External integrations (optional, graceful fallback if absent):
+  vfs CLI    — signature extraction
+  Serena MCP — symbol-level call graph (future, via subprocess)
+
+────────────────────────────────────────────────────────────────
+Full run — phases
+────────────────────────────────────────────────────────────────
+
+  Phase 1  File tree scan      apply absorber.ignored rules → file inventory
+  Phase 2  Content extraction  full / key-only / signature-only per file type
+                               SHA256 cache skips files unchanged since last run
+  Phase 3  Semantic compression  1 LLM call → full codebase_map.md narrative
+  Phase 4  Git crawl           git log → codebase_map.json["git"]
+  Phase 5  Write artifacts     codebase_map.md (OVERWRITE), codebase_map.json (OVERWRITE)
+  Phase 6  Append log          1 entry appended to codebase_log.json
+
+────────────────────────────────────────────────────────────────
+Usage A — Full run  (first-time onboarding or major refactor)
+────────────────────────────────────────────────────────────────
+
   python 01_absorber.py
   python 01_absorber.py --project my-app
-  PIPELINE_PROJECT=my-app python 01_absorber.py
-
-  python 01_absorber.py --git-scope 6m
-  python 01_absorber.py --git-scope 500
-  python 01_absorber.py --git-scope all
-  python 01_absorber.py --force
-  python 01_absorber.py --dry-run
   python 01_absorber.py --target /path/to/repo
+  python 01_absorber.py --git-scope 6m|3m|500|all
+  python 01_absorber.py --force
 
-Writes, owner: absorber (01_absorber.py):
-  artifacts_<slug>/absorber/codebase_map.md          (short-term, overwrite — LLM narrative)
-  artifacts_<slug>/absorber/codebase_map.json        (short-term, overwrite — structured data)
-  artifacts_<slug>/absorber/codebase_log.json        (long-term, append)
-  artifacts_<slug>/absorber/cache/codebase_snapshot.json  (internal cache)
+  All commands above run all 6 phases.
 
-Reads:
-  project source files (target codebase)
-  artifacts_<slug>/absorber/cache/codebase_snapshot.json if present
+  Phases 1→2→3→4→5→6
+    ├─ Phase 2: unchanged files served from SHA256 cache (--force bypasses)
+    ├─ Phase 3: 1 LLM call, full context (~800k chars), rewrites entire codebase_map.md
+    └─ Phase 4: git history depth controlled by --git-scope (default: all)
 
-At the end of each run, prints:
-  - artifacts/files read
-  - artifacts/files created/updated/overwritten/appended
+  Artifact impact:
+    codebase_map.md          OVERWRITE  — entire file replaced by LLM output
+    codebase_map.json        OVERWRITE  — entire file replaced; meta.stale_since = null
+    codebase_log.json        APPEND     — 1 new entry {mode: "full", …}
+    cache/snapshot.json      OVERWRITE  — updated SHA256s for all scanned files
 
-For taxonomy details see artifacts/TAXONOMY.md
+  Cost: 1 LLM call. Runtime: 30s–5min depending on codebase size.
+  When to use: first run, after a major refactor, after changing absorber config.
+
+  ── --dry-run ──
+  python 01_absorber.py --dry-run
+    Runs Phase 1 + Phase 2 (scan + extract/cache) only. Stops before LLM.
+    Prints context size (chars + estimated tokens). No artifact writes.
+    Use to preview LLM input size or warm the cache without spending tokens.
+
+    Artifact impact:
+      cache/snapshot.json    OVERWRITE  — cache warmed
+      everything else        UNCHANGED
+
+────────────────────────────────────────────────────────────────
+Usage B — --install-hook  (one-time setup, enables auto patch on every commit)
+────────────────────────────────────────────────────────────────
+
+  python 01_absorber.py --install-hook
+
+  Writes a post-commit hook to .git/hooks/post-commit (appends if hook exists,
+  never overwrites). The installed hook runs on every subsequent `git commit`:
+
+    python 01_absorber.py --changed-since HEAD~1 --mode patch
+
+  After --install-hook is run once, no further manual intervention is needed.
+  Every commit automatically triggers a patch run (see Pattern 2 below).
+
+  Artifact impact of --install-hook itself:
+    .git/hooks/post-commit   WRITE/APPEND  — hook script added
+    everything else          UNCHANGED     — no scan, no LLM
+
+────────────────────────────────────────────────────────────────
+Pattern 2 — --mode patch  (0 LLM · git-only update · auto or manual)
+────────────────────────────────────────────────────────────────
+
+  Triggered automatically by the post-commit hook after every commit.
+  Can also be called manually at any time.
+
+  python 01_absorber.py --mode patch                    ← manual
+  python 01_absorber.py --changed-since HEAD~1 --mode patch  ← what hook runs
+
+  Requires a prior full run (codebase_map.json must already exist).
+  Skips Phase 1 (scan), Phase 2 (extraction), Phase 3 (LLM).
+  Runs Phase 4 (git crawl) only, then writes results.
+
+  commit
+    └─► hook fires
+          └─► Phase 4: git log → new git data
+                ├─► codebase_map.json["git"]          IN-PLACE OVERWRITE
+                ├─► codebase_map.json["meta"]
+                │     patched_at  = now               IN-PLACE UPDATE
+                │     stale_since = null              IN-PLACE UPDATE
+                ├─► codebase_map.md ## Git/Blame      REGEX REPLACE (section only)
+                │     (all other sections untouched)
+                └─► codebase_log.json                 APPEND {mode:"patch", …}
+
+  Cost: 0 LLM calls. Runtime: <1s.
+
+  Note on --changed-since in patch mode:
+    The hook combines --changed-since HEAD~1 with --mode patch.
+    --changed-since invalidates cache entries for files in the diff.
+    In patch mode extraction is skipped, so those invalidated cache entries
+    will be re-extracted on the next full run or --changed-since full run.
+    It is harmless and intentional: the cache is kept honest for whenever
+    the next LLM run happens.
+
+────────────────────────────────────────────────────────────────
+Pattern 3 — --check-stale  (passive CI gate · 0 LLM · 0 extraction)
+────────────────────────────────────────────────────────────────
+
+  python 01_absorber.py --check-stale
+  python 01_absorber.py --check-stale --stale-threshold 3
+
+  Does NOT check for uncommitted/unstaged files.
+  Checks the AGE of the artifact itself:
+    reads codebase_map.json["meta"]["patched_at"]  (or "generated_at" if never patched)
+    computes days since that timestamp
+    if days > threshold (default 7) → marks as stale
+
+  Also counts commits that landed after the artifact was last updated:
+    git log --since=<patched_at> --name-only → changed_files count
+  This reflects commits that the hook may have patched but a full LLM
+  re-compression has not yet captured.
+
+  why --check-stale is still useful even when hook is installed:
+    - Hook only runs when YOU commit. If the repo is shared, a teammate's
+      commits don't trigger your hook.
+    - If the hook was installed recently on an existing repo, early commits
+      were never patched.
+    - Long-running branches may go days without a commit.
+    - CI environments clone fresh — no hook, no patch history.
+
+  Artifact impact:
+    codebase_map.json["staleness"]   IN-PLACE UPSERT:
+      {
+        "checked_at":     "<iso>",
+        "stale":          true | false,
+        "reason":         "age" | "fresh" | "no_artifacts" | "unreadable_timestamp",
+        "days_old":       N,
+        "changed_files":  N,   ← commits since last absorb, not uncommitted files
+        "threshold_days": N
+      }
+    everything else                  UNCHANGED
+
+  Exit codes: 0 = fresh · 2 = stale
+  Downstream agents read codebase_map.json["staleness"]["stale"] directly.
+
+  Recommended CI gate:
+    python 01_absorber.py --check-stale || python 01_absorber.py --mode patch
+    # fresh → exit 0, nothing runs
+    # stale → patch mode refreshes git data (0 LLM)
+
+    For full narrative refresh on stale:
+    python 01_absorber.py --check-stale || python 01_absorber.py --changed-since HEAD~20
+
+────────────────────────────────────────────────────────────────
+Pattern 4 — --changed-since  (manual · 1 LLM · partial extraction)
+────────────────────────────────────────────────────────────────
+
+  python 01_absorber.py --changed-since HEAD~1
+  python 01_absorber.py --changed-since HEAD~20
+  python 01_absorber.py --changed-since abc1234
+
+  Human manual command. Runs all 6 phases (full run) but limits Phase 2
+  extraction to only the files that changed since the given git ref.
+
+  git diff --name-only <ref> HEAD
+    └─► for each changed file: delete its SHA256 cache entry
+          └─► Phase 2 re-extracts only those files from disk
+                └─► unchanged files served from cache as before
+                      └─► Phase 3: 1 LLM call
+                            full context = re-extracted files + cached unchanged files
+                            → codebase_map.md        OVERWRITE  (full narrative rewritten)
+                            → codebase_map.json      OVERWRITE  (meta + git + config)
+                            → codebase_log.json      APPEND
+                            → cache/snapshot.json    OVERWRITE
+
+  This is the primary way to refresh the full LLM narrative after commits
+  have accumulated. The hook keeps git data current per-commit (patch mode),
+  and --changed-since re-compresses the narrative when you decide it's needed.
+
+  Typical trigger points:
+    after merging a feature branch    → --changed-since HEAD~20
+    after a sprint's worth of commits → --changed-since HEAD~50
+    after a specific refactor commit  → --changed-since abc1234
+
+  Cost: 1 LLM call. Extraction I/O proportional to number of changed files only.
+
+  Relationship to Pattern 2:
+    --mode patch     → per-commit, automatic, 0 LLM, only Git/Blame updated
+    --changed-since  → manual, 1 LLM, full narrative rewritten with fresh context
+
+────────────────────────────────────────────────────────────────
+Recommended operational cadence
+────────────────────────────────────────────────────────────────
+
+  Day 0:
+    python 01_absorber.py --target /path/to/repo   ← full run, build initial artifacts
+    python 01_absorber.py --install-hook           ← enable auto patch on every commit
+
+  Every commit (automatic, no action needed after Day 0):
+    hook → --changed-since HEAD~1 --mode patch
+    effect: codebase_map.json["git"] + ## Git/Blame stay current · 0 LLM
+
+  Periodically / after feature branch merges:
+    python 01_absorber.py --changed-since HEAD~N   ← refresh full narrative · 1 LLM
+    (N = number of commits since last full LLM run)
+
+  In CI before any agent pipeline run:
+    python 01_absorber.py --check-stale --stale-threshold 3
+    exit 2 → trigger --mode patch or --changed-since before agents consume artifacts
+
+  After major refactor or dependency upgrade:
+    python 01_absorber.py --force                  ← full re-extract + full LLM
+
+────────────────────────────────────────────────────────────────
+Artifact impact summary by command
+────────────────────────────────────────────────────────────────
+
+  Command                         md (full) md (Git/Blame) json (git) json (meta) json (stale) log    cache
+  ──────────────────────────────  ───────── ────────────── ────────── ─────────── ──────────── ────── ─────
+  (full run)                      OVERWRITE incl. above    OVERWRITE  OVERWRITE   cleared      APPEND OVERWRITE
+  --force                         OVERWRITE incl. above    OVERWRITE  OVERWRITE   cleared      APPEND OVERWRITE
+  --dry-run                       –         –              –          –           –            –      OVERWRITE
+  --install-hook                  –         –              –          –           –            –      –
+  --mode patch                    –         REGEX REPLACE  OVERWRITE  UPDATE      cleared      APPEND –
+  --changed-since <ref>           OVERWRITE incl. above    OVERWRITE  OVERWRITE   cleared      APPEND OVERWRITE (partial)
+  --check-stale                   –         –              –          –           UPSERT       –      –
+
+  OVERWRITE = entire file replaced
+  REGEX REPLACE = only ## Git/Blame section replaced, rest of file untouched
+  UPDATE = specific keys updated in-place, rest of JSON untouched
+  UPSERT = staleness key added/replaced in-place
+  cleared = meta.stale_since set to null
+  – = not touched
+
+────────────────────────────────────────────────────────────────
+Artifact paths (owner: absorber)
+────────────────────────────────────────────────────────────────
+
+  artifacts_<slug>/absorber/codebase_map.md
+  artifacts_<slug>/absorber/codebase_map.json
+  artifacts_<slug>/absorber/codebase_log.json
+  artifacts_<slug>/absorber/cache/codebase_snapshot.json
+
+  Reads: project source files + cache/codebase_snapshot.json (if present)
+  At end of each run: prints files read and files written/appended.
+  For taxonomy details see artifacts/TAXONOMY.md
 """
 
 from __future__ import annotations
@@ -1315,6 +1535,318 @@ def _build_context(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Pattern 1 — Git-hook installer
+# ─────────────────────────────────────────────────────────────────────────────
+
+_HOOK_SCRIPT = """\
+#!/bin/sh
+# absorber post-commit hook — invalidates cache for files changed in this commit
+# then re-runs absorber in patch mode (git+staleness update, no LLM call).
+# Installed by: python 01_absorber.py --install-hook
+ABSORBER_SCRIPT="$(git rev-parse --show-toplevel)/pipeline/01_absorber.py"
+if [ ! -f "$ABSORBER_SCRIPT" ]; then
+    # fallback: look relative to hook location
+    ABSORBER_SCRIPT="$(dirname "$0")/../../pipeline/01_absorber.py"
+fi
+if [ -f "$ABSORBER_SCRIPT" ]; then
+    python "$ABSORBER_SCRIPT" --changed-since HEAD~1 --mode patch
+fi
+"""
+
+
+def install_git_hook(target: Path) -> None:
+    """
+    Install a post-commit hook that runs absorber --changed-since HEAD~1 --mode patch
+    after every commit. Appends to existing hook if one exists; does not overwrite.
+    """
+    git_dir = target / ".git"
+    if not git_dir.is_dir():
+        print("[absorber][error] Not a git repository — cannot install hook.", file=sys.stderr)
+        sys.exit(1)
+
+    hooks_dir = git_dir / "hooks"
+    hooks_dir.mkdir(exist_ok=True)
+    hook_path = hooks_dir / "post-commit"
+
+    marker = "# absorber post-commit hook"
+
+    if hook_path.exists():
+        existing = hook_path.read_text()
+        if marker in existing:
+            print(f"[absorber] Hook already installed at {hook_path} — skipping.")
+            return
+        # Append to existing hook
+        updated = existing.rstrip("\n") + "\n\n" + _HOOK_SCRIPT
+        hook_path.write_text(updated)
+        print(f"[absorber] Appended absorber hook to existing {hook_path}")
+    else:
+        hook_path.write_text(_HOOK_SCRIPT)
+        print(f"[absorber] Installed hook at {hook_path}")
+
+    hook_path.chmod(0o755)
+    print("[absorber] Hook will run: absorber --changed-since HEAD~1 --mode patch on every commit")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pattern 1 — Changed-since: invalidate cache for files touched since a ref
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _invalidate_changed_files(target: Path, since_ref: str, cache: dict[str, Any]) -> list[str]:
+    """
+    Get files changed since git ref and delete their cache entries so
+    extract_content() will re-extract them on the next _build_context() call.
+
+    Returns list of invalidated rel_paths (for logging).
+    """
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--name-only", since_ref, "HEAD"],
+            capture_output=True, text=True, cwd=target, timeout=15,
+        )
+        if result.returncode != 0:
+            print(f"[absorber][warn] git diff failed for ref '{since_ref}': {result.stderr.strip()}")
+            return []
+    except Exception as e:
+        print(f"[absorber][warn] Could not run git diff: {e}")
+        return []
+
+    changed = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    invalidated: list[str] = []
+
+    for rel_path in changed:
+        if rel_path in cache:
+            del cache[rel_path]
+            invalidated.append(rel_path)
+
+    if invalidated:
+        print(f"[absorber] Changed-since '{since_ref}': invalidated {len(invalidated)} cache entries")
+        for p in invalidated[:10]:
+            print(f"  - {p}")
+        if len(invalidated) > 10:
+            print(f"  ... and {len(invalidated) - 10} more")
+    else:
+        print(f"[absorber] Changed-since '{since_ref}': no cached files affected ({len(changed)} changed total)")
+
+    return invalidated
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pattern 2 — Patch mode: update git + staleness, skip LLM re-compression
+# ─────────────────────────────────────────────────────────────────────────────
+
+_PATCH_GIT_SECTION_RE = re.compile(
+    r"^## Git/Blame\s*\n.*?(?=^## |\Z)",
+    re.MULTILINE | re.DOTALL,
+)
+
+
+def run_patch_mode(target: Path, args: argparse.Namespace) -> None:
+    """
+    Patch mode: re-run git crawl and update staleness in codebase_map.json
+    without calling the LLM. Also surgically replaces the ## Git/Blame section
+    in codebase_map.md so it stays accurate after every commit.
+
+    Appropriate for post-commit hooks and frequent incremental updates.
+    Cost: 0 LLM calls, <1s typically.
+    """
+    print("[absorber] Mode: patch — updating git data and staleness (no LLM call)")
+
+    md_path  = Path(str(CODEBASE_MD))
+    map_path = Path(str(CODEBASE_MAP))
+
+    if not map_path.exists():
+        print("[absorber][warn] No codebase_map.json found — patch mode requires a prior full run.")
+        print("[absorber]       Run without --mode patch first to generate initial artifacts.")
+        sys.exit(1)
+
+    # Load existing JSON
+    try:
+        track_read(map_path)
+        existing_json: dict[str, Any] = json.loads(map_path.read_text())
+    except Exception as e:
+        print(f"[absorber][error] Could not read codebase_map.json: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Re-run git crawl
+    print(f"[absorber] Patch — git crawl (scope: {args.git_scope})")
+    new_git = _git_log_stats(target, args.git_scope)
+    if new_git:
+        total_c = new_git.get("total_commits", 0)
+        high_n  = len(new_git.get("hotspots", {}).get("high", []))
+        print(f"  Commits: {total_c} | High-churn files: {high_n}")
+
+    # Update JSON in-place
+    existing_json["git"] = new_git
+    existing_json.setdefault("meta", {})["patched_at"] = datetime.now(timezone.utc).isoformat()
+    existing_json["meta"]["stale_since"] = None  # cleared on patch
+
+    map_path.write_text(json.dumps(existing_json, indent=2, ensure_ascii=False))
+    track_write(map_path)
+    print(f"[absorber] Patched: {map_path}")
+
+    # Surgically update ## Git/Blame section in .md
+    if md_path.exists():
+        try:
+            track_read(md_path)
+            md_text = md_path.read_text(encoding="utf-8")
+
+            new_git_section = (
+                "## Git/Blame\n"
+                + _git_structured_to_prompt(new_git)
+                + "\n\n"
+            )
+
+            if _PATCH_GIT_SECTION_RE.search(md_text):
+                updated_md = _PATCH_GIT_SECTION_RE.sub(new_git_section, md_text)
+            else:
+                # Section not found — append
+                updated_md = md_text.rstrip("\n") + "\n\n" + new_git_section
+
+            md_path.write_text(updated_md, encoding="utf-8")
+            track_write(md_path)
+            print(f"[absorber] Patched Git/Blame section in: {md_path}")
+        except Exception as e:
+            print(f"[absorber][warn] Could not patch codebase_map.md: {e}")
+
+    # Append a terse patch entry to codebase_log
+    log_path = Path(str(CODEBASE_LOG))
+    existing_log: list[dict[str, Any]] = []
+    if log_path.exists():
+        try:
+            track_read(log_path)
+            data = json.loads(log_path.read_text())
+            existing_log = data.get("entries", data) if isinstance(data, dict) else data
+        except Exception:
+            pass
+
+    patch_entry = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "mode":         "patch",
+        "target":       str(target),
+        "git_scope":    args.git_scope,
+        "total_commits": new_git.get("total_commits", 0) if new_git else 0,
+    }
+    existing_log.append(patch_entry)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(json.dumps({"entries": existing_log}, indent=2))
+    track_write(log_path)
+    print(f"[absorber] Appended patch entry to codebase_log (total: {len(existing_log)})")
+
+    print()
+    print_artifact_summary()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pattern 3 — Staleness signal: detect drift without running absorber
+# ─────────────────────────────────────────────────────────────────────────────
+
+def check_stale(target: Path, threshold_days: int = 7) -> None:
+    """
+    Check if codebase_map artifacts are stale relative to the current git HEAD.
+
+    Prints a machine-readable staleness report and sets exit code:
+      0 — fresh (within threshold)
+      2 — stale (exceeds threshold or no artifacts found)
+
+    Downstream agents / CI can call this before consuming artifacts:
+      python 01_absorber.py --check-stale || python 01_absorber.py --mode patch
+    """
+    map_path = Path(str(CODEBASE_MAP))
+
+    print("[absorber] Staleness check")
+
+    if not map_path.exists():
+        print("[absorber][stale] No codebase_map.json found — never absorbed.")
+        _write_staleness_to_json(map_path, stale=True, reason="no_artifacts", days_old=None)
+        sys.exit(2)
+
+    # Load generated_at from JSON
+    try:
+        track_read(map_path)
+        meta      = json.loads(map_path.read_text()).get("meta", {})
+        # prefer patched_at if available (patch mode refreshes this)
+        ts_str    = meta.get("patched_at") or meta.get("generated_at", "")
+        generated = datetime.fromisoformat(ts_str) if ts_str else None
+    except Exception:
+        generated = None
+
+    if not generated:
+        print("[absorber][stale] Could not parse generated_at from codebase_map.json.")
+        _write_staleness_to_json(map_path, stale=True, reason="unreadable_timestamp", days_old=None)
+        sys.exit(2)
+
+    now      = datetime.now(timezone.utc)
+    days_old = (now - generated.replace(tzinfo=timezone.utc)).days
+
+    # Count files changed since artifact was generated (git-based drift signal)
+    changed_count = 0
+    if (target / ".git").is_dir():
+        try:
+            since_iso = generated.strftime("%Y-%m-%dT%H:%M:%S")
+            result    = subprocess.run(
+                ["git", "log", f"--since={since_iso}", "--name-only", "--format="],
+                capture_output=True, text=True, cwd=target, timeout=15,
+            )
+            if result.returncode == 0:
+                changed_count = len([l for l in result.stdout.splitlines() if l.strip()])
+        except Exception:
+            pass
+
+    stale  = days_old > threshold_days
+    reason = "age" if stale else "fresh"
+
+    status = "STALE" if stale else "FRESH"
+    print(f"  Status:        {status}")
+    print(f"  Generated:     {generated.isoformat()}")
+    print(f"  Age:           {days_old} day(s)")
+    print(f"  Threshold:     {threshold_days} day(s)")
+    print(f"  Files drifted: {changed_count} (since last absorb)")
+
+    # Write staleness signal into codebase_map.json so agents can read it
+    _write_staleness_to_json(map_path, stale=stale, reason=reason, days_old=days_old,
+                             changed_count=changed_count, threshold_days=threshold_days)
+
+    if stale:
+        print(f"\n[absorber][stale] Artifacts are {days_old}d old (>{threshold_days}d threshold).")
+        print("  Suggested: python 01_absorber.py --mode patch")
+        print("  Or full:   python 01_absorber.py")
+        sys.exit(2)
+    else:
+        print("\n[absorber] Artifacts are fresh.")
+        sys.exit(0)
+
+
+def _write_staleness_to_json(
+    map_path: Path,
+    *,
+    stale:          bool,
+    reason:         str,
+    days_old:       int | None,
+    changed_count:  int  = 0,
+    threshold_days: int  = 7,
+) -> None:
+    """
+    Upsert a 'staleness' key into codebase_map.json so downstream agents
+    can read it without shelling out to git.
+    """
+    if not map_path.exists():
+        return
+    try:
+        data = json.loads(map_path.read_text())
+        data["staleness"] = {
+            "checked_at":     datetime.now(timezone.utc).isoformat(),
+            "stale":          stale,
+            "reason":         reason,
+            "days_old":       days_old,
+            "changed_files":  changed_count,
+            "threshold_days": threshold_days,
+        }
+        map_path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    except Exception as e:
+        print(f"[absorber][warn] Could not write staleness to JSON: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main orchestrator
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1365,11 +1897,19 @@ def run_absorber(args: argparse.Namespace) -> None:
         print("[absorber][warn] No files found. Check target directory and absorber.ignored rules.")
         return
 
-    # ── Phase 2: Content extraction ───────────────────────────────────────────
-    cache                               = _load_cache()
+    # ── Phase 2: Content extraction (with optional changed-since invalidation) ──
+    cache = _load_cache()
+
+    # Pattern 1+4 — invalidate only files touched since a git ref
+    if getattr(args, "changed_since", None):
+        _invalidate_changed_files(target, args.changed_since, cache)
+        print()
+
     context, cached_count, extracted_count = _build_context(inventory, cache, args.force)
 
     print(f"[absorber] Phase 2 — Extracted: {extracted_count} new, {cached_count} from cache")
+    if getattr(args, "changed_since", None):
+        print(f"  (incremental run — only files changed since '{args.changed_since}' were re-extracted)")
     print()
 
     _save_cache(cache)
@@ -1414,12 +1954,15 @@ def run_absorber(args: argparse.Namespace) -> None:
             "target":           str(target),
             "git_scope":        args.git_scope,
             "absorber_version": 2,
+            "run_mode":         getattr(args, "mode", "full"),
+            "changed_since":    getattr(args, "changed_since", None),
             "total_files":      len(inventory),
             "cached_files":     cached_count,
             "extracted_files":  extracted_count,
             "map_md":           str(md_path),
             "map_size_bytes":   len(map_text.encode()),
             "cost":             round(call_cost or 0.0, 6),
+            "stale_since":      None,   # cleared on every full run; set by --check-stale
             "modes": {
                 "full":           sum(1 for f in inventory if f["mode"] == "full"),
                 "key_only":       sum(1 for f in inventory if f["mode"] == "key-only"),
@@ -1497,6 +2040,58 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Scan and extract but skip LLM call and artifact writes",
     )
+
+    # ── Pattern 1+4 — Incremental: invalidate cache for files changed since ref ──
+    parser.add_argument(
+        "--changed-since",
+        default=None,
+        metavar="GIT_REF",
+        help=(
+            "Invalidate cache only for files changed since this git ref "
+            "(e.g. HEAD~1, HEAD~5, abc1234). "
+            "Combines with --mode patch for zero-LLM incremental updates."
+        ),
+    )
+
+    # ── Pattern 1 — Install post-commit git hook ──────────────────────────────
+    parser.add_argument(
+        "--install-hook",
+        action="store_true",
+        help=(
+            "Install a post-commit git hook that runs "
+            "'absorber --changed-since HEAD~1 --mode patch' after every commit."
+        ),
+    )
+
+    # ── Pattern 2 — Run mode ──────────────────────────────────────────────────
+    parser.add_argument(
+        "--mode",
+        default="full",
+        choices=["full", "patch"],
+        help=(
+            "full  — full scan + LLM semantic compression (default). "
+            "patch — re-run git crawl + update staleness only, no LLM call. "
+            "Designed for post-commit hooks and frequent incremental updates."
+        ),
+    )
+
+    # ── Pattern 3 — Staleness check ──────────────────────────────────────────
+    parser.add_argument(
+        "--check-stale",
+        action="store_true",
+        help=(
+            "Check if artifacts are stale without running absorber. "
+            "Exits 0 if fresh, 2 if stale. Writes staleness signal to codebase_map.json."
+        ),
+    )
+    parser.add_argument(
+        "--stale-threshold",
+        type=int,
+        default=7,
+        metavar="DAYS",
+        help="Days before artifacts are considered stale (default: 7, used with --check-stale)",
+    )
+
     return parser.parse_args()
 
 
@@ -1506,13 +2101,32 @@ def main() -> None:
     if args.project:
         os.environ["PIPELINE_PROJECT"] = args.project
 
+    target = _resolve_target(args)
+
     print("=" * 60)
     print("  STEP 1 — ABSORBER")
     print("=" * 60)
     print()
 
     try:
+        # ── Pattern 1 — Install git hook ─────────────────────────────────────
+        if args.install_hook:
+            install_git_hook(target)
+            return
+
+        # ── Pattern 3 — Staleness check (no extraction) ──────────────────────
+        if args.check_stale:
+            check_stale(target, threshold_days=args.stale_threshold)
+            return  # check_stale calls sys.exit itself; this is a safety fallback
+
+        # ── Pattern 2 — Patch mode (no LLM) ──────────────────────────────────
+        if args.mode == "patch":
+            run_patch_mode(target, args)
+            return
+
+        # ── Full run ──────────────────────────────────────────────────────────
         run_absorber(args)
+
     except KeyboardInterrupt:
         print("\n[absorber] Interrupted by user.")
         sys.exit(130)

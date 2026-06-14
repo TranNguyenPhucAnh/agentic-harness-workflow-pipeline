@@ -111,9 +111,25 @@ ROLES: dict[str, str] = {
     "debugger_secondary": "openrouter/xiaomi/mimo-v2.5-pro",
     "reporter":           "openrouter/minimax/minimax-m2.7",
     "judge":              "openrouter/moonshotai/kimi-k2.6",
+    "done_checker":       "openrouter/moonshotai/kimi-k2.6",
     "patcher":            "openrouter/deepseek/deepseek-v4-pro",
     "patcher_secondary":  "openrouter/xiaomi/mimo-v2.5-pro",
+    "error_fixer":        "openrouter/deepseek/deepseek-v4-pro",
+    "summarizer":         "gemini/gemini-3.5-flash",
     #"archivist":         "openrouter/minimax/minimax-m2.7",
+
+    # ── DevOps / MLOps toolkit roles ────────────────────────────────────────
+    # Dùng model mạnh cho analysis + low-cost cho summarization tasks.
+    # Điều chỉnh theo budget — các roles này gọi AWS APIs nên ít LLM calls hơn SWE.
+    "infra_absorber":           "openrouter/deepseek/deepseek-v4-pro",   # HCL/YAML extraction
+    "doc_absorber":             "openrouter/moonshotai/kimi-k2.6",       # unstructured doc analysis
+    "config_consistency_checker": "openrouter/moonshotai/kimi-k2.6",    # cross-file reasoning
+    "incident_clarificator":    "openrouter/deepseek/deepseek-v4-pro",   # Q&A diagnosis loop
+    "postmortem_archivist":     "openrouter/minimax/minimax-m2.7",       # structured extraction
+    "metrics_reporter":         "gemini/gemini-3.5-flash",               # no LLM (AWS APIs only)
+    "live_discovery":           "gemini/gemini-3.5-flash",               # no LLM (AWS APIs only)
+    "spec_risk_assessor":       "openrouter/moonshotai/kimi-k2.6",       # risk + impact analysis
+    "spec_impact_assessor":     "openrouter/moonshotai/kimi-k2.6",       # same — separate role
 
     # ── Aux / utility roles (thêm khi cần) ─────────────────────────────────
     # "summarizer":       "deepseek/deepseek-v4-flash",

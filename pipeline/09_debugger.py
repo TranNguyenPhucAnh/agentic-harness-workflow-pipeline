@@ -48,7 +48,6 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from artifacts.paths import (  # noqa: E402
     ABSORBER_CODEBASE_MD,
-    ARCHIVIST_KNOWLEDGE_LOG,
     DEBUGGER_OVERWRITE_TEST_SUMMARY,
     EXECUTOR_OVERWRITE_MANIFEST,
     SRC_DIR,
@@ -65,6 +64,18 @@ from modules.post_interactive import prompt_next_step  # noqa: E402
 
 ROLE = "debugger"
 _RE_ANSI = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+
+# Extensions that have well-known language names for code fences
+_EXT_LANG: dict[str, str] = {
+    ".ts": "typescript", ".tsx": "typescript",
+    ".js": "javascript", ".jsx": "javascript",
+    ".py": "python",
+    ".css": "css", ".scss": "scss",
+    ".html": "html",
+    ".json": "json",
+    ".md": "markdown",
+    ".sh": "bash",
+}
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -105,7 +116,7 @@ def _read_text(path: Path) -> str:
     if not path.exists():
         return ""
     track_read(path)
-    return path.read_text(errors="replace")
+    return path.read_text(encoding="utf-8", errors="replace")
 
 
 def _read_json(path: Path) -> Any:
@@ -132,6 +143,12 @@ def _strip_ansi(text: str) -> str:
     return _RE_ANSI.sub("", text)
 
 
+def _lang_for(file_path: str) -> str:
+    """Return code fence language identifier for a given file path."""
+    ext = Path(file_path).suffix.lower()
+    return _EXT_LANG.get(ext, "")
+
+
 def _call_llm(role: str, messages: list[dict[str, str]], max_tokens: int = 8192) -> str:
     content, _ = call_llm_messages(
         role, messages,
@@ -140,39 +157,67 @@ def _call_llm(role: str, messages: list[dict[str, str]], max_tokens: int = 8192)
         label=f"[09] {get_model(role)}",
         max_tokens=max_tokens,
     )
-    # === DEBUG LOG ===
-    import sys as _sys
-    print(f"[DEBUG debugger] _call_llm content ({len(content)} chars): {repr(content[:300])}", file=_sys.stderr)
-    # === END DEBUG ===
-
     return content
 
 
 def _parse_json_response(raw: str) -> dict[str, Any]:
+    """
+    Robustly extract a JSON object from LLM output.
+
+    Handles:
+    - Markdown fences (```json ... ```)
+    - Prose/explanation before the JSON
+    - Tool-call hallucination: <tool_call>{"name":...}</tool_call> tags
+      followed by the actual JSON response
+    - Multiple JSON objects in output (takes the LAST outermost one,
+      which is the actual answer after any tool-call preamble)
+    - Literal newlines inside string values (invalid JSON from some models)
+
+    Uses brace-depth counting (not regex) to find balanced { ... } objects,
+    then attempts json.loads on each candidate from last to first.
+    This correctly handles the tool-hallucination case where the model outputs
+      {"name": "read_file", ...}   ← small tool_call JSON  (char 82 = end)
+      <large actual response JSON>
+    """
     text = raw.strip()
 
     # Strip markdown fences
-    text = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", text)
-    text = re.sub(r"\n?```$", "", text.strip())
+    text = re.sub(r"^```[a-zA-Z0-9_-]*\s*\n?", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\n?\s*```\s*$", "", text.strip())
 
-    # Strip tool-call hallucination: model đôi khi tự viết <tool_call>...</tool_call>
-    # và <tool_response>...</tool_response> trước khi trả JSON thật.
-    # Bỏ hết mọi thứ trước dấu { đầu tiên.
-    brace_idx = text.find("{")
-    if brace_idx > 0:
-        text = text[brace_idx:]
+    # Strip XML-style tool tags that some models hallucinate
+    text = re.sub(r"<tool_call>.*?</tool_call>", "", text, flags=re.DOTALL)
+    text = re.sub(r"<tool_response>.*?</tool_response>", "", text, flags=re.DOTALL)
+    text = text.strip()
 
-    # Nếu có nhiều JSON objects liên tiếp (tool_call JSON + response JSON),
-    # chỉ lấy object đầu tiên bằng cách tìm closing brace cân bằng.
+    # Fast path: direct parse
     try:
-        return json.loads(text)
+        result = json.loads(text)
+        if isinstance(result, dict):
+            return result
     except json.JSONDecodeError:
         pass
 
-    # Tìm outermost balanced { ... }
+    # Collect ALL balanced top-level { ... } objects via brace counting,
+    # then try from last to first (last = actual answer, first = tool preamble).
+    candidates: list[str] = []
     depth = 0
-    start = None
+    start: int | None = None
+    in_string = False
+    escape_next = False
+
     for i, ch in enumerate(text):
+        if escape_next:
+            escape_next = False
+            continue
+        if ch == "\\" and in_string:
+            escape_next = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
         if ch == "{":
             if depth == 0:
                 start = i
@@ -180,22 +225,84 @@ def _parse_json_response(raw: str) -> dict[str, Any]:
         elif ch == "}":
             depth -= 1
             if depth == 0 and start is not None:
-                candidate = text[start:i+1]
-                try:
-                    return json.loads(candidate)
-                except json.JSONDecodeError:
-                    # reset và tìm tiếp
-                    start = None
-                    continue
+                candidates.append(text[start:i + 1])
+                start = None
 
-    raise json.JSONDecodeError("No valid JSON object found", text, 0)
+    # Try candidates last-to-first
+    for candidate in reversed(candidates):
+        # Also try escaping literal newlines inside strings (some models output these)
+        for attempt in (candidate, _escape_string_newlines(candidate)):
+            try:
+                result = json.loads(attempt)
+                if isinstance(result, dict):
+                    return result
+            except json.JSONDecodeError:
+                pass
+
+    raise json.JSONDecodeError(
+        f"No valid JSON object found in model output ({len(raw)} chars). "
+        f"First 200 chars: {raw[:200]!r}",
+        raw, 0,
+    )
+
+
+def _escape_string_newlines(text: str) -> str:
+    """
+    Escape literal \\n / \\t / \\r inside JSON string values.
+    Models sometimes write actual newline chars in "code": "..." fields.
+    Walks character-by-character tracking in-string state.
+    """
+    result: list[str] = []
+    in_string = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and in_string:
+            result.append(ch)
+            i += 1
+            if i < len(text):
+                result.append(text[i])
+            i += 1
+            continue
+        if ch == '"':
+            in_string = not in_string
+        if in_string and ch == "\n":
+            result.append("\\n")
+        elif in_string and ch == "\t":
+            result.append("\\t")
+        elif in_string and ch == "\r":
+            result.append("\\r")
+        else:
+            result.append(ch)
+        i += 1
+    return "".join(result)
+
 
 def _colored_diff(old: str, new: str, filename: str) -> str:
     """Generate unified diff string."""
     old_lines = old.splitlines(keepends=True)
     new_lines = new.splitlines(keepends=True)
-    diff = difflib.unified_diff(old_lines, new_lines, fromfile=f"a/{filename}", tofile=f"b/{filename}", n=3)
+    diff = difflib.unified_diff(
+        old_lines, new_lines,
+        fromfile=f"a/{filename}",
+        tofile=f"b/{filename}",
+        n=3,
+    )
     return "".join(diff)
+
+
+def _flush_stdin() -> None:
+    """
+    Discard any pending bytes in stdin's line buffer (macOS/Linux only).
+    Prevents leftover newlines from interactive phase1 intake being
+    consumed by the Y/N prompt in phase5.
+    Safe to call even if stdin is not a TTY — errors are silently ignored.
+    """
+    try:
+        import termios
+        termios.tcflush(sys.stdin, termios.TCIFLUSH)
+    except Exception:
+        pass
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -238,7 +345,6 @@ def _run_vitest_for_report() -> str:
 
 def phase1_intake(args: argparse.Namespace) -> str:
     """Gather bug report from CLI args, stdin, or Vitest output."""
-    # If --run-tests, use Vitest output as the bug report
     if args.run_tests:
         print("[09] Phase 1 — Running Vitest to gather failure report …")
         report = _run_vitest_for_report()
@@ -247,7 +353,6 @@ def phase1_intake(args: argparse.Namespace) -> str:
         print(f"[09] Vitest failures captured ({len(report)} chars)")
         return report
 
-    # Otherwise gather from user input
     print("[09] Phase 1 — Gathering bug report …")
     try:
         bundle = gather_text_file_bundle(
@@ -283,11 +388,11 @@ You are a senior developer analyzing a bug report against a codebase.
 Given:
 - A bug report (test failures, error messages, or user description)
 - A codebase map showing all files and their structure
-- A blueprint showing module dependencies, exports, and behavioral quirks
+- Optionally: a list of recently implemented files
 
 Your job: identify which files need to be read to understand and fix the bug.
 
-Return ONLY valid JSON (no markdown fences, no explanation, no tool calls):
+Return ONLY valid JSON — no markdown fences, no explanation, no prose before or after:
 {
   "reasoning": "1-3 sentences explaining your analysis",
   "files_to_read": ["src/hooks/useLoopRecorder.ts", "tests/hooks/useLoopRecorder.test.ts", "src/types.ts"],
@@ -298,13 +403,16 @@ RULES:
 - Include BOTH the source file and its test file if relevant.
 - Include dependency files (types, utils) that the buggy file imports.
 - Maximum 8 files — focus on what's needed to fix the bug.
-- Paths must match exactly what appears in the codebase map / blueprint.
-- CRITICAL: Output ONLY the raw JSON object. No prose before it, no prose after it.
+- Paths must match exactly what appears in the codebase map.
+- CRITICAL: Output ONLY the raw JSON object. Start with { and end with }. Nothing else.
 - CRITICAL: Do NOT simulate reading files. Do NOT write <tool_call>, <tool_response>,
-  or any XML/function-call tags. You already have all the information you need in the
-  codebase map above. Your only output is the JSON object.
-- The JSON must start with {{ and end with }}. Nothing else.
+  <function_call>, or any XML/function-call tags whatsoever. You already have all
+  information you need in the codebase map provided. Any such tags will cause a
+  parse error and the entire run will fail.
+- Do NOT explain your reasoning outside the JSON. The "reasoning" key inside
+  the JSON is the only place for explanation.
 """
+
 
 def phase2_locate(bug_report: str) -> dict[str, Any]:
     """LLM call 1: identify which files are relevant to the bug."""
@@ -312,40 +420,25 @@ def phase2_locate(bug_report: str) -> dict[str, Any]:
 
     codebase_map = _read_text(ABSORBER_CODEBASE_MD)
 
-    # Load manifest for recently-changed files context
-    manifest_raw = ""
-    if EXECUTOR_OVERWRITE_MANIFEST.exists():
-        manifest_raw = _read_text(EXECUTOR_OVERWRITE_MANIFEST).strip()
-
-    blueprint_path = artifact_root() / "blueprint.json"
-    if not blueprint_path.exists():
-        blueprint_path = artifact_root() / "planner" / "blueprint.json"
-    blueprint_raw = _read_text(blueprint_path) if blueprint_path.exists() else ""
-
-    # Build user prompt.
-    # - codebase_map: full structural overview, model needs it to locate files
-    # - manifest: only the file list (not full content) — enough for context
-    # - blueprint: skip — too large, not needed for file location
+    # Build user prompt parts
     parts = [f"## Bug Report\n\n{bug_report}"]
 
     if codebase_map:
         parts.append(f"## Codebase Map\n\n{codebase_map}")
 
+    # Add recently-changed files from executor manifest (file list only, not content)
     if EXECUTOR_OVERWRITE_MANIFEST.exists():
-        try:
-            manifest_data = json.loads(manifest_raw) if manifest_raw else {}
-            file_list = (
-                manifest_data.get("files_written")
-                or manifest_data.get("written")
-                or []
-            )
-            if file_list:
-                lines = []
-                for f in file_list:
-                    lines.append(f"  - {f}" if isinstance(f, str) else f"  - {f.get('path', str(f))}")
-                parts.append("## Recently implemented files\n\n" + "\n".join(lines))
-        except Exception:
-            pass  # manifest unreadable — skip silently
+        manifest_data = _read_json(EXECUTOR_OVERWRITE_MANIFEST)
+        file_list = (
+            manifest_data.get("files_written")
+            or manifest_data.get("written")
+            or []
+        )
+        if file_list:
+            lines = []
+            for f in file_list:
+                lines.append(f"  - {f}" if isinstance(f, str) else f"  - {f.get('path', str(f))}")
+            parts.append("## Recently implemented files\n\n" + "\n".join(lines))
 
     user_content = "\n\n---\n\n".join(parts)
 
@@ -382,7 +475,7 @@ def phase3_read(files: list[str]) -> dict[str, str]:
     for rel in files:
         path = _resolve_path(rel)
         if path.exists():
-            content = path.read_text(errors="replace")
+            content = path.read_text(encoding="utf-8", errors="replace")
             track_read(path)
             contents[rel] = content
             lines = len(content.splitlines())
@@ -399,7 +492,7 @@ def phase3_read(files: list[str]) -> dict[str, str]:
 # ════════════════════════════════════════════════════════════════════════════
 
 PATCH_SYSTEM = """\
-You are a senior TypeScript developer fixing a bug.
+You are a senior developer fixing a bug.
 
 Given:
 - A bug report describing the problem
@@ -408,7 +501,7 @@ Given:
 
 Your job: produce corrected file contents that fix the bug.
 
-Return ONLY valid JSON (no markdown fences, no explanation, no tool calls):
+Return ONLY valid JSON — no markdown fences, no explanation, no prose before or after:
 {
   "reasoning": "explain what was wrong and what you changed",
   "patches": [
@@ -421,40 +514,53 @@ Return ONLY valid JSON (no markdown fences, no explanation, no tool calls):
 }
 
 RULES:
-- "code" must be the COMPLETE file content (not a diff, not a snippet).
+- "code" must be the COMPLETE file content — not a diff, not a snippet.
 - Only include files you actually changed.
-- Do NOT change files unnecessarily — minimal fix only.
+- Change only what is needed to address the reported issue — no unrelated refactors.
+- The scope of changes should match the scope of the report: a one-line bug gets
+  a minimal fix; a behavioral refinement or feature request may require broader changes.
 - If a test is wrong (testing incorrect behavior), fix the test.
 - If source code is wrong, fix the source.
 - Maximum 4 files per response.
-- Do NOT use any tools. Do NOT output <tool_call> or <tool_response> tags. You have no tools available.
-- Output ONLY the JSON object, nothing else before or after it.
+- CRITICAL: Output ONLY the raw JSON object. Start with { and end with }. Nothing else.
+- CRITICAL: Do NOT write <tool_call>, <tool_response>, <function_call>, or any
+  XML/function-call tags. Any such tags will cause a parse error and the run will fail.
+- CRITICAL: Inside JSON string values, escape newlines as \\n, tabs as \\t.
+  Do NOT write literal newline characters inside a JSON string.
 """
 
 
-def phase4_patch(bug_report: str, locate_result: dict[str, Any], file_contents: dict[str, str]) -> dict[str, Any]:
+def phase4_patch(
+    bug_report: str,
+    locate_result: dict[str, Any],
+    file_contents: dict[str, str],
+) -> dict[str, Any]:
     """LLM call 2: generate patches for the identified files."""
     print("[09] Phase 4 — Generating patches …")
 
-    # Build file content block
+    # Build file content block with correct language per extension
     file_blocks = []
     for rel, content in file_contents.items():
-        file_blocks.append(f"### {rel}\n```typescript\n{content}\n```")
+        lang = _lang_for(rel)
+        file_blocks.append(f"### {rel}\n```{lang}\n{content}\n```")
 
     user_parts = [
         f"## Bug Report\n\n{bug_report}",
-        f"## Analysis\n\nReasoning: {locate_result.get('reasoning', '')}\nLikely root cause: {locate_result.get('likely_root_cause', '')}",
+        (
+            f"## Analysis\n\n"
+            f"Reasoning: {locate_result.get('reasoning', '')}\n"
+            f"Likely root cause: {locate_result.get('likely_root_cause', '')}"
+        ),
         "## File Contents\n\n" + "\n\n".join(file_blocks),
     ]
 
-    # Load blueprint quirks for relevant modules
+    # Load blueprint quirks for relevant modules (use _read_json helper)
     blueprint_path = artifact_root() / "blueprint.json"
     if not blueprint_path.exists():
         blueprint_path = artifact_root() / "planner" / "blueprint.json"
     if blueprint_path.exists():
         try:
-            bp = json.loads(blueprint_path.read_text(encoding="utf-8"))
-            # Find quirks for files being patched
+            bp = _read_json(blueprint_path)
             quirks_block = _extract_relevant_quirks(bp, list(file_contents.keys()))
             if quirks_block:
                 user_parts.append(f"## Blueprint Quirks (correct behavior)\n\n{quirks_block}")
@@ -508,7 +614,18 @@ def phase5_review(
     file_contents: dict[str, str],
     auto: bool,
 ) -> bool:
-    """Show diffs and ask for confirmation. Returns True if user approves."""
+    """
+    Show diffs and ask for confirmation. Returns True if user approves.
+
+    Fix notes vs previous version:
+    - Tracks whether any patch actually has a diff (has_changes).
+      If all patches produce empty diffs, return False immediately —
+      there is nothing to apply.
+    - Flushes stdin before input() to discard leftover newlines from
+      the interactive phase1 intake (double-Enter submit), which would
+      otherwise cause input() to return "" and silently approve.
+    - Prints repr(answer) so the received value is always visible in logs.
+    """
     patches = patch_result.get("patches", [])
     reasoning = patch_result.get("reasoning", "")
 
@@ -521,22 +638,25 @@ def phase5_review(
     print("═" * 70)
     print(f"\nReasoning: {reasoning}\n")
 
+    has_changes = False
+
     for patch in patches:
         file_path = patch.get("file_path", "")
         new_code = patch.get("code", "")
 
         if not file_path or not new_code:
+            print(f"  [skip] patch missing file_path or code: {patch.get('file_path', '?')!r}")
             continue
 
         old_code = file_contents.get(file_path, "")
         diff = _colored_diff(old_code, new_code, file_path)
 
         if not diff:
-            print(f"  {file_path}: no changes")
+            print(f"  {file_path}: no changes (new content identical to existing)")
             continue
 
+        has_changes = True
         print(f"┌─ {file_path} ─────────────────────────────────")
-        # Show abbreviated diff (max 60 lines)
         diff_lines = diff.splitlines()
         if len(diff_lines) > 60:
             for line in diff_lines[:50]:
@@ -548,17 +668,25 @@ def phase5_review(
         print(f"└{'─' * 50}")
         print()
 
+    if not has_changes:
+        print("[09] All patches produce no diff — nothing to apply.")
+        return False
+
     if auto:
         print("[09] --auto mode: applying patches without confirmation.")
         return True
 
-    # Interactive confirmation
+    # Non-interactive (piped/redirected) — apply automatically
     if not sys.stdin.isatty():
-        print("[09] Non-interactive mode: applying patches.")
+        print("[09] Non-interactive mode: applying patches automatically.")
         return True
+
+    # Interactive TTY — flush any leftover newlines from phase1 intake
+    _flush_stdin()
 
     try:
         answer = input("[09] Apply these patches? [Y/n] ").strip().lower()
+        print(f"[09] Answer received: {answer!r}", file=sys.stderr)
         return answer in ("", "y", "yes")
     except (EOFError, KeyboardInterrupt):
         print("\n[09] Cancelled.")
@@ -585,7 +713,7 @@ def phase6_apply(patch_result: dict[str, Any]) -> list[str]:
 
         out_path = _resolve_path(file_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(new_code)
+        out_path.write_text(new_code, encoding="utf-8")  # explicit utf-8
         track_write(out_path)
         written.append(file_path)
         print(f"     ✓ {file_path}")
@@ -664,10 +792,16 @@ def main() -> None:
             if approved:
                 # Phase 6 — Apply
                 written = phase6_apply(patch_result)
-                _write_summary(bug_report, locate_result, patch_result, applied=True, written_files=written)
+                _write_summary(
+                    bug_report, locate_result, patch_result,
+                    applied=True, written_files=written,
+                )
                 print(f"\n[09] ✓ Done — {len(written)} file(s) patched.")
             else:
-                _write_summary(bug_report, locate_result, patch_result, applied=False, written_files=[])
+                _write_summary(
+                    bug_report, locate_result, patch_result,
+                    applied=False, written_files=[],
+                )
                 print("[09] Patches rejected. No files modified.")
                 exit_code = 1
 

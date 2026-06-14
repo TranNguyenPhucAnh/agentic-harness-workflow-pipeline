@@ -1,0 +1,2628 @@
+"""
+pipeline/09_debugger.py
+=======================
+Step 9 — Test / verify / iterate.
+
+FULL mode:
+  Clustered repair loop:
+    - Optionally accept a user-provided bug report (text inline, piped stdin,
+      or drag-and-drop file) describing observed behavior, reproduction steps,
+      and expected behavior.  When present, the bug report replaces the canonical
+      spec as the primary run context fed to repair models.
+    - Load absorber/codebase_map.md as structural context so the model can scan
+      and identify which files to fix.
+    - Run Vitest.
+    - Parse failing clusters.
+    - Apply static fixes.
+    - Dispatch surface/component bugs to primary repair model (role: debugger).
+    - Dispatch hook/data/type/util logic bugs to secondary repair model
+      (role: debugger_secondary).
+    - Write debugger/test_summary.json (short-term) and append
+      debugger/test_log.json (long-term).
+
+MINI mode:
+  Safe targeted verification:
+    - Detect scope from executor/manifest.json.
+    - Do not require the canonical spec.
+    - Build context from clarificator/session.json (field: requirement_synthesis),
+      planner/mini_plan.json (fields: plan + impact), executor/manifest.json.
+    - Dispatch lightweight verifiers by target file extension:
+        .py                  → py_compile
+        .json                → json parse
+        .yaml/.yml           → yaml parse if PyYAML is installed, else basic check
+        .toml                → tomllib parse
+        .ts/.tsx/.js/.jsx    → vitest if package.json exists, otherwise syntax skipped
+    - For TS/Vitest projects, can still run the full Vitest repair loop.
+
+Writes:
+  artifacts_<slug>/debugger/test_summary.json   (short-term, overwrite)
+  artifacts_<slug>/debugger/test_log.json       (long-term, append)
+  artifacts_<slug>/output/src/**                repair loop patches, if needed
+  artifacts_<slug>/output/tests/**              fragile-test repair, if auditor allows
+
+Reads (full mode):
+  artifacts_<slug>/absorber/codebase_map.md     ← primary structural context
+  artifacts_<slug>/executor/manifest.json       ← recently implemented files + status
+  artifacts_<slug>/archivist/knowledge_log.md   (→ system prompt, repair models)
+  artifacts_<slug>/output/src/**
+  artifacts_<slug>/output/tests/**
+
+Reads (mini mode):
+  artifacts_<slug>/clarificator/session.json    (field: requirement_synthesis)
+  artifacts_<slug>/enricher/enriched_prompt.md
+  artifacts_<slug>/planner/mini_plan.json
+  artifacts_<slug>/executor/manifest.json
+  artifacts_<slug>/archivist/knowledge_log.md
+  artifacts_<slug>/output/src/**
+  artifacts_<slug>/output/tests/**
+
+Note: patcher/attempt_log.json is no longer read by the debugger (full mode).
+      Use 12_patcher.py or 13_archivist.py for patcher-based context.
+
+Direct execution:
+  python 09_debugger.py --project my-app
+  python 09_debugger.py --project my-app --text "Button click crashes app"
+  PIPELINE_PROJECT=my-app python 09_debugger.py
+
+At the end of each run, prints:
+  - artifacts/files read
+  - artifacts/files created/updated/overwritten/appended
+
+For taxonomy details see artifacts/TAXONOMY.md
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import py_compile
+import re
+import subprocess
+import sys
+import time
+from collections import Counter
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any, Callable
+
+# === WRITE AUTHORITY: debugger ===
+# OWNS  : artifacts_<slug>/debugger/test_summary.json   (short-term, overwrite)
+#         artifacts_<slug>/debugger/test_log.json        (long-term, append)
+#         artifacts_<slug>/output/src/**                 repair patches
+#         artifacts_<slug>/output/tests/**               fragile-test patches
+#
+# READS full:
+#   artifacts_<slug>/absorber/codebase_map.md            (→ run context, all repair models)
+#   artifacts_<slug>/executor/manifest.json              (→ run context, recently changed files)
+#   artifacts_<slug>/archivist/knowledge_log.md          (→ system prompt, repair models)
+#   artifacts_<slug>/output/src/**                       (test targets)
+#   artifacts_<slug>/output/tests/**                     (test files)
+#
+# READS mini:
+#   artifacts_<slug>/clarificator/session.json           (field: requirement_synthesis)
+#   artifacts_<slug>/enricher/enriched_prompt.md
+#   artifacts_<slug>/planner/mini_plan.json
+#   artifacts_<slug>/executor/manifest.json
+#   artifacts_<slug>/archivist/knowledge_log.md          (→ system prompt, repair models)
+#   artifacts_<slug>/output/src/**                       (test targets)
+#   artifacts_<slug>/output/tests/**                     (test files)
+#
+# NOTE: patcher/attempt_log.json is NOT read by the debugger (full mode).
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from artifacts.paths import (  # noqa: E402
+    ABSORBER_CODEBASE_MD,
+    ARCHIVIST_KNOWLEDGE_LOG,
+    CLARIFIED_REQ,
+    DEBUGGER_OVERWRITE_TEST_SUMMARY,
+    DEBUGGER_TEST_LOG,
+    ENRICHER_OVERWRITE_PROMPT,
+    EXECUTOR_OVERWRITE_MANIFEST,
+    PLANNER_MINI_PLAN,
+    SRC_DIR,
+    TESTS_DIR,
+    artifact_root,
+    ensure_dirs,
+)
+from artifacts.models import call_model, get_model, get_provider  # noqa: E402
+from modules.artifact_tracking import track_read, track_write, print_summary as print_artifact_summary  # noqa: E402
+from modules.cost import print_call, print_summary, record_usage  # noqa: E402
+from modules.call_llm import call_llm_messages
+from modules.drag_and_drop import gather_text_file_bundle  # noqa: E402
+from modules.post_interactive import prompt_next_step  # noqa: E402
+from pipeline.compile_fixer import run_compile_fixer
+
+# Module-level model label constants — derived from models.py at import time.
+_DEBUGGER_MODEL           = get_model("debugger")
+_DEBUGGER_SECONDARY_MODEL = get_model("debugger_secondary")
+
+ROLE = "debugger"
+
+# Bug report provided by the user at invocation time (full mode only).
+# Set once in main() via gather_bug_report(); consumed by _load_run_context().
+_BUG_REPORT_TEXT: str = ""
+
+
+_SRC_PREFIX = "src"
+
+MINIMAX_SCOPE_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"^src/hooks/"),
+    re.compile(r"^src/data/"),
+    re.compile(r"^src/types/"),
+    re.compile(r"^src/utils/"),
+]
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Data structures
+# ════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class TestFailure:
+    test_file: str
+    test_name: str
+    error_snippet: str
+
+
+@dataclass
+class FailureCluster:
+    test_file: str
+    src_file: str
+    failures: list[TestFailure] = field(default_factory=list)
+
+    attempt_count: int = 0
+    last_fingerprint: str = ""
+    escalated: bool = False
+    is_transform_error: bool = False
+    owner: str = ""
+
+    @property
+    def key(self) -> str:
+        return self.test_file
+
+    def error_block(self) -> str:
+        return "\n\n".join(
+            f"  x {failure.test_name}\n{failure.error_snippet}"
+            for failure in self.failures
+        )
+
+    def fingerprint(self) -> str:
+        return re.sub(r"\s+", " ", self.error_block()).strip()[:400]
+
+    def is_minimax_scope(self) -> bool:
+        return any(pattern.match(self.src_file) for pattern in MINIMAX_SCOPE_PATTERNS)
+
+
+@dataclass
+class ClusterRepairRecord:
+    cluster: str
+    src_file: str
+    failures: int
+    repaired: bool
+    layer_used: str
+    escalated: bool
+    escalated_to: str
+    owner: str
+    note: str = ""
+    consistency_verdict: str = ""
+
+
+@dataclass
+class IterationRecord:
+    iteration: int
+    passed: bool
+    summary: str
+    clusters_found: int
+    clusters_repaired: int
+    cluster_details: list[dict[str, Any]]
+    log_snippet: str
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# CLI / project setup
+# ════════════════════════════════════════════════════════════════════════════
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="09_debugger.py",
+        description="Run tests/verifiers and optionally repair failing clusters.",
+    )
+    parser.add_argument(
+        "--project",
+        default=None,
+        help="Project name for direct execution. Sets PIPELINE_PROJECT.",
+    )
+    parser.add_argument("--max-iter", type=int, default=3)
+    parser.add_argument("--max-cluster-attempts", type=int, default=2)
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument(
+        "--impl",
+        default="primary",
+        choices=["primary"],
+        help="Kept for harness.py compatibility — internally dispatches via model roles debugger + debugger_secondary.",
+    )
+    parser.add_argument(
+        "--no-repair",
+        action="store_true",
+        help="Run verifier/test only. Do not call LLM repair loop.",
+    )
+    parser.add_argument(
+        "--text",
+        default=None,
+        metavar="TEXT",
+        help=(
+            "Bug description as inline text: observed behavior, reproduction steps, "
+            "expected behavior. Used as primary run context for repair models (full mode). "
+            "Can also be piped via stdin."
+        ),
+    )
+    parser.add_argument(
+        "--input",
+        metavar="FILE",
+        nargs="+",
+        help=(
+            "Bug report file(s). Supports text/markdown files. "
+            "Can be repeated or drag-dropped as space-separated paths."
+        ),
+    )
+    parser.add_argument(
+        "--no-interactive",
+        action="store_true",
+        help=(
+            "Disable terminal prompts. Use in CI or piped contexts where stdin "
+            "is not a TTY. When omitted, the prompt appears automatically on TTY "
+            "(both direct invocation and harness)."
+        ),
+    )
+    return parser
+
+
+def _configure_project(
+    project: str | None,
+    parser: argparse.ArgumentParser,
+) -> None:
+    if project:
+        os.environ["PIPELINE_PROJECT"] = project
+        return
+
+    if os.environ.get("PIPELINE_PROJECT"):
+        return
+
+    parser.error(
+        "PIPELINE_PROJECT is not set. Use --project <name> or export "
+        "PIPELINE_PROJECT=<name> before running 09_debugger.py directly."
+    )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Scope / context loaders
+# ════════════════════════════════════════════════════════════════════════════
+
+def _read_json(path: Any, default: Any) -> Any:
+    if not path.exists():
+        return default
+    try:
+        track_read(path)
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def _read_text_if_exists(path: Any, *, errors: str = "replace") -> str:
+    if not path.exists():
+        return ""
+    track_read(path)
+    return path.read_text(errors=errors)
+
+
+def _load_impl_record() -> dict[str, Any]:
+    data = _read_json(EXECUTOR_OVERWRITE_MANIFEST, {})
+    return data if isinstance(data, dict) else {}
+
+
+def _current_scope() -> str:
+    rec = _load_impl_record()
+    scope = rec.get("scope", "full")
+    return scope if scope in {"full", "mini"} else "full"
+
+
+def _load_spec_or_full_context() -> str:
+    """
+    Full-mode run context.
+
+    Sources (in priority order):
+      1. User-provided bug report (_BUG_REPORT_TEXT) — primary context when user
+         describes a specific observed bug.
+      2. absorber/codebase_map.md — compact structural map so models can identify
+         which files to fix.
+      3. executor/manifest.json — list of files implemented this run, per-file
+         status (written/skipped/failed), and model used. Helps repair models
+         focus on recently changed files and flag skipped/failed ones.
+    """
+    parts: list[str] = []
+
+    if _BUG_REPORT_TEXT:
+        parts.append("## Bug Report\n\n" + _BUG_REPORT_TEXT)
+
+    codebase_map = _load_codebase_map()
+    if codebase_map:
+        parts.append("## Codebase Map (absorber/codebase_map.md)\n\n" + codebase_map)
+
+    if EXECUTOR_OVERWRITE_MANIFEST.exists():
+        manifest_raw = _read_text_if_exists(EXECUTOR_OVERWRITE_MANIFEST).strip()
+        if manifest_raw:
+            parts.append(
+                "## Executor Manifest (executor/manifest.json)\n\n"
+                "```json\n" + manifest_raw + "\n```"
+            )
+
+    return "\n\n---\n\n".join(parts)
+
+
+def _load_mini_context() -> str:
+    parts: list[str] = []
+
+    # clarificator/session.json — extract requirement_synthesis field
+    if CLARIFIED_REQ.exists():
+        try:
+            raw = CLARIFIED_REQ.read_text(encoding="utf-8")
+            track_read(CLARIFIED_REQ)
+            data = json.loads(raw)
+            synthesis = data.get("requirement_synthesis", "")
+            if isinstance(synthesis, str) and synthesis.strip():
+                parts.append(
+                    "## clarificator/session.json (requirement_synthesis)\n\n"
+                    + synthesis.strip()
+                )
+            else:
+                parts.append(
+                    "## clarificator/session.json\n\n```json\n"
+                    + raw.strip()
+                    + "\n```"
+                )
+        except Exception:
+            text = _read_text_if_exists(CLARIFIED_REQ).strip()
+            if text:
+                parts.append("## clarificator/session.json\n\n" + text)
+
+    if ENRICHER_OVERWRITE_PROMPT.exists():
+        parts.append(
+            "## enricher/enriched_prompt.md\n\n"
+            + _read_text_if_exists(ENRICHER_OVERWRITE_PROMPT).strip()
+        )
+
+    # planner/mini_plan.json — new merged format {plan, impact}
+    if PLANNER_MINI_PLAN.exists():
+        try:
+            raw = _read_text_if_exists(PLANNER_MINI_PLAN).strip()
+            merged = json.loads(raw)
+            if isinstance(merged, dict) and "plan" in merged:
+                plan_obj = merged["plan"]
+                impact_obj = merged.get("impact", {})
+                parts.append(
+                    "## planner/mini_plan.json (plan)\n\n```json\n"
+                    + json.dumps(plan_obj, indent=2, ensure_ascii=False)
+                    + "\n```"
+                )
+                if impact_obj:
+                    parts.append(
+                        "## planner/mini_plan.json (impact)\n\n```json\n"
+                        + json.dumps(impact_obj, indent=2, ensure_ascii=False)
+                        + "\n```"
+                    )
+            else:
+                parts.append(
+                    "## planner/mini_plan.json\n\n```json\n"
+                    + raw
+                    + "\n```"
+                )
+        except Exception:
+            parts.append(
+                "## planner/mini_plan.json\n\n```json\n"
+                + _read_text_if_exists(PLANNER_MINI_PLAN).strip()
+                + "\n```"
+            )
+
+    if EXECUTOR_OVERWRITE_MANIFEST.exists():
+        parts.append(
+            "## executor/manifest.json\n\n```json\n"
+            + _read_text_if_exists(EXECUTOR_OVERWRITE_MANIFEST).strip()
+            + "\n```"
+        )
+
+    if not parts:
+        return "(mini context unavailable)"
+
+    return "\n\n---\n\n".join(parts)
+
+
+def _load_run_context() -> str:
+    if _current_scope() == "mini":
+        return _load_mini_context()
+
+    ctx = _load_spec_or_full_context()
+    return ctx or "(spec context unavailable)"
+
+
+def _load_judge_findings() -> str:
+    """
+    Load archivist knowledge log for injection into repair model system prompts.
+
+    Note: patcher/attempt_log.json is intentionally NOT read here.
+    The debugger operates on the live codebase + bug report; patcher findings
+    are managed by 12_patcher.py and 13_archivist.py downstream.
+    """
+    if not ARCHIVIST_KNOWLEDGE_LOG.exists():
+        return ""
+
+    try:
+        text = _read_text_if_exists(ARCHIVIST_KNOWLEDGE_LOG).strip()
+        return text
+    except Exception as exc:
+        print(f"[09] WARNING: could not read archivist knowledge log: {exc}", file=sys.stderr)
+        return ""
+
+
+def _load_knowledge_base() -> str:
+    if not ARCHIVIST_KNOWLEDGE_LOG.exists():
+        return ""
+
+    content = _read_text_if_exists(ARCHIVIST_KNOWLEDGE_LOG).strip()
+    lines = content.splitlines()
+    body_lines = [
+        line
+        for line in lines
+        if not line.startswith("# ") and not line.startswith("_")
+    ]
+    return "\n".join(body_lines).strip()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Bug report intake (full mode)
+# ════════════════════════════════════════════════════════════════════════════
+
+def _read_bug_file(path: Path) -> str:
+    """Delegate to track_read so file appears in artifact summary."""
+    track_read(path)
+    return path.read_text(errors="replace")
+
+
+def gather_bug_report(
+    cli_text: str | None,
+    cli_files: list[str],
+    *,
+    allow_interactive: bool = True,
+) -> str:
+    """
+    Collect bug report text via gather_text_file_bundle.
+
+    TTY detection is handled inside gather_text_file_bundle — when stdin is not
+    a TTY (harness subprocess, CI) interactive prompts are skipped automatically.
+    Returns "" if no input provided (caller continues with codebase_map context).
+    """
+    try:
+        bundle = gather_text_file_bundle(
+            cli_text=cli_text,
+            cli_files=cli_files or [],
+            read_file_fn=_read_bug_file,
+            prompt_title="Bug report (optional — press Enter twice to skip)",
+            prompt_body=(
+                "Describe the bug: observed behavior, reproduction steps, expected behavior.\n"
+                "You can also drag-and-drop a .txt or .md file.\n"
+                "Leave blank and press Enter twice to skip."
+            ),
+            attachment_prompt="Attach additional bug report files if any",
+            default_attachment_only_prompt="Analyze the attached bug report file(s).",
+            allow_interactive=allow_interactive,
+            ask_for_attachments_after_text=True,
+        )
+        return bundle.text.strip()
+    except RuntimeError:
+        # No input provided — not an error, caller continues without bug report.
+        return ""
+
+
+def _load_codebase_map() -> str:
+    """
+    Load absorber/codebase_map.md as structural context for full-mode repairs.
+
+    This replaces the full spec file as the primary codebase reference,
+    giving models a compact navigable map without the full spec weight.
+    """
+    if not ABSORBER_CODEBASE_MD.exists():
+        return ""
+    content = _read_text_if_exists(ABSORBER_CODEBASE_MD).strip()
+    return content
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# API helpers
+# ════════════════════════════════════════════════════════════════════════════
+
+def _strip_json_fences(raw: str) -> str:
+    text = raw.strip()
+    text = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", text)
+    text = re.sub(r"\n?```$", "", text.strip())
+    return text
+
+
+def _parse_model_json(raw: str) -> dict[str, Any]:
+    text = _strip_json_fences(raw)
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if not match:
+            raise
+        parsed = json.loads(match.group())
+
+    if not isinstance(parsed, dict):
+        raise ValueError("model returned non-object JSON")
+
+    return parsed
+
+
+def call_qwen(messages: list[dict[str, str]], max_tokens: int = 2000) -> str:
+    """Surface/component repair — role: debugger."""
+    content, _ = call_llm_messages(
+        "debugger", messages,
+        retries=2, backoff=False,
+        caller_file=__file__, label=f"[09] {get_model('debugger')}",
+        max_tokens=max_tokens,
+    )
+    return content
+
+
+def call_minimax(messages: list[dict[str, str]], max_tokens: int = 2000) -> str:
+    """Logic/hook/data repair — role: debugger_secondary."""
+    content, _ = call_llm_messages(
+        "debugger_secondary", messages,
+        retries=2, backoff=False,
+        caller_file=__file__, label=f"[09] {get_model('debugger_secondary')}",
+        max_tokens=max_tokens,
+    )
+    return content
+
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Path helpers
+# ════════════════════════════════════════════════════════════════════════════
+
+def _safe_rel_path(raw: str) -> Path:
+    normalized = raw.replace("\\", "/").strip()
+    rel = Path(normalized)
+
+    if not normalized:
+        raise ValueError("empty path")
+
+    if rel.is_absolute():
+        raise ValueError(f"absolute path rejected: {raw}")
+
+    if any(part == ".." for part in rel.parts):
+        raise ValueError(f"path traversal rejected: {raw}")
+
+    return rel
+
+
+def _resolve_artifact_path(rel: str) -> Path:
+    safe = _safe_rel_path(rel)
+    raw = safe.as_posix()
+
+    if raw.startswith("src/"):
+        return SRC_DIR / raw[len("src/"):]
+
+    if raw.startswith("tests/"):
+        return TESTS_DIR / raw[len("tests/"):]
+
+    return artifact_root() / safe
+
+
+def _is_under(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _plan_mini_target_files() -> set[str]:
+    raw = _read_json(PLANNER_MINI_PLAN, {})
+    if not isinstance(raw, dict):
+        return set()
+
+    if "plan" in raw and isinstance(raw["plan"], dict):
+        plan = raw["plan"]
+    else:
+        plan = raw
+
+    targets = plan.get("target_files", [])
+    allowed: set[str] = set()
+
+    if isinstance(targets, list):
+        for entry in targets:
+            if isinstance(entry, str):
+                allowed.add(entry)
+            elif isinstance(entry, dict) and isinstance(entry.get("path"), str):
+                allowed.add(entry["path"])
+
+    return allowed
+
+
+def _mini_allowed_to_write(rel_path: str) -> bool:
+    if _current_scope() != "mini":
+        return True
+
+    allowed = _plan_mini_target_files()
+    if not allowed:
+        return False
+
+    return rel_path in allowed
+
+
+def _read_file_safe(path: Path) -> str:
+    if path.exists():
+        track_read(path)
+        return path.read_text(errors="replace")
+    return f"// FILE NOT FOUND: {path}\n"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Verifier dispatcher for mini mode
+# ════════════════════════════════════════════════════════════════════════════
+
+def _implemented_files_from_record() -> list[str]:
+    rec = _load_impl_record()
+    files = rec.get("files", [])
+
+    out: list[str] = []
+    if isinstance(files, list):
+        for item in files:
+            if isinstance(item, str):
+                out.append(item)
+            elif isinstance(item, dict) and isinstance(item.get("path"), str):
+                out.append(item["path"])
+
+    return sorted(set(out))
+
+
+def _target_files_for_mini() -> list[str]:
+    files = set(_implemented_files_from_record())
+    files.update(_plan_mini_target_files())
+    return sorted(files)
+
+
+def _package_json_exists() -> bool:
+    return (artifact_root() / "package.json").exists()
+
+
+def _verify_python(path: Path) -> tuple[bool, str]:
+    try:
+        track_read(path)
+        py_compile.compile(str(path), doraise=True)
+        return True, "py_compile OK"
+    except Exception as exc:
+        return False, f"py_compile failed: {exc}"
+
+
+def _verify_json(path: Path) -> tuple[bool, str]:
+    try:
+        track_read(path)
+        json.loads(path.read_text(errors="replace"))
+        return True, "JSON parse OK"
+    except Exception as exc:
+        return False, f"JSON parse failed: {exc}"
+
+
+def _verify_toml(path: Path) -> tuple[bool, str]:
+    try:
+        import tomllib
+        track_read(path)
+        tomllib.loads(path.read_text(errors="replace"))
+        return True, "TOML parse OK"
+    except Exception as exc:
+        return False, f"TOML parse failed: {exc}"
+
+
+def _verify_yaml(path: Path) -> tuple[bool, str]:
+    track_read(path)
+
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        text = path.read_text(errors="replace")
+        if "\t" in text:
+            return False, "YAML basic check failed: tabs found; install PyYAML for full parse"
+        return True, "YAML basic check OK; PyYAML not installed"
+
+    try:
+        yaml.safe_load(path.read_text(errors="replace"))
+        return True, "YAML parse OK"
+    except Exception as exc:
+        return False, f"YAML parse failed: {exc}"
+
+
+def _run_mini_verifiers(verbose: bool = False) -> tuple[bool, dict[str, Any]]:
+    files = _target_files_for_mini()
+
+    if not files:
+        return False, {
+            "summary": "No mini target/implemented files found",
+            "checks": [],
+        }
+
+    checks: list[dict[str, Any]] = []
+    ts_like = False
+
+    for rel in files:
+        try:
+            path = _resolve_artifact_path(rel)
+        except Exception as exc:
+            checks.append({
+                "file": rel,
+                "passed": False,
+                "kind": "path",
+                "message": str(exc),
+            })
+            continue
+
+        ext = path.suffix.lower()
+        kind = ext.lstrip(".") or "unknown"
+
+        if not path.exists():
+            checks.append({
+                "file": rel,
+                "passed": False,
+                "kind": kind,
+                "message": f"file not found: {path}",
+            })
+            continue
+
+        if ext == ".py":
+            ok, msg = _verify_python(path)
+        elif ext == ".json":
+            ok, msg = _verify_json(path)
+        elif ext in {".yaml", ".yml"}:
+            ok, msg = _verify_yaml(path)
+        elif ext == ".toml":
+            ok, msg = _verify_toml(path)
+        elif ext in {".ts", ".tsx", ".js", ".jsx"}:
+            ts_like = True
+            track_read(path)
+            ok, msg = True, "TS/JS file present; Vitest will run if package.json exists"
+        elif ext in {".sql", ".md", ".txt", ".cfg", ".conf", ".ini"}:
+            track_read(path)
+            ok, msg = True, "basic existence check OK"
+        else:
+            track_read(path)
+            ok, msg = True, "basic existence check OK"
+
+        checks.append({
+            "file": rel,
+            "passed": ok,
+            "kind": kind,
+            "message": msg,
+        })
+
+        if verbose:
+            status = "PASS" if ok else "FAIL"
+            print(f"[09][mini] {status} {rel} — {msg}")
+
+    all_basic_ok = all(c["passed"] for c in checks)
+
+    if ts_like and _package_json_exists():
+        print("[09][mini] TS/JS targets detected and package.json exists — running Vitest.")
+        vitest_ok, vitest_output = run_vitest()
+        checks.append({
+            "file": "(vitest)",
+            "passed": vitest_ok,
+            "kind": "vitest",
+            "message": _summarize_test_output(vitest_output),
+            "log_snippet": _extract_error_block(vitest_output, max_chars=4000),
+        })
+        all_basic_ok = all_basic_ok and vitest_ok
+    elif ts_like:
+        checks.append({
+            "file": "(vitest)",
+            "passed": True,
+            "kind": "vitest",
+            "message": "skipped: package.json not found",
+        })
+
+    return all_basic_ok, {
+        "summary": "Mini verification complete",
+        "checks": checks,
+    }
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Phase B — run Vitest + parse failures
+# ════════════════════════════════════════════════════════════════════════════
+
+def run_vitest() -> tuple[bool, str]:
+    # Vitest must run from the directory that owns package.json (output/).
+    # artifact_root() is artifacts_<slug>/; the actual Vite project is in output/.
+    artifact_dir = artifact_root()
+    output_dir   = artifact_dir / "output"
+    project_dir  = output_dir if (output_dir / "package.json").exists() else artifact_dir
+
+    # Find vitest config — prefer file local to project_dir
+    config_candidates = [
+        project_dir / "vitest.config.ts",
+        project_dir / "vitest.config.js",
+        artifact_dir / "vitest.config.ts",
+        artifact_dir / "vitest.config.js",
+    ]
+    config_flag: list[str] = []
+    for candidate in config_candidates:
+        if candidate.exists():
+            config_flag = ["--config", str(candidate)]
+            break
+
+    result = subprocess.run(
+        ["npx", "vitest", "run", "--reporter=verbose"] + config_flag,
+        cwd=project_dir,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env={**os.environ, "CI": "true", "FORCE_COLOR": "0"},
+    )
+    combined = _strip_ansi(result.stdout + "\n" + result.stderr)
+
+    # Vitest 4.x exits non-zero when test files exist but contain no tests
+    # (e.g. setupTests.ts, types.ts scaffolded without describe/it blocks).
+    # Treat this as "pass" — there's nothing to repair.
+    if result.returncode != 0 and _is_no_tests_failure(combined):
+        return True, combined
+
+    return result.returncode == 0, combined
+
+
+def _has_any_failure(output: str) -> bool:
+    """Return True if output contains any × failure line (Vitest 4.x) or legacy FAIL line."""
+    has_inline = bool(re.search(
+        r"^\s*[×✗xX]\s+(?:output/)?tests/\S+\.test\.[tj]sx?",
+        output, re.MULTILINE,
+    ))
+    has_legacy = bool(_RE_TEST_FILE.search(output))
+    return has_inline or has_legacy
+
+
+def _is_no_tests_failure(output: str) -> bool:
+    """
+    Return True if Vitest exited non-zero solely because some files had
+    no test cases — not because any test actually failed.
+
+    Vitest 4.x exits 1 when it finds test files with zero tests inside them.
+    This is not a real failure — the files are likely empty scaffolds.
+    We detect it by checking:
+      - output contains "Tests  no tests" or "0 tests"
+      - output contains NO failure lines (neither × inline nor legacy FAIL)
+    """
+    has_no_tests_line = bool(re.search(
+        r"Tests\s+no tests|0\s+tests?\b",
+        output, re.IGNORECASE,
+    ))
+    return has_no_tests_line and not _has_any_failure(output)
+
+
+
+_RE_TRANSFORM_ERR = re.compile(
+    r"(Transform failed|ERROR: Expected|SyntaxError.*esbuild|error TS\d+"
+    r"|Cannot find module|Failed to resolve|does not provide an export"
+    r"|SyntaxError|ERR_PACKAGE_PATH_NOT_EXPORTED)",
+    re.IGNORECASE,
+)
+
+# ── Vitest 4.x inline format ─────────────────────────────────────────────────
+#
+# Vitest 4.x --reporter=verbose streams each test inline:
+#   ✓ tests/hooks/useWavesurfer.test.ts > useWavesurfer > returns initial state 8ms
+#   × tests/hooks/useWavesurfer.test.ts > useWavesurfer > creates WaveSurfer 7ms
+#     → waitFor is not a function
+#
+# Suite-level import failures appear as:
+#   ⎯⎯⎯ tests/db.test.ts ⎯⎯⎯
+#   Error: Cannot find module '../../src/db'
+#
+# Legacy Vitest ≤3.x used per-file FAIL/PASS lines — kept as fallback.
+
+_RE_INLINE_RESULT = re.compile(
+    r"^\s*([✓×✗xX])\s+((?:output/)?tests/\S+\.test\.[tj]sx?)\s+>\s+(.+?)(?:\s+\d+ms)?$",
+    re.MULTILINE,
+)
+_RE_INLINE_ERROR_HINT = re.compile(r"^\s+→\s+(.+)$", re.MULTILINE)
+_RE_SUITE_ERROR_HEADER = re.compile(
+    r"[⎯─\-]{3,}\s*((?:output/)?tests/\S+\.test\.[tj]sx?)\s*[⎯─\-]{3,}",
+    re.MULTILINE,
+)
+# Legacy format kept for fallback
+_RE_TEST_FILE = re.compile(
+    r"^\s*(FAIL|PASS)\s+((?:output/)?tests/\S+\.test\.[tj]sx?)",
+    re.MULTILINE,
+)
+_FAIL_CHARS = frozenset("×✗xX")
+
+
+def _extract_error_block(output: str, max_chars: int = 4000) -> str:
+    sep_match = re.search(r"[⎯─\-]{3,}\s*Failed Suites\s*[⎯─\-]{3,}", output)
+    if sep_match:
+        return output[sep_match.start():][:max_chars]
+    first_x = _RE_INLINE_RESULT.search(output)
+    if first_x and first_x.group(1) in _FAIL_CHARS:
+        return output[first_x.start():][:max_chars]
+    return output[-max_chars:]
+
+
+def _build_suite_error_index(output: str) -> dict[str, str]:
+    index: dict[str, str] = {}
+    headers = list(_RE_SUITE_ERROR_HEADER.finditer(output))
+    for i, match in enumerate(headers):
+        file_path = match.group(1).strip()
+        start = match.end()
+        end = headers[i + 1].start() if i + 1 < len(headers) else len(output)
+        block = output[start:end].strip()
+        if block:
+            index[file_path] = block[:800]
+    return index
+
+
+def _summarize_test_output(output: str) -> str:
+    for line in output.splitlines():
+        s = line.strip()
+        if re.search(r"\d+\s+failed", s) and re.search(r"\d+\s+passed", s):
+            return s
+        if re.search(r"Test Files\s+\d+", s):
+            return s
+    for line in reversed(output.splitlines()):
+        if line.strip():
+            return line.strip()
+    return "no output"
+
+
+def _infer_src_file(test_file: str) -> str:
+    rel = re.sub(r"^output/", "", test_file)
+    rel = rel.replace("tests/", "", 1)
+    rel = re.sub(r"\.test\.(tsx?)$", r".\1", rel)
+    rel = re.sub(r"\.test\.(ts)$", r".\1", rel)
+    return f"{_SRC_PREFIX}/{rel}"
+
+
+def parse_failures(output: str) -> list[FailureCluster]:
+    """
+    Parse Vitest output into FailureCluster objects.
+    Handles three formats:
+      1. Vitest 4.x inline:  × tests/foo.test.ts > Suite > test name
+                                 → error hint
+      2. Legacy per-file:    FAIL  tests/foo.test.ts  (Vitest ≤ 3.x)
+      3. Suite-level:        ⎯⎯⎯ tests/foo.test.ts ⎯⎯⎯  (import/transform errors)
+    """
+    clusters: dict[str, FailureCluster] = {}
+    suite_error_index = _build_suite_error_index(output)
+
+    # ── Format 1: Vitest 4.x inline per-test lines ───────────────────────────
+    lines = output.splitlines()
+    i = 0
+    while i < len(lines):
+        m = _RE_INLINE_RESULT.match(lines[i])
+        if m and m.group(1) in _FAIL_CHARS:
+            test_file  = m.group(2)
+            test_title = m.group(3).strip()
+
+            # Collect → hint lines immediately following
+            hint_lines: list[str] = []
+            j = i + 1
+            while j < len(lines):
+                hint_m = _RE_INLINE_ERROR_HINT.match(lines[j])
+                if hint_m:
+                    hint_lines.append(hint_m.group(1).strip())
+                    j += 1
+                elif lines[j].strip() == "":
+                    j += 1
+                    break
+                else:
+                    break
+
+            src_file = _infer_src_file(test_file)
+            cluster  = clusters.setdefault(
+                test_file,
+                FailureCluster(test_file=test_file, src_file=src_file, owner=_DEBUGGER_MODEL),
+            )
+            cluster.failures.append(TestFailure(
+                test_file=test_file,
+                test_name=test_title,
+                error_snippet=(" | ".join(hint_lines))[:600],
+            ))
+        i += 1
+
+    # ── Format 2: legacy FAIL/PASS per-file lines (Vitest ≤ 3.x) ────────────
+    if not clusters:
+        file_matches = list(_RE_TEST_FILE.finditer(output))
+        sections: list[tuple[str, str, str]] = []
+        for idx, match in enumerate(file_matches):
+            start = match.end()
+            end   = file_matches[idx + 1].start() if idx + 1 < len(file_matches) else len(output)
+            sections.append((match.group(1), match.group(2), output[start:end]))
+        for status, test_file, section in sections:
+            if status != "FAIL":
+                continue
+            src_file = _infer_src_file(test_file)
+            cluster  = clusters.setdefault(
+                test_file,
+                FailureCluster(test_file=test_file, src_file=src_file, owner=_DEBUGGER_MODEL),
+            )
+            suite_detail = suite_error_index.get(test_file) or suite_error_index.get(test_file.removeprefix("output/")) or ""
+            full_section = (section + "\n" + suite_detail).strip()
+            if _RE_TRANSFORM_ERR.search(full_section):
+                cluster.is_transform_error = True
+            for hint in _RE_INLINE_ERROR_HINT.findall(section):
+                cluster.failures.append(TestFailure(test_file=test_file, test_name=hint.strip(), error_snippet=full_section[:500]))
+            if not cluster.failures:
+                cluster.failures.append(TestFailure(
+                    test_file=test_file,
+                    test_name="(suite-level import/transform error)",
+                    error_snippet=(suite_detail or full_section)[:800].strip() or "(no error detail)",
+                ))
+
+    # ── Format 3: suite-level errors for files with no inline results ─────────
+    for file_path, error_detail in suite_error_index.items():
+        if file_path not in clusters:
+            src_file = _infer_src_file(file_path)
+            cluster  = FailureCluster(test_file=file_path, src_file=src_file, owner=_DEBUGGER_MODEL)
+            cluster.is_transform_error = bool(_RE_TRANSFORM_ERR.search(error_detail))
+            cluster.failures.append(TestFailure(
+                test_file=file_path,
+                test_name="(suite-level import/transform error)",
+                error_snippet=error_detail[:800],
+            ))
+            clusters[file_path] = cluster
+
+    return list(clusters.values())
+
+
+def merge_cluster_state(
+    new_clusters: list[FailureCluster],
+    prev_state: dict[str, FailureCluster],
+) -> list[FailureCluster]:
+    for cluster in new_clusters:
+        if cluster.key in prev_state:
+            prev = prev_state[cluster.key]
+            cluster.attempt_count = prev.attempt_count
+            cluster.last_fingerprint = prev.last_fingerprint
+            cluster.escalated = prev.escalated
+            cluster.owner = prev.owner
+    return new_clusters
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Early-exit and systemic error detection
+# ════════════════════════════════════════════════════════════════════════════
+
+def _detect_systemic_error(clusters: list[FailureCluster]) -> str | None:
+    """
+    If the same error message appears in > 50% of clusters, return it.
+    This indicates a systemic issue that looping won't fix.
+    """
+    if len(clusters) < 2:
+        return None
+
+    # Extract first error snippet from each cluster, normalized
+    snippets: list[str] = []
+    for cluster in clusters:
+        if cluster.failures:
+            # Take first line of first failure's error as the "signature"
+            first_err = cluster.failures[0].error_snippet.strip().splitlines()[0] if cluster.failures[0].error_snippet else ""
+            # Normalize: strip file paths and line numbers
+            normalized = re.sub(r"at .+:\d+:\d+", "", first_err).strip()
+            normalized = re.sub(r"\s+", " ", normalized)[:200]
+            if normalized:
+                snippets.append(normalized)
+
+    if not snippets:
+        return None
+
+    counts = Counter(snippets)
+    most_common_msg, most_common_count = counts.most_common(1)[0]
+
+    if most_common_count > len(clusters) * 0.5:
+        return most_common_msg
+
+    return None
+
+
+def _should_early_exit(cluster_counts: list[int]) -> bool:
+    """
+    If cluster count has not decreased over 2 consecutive iterations,
+    the repair loop is not making progress — break early.
+    """
+    if len(cluster_counts) < 3:
+        return False
+
+    # Check last 2 transitions: if count didn't decrease either time, bail
+    return (
+        cluster_counts[-1] >= cluster_counts[-2]
+        and cluster_counts[-2] >= cluster_counts[-3]
+    )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Layer 0 — Static pre-pass
+# ════════════════════════════════════════════════════════════════════════════
+
+_RE_JSX_GENERIC = re.compile(
+    r"(<\w[\w.]*)<(\w[\w,\s]*)>(\s*(?:events|data|items|props|value)\s*=)",
+)
+_RE_TEMPLATE_WIDTH = re.compile(r"(`\$\{)([^}]*\*\s*100)(\}%`)")
+_RE_FLOAT_WIDTH = re.compile(r"(width:\s*)(\d+\.\d+)(%)")
+
+_RE_ANSI = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+
+
+def _strip_ansi(text: str) -> str:
+    return _RE_ANSI.sub("", text)
+
+def _static_fix_transform(path: Path) -> tuple[bool, str]:
+    if not path.exists():
+        return False, "file not found"
+
+    track_read(path)
+    original = path.read_text(errors="replace")
+    patched = _RE_JSX_GENERIC.sub(r"\1\3", original)
+
+    if patched != original:
+        path.write_text(patched)
+        track_write(path)
+        return True, "removed JSX generic type param causing esbuild parse error"
+
+    return False, "no static transform pattern matched"
+
+
+def _static_fix_src(path: Path) -> tuple[bool, str]:
+    if not path.exists():
+        return False, "file not found"
+
+    track_read(path)
+    original = path.read_text(errors="replace")
+    patched = _RE_TEMPLATE_WIDTH.sub(r"`${Math.round(\2)}\3", original)
+    patched = _RE_FLOAT_WIDTH.sub(
+        lambda m: f"{m.group(1)}{round(float(m.group(2)))}{m.group(3)}",
+        patched,
+    )
+
+    if patched != original:
+        path.write_text(patched)
+        track_write(path)
+        return True, "rounded floating-point percentage widths"
+
+    return False, "no static src pattern matched"
+
+
+def layer0_static_prepass(
+    cluster: FailureCluster,
+    verbose: bool,
+) -> tuple[bool, str]:
+    if verbose:
+        print(f"    [L0] Static pre-pass for {cluster.test_file} …")
+
+    if cluster.is_transform_error:
+        test_path = TESTS_DIR / cluster.test_file.replace("tests/", "", 1)
+        fixed, desc = _static_fix_transform(test_path)
+        if fixed:
+            print(f"    [L0] ✓ {desc}")
+            return True, desc
+
+    src_path = SRC_DIR / cluster.src_file.replace("src/", "", 1)
+    fixed, desc = _static_fix_src(src_path)
+    if fixed:
+        print(f"    [L0] ✓ {desc}")
+        return True, desc
+
+    if verbose:
+        print("    [L0] No static pattern matched.")
+
+    return False, "no static fix applicable"
+
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Rule-based short-circuits — skip LLM for known patterns
+# ════════════════════════════════════════════════════════════════════════════
+
+_RULE_PATTERNS: list[tuple[re.Pattern[str], str, "Callable[[FailureCluster], tuple[bool, str]]"]] = []
+
+
+def _register_rule(pattern: str, description: str):
+    """Decorator to register a rule-based fix."""
+    def decorator(fn):
+        _RULE_PATTERNS.append((re.compile(pattern, re.IGNORECASE), description, fn))
+        return fn
+    return decorator
+
+
+@_register_rule(
+    r"waitFor is not a function|waitFor is not exported",
+    "Fix waitFor import — must be imported directly from @testing-library/react"
+)
+def _fix_waitfor_import(cluster: FailureCluster) -> tuple[bool, str]:
+    test_path = _resolve_artifact_path(cluster.test_file)
+    if not test_path.exists():
+        return False, "test file not found"
+    content = test_path.read_text(errors="replace")
+    # Pattern: destructuring waitFor from renderHook result
+    if "waitFor" not in content:
+        return False, "waitFor not in file"
+    # Add waitFor to existing @testing-library/react import
+    new_content = re.sub(
+        r"import\s*\{([^}]*?)\}\s*from\s*['"]@testing-library/react['"]",
+        lambda m: (
+            m.group(0) if "waitFor" in m.group(1)
+            else f"import {{{m.group(1)}, waitFor}} from '@testing-library/react'"
+        ),
+        content,
+    )
+    # Remove waitFor from renderHook destructuring
+    new_content = re.sub(
+        r"const\s*\{([^}]*?)waitFor([^}]*?)\}\s*=\s*renderHook",
+        lambda m: f"const {{{m.group(1)}{m.group(2)}}} = renderHook",
+        new_content,
+    )
+    if new_content != content:
+        test_path.write_text(new_content)
+        track_write(test_path)
+        return True, "Added waitFor import from @testing-library/react"
+    return False, "no change needed"
+
+
+@_register_rule(
+    r"toHaveAttribute\(.*type.*text",
+    "Fix type attribute check — use .type property instead"
+)
+def _fix_type_attribute(cluster: FailureCluster) -> tuple[bool, str]:
+    test_path = _resolve_artifact_path(cluster.test_file)
+    if not test_path.exists():
+        return False, "test file not found"
+    content = test_path.read_text(errors="replace")
+    new_content = re.sub((
+        r"expect\(([^)]+)\)\.toHaveAttribute\(['"]type['"],\s*['"]text['"]\)",
+        r"expect((\1 as HTMLInputElement).type).toBe('text')",
+        content,
+    )
+    if new_content != content:
+        test_path.write_text(new_content)
+        track_write(test_path)
+        return True, "Changed toHaveAttribute('type','text') to .type property check"
+    return False, "pattern not found"
+
+
+@_register_rule(
+    r"Cannot find module|Failed to resolve import",
+    "Fix mock path — try @/ alias vs relative"
+)
+def _fix_mock_path(cluster: FailureCluster) -> tuple[bool, str]:
+    test_path = _resolve_artifact_path(cluster.test_file)
+    if not test_path.exists():
+        return False, "test file not found"
+    content = test_path.read_text(errors="replace")
+    # Convert relative mock paths like '../@/components/...' to '@/components/...'
+    new_content = re.sub((
+        r"vi\.mock\(['"]\.\./@/",
+        "vi.mock('@/",
+        content,
+    )
+    new_content = re.sub((
+        r"vi\.mock\(['"]\.\.\./\.\./@/",
+        "vi.mock('@/",
+        new_content,
+    )
+    if new_content != content:
+        test_path.write_text(new_content)
+        track_write(test_path)
+        return True, "Fixed mock path from relative to @/ alias"
+    return False, "no relative @/ mock paths found"
+
+
+def try_rule_based_fix(cluster: FailureCluster, verbose: bool = False) -> tuple[bool, str]:
+    """Try all registered rules against cluster errors. Returns (fixed, description)."""
+    error_text = cluster.error_block()
+    for pattern, description, fix_fn in _RULE_PATTERNS:
+        if pattern.search(error_text):
+            if verbose:
+                print(f"    [RULE] Trying: {description}")
+            ok, msg = fix_fn(cluster)
+            if ok:
+                print(f"    [RULE] ✓ {msg}")
+                return True, msg
+    return False, "no rule matched"
+
+
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Context slicing — send only relevant code snippets, not full files
+# ════════════════════════════════════════════════════════════════════════════
+
+def _slice_relevant_code(file_content: str, error_snippet: str, max_lines: int = 60) -> str:
+    """
+    Extract only the relevant portion of a file based on error context.
+    Returns at most max_lines of code centered around the error location.
+    """
+    lines = file_content.splitlines()
+    if len(lines) <= max_lines:
+        return file_content
+
+    # Try to find error-referenced line numbers
+    line_refs = re.findall(r"(?:line |:)(\d+)", error_snippet)
+    if line_refs:
+        center = int(line_refs[0]) - 1
+    else:
+        # Try to find referenced function/variable names in error
+        identifiers = re.findall(r"['\"]([a-zA-Z_]\w*)['\"]", error_snippet)
+        center = None
+        for ident in identifiers[:5]:
+            for i, line in enumerate(lines):
+                if ident in line and not line.strip().startswith("import"):
+                    center = i
+                    break
+            if center is not None:
+                break
+
+    if center is None:
+        # Default: return first max_lines/2 + last max_lines/2
+        half = max_lines // 2
+        return "\n".join(lines[:half] + ["// ... (truncated) ..."] + lines[-half:])
+
+    start = max(0, center - max_lines // 2)
+    end = min(len(lines), start + max_lines)
+    start = max(0, end - max_lines)
+
+    prefix = f"// ... (lines 1-{start} omitted) ...\n" if start > 0 else ""
+    suffix = f"\n// ... (lines {end+1}-{len(lines)} omitted) ..." if end < len(lines) else ""
+
+    return prefix + "\n".join(lines[start:end]) + suffix
+
+
+def _slice_test_failures(test_content: str, failure_names: list[str], max_lines: int = 80) -> str:
+    """Extract only the failing test blocks from a test file."""
+    lines = test_content.splitlines()
+    if len(lines) <= max_lines:
+        return test_content
+
+    # Always include imports (first 15 lines or until first describe/it)
+    import_end = 0
+    for i, line in enumerate(lines[:30]):
+        if re.match(r"\s*(describe|it|test)\(", line):
+            import_end = i
+            break
+    else:
+        import_end = min(15, len(lines))
+
+    imports = lines[:import_end]
+
+    # Find test blocks that match failure names
+    relevant_blocks: list[str] = []
+    for name in failure_names[:5]:  # Cap at 5 failures
+        # Find the test/it block containing this name
+        escaped = re.escape(name.split(" > ")[-1] if " > " in name else name)
+        for i, line in enumerate(lines):
+            if re.search(escaped[:40], line):
+                # Grab surrounding block (up to 20 lines)
+                block_start = max(import_end, i - 2)
+                block_end = min(len(lines), i + 18)
+                relevant_blocks.append("\n".join(lines[block_start:block_end]))
+                break
+
+    if not relevant_blocks:
+        # Fallback: return truncated
+        return "\n".join(lines[:max_lines]) + "\n// ... (truncated) ..."
+
+    result = "\n".join(imports) + "\n\n// --- Relevant test blocks ---\n\n"
+    result += "\n\n// ---\n\n".join(relevant_blocks)
+    return result[:max_lines * 100]  # Hard char cap
+
+
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Merged verdict + fix prompt — single LLM call replaces consistency + repair
+# ════════════════════════════════════════════════════════════════════════════
+
+MERGED_FIX_SYSTEM = """\
+You are a senior TypeScript debugger. Analyze the failing test cluster and fix it in ONE response.
+
+Step 1: Classify the bug.
+Step 2: If fixable, provide the minimal patch.
+
+RULES:
+- Output ONLY valid JSON matching the schema below.
+- Keep root_cause under 120 chars.
+- edits array: each edit is a search/replace pair (NOT full file content).
+- Maximum 5 edits per response.
+- If the bug is in the TEST (fragile assertion, wrong mock path, missing import):
+  set target="test" and edit the test file.
+- If the bug is in SOURCE CODE: set target="src" and edit the src file.
+- If ambiguous or needs human review: set verdict="ESCALATE".
+
+JSON Schema:
+{
+  "verdict": "TEST_FRAGILE" | "CODE_BUG" | "ESCALATE",
+  "confidence": "high" | "medium" | "low",
+  "root_cause": "string, max 120 chars",
+  "target": "test" | "src",
+  "target_file": "relative path to file being edited",
+  "edits": [
+    {"search": "exact string to find", "replace": "replacement string"}
+  ]
+}
+
+IMPORTANT:
+- "search" must be an EXACT substring of the current file content.
+- Keep edits minimal — only change what's needed to fix the failure.
+- Do NOT include explanations outside the JSON object.
+"""
+
+MERGED_FIX_SYSTEM_LOGIC = """\
+You are a senior TypeScript logic debugger for hooks, data, types, and utilities.
+
+Analyze and fix the failing test in ONE response.
+
+SCOPE: You may ONLY edit files in src/hooks/, src/data/, src/types/, src/utils/.
+Never touch src/components/.
+
+JSON Schema:
+{
+  "verdict": "TEST_FRAGILE" | "CODE_BUG" | "ESCALATE",
+  "confidence": "high" | "medium" | "low",
+  "root_cause": "string, max 120 chars",
+  "target": "test" | "src",
+  "target_file": "relative path",
+  "edits": [
+    {"search": "exact string to find", "replace": "replacement string"}
+  ]
+}
+
+RULES:
+- Maximum 5 edits.
+- "search" must be EXACT substring match.
+- No explanations outside JSON.
+- If you cannot fix it, set verdict="ESCALATE" and edits=[].
+"""
+
+
+def _build_merged_user_prompt(
+    cluster: FailureCluster,
+    run_context: str,
+    src_content: str,
+    test_content: str,
+) -> str:
+    """Build a compact user prompt with sliced context."""
+    error_text = cluster.error_block()
+
+    # Slice source to relevant portion
+    sliced_src = _slice_relevant_code(src_content, error_text, max_lines=50)
+
+    # Slice test to failing blocks only
+    failure_names = [f.test_name for f in cluster.failures]
+    sliced_test = _slice_test_failures(test_content, failure_names, max_lines=60)
+
+    parts = []
+    if run_context and len(run_context) < 2000:
+        parts.append(f"## Context\n{run_context[:1500]}")
+
+    parts.append(f"## Source: {cluster.src_file}\n```typescript\n{sliced_src}\n```")
+    parts.append(f"## Test: {cluster.test_file}\n```typescript\n{sliced_test}\n```")
+    parts.append(f"## Failures ({len(cluster.failures)})\n```\n{error_text[:1500]}\n```")
+
+    return "\n\n".join(parts)
+
+
+def _apply_search_replace_edits(
+    file_path: Path,
+    edits: list[dict[str, str]],
+    verbose: bool = False,
+) -> tuple[bool, str]:
+    """Apply search/replace edits to a file. Returns (success, message)."""
+    if not file_path.exists():
+        return False, f"file not found: {file_path}"
+
+    content = file_path.read_text(errors="replace")
+    original = content
+    applied = 0
+    failed_searches: list[str] = []
+
+    for edit in edits:
+        search = edit.get("search", "")
+        replace = edit.get("replace", "")
+        if not search:
+            continue
+        if search in content:
+            content = content.replace(search, replace, 1)
+            applied += 1
+        else:
+            # Try with normalized whitespace
+            normalized_search = re.sub(r"\s+", " ", search.strip())
+            # Search line by line for fuzzy match
+            found = False
+            for i, line in enumerate(content.splitlines()):
+                if normalized_search[:50] in re.sub(r"\s+", " ", line):
+                    # Found approximate match — skip this edit to be safe
+                    found = True
+                    break
+            if not found:
+                failed_searches.append(search[:60])
+
+    if content == original:
+        return False, f"no edits applied; {len(failed_searches)} search(es) not found"
+
+    file_path.write_text(content)
+    track_write(file_path)
+
+    msg = f"{applied}/{len(edits)} edits applied"
+    if failed_searches:
+        msg += f"; {len(failed_searches)} not found"
+    return True, msg
+
+
+def merged_repair_cluster(
+    cluster: FailureCluster,
+    run_context: str,
+    judge_findings: str = "",
+    verbose: bool = False,
+) -> ClusterRepairRecord:
+    """
+    Single-call repair: verdict + fix in one LLM request.
+    Replaces the old two-call pattern (consistency check + separate repair).
+    """
+    src_path = _resolve_artifact_path(cluster.src_file)
+    test_path = _resolve_artifact_path(cluster.test_file)
+
+    src_content = _read_file_safe(src_path)
+    test_content = _read_file_safe(test_path)
+
+    # Choose system prompt based on scope
+    is_logic = cluster.is_minimax_scope()
+    system = MERGED_FIX_SYSTEM_LOGIC if is_logic else MERGED_FIX_SYSTEM
+
+    if judge_findings:
+        system = f"## Prior findings (avoid regressions)\n{judge_findings[:2000]}\n\n---\n\n" + system
+
+    user_prompt = _build_merged_user_prompt(cluster, run_context, src_content, test_content)
+
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    model_label = _DEBUGGER_SECONDARY_MODEL if is_logic else _DEBUGGER_MODEL
+    call_fn = call_minimax if is_logic else call_qwen
+
+    if verbose:
+        print(f"    [MERGED] → {model_label} (attempt #{cluster.attempt_count + 1}) …")
+
+    try:
+        raw = call_fn(messages)
+        result = _parse_model_json(raw)
+    except Exception as exc:
+        print(f"    [MERGED] Parse error: {exc}", file=sys.stderr)
+        cluster.attempt_count += 1
+        return ClusterRepairRecord(
+            cluster=cluster.key,
+            src_file=cluster.src_file,
+            failures=len(cluster.failures),
+            repaired=False,
+            layer_used="merged",
+            escalated=True,
+            escalated_to="human",
+            owner=cluster.owner,
+            note=f"parse error: {exc}",
+        )
+
+    verdict = result.get("verdict", "CODE_BUG")
+    confidence = result.get("confidence", "low")
+    root_cause = result.get("root_cause", "")
+    target = result.get("target", "src")
+    target_file = result.get("target_file", "")
+    edits = result.get("edits", [])
+
+    print(f"    [MERGED] verdict={verdict} confidence={confidence} root_cause={root_cause[:80]}")
+
+    if verdict == "ESCALATE" or not edits:
+        cluster.attempt_count += 1
+        cluster.escalated = True
+        return ClusterRepairRecord(
+            cluster=cluster.key,
+            src_file=cluster.src_file,
+            failures=len(cluster.failures),
+            repaired=False,
+            layer_used="merged",
+            escalated=True,
+            escalated_to="human",
+            owner=cluster.owner,
+            note=f"escalated: {root_cause}",
+            consistency_verdict=verdict,
+        )
+
+    # Determine which file to edit
+    if target == "test":
+        edit_path = test_path if not target_file else _resolve_artifact_path(target_file)
+    else:
+        edit_path = src_path if not target_file else _resolve_artifact_path(target_file)
+
+    # Scope check for logic model
+    if is_logic and target == "src":
+        rel = edit_path.relative_to(SRC_DIR.parent).as_posix() if _is_under(edit_path, SRC_DIR.parent) else target_file
+        if not any(p.match(rel) for p in MINIMAX_SCOPE_PATTERNS):
+            print(f"    [MERGED] Scope violation: {rel}")
+            cluster.attempt_count += 1
+            return ClusterRepairRecord(
+                cluster=cluster.key,
+                src_file=cluster.src_file,
+                failures=len(cluster.failures),
+                repaired=False,
+                layer_used="merged",
+                escalated=True,
+                escalated_to="human",
+                owner=cluster.owner,
+                note=f"scope violation: {rel}",
+            )
+
+    # Apply edits
+    ok, msg = _apply_search_replace_edits(edit_path, edits, verbose=verbose)
+    cluster.attempt_count += 1
+    cluster.last_fingerprint = cluster.fingerprint()
+
+    if ok:
+        print(f"    [MERGED] ✓ {msg} on {edit_path.name}")
+
+    return ClusterRepairRecord(
+        cluster=cluster.key,
+        src_file=cluster.src_file,
+        failures=len(cluster.failures),
+        repaired=ok,
+        layer_used="merged",
+        escalated=not ok,
+        escalated_to="human" if not ok else "",
+        owner=cluster.owner,
+        note=f"{root_cause} — {msg}",
+        consistency_verdict=verdict,
+    )
+
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Prompts
+# ════════════════════════════════════════════════════════════════════════════
+
+FIX_SYSTEM_QWEN = """\
+You are a senior TypeScript/React developer doing a SURFACE-LEVEL fix for ONE failing cluster.
+
+Your scope is LIMITED to surface bugs:
+- Wrong DOM selector or missing test-id attribute
+- Incorrect import path or missing export
+- Tailwind class typo or wrong state class
+- Floating-point precision in style values
+- Text content or badge label mismatch
+- Missing or wrong aria attribute
+
+DO NOT:
+- Rewrite hook logic, state machines, or data generation
+- Change public interfaces
+- Touch any file other than the one src file listed
+
+If the bug is logic/algorithmic, return the file unchanged and set:
+"explanation": "LOGIC_BUG — needs Minimax debugger"
+
+Return raw JSON only:
+{
+  "file_path": "src/components/SummaryStickyBar.tsx",
+  "code": "<full file content>",
+  "explanation": "what was fixed, or LOGIC_BUG"
+}
+"""
+
+
+def _build_qwen_system_with_findings(findings: str) -> str:
+    if not findings:
+        return FIX_SYSTEM_QWEN
+
+    return (
+        "## Previous judge/patcher/archivist findings — avoid regressions\n"
+        f"{findings[:6000]}\n\n---\n\n"
+        + FIX_SYSTEM_QWEN
+    )
+
+
+def _build_minimax_system(judge_findings: str = "") -> str:
+    findings_block = (
+        f"\n## Archivist knowledge / previous findings\n{judge_findings}\n"
+        if judge_findings else ""
+    )
+
+    return f"""\
+You are a senior TypeScript logic debugger specialising in hooks, data generation, types, and utilities.
+{findings_block}
+Fix the LOGIC — not UI styling.
+
+SCOPE:
+- You may ONLY write to src/hooks/, src/data/, src/types/, src/utils/
+- Never touch src/components/
+- Never change public interfaces unless they contradict run context + test
+
+Return raw JSON only:
+{{
+  "file_path": "src/hooks/useReplay.ts",
+  "code": "<full corrected file>",
+  "root_cause": "one sentence",
+  "explanation": "what changed and why"
+}}
+"""
+
+
+def _build_state_timeline(test_code: str, max_entries: int = 12) -> str:
+    timeline: list[str] = []
+
+    for line in test_code.splitlines():
+        stripped = line.strip()
+
+        if not stripped or stripped.startswith("//") or stripped.startswith("import"):
+            continue
+
+        if stripped.startswith(("describe(", "it(", "test(")):
+            timeline.append(f"TEST: {stripped[:100]}")
+        elif any(token in stripped for token in ("render(", "fireEvent", "userEvent", "act(")):
+            timeline.append(f"  ACTION: {stripped[:100]}")
+        elif stripped.startswith("expect("):
+            timeline.append(f"  ASSERT: {stripped[:100]}")
+
+        if len(timeline) >= max_entries * 3:
+            timeline.append("  … (truncated)")
+            break
+
+    return "\n".join(timeline) if timeline else "(could not extract timeline)"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Consistency checker
+# ════════════════════════════════════════════════════════════════════════════
+
+CONSISTENCY_SYSTEM = """\
+You are a test-vs-code consistency auditor. You do NOT fix code or tests.
+Classify who is wrong.
+
+Return raw JSON only:
+{
+  "verdict": "CODE_BUG" | "TEST_FRAGILE" | "SPEC_AMBIG" | "THRESHOLD_OK",
+  "confidence": "high" | "medium" | "low",
+  "reasoning": "one paragraph",
+  "test_patch_allowed": true | false,
+  "test_patch_rationale": "only if test_patch_allowed=true"
+}
+
+Never set test_patch_allowed=true for CODE_BUG.
+"""
+
+TEST_REPAIR_SYSTEM = """\
+You are fixing a FRAGILE TEST or THRESHOLD.
+Allowed changes only:
+- DOM query selectors
+- async patterns
+- text-content matchers
+- numeric threshold relaxation when justified
+
+Not allowed:
+- Changing intended behavior
+- Removing assertions
+- Touching src files
+
+Return raw JSON only:
+{
+  "file_path": "tests/components/AnomalyFeed.test.tsx",
+  "code": "<full corrected test file>",
+  "changes_made": ["before → after"],
+  "explanation": "one sentence"
+}
+"""
+
+
+def check_consistency(
+    cluster: FailureCluster,
+    run_context: str,
+    verbose: bool = False,
+) -> dict[str, Any]:
+    src_code = _read_file_safe(_resolve_artifact_path(cluster.src_file))
+    test_code = _read_file_safe(_resolve_artifact_path(cluster.test_file))
+    error_log = cluster.error_block()
+
+    user_content = (
+        f"### Run context\n\n{run_context}\n\n"
+        f"### Test file: {cluster.test_file}\n"
+        f"```typescript\n{test_code}\n```\n\n"
+        f"### Source file: {cluster.src_file}\n"
+        f"```typescript\n{src_code}\n```\n\n"
+        f"### Failing assertions\n```\n{error_log}\n```"
+    )
+
+    messages = [
+        {"role": "system", "content": CONSISTENCY_SYSTEM},
+        {"role": "user", "content": user_content},
+    ]
+
+    if verbose:
+        print(f"    [P0] Consistency check → {_DEBUGGER_MODEL} ({cluster.test_file}) …")
+
+    try:
+        raw = call_qwen(messages)
+        result = _parse_model_json(raw)
+        verdict = result.get("verdict", "CODE_BUG")
+        confidence = result.get("confidence", "low")
+        print(f"    [P0] verdict={verdict} confidence={confidence}")
+        return result
+    except Exception as exc:
+        print(
+            f"    [P0] Check failed ({exc}), defaulting to CODE_BUG.",
+            file=sys.stderr,
+        )
+        return {
+            "verdict": "CODE_BUG",
+            "confidence": "low",
+            "test_patch_allowed": False,
+            "reasoning": f"consistency check error: {exc}",
+            "test_patch_rationale": "",
+        }
+
+
+def repair_test_file(
+    cluster: FailureCluster,
+    verdict: dict[str, Any],
+    run_context: str,
+    verbose: bool = False,
+) -> bool:
+    test_code = _read_file_safe(_resolve_artifact_path(cluster.test_file))
+    src_code = _read_file_safe(_resolve_artifact_path(cluster.src_file))
+    error_log = cluster.error_block()
+
+    user_content = (
+        f"### Run context\n\n{run_context}\n\n"
+        f"### Source file (DO NOT MODIFY): {cluster.src_file}\n"
+        f"```typescript\n{src_code}\n```\n\n"
+        f"### Test file to fix: {cluster.test_file}\n"
+        f"```typescript\n{test_code}\n```\n\n"
+        f"### Failing assertions\n```\n{error_log}\n```\n\n"
+        f"### Auditor rationale\n{verdict.get('test_patch_rationale', '')}\n\n"
+        f"Verdict: {verdict.get('verdict')} — fix ONLY what rationale describes."
+    )
+
+    messages = [
+        {"role": "system", "content": TEST_REPAIR_SYSTEM},
+        {"role": "user", "content": user_content},
+    ]
+
+    if verbose:
+        print(f"    [P0-fix] Rewriting test: {cluster.test_file} …")
+
+    try:
+        patch = _parse_model_json(call_qwen(messages))
+    except Exception as exc:
+        print(f"    [P0-fix] Parse error: {exc}", file=sys.stderr)
+        return False
+
+    out_rel = patch.get("file_path", cluster.test_file)
+    out_path = _resolve_artifact_path(out_rel)
+
+    if not _is_under(out_path, TESTS_DIR):
+        print(
+            f"    [P0-fix] Scope violation: tried to write {out_path}. Rejected.",
+            file=sys.stderr,
+        )
+        return False
+
+    code = patch.get("code")
+    if not isinstance(code, str):
+        print("    [P0-fix] Invalid patch: missing code string.", file=sys.stderr)
+        return False
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(code)
+    track_write(out_path)
+
+    print(f"    [P0-fix] ✓ Test updated — {patch.get('explanation', '(no explanation)')}")
+    for change in patch.get("changes_made", []):
+        print(f"      • {change}")
+
+    return True
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Shared repair executor
+# ════════════════════════════════════════════════════════════════════════════
+
+def _call_repair(
+    cluster: FailureCluster,
+    call_api: Callable[[list[dict[str, str]]], str],
+    system: str,
+    run_context: str,
+    extra_ctx: str = "",
+    verbose: bool = False,
+    layer_name: str = "L1",
+    scope_check: bool = False,
+) -> tuple[bool, str]:
+    src_code = _read_file_safe(_resolve_artifact_path(cluster.src_file))
+    test_code = _read_file_safe(_resolve_artifact_path(cluster.test_file))
+    error_log = cluster.error_block()
+
+    user_content = (
+        f"### Run context\n\n{run_context}\n\n"
+        f"### Test file (read-only): {cluster.test_file}\n"
+        f"```typescript\n{test_code}\n```\n\n"
+        f"### Source file to fix: {cluster.src_file}\n"
+        f"```typescript\n{src_code}\n```\n\n"
+        f"### Failing tests\n```\n{error_log}\n```"
+        + (f"\n\n### Expected state timeline\n```\n{extra_ctx}\n```" if extra_ctx else "")
+    )
+
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user_content},
+    ]
+
+    model_label = _DEBUGGER_MODEL if layer_name == "L1" else _DEBUGGER_SECONDARY_MODEL
+    if verbose:
+        print(
+            f"    [{layer_name}] → {model_label} "
+            f"(attempt #{cluster.attempt_count + 1}, "
+            f"{len(cluster.failures)} failure(s)) …"
+        )
+
+    try:
+        patch = _parse_model_json(call_api(messages))
+    except Exception as exc:
+        print(f"    [{layer_name}] Parse error: {exc}", file=sys.stderr)
+        return False, f"parse error: {exc}"
+
+    explanation = str(patch.get("explanation", ""))
+
+    if layer_name == "L1" and "LOGIC_BUG" in explanation.upper():
+        print(f"    [L1] {_DEBUGGER_MODEL} signalled LOGIC_BUG — deferring to {_DEBUGGER_SECONDARY_MODEL}.")
+        return False, "LOGIC_BUG"
+
+    out_rel = str(patch.get("file_path", cluster.src_file))
+
+    if scope_check and not any(pattern.match(out_rel) for pattern in MINIMAX_SCOPE_PATTERNS):
+        print(
+            f"    [{layer_name}] Scope violation: tried to write {out_rel}. "
+            "Allowed: src/hooks/, src/data/, src/types/, src/utils/. Patch rejected.",
+            file=sys.stderr,
+        )
+        return False, f"scope violation: {out_rel}"
+
+    if _current_scope() == "mini" and not _mini_allowed_to_write(out_rel):
+        print(
+            f"    [{layer_name}] Mini scope violation: tried to write {out_rel}; "
+            "not in mini_plan target_files. Patch rejected.",
+            file=sys.stderr,
+        )
+        return False, f"mini scope violation: {out_rel}"
+
+    out_path = _resolve_artifact_path(out_rel)
+    code = patch.get("code")
+    if not isinstance(code, str):
+        return False, "invalid patch: missing code string"
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(code)
+    track_write(out_path)
+
+    root_cause = patch.get("root_cause", "")
+    summary = f"{root_cause} — {explanation}" if root_cause else explanation
+    print(f"    [{layer_name}] ✓ Patched {out_rel} — {summary or '(no explanation)'}")
+    return True, explanation
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Phase C — cluster dispatch
+# ════════════════════════════════════════════════════════════════════════════
+
+def repair_cluster(
+    cluster: FailureCluster,
+    max_cluster_attempts: int,
+    judge_findings: str = "",
+    verbose: bool = False,
+) -> ClusterRepairRecord:
+    """
+    Optimized repair flow:
+    1. Skip if escalated
+    2. Skip if stale (same fingerprint, already attempted)
+    3. Try rule-based fixes first (zero tokens)
+    4. Try static pre-pass
+    5. Single merged LLM call (verdict + fix combined)
+    """
+    run_context = _load_run_context()
+
+    # Skip escalated
+    if cluster.escalated:
+        print(f"    [SKIP] {cluster.test_file} — ESCALATED, skipping.")
+        return ClusterRepairRecord(
+            cluster=cluster.key,
+            src_file=cluster.src_file,
+            failures=len(cluster.failures),
+            repaired=False,
+            layer_used="skipped",
+            escalated=True,
+            escalated_to=cluster.owner,
+            owner=cluster.owner,
+            note="previously escalated",
+        )
+
+    # Skip stale — fingerprint unchanged means same error, don't waste tokens
+    current_fp = cluster.fingerprint()
+    if cluster.attempt_count > 0 and cluster.last_fingerprint == current_fp:
+        print(f"    [SKIP] {cluster.test_file} — STALE fingerprint, skipping LLM call.")
+        cluster.escalated = True
+        return ClusterRepairRecord(
+            cluster=cluster.key,
+            src_file=cluster.src_file,
+            failures=len(cluster.failures),
+            repaired=False,
+            layer_used="skipped_stale",
+            escalated=True,
+            escalated_to="human",
+            owner=cluster.owner,
+            note=f"stale after {cluster.attempt_count} attempt(s)",
+        )
+
+    # Max attempts check
+    if cluster.attempt_count >= max_cluster_attempts:
+        cluster.escalated = True
+        print(f"    [SKIP] {cluster.test_file} — max attempts reached.")
+        return ClusterRepairRecord(
+            cluster=cluster.key,
+            src_file=cluster.src_file,
+            failures=len(cluster.failures),
+            repaired=False,
+            layer_used="skipped",
+            escalated=True,
+            escalated_to="human",
+            owner=cluster.owner,
+            note=f"gave up after {cluster.attempt_count} attempts",
+        )
+
+    # Step 1: Rule-based fixes (zero tokens)
+    rule_ok, rule_msg = try_rule_based_fix(cluster, verbose=verbose)
+    if rule_ok:
+        cluster.attempt_count += 1
+        cluster.last_fingerprint = current_fp
+        return ClusterRepairRecord(
+            cluster=cluster.key,
+            src_file=cluster.src_file,
+            failures=len(cluster.failures),
+            repaired=True,
+            layer_used="rule_based",
+            escalated=False,
+            escalated_to="",
+            owner=cluster.owner,
+            note=rule_msg,
+        )
+
+    # Step 2: Static pre-pass
+    l0_fixed, l0_desc = layer0_static_prepass(cluster, verbose)
+    if l0_fixed:
+        cluster.attempt_count += 1
+        cluster.last_fingerprint = current_fp
+        return ClusterRepairRecord(
+            cluster=cluster.key,
+            src_file=cluster.src_file,
+            failures=len(cluster.failures),
+            repaired=True,
+            layer_used="static",
+            escalated=False,
+            escalated_to="",
+            owner=cluster.owner,
+            note=l0_desc,
+        )
+
+    # Step 3: Single merged LLM call (verdict + fix in one)
+    return merged_repair_cluster(
+        cluster,
+        run_context=run_context,
+        judge_findings=judge_findings,
+        verbose=verbose,
+    )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Report writers
+# ════════════════════════════════════════════════════════════════════════════
+
+def _trim_iteration_for_log(record: dict[str, Any], is_last: bool) -> dict[str, Any]:
+    trimmed = {
+        "iteration": record.get("iteration"),
+        "passed": record.get("passed"),
+        "clusters_found": record.get("clusters_found"),
+        "clusters_repaired": record.get("clusters_repaired"),
+        "summary": record.get("summary"),
+    }
+    if is_last:
+        trimmed["cluster_details"] = record.get("cluster_details", [])
+    return trimmed
+
+
+def append_test_log(report: dict[str, Any]) -> None:
+    iterations = report.get("iterations", [])
+    trimmed_iterations = []
+    for i, rec in enumerate(iterations):
+        is_last = (i == len(iterations) - 1)
+        trimmed_iterations.append(_trim_iteration_for_log(rec, is_last=is_last))
+
+    entry: dict[str, Any] = {
+        "scope": report.get("scope"),
+        "final_status": report.get("final_status"),
+        "total_iterations": report.get("total_iterations"),
+        "max_iter": report.get("max_iter"),
+        "max_cluster_attempts": report.get("max_cluster_attempts"),
+        "impl": report.get("impl"),
+        "escalated": report.get("escalated", []),
+        "iterations": trimmed_iterations,
+    }
+
+    log_path = DEBUGGER_TEST_LOG
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if log_path.exists():
+            raw = log_path.read_text(encoding="utf-8").strip()
+            try:
+                data = json.loads(raw)
+                entries = data.get("entries", []) if isinstance(data, dict) else data
+                if not isinstance(entries, list):
+                    entries = []
+            except Exception:
+                entries = []
+        else:
+            entries = []
+
+        entries.append(entry)
+        log_path.write_text(
+            json.dumps({"entries": entries}, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        track_write(log_path)
+        print(f"[09] Test log appended ({len(entries)} entries) → {log_path}")
+    except Exception as exc:
+        print(f"[09] WARNING: could not append test log: {exc}", file=sys.stderr)
+
+
+def _write_report(report: dict[str, Any]) -> None:
+    DEBUGGER_OVERWRITE_TEST_SUMMARY.parent.mkdir(parents=True, exist_ok=True)
+    DEBUGGER_OVERWRITE_TEST_SUMMARY.write_text(
+        json.dumps(report, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    track_write(DEBUGGER_OVERWRITE_TEST_SUMMARY)
+    print(f"\n[09] Debugger test summary → {DEBUGGER_OVERWRITE_TEST_SUMMARY}")
+
+    append_test_log(report)
+
+
+def _write_mini_report(passed: bool, details: dict[str, Any]) -> None:
+    report = {
+        "impl": "mini-verifier",
+        "scope": "mini",
+        "final_status": "PASS" if passed else "FAIL",
+        "total_iterations": 1,
+        "mini_verification": details,
+        "iterations": [
+            {
+                "iteration": 1,
+                "passed": passed,
+                "summary": details.get("summary", ""),
+                "clusters_found": 0,
+                "clusters_repaired": 0,
+                "cluster_details": details.get("checks", []),
+                "log_snippet": "",
+            }
+        ],
+        "escalated": [],
+    }
+    _write_report(report)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Full Vitest loop
+# ════════════════════════════════════════════════════════════════════════════
+
+def _run_full_vitest_loop(
+    *,
+    max_iter: int,
+    max_cluster_attempts: int,
+    verbose: bool,
+    no_repair: bool,
+) -> bool:
+    judge_findings = _load_judge_findings()
+    if judge_findings:
+        print(
+            f"[09] Archivist knowledge loaded ({len(judge_findings)} chars) "
+            "— injected into repair prompts"
+        )
+
+    iteration_records: list[IterationRecord] = []
+    cluster_state: dict[str, FailureCluster] = {}
+    escalated_log: list[dict[str, Any]] = []
+    cluster_counts: list[int] = []
+
+    for iteration in range(1, max_iter + 1):
+        tag = f"[09][{iteration}/{max_iter}]"
+
+        print(f"\n{tag} Phase B — running Vitest …")
+        passed, output = run_vitest()
+        summary_line = _summarize_test_output(output)
+        print(f"{tag} {summary_line}")
+
+        if passed:
+            print(f"{tag} ✓ All tests passed.")
+            iteration_records.append(
+                IterationRecord(
+                    iteration=iteration,
+                    passed=True,
+                    summary=summary_line,
+                    clusters_found=0,
+                    clusters_repaired=0,
+                    cluster_details=[],
+                    log_snippet="",
+                )
+            )
+            break
+
+        clusters = parse_failures(output)
+        clusters = merge_cluster_state(clusters, cluster_state)
+        cluster_counts.append(len(clusters))
+
+        print(f"{tag} {len(clusters)} failing cluster(s):")
+        for cluster in clusters:
+            markers: list[str] = []
+            if cluster.attempt_count > 0 and cluster.last_fingerprint == cluster.fingerprint():
+                markers.append("STALE")
+            if cluster.escalated:
+                markers.append("ESCALATED")
+            if cluster.owner == _DEBUGGER_SECONDARY_MODEL:
+                markers.append(_DEBUGGER_SECONDARY_MODEL.upper()[:12])
+
+            scope_label = "[hook/data/logic]" if cluster.is_minimax_scope() else "[component]"
+            marker_str = f"  [{', '.join(markers)}]" if markers else ""
+            print(
+                f"  * {scope_label} {cluster.test_file} "
+                f"({len(cluster.failures)} failure(s)){marker_str}"
+            )
+
+        if not clusters:
+            has_any_fail_line = _has_any_failure(output)
+            if has_any_fail_line:
+                print(
+                    f"{tag} ⚠ Vitest reported failures but no clusters could be "
+                    "parsed. Possible cause: Vitest output format changed. Stopping.",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"{tag} Vitest exited non-zero but no failure lines found. "
+                    "Possibly only deprecation warnings or empty test files. Stopping.",
+                    file=sys.stderr,
+                )
+            iteration_records.append(
+                IterationRecord(
+                    iteration=iteration,
+                    passed=False,
+                    summary=summary_line,
+                    clusters_found=0,
+                    clusters_repaired=0,
+                    cluster_details=[],
+                    log_snippet=output[-1200:],
+                )
+            )
+            break
+
+        # Systemic error detection: if same error in >50% clusters, escalate immediately
+        systemic_msg = _detect_systemic_error(clusters)
+        if systemic_msg:
+            print(
+                f"{tag} ⚠ Systemic error detected in >{len(clusters)//2} clusters: "
+                f"{systemic_msg[:120]}"
+            )
+            print(f"{tag} Escalating all clusters — looping will not help.")
+            for cluster in clusters:
+                cluster.escalated = True
+                escalated_log.append({
+                    "iteration": iteration,
+                    "cluster": cluster.key,
+                    "src_file": cluster.src_file,
+                    "failures": len(cluster.failures),
+                    "repaired": False,
+                    "layer_used": "skipped",
+                    "escalated": True,
+                    "escalated_to": "human",
+                    "owner": cluster.owner,
+                    "note": f"systemic error: {systemic_msg[:200]}",
+                })
+            iteration_records.append(
+                IterationRecord(
+                    iteration=iteration,
+                    passed=False,
+                    summary=f"systemic error: {systemic_msg[:120]}",
+                    clusters_found=len(clusters),
+                    clusters_repaired=0,
+                    cluster_details=[
+                        {
+                            "cluster": c.key,
+                            "src_file": c.src_file,
+                            "failures": len(c.failures),
+                            "escalated": True,
+                            "escalated_to": "human",
+                            "owner": c.owner,
+                            "note": f"systemic: {systemic_msg[:100]}",
+                        }
+                        for c in clusters
+                    ],
+                    log_snippet=output[-1200:],
+                )
+            )
+            break
+
+        # Early-exit: if cluster count hasn't decreased over 2 consecutive iterations
+        if _should_early_exit(cluster_counts):
+            print(
+                f"{tag} ⚠ Cluster count not decreasing over last 3 iterations "
+                f"({cluster_counts[-3:]}). Breaking early."
+            )
+            iteration_records.append(
+                IterationRecord(
+                    iteration=iteration,
+                    passed=False,
+                    summary=f"early exit: no progress ({cluster_counts[-3:]})",
+                    clusters_found=len(clusters),
+                    clusters_repaired=0,
+                    cluster_details=[
+                        {
+                            "cluster": c.key,
+                            "src_file": c.src_file,
+                            "failures": len(c.failures),
+                            "escalated": c.escalated,
+                            "owner": c.owner,
+                            "attempts": c.attempt_count,
+                        }
+                        for c in clusters
+                    ],
+                    log_snippet=output[-1200:],
+                )
+            )
+            break
+
+        if no_repair:
+            print(f"{tag} --no-repair set; stopping after test run.")
+            iteration_records.append(
+                IterationRecord(
+                    iteration=iteration,
+                    passed=False,
+                    summary=summary_line,
+                    clusters_found=len(clusters),
+                    clusters_repaired=0,
+                    cluster_details=[
+                        {
+                            "cluster": c.key,
+                            "src_file": c.src_file,
+                            "failures": len(c.failures),
+                            "owner": c.owner,
+                            "attempts": c.attempt_count,
+                        }
+                        for c in clusters
+                    ],
+                    log_snippet=output[-1200:],
+                )
+            )
+            break
+
+        if iteration == max_iter:
+            print(f"{tag} Reached max_iter — {len(clusters)} cluster(s) remaining.")
+            iteration_records.append(
+                IterationRecord(
+                    iteration=iteration,
+                    passed=False,
+                    summary=summary_line,
+                    clusters_found=len(clusters),
+                    clusters_repaired=0,
+                    cluster_details=[
+                        {
+                            "cluster": c.key,
+                            "failures": len(c.failures),
+                            "escalated": c.escalated,
+                            "owner": c.owner,
+                            "attempts": c.attempt_count,
+                        }
+                        for c in clusters
+                    ],
+                    log_snippet=output[-1200:],
+                )
+            )
+            break
+
+        print(f"{tag} Phase C — dispatching {len(clusters)} cluster(s) …")
+        repaired = 0
+        cluster_details: list[dict[str, Any]] = []
+
+        for cluster in clusters:
+            print(
+                f"  -> {cluster.test_file} "
+                f"(owner={cluster.owner}, attempt #{cluster.attempt_count + 1})"
+            )
+
+            record = repair_cluster(
+                cluster,
+                max_cluster_attempts,
+                judge_findings=judge_findings,
+                verbose=verbose,
+            )
+
+            cluster_state[cluster.key] = cluster
+            repaired += int(record.repaired)
+
+            detail = {
+                "cluster": record.cluster,
+                "src_file": record.src_file,
+                "failures": record.failures,
+                "repaired": record.repaired,
+                "layer_used": record.layer_used,
+                "escalated": record.escalated,
+                "escalated_to": record.escalated_to,
+                "owner": record.owner,
+                "note": record.note,
+                "consistency_verdict": record.consistency_verdict,
+            }
+            cluster_details.append(detail)
+
+            if record.escalated:
+                escalated_log.append({"iteration": iteration, **detail})
+
+        print(f"{tag} Phase C done — {repaired}/{len(clusters)} patched.")
+        iteration_records.append(
+            IterationRecord(
+                iteration=iteration,
+                passed=False,
+                summary=summary_line,
+                clusters_found=len(clusters),
+                clusters_repaired=repaired,
+                cluster_details=cluster_details,
+                log_snippet=output[-1200:],
+            )
+        )
+
+    final_passed = bool(iteration_records and iteration_records[-1].passed)
+
+    report = {
+        "impl": f"primary:{get_model('debugger')}+secondary:{get_model('debugger_secondary')}",
+        "scope": _current_scope(),
+        "max_iter": max_iter,
+        "max_cluster_attempts": max_cluster_attempts,
+        "total_iterations": len(iteration_records),
+        "final_status": "PASS" if final_passed else "FAIL",
+        "iterations": [asdict(record) for record in iteration_records],
+        "escalated": escalated_log,
+    }
+
+    _write_report(report)
+
+    if escalated_log:
+        print(f"[09] ⚠ {len(escalated_log)} cluster(s) escalated")
+
+    return final_passed
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Main
+# ════════════════════════════════════════════════════════════════════════════
+
+def main() -> None:
+    parser = _build_parser()
+    args = parser.parse_args()
+
+    _configure_project(args.project, parser)
+
+    # Important: PIPELINE_PROJECT must be configured before ensure_dirs().
+    ensure_dirs()
+
+    exit_code = 0
+
+    try:
+        scope = _current_scope()
+        print(f"[09] Scope detected: {scope}")
+
+        # ── Bug report intake (full mode only) ──────────────────────────────
+        # gather_text_file_bundle handles TTY detection automatically:
+        #   - TTY + no args  → interactive prompt (drag-drop / paste / /done)
+        #   - no TTY         → silent, returns "" (harness / CI subprocess)
+        #   - --text / --input provided → used directly, no prompt
+        #   - --no-interactive → suppresses prompt even on TTY
+        if scope == "full":
+            global _BUG_REPORT_TEXT
+            bug_text = gather_bug_report(
+                cli_text=args.text,
+                cli_files=args.input or [],
+                allow_interactive=not args.no_interactive,
+            )
+            if bug_text:
+                _BUG_REPORT_TEXT = bug_text
+                print(
+                    f"[09] Bug report received ({len(bug_text)} chars) — "
+                    "will use as primary run context for repair models."
+                )
+            else:
+                print(
+                    "[09] No bug report provided — "
+                    "using codebase_map.md + manifest as run context."
+                )
+
+        if scope == "mini":
+            passed, mini_details = _run_mini_verifiers(verbose=args.verbose)
+
+            # If mini is TS/Vitest and failed, optionally allow the existing repair loop.
+            checks = mini_details.get("checks", [])
+            vitest_failed = any(
+                c.get("kind") == "vitest" and not c.get("passed")
+                for c in checks
+                if isinstance(c, dict)
+            )
+
+            if vitest_failed and not args.no_repair:
+                print("[09][mini] Vitest failed; entering TS repair loop with mini context.")
+                final_passed = _run_full_vitest_loop(
+                    max_iter=args.max_iter,
+                    max_cluster_attempts=args.max_cluster_attempts,
+                    verbose=args.verbose,
+                    no_repair=args.no_repair,
+                )
+                if not final_passed:
+                    exit_code = 1
+            else:
+                _write_mini_report(passed, mini_details)
+                if not passed:
+                    exit_code = 1
+
+        else:
+            final_passed = _run_full_vitest_loop(
+                max_iter=args.max_iter,
+                max_cluster_attempts=args.max_cluster_attempts,
+                verbose=args.verbose,
+                no_repair=args.no_repair,
+            )
+
+            if not final_passed:
+                exit_code = 1
+
+    except Exception as exc:
+        print(f"[09] ERROR: {exc}", file=sys.stderr)
+
+        # Best-effort failure report.
+        try:
+            _write_report(
+                {
+                    "impl": f"primary:{get_model('debugger')}+secondary:{get_model('debugger_secondary')}",
+                    "scope": "unknown",
+                    "final_status": "FAIL",
+                    "total_iterations": 0,
+                    "iterations": [],
+                    "escalated": [],
+                    "error": str(exc),
+                }
+            )
+        except Exception:
+            pass
+
+        exit_code = 1
+
+    finally:
+        print_summary("[09]")
+        print_artifact_summary("[09]")
+        prompt_next_step(ROLE, prefix="[09]")
+
+    sys.exit(exit_code)
+
+
+if __name__ == "__main__":
+    main()
